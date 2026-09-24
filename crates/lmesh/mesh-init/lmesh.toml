@@ -1,0 +1,51 @@
+# Linux mesh service with radio and BLE adapters.
+# Install as lmesh.toml in the mesh-init service directory.
+
+[Service]
+Type = "exec"
+ExecStart = "lmesh"
+WorkingDirectory = "/home/lmesh"
+User = "build"
+Group = "build"
+SupplementaryGroups = ["plugdev"]
+Restart = "always"
+RestartSec = "1s"
+KillMode = "control-group"
+TimeoutStopSec = "2s"
+NoNewPrivileges = false
+CapabilityBoundingSet = ["CAP_SETPCAP", "CAP_NET_ADMIN", "CAP_NET_RAW"]
+AmbientCapabilities = ["CAP_NET_ADMIN", "CAP_NET_RAW"]
+# tracing writes to the rotated MESH_LOG_FILE; do not send a duplicate stream
+# through mesh-init's shared stderr (often /tmp/log.json).
+StandardOutput = "null"
+StandardError = "null"
+
+[Environment]
+HOME = "/home/lmesh"
+MESH_LOG_DIR = "/home/lmesh/log"
+MESH_LOG_FILE = "/home/lmesh/log/lmesh.log"
+MESH_TOOLS = "/opt/lmesh/etc/schemas/tools.json"
+# The binary owns its endpoint defaults: /run/mesh/lmesh/mesh.sock.cbor,
+# localhost HTTP 18981, and normal UDP/QUIC-lite 3336.
+# mesh-init supplies HOME and creates /run/mesh/lmesh before launch.
+# Change this per host; do not hardcode a physical wlan name in the binary.
+LMESH_INTERFACES = "wlan0"
+LMESH_WIFI_IFACE = "wlan0"
+# `costin` is the shared UDP6 LAN label. This host reaches it through br-lan;
+# other hosts may map the same label to eth0 or their associated STA instead.
+LMESH_UDP6_NETWORKS = "costin=br-lan"
+# The recovery watcher is scoped in-process to this service's owned interface
+# set. lmesh/wlan1 link transitions cannot trigger lmesh/wlan0 recovery.
+# Keep wlan0 on the shared Android/Linux/ESP WPA2-PSK identity. The identity
+# and passphrase are code-owned, never supplied by a control request.
+LMESH_AP_CHANNEL = "6"
+# Start a conventional WPA2 infrastructure AP. Android sees an ordinary
+# secured network rather than a P2P group or an open-network confirmation.
+# Set `p2p` or `open` only for the corresponding diagnostic comparison.
+LMESH_AP_BACKEND = "wpa2-ap"
+# WPA2 AP and P2P use the same service-owned control runtime.
+LMESH_WPA_RUNTIME_DIR = "/run/mesh/lmesh/wpa"
+# Raw-NAN is provided by dmesh-rawnan.
+
+[Mesh]
+Address = "unix:///run/mesh/lmesh/mesh.sock.cbor"

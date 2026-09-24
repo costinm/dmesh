@@ -21,69 +21,7 @@ pub trait BleBackend: Send + Sync {
 }
 
 pub fn tools_json() -> Value {
-    json!([
-        {
-            "name": "ble.status",
-            "description": "Report the local BLE adapter, CoC, and bearer state.",
-            "inputSchema": {"type": "object"},
-            "outputSchema": {"type": "object"},
-            "x-ui-visibility": "default"
-        },
-        {
-            "name": "ble.scan",
-            "description": "Start a bounded local BLE scan for DMesh companion advertisements.",
-            "inputSchema": {"type": "object"},
-            "outputSchema": {"type": "object"},
-            "x-ui-visibility": "default"
-        },
-        {
-            "name": "ble.scan_stop",
-            "description": "Stop the local BLE scan without clearing retained results.",
-            "inputSchema": {"type": "object"},
-            "outputSchema": {"type": "object"},
-            "x-ui-visibility": "default"
-        },
-        {
-            "name": "ble.scan_results",
-            "description": "List retained BLE scan results for multi-device selection.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 64}
-                }
-            },
-            "outputSchema": {"type": "object"},
-            "x-ui-visibility": "default"
-        },
-        {
-            "name": "ble.scan_clear",
-            "description": "Clear retained BLE scan results.",
-            "inputSchema": {"type": "object"},
-            "outputSchema": {"type": "object"},
-            "x-ui-visibility": "default"
-        },
-        {
-            "name": "ble.connect",
-            "description": "Connect to one scanned BLE device over L2CAP CoC.",
-            "inputSchema": {
-                "type": "object",
-                "required": ["address"],
-                "properties": {
-                    "address": {"type": "string"},
-                    "psm": {"type": "integer", "minimum": 1, "maximum": 65535}
-                }
-            },
-            "outputSchema": {"type": "object"},
-            "x-ui-visibility": "default"
-        },
-        {
-            "name": "ble.disconnect",
-            "description": "Disconnect the local BLE CoC bearer.",
-            "inputSchema": {"type": "object"},
-            "outputSchema": {"type": "object"},
-            "x-ui-visibility": "default"
-        },
-    ])
+    crate::platform_catalog::tools_for("ble.")
 }
 
 pub struct BleService {
@@ -101,7 +39,8 @@ impl BleService {
     pub fn mesh_service(backend: Arc<dyn BleBackend>) -> anyhow::Result<MeshService> {
         Ok(MeshService {
             backend: MeshServiceBackend::Direct(Arc::new(Self::new(backend)?)),
-            catalog: Some(tools_json()),
+            encoding: ssh_mesh::mesh_rest::MeshServiceEncoding::TaggedCbor,
+            component: "ble".to_owned(),
         })
     }
 }
@@ -121,10 +60,7 @@ impl TaggedRecordHandler for BleService {
                 let id = record.id.context("ble service request missing id")?;
                 Ok(Some(match output {
                     Ok(value) => response_ok(id, value),
-                    Err(error) => response_error(
-                        id,
-                        json!({"error": error.to_string()}),
-                    ),
+                    Err(error) => response_error(id, json!({"error": error.to_string()})),
                 }))
             }
             _ => {
@@ -216,18 +152,34 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(response.id, Some(json!(7)));
+        assert_eq!(response.result, Some(json!({"operation": "status"})));
+
+        let response = service
+            .handle_record(TaggedRecord {
+                component: NameOrTag::Tag(201),
+                method: NameOrTag::Tag(4),
+                id: Some(json!(8)),
+                env: [(NameOrTag::Tag(1), json!(5))].into_iter().collect(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.id, Some(json!(8)));
         assert_eq!(
             response.result,
-            Some(json!({"operation": "status"}))
+            Some(json!({"operation": "scan_results", "limit": 5}))
         );
     }
-
 
     #[test]
     fn ble_service_mesh_registration_uses_the_shared_catalog() {
         let service = BleService::mesh_service(Arc::new(MockBackend)).unwrap();
-        assert!(service.catalog.is_some());
-        let names = TaggedCatalog::from_tools_json(service.catalog.as_ref().unwrap())
+        assert_eq!(
+            service.encoding,
+            ssh_mesh::mesh_rest::MeshServiceEncoding::TaggedCbor
+        );
+        let names = TaggedCatalog::from_tools_json(&tools_json())
             .unwrap()
             .method("ble.scan_results")
             .is_some();

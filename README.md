@@ -1,5 +1,8 @@
 # Device Mesh
 
+The [DMesh API](API.md) is the single schema and request reference for device,
+Linux, Android, and optional module services.
+
 The project goal is to provide communication paths across ad-hoc,
 untrusted device-to-device links. Unlike other mesh projects it is 
 not tied to a protocol, medium or device type - but attempts to use
@@ -64,4 +67,3 @@ directly on the wire, using only the 'destination connection ID' for forwarding.
 Communication uses short lived and dynamic multi-path circuits, with local
 control planes (powered devices - or rotating battery devices) maintaining
 discovery information.
-

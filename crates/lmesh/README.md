@@ -67,12 +67,13 @@ Default:
 by Android and firmware-adjacent tests. `lmesh::radio_protocol` is a
 compatibility re-export. Keep hardware access outside the protocol module:
 Android Java owns Android BLE/WiFi Aware permissions and callbacks, while
-`lmesh-wifi` owns the Wi-Fi bearer and raw-NAN monitor. The full `lmesh`
-service uses the shared raw-NAN monitor through that bearer.
+the Linux `lmesh` daemon owns the Wi-Fi bearer and raw-NAN monitor. The
+`lmesh-wifi` crate remains an internal radio implementation library; it no
+longer provides a second daemon.
 
-Local adapters should use message/pubsub style boundaries with text command
-metadata, raw byte payloads, and optional FDs. CBOR is a good future fit for
-structured binary frames; protobuf is not planned.
+Local service requests use tagged CBOR with numeric IDs from the
+[root API](../../API.md). HTTP accepts JSON at the operator edge and
+uses the upstream ssh-mesh catalog translator before dispatch.
 
 The current radio architecture, verified Linux Wi-Fi/USB results, reproduction
 commands, and next-session test order are in
@@ -80,11 +81,8 @@ commands, and next-session test order are in
 
 ## Web UI
 
-`web/` contains the DMesh discovery dashboard served by lmesh at
-`/_m/adm/`. It shadows only the local assets and falls back to ssh-mesh's
-generic admin pages (for example `services.html`). Edit this directory for
-DMesh UI work; ssh-mesh remains independent of DMesh. Set
-`LMESH_HTTP_WEB_DIR` to use a packaged or alternate asset directory.
+The HTTP admin endpoint serves upstream ssh-mesh assets by default. Set
+`LMESH_HTTP_WEB_DIR` to use a packaged DMesh dashboard when one is available.
 
 ## TODO
 
@@ -95,3 +93,7 @@ DMesh UI work; ssh-mesh remains independent of DMesh. Set
 - any info should be in the certificate
 - include current list of public and mesh IPs, if any.
 - save valid announcements to files, load from files, GC and timestamp if not updated in 1 day.
+
+The [root API](../../API.md) specifies local and shared portable requests.
+Their method and field tags are listed in the single installed
+[`resources/tools.json`](resources/tools.json) catalog.

@@ -2645,16 +2645,11 @@ impl LmeshService {
         }
     }
 
-    /// A UDP-only lmesh companion must not fall back to the historical
-    /// `wlan1` default for a NOW address. `lmesh-wifi` is the explicit radio
-    /// owner in that deployment; callers select its endpoint when they need
-    /// a NOW path. This keeps radio ownership out of the portable HTTP/QUIC
-    /// controller rather than turning a missing interface into a late raw
-    /// frame error.
+    /// A host without an owned Wi-Fi interface cannot route a NOW request.
     fn require_owned_wifi_for_now(&self) -> Result<()> {
         if self.wifi_owned_interfaces().names().is_empty() {
             anyhow::bail!(
-                "unsupported/no_quic_route: lmesh is UDP-only; send NOW requests to lmesh-wifi"
+                "unsupported/no_quic_route: lmesh has no owned Wi-Fi interface for NOW"
             );
         }
         Ok(())

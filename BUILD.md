@@ -140,36 +140,29 @@ written to `target/x86_64-unknown-linux-musl/release/`. The generic `mesh` CLI
 is built only by the sibling ssh-mesh workspace, at
 `$DMESH_SSH_MESH_DIR/target/x86_64-unknown-linux-musl/release/mesh`. After
 sourcing `env.sh`, that is the only `mesh` selected through PATH and
-placed on `PATH`; `MESH_TOOLS` defaults to lmesh's
-generated command catalog. The default `MESH_SERVICE_DIR` selects the installed
+placed on `PATH`; `MESH_SCHEMA_DIR` points to the single `lmesh` service catalog. The default `MESH_SERVICE_DIR` selects the installed
 mesh-init service definitions. The `lmesh-uart` forwarding service is retired;
 use `dmesh-cli` for a physical serial interface. `mesh` itself remains
-service-independent, and callers can override `MESH_TOOLS` or
+service-independent, and callers can override `MESH_SCHEMA_DIR`, `MESH_TOOLS`, or
 `MESH_SERVICE_DIR`.
 
 ### Managed Linux radio services
 
-The privileged stable AP/radio service is `lmesh-wifi` on `wlan0`. `lmesh` is
-the separate development/test service and normally uses `wlan1`; do not mix
-their interfaces or UDP test endpoints. After sourcing `env.sh`, use the
-ssh-mesh `mesh` client for operational RPC rather than invoking a service
-binary directly:
+The `lmesh` daemon owns the configured Linux radio (normally `wlan0`) and
+its AP/NAN control. The `lmesh-wifi` crate remains an implementation library,
+not another supervised service. After sourcing `env.sh`, use the ssh-mesh
+`mesh` client for operational RPC:
 
 ```sh
 # Read-only state useful before and after a firmware bearer test.
-mesh lmesh-wifi wifi.ap.stations iface=wlan0
-mesh lmesh-wifi wifi.rawnan.status iface=wlan0
-mesh lmesh wifi.ap.stations iface=wlan1
+mesh lmesh wifi.interface.list
+mesh lmesh telemetry.nan_status
 ```
 
-Both are supervised by `mesh-init`. On this host its control socket is
-`/run/mesh/mesh-init/mesh.sock`; the checkout environment can select another
-run directory, so set it explicitly for supervisor calls:
+`mesh-init` supervises lmesh. Query its status through the mesh client:
 
 ```sh
-export MESH_INIT_SOCK=/run/mesh/mesh-init/mesh.sock
-mesh-init status lmesh-wifi
-mesh-init status lmesh
+mesh mesh-init mesh-init status lmesh
 ```
 
 Do not use `systemctl`, signal a service PID, or spawn an unsupervised
@@ -179,8 +172,8 @@ does not automatically restart the service, so always issue the matching
 `start` and capture station/recovery evidence:
 
 ```sh
-mesh-init stop lmesh-wifi
-mesh-init start lmesh-wifi
+mesh mesh-init mesh-init stop lmesh
+mesh mesh-init mesh-init start lmesh
 ```
 
 Android JNI/UI crates remain Android build inputs and are not included in the
@@ -276,7 +269,7 @@ transport in this checkout.
 Raw UDP6 and raw ESP-NOW/action are current QUIC-lite bearers shared by Main
 and Recovery. They use `dmesh-fw-transport` hardware glue and portable framing
 from host-tested crates; they are not socket emulation or ESP-IDF ESP-NOW.
-`lmesh-wifi` owns the privileged host AP/radio side. See
+`lmesh` owns the privileged host AP/radio side. See
 [notes/2026-08-18-c6-raw-udp6-espnow-results.md](notes/2026-08-18-c6-raw-udp6-espnow-results.md)
 for exact C6 commands, rates, sizes, and known limitations.
 
@@ -288,7 +281,7 @@ it has no special command or logging role. Routine flashing uses
 chip. It does not contact a mesh service or open a runtime transport.
 
 The persistent UDP object bearer is owned by the mesh-init-supervised
-`lmesh-wifi` service; the flasher does not start or replace it.
+`lmesh` service; the flasher does not start or replace it.
 
 ### Shared Main/Recovery transport
 
@@ -304,15 +297,9 @@ host crate with tests. Main-only differences are application handlers,
 sleepy-device hooks, and beacon synchronization/power policy. Treat other
 Main/Recovery behavioral differences as bugs.
 
-For the lab host's Recovery network, install the separate
-`crates/lmesh-wifi/examples/mesh-init/lmesh-wifi.toml` mesh-init service and set its
-`LMESH_INTERFACES` value to the AP interface, for example `wlan0`.
-`lmesh-wifi` owns the open MAC-derived `Direct-XXXXXXXX-Dmesh-local` AP and the
-shared raw-NAN monitor on `wlan0` at startup. Do not run a separate hostapd or
-WPA/NAN control daemon. Use `mesh lmesh-wifi wifi.rawnan.status` and
-`mesh lmesh-wifi wifi.rawnan.ping` for bounded host tests.
-
-The frequently rebuilt experimental `lmesh` service is separate: its
-`LMESH_INTERFACES` should be `wlan1`, and it starts the same raw-NAN monitor on
-that interface. Restart it with `scripts/build.sh lmesh-restart`; restart the
-stable AP service with `scripts/build.sh lmesh-wifi-restart`.
+For the lab host's Recovery network, install
+`crates/lmesh/mesh-init/lmesh.toml` and set `LMESH_INTERFACES` to the owned AP
+interface, normally `wlan0`. lmesh owns the AP and shared raw-NAN monitor at
+startup. Use `mesh lmesh telemetry.nan_status` for a bounded host
+check. Restart only through mesh-init when a controlled service disruption is
+needed.

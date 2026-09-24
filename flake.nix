@@ -158,22 +158,27 @@
             pname = "dmesh";
             version = "0.1.0";
             src = self;
+            nativeBuildInputs = [ pkgs.makeWrapper ];
             cargoLock = {
               lockFile = ./Cargo.lock;
               # costinm/ssh-mesh is a git dependency; importCargoLock needs
               # the store hash for the mutable git sources.
               # Hash pinned to the ssh-mesh revision in Cargo.lock; updated
               # together with the lockfile when the dependency moves.
-              outputHashes."ssh-mesh-0.1.0" = "sha256-LVGe3QKCa2jsWA174ddhDAudTFhLIYjgxcFrgiDa+Ls=";
+              outputHashes."ssh-mesh-0.1.0" = "sha256-5rWzd8kP0CrjXZgaLgVHScsHNY/+lT6RgA8bPN5USk8=";
             };
             doCheck = false;
             cargoBuildFlags = [
               "-p" "lmesh"
-              "-p" "lmesh-wifi"
               "-p" "dmesh-cli"
               "-p" "mesh-tun"
               "-p" "dmeshtui"
             ];
+            postInstall = ''
+              install -Dm644 crates/lmesh/resources/tools.json "$out/etc/schemas/tools.json"
+              install -Dm644 crates/lmesh/resources/tools.json "$out/etc/schemas/lmesh/tools.json"
+              wrapProgram "$out/bin/dmesh-cli" --set-default MESH_SCHEMA_DIR "$out/etc/schemas"
+            '';
             meta.priority = 5;
           };
           musl-toolchain = pkgs.runCommand "dmesh-musl-toolchain" { } ''

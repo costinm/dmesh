@@ -20,7 +20,7 @@ serde = { version = "1.0", features = ["derive"] }
 uart-codec = { path = "../uart-codec" }
 mesh = { git = "https://github.com/costinm/ssh-mesh", package = "mesh" }
 serde_json = "1.0"
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
 lmesh = { path = "../lmesh" }

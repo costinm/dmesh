@@ -7,7 +7,7 @@ ESP-IDF. Main supplies the generic ABI declared in
 `fw/modules/include/dmesh_hw_abi.h`; the implementation is in
 `fw/esp32/rust/native/dmesh_module_loader/dmesh_hw_host.c`.
 
-The normative wire and callback contract is [API.md](API.md).
+The normative wire and callback contract is [root API](../../API.md).
 
 The module uses compact CBOR tuple requests: operation `1` is battery, `2` is
 ADC probing, and `3` is the GPIO button task. Events are CBOR tuples carried as

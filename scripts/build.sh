@@ -132,24 +132,33 @@ check_lmesh_api() {
         if [ -f ./env.sh ]; then
             . ./env.sh
         fi
-        local generated
+        local generated generated_api generated_rust
         generated="$(mktemp)"
-        cargo run -p mesh-api-gen -- \
-            --api "$DMESH_REPO/crates/dmesh-server/API.md" \
-            --out-tools "$generated"
-        # The versioned firmware schema is the runtime catalog authority.
-        # API.md documents a reviewed subset, so check that every generated
-        # wire name and numeric tag agrees with that schema instead of
-        # overwriting the composed lmesh catalog (which also carries local
-        # controller operations).
-        jq -e --slurpfile schema "$DMESH_REPO/crates/lmesh/resources/firmware-schema.json" '
-            all(.[]; . as $tool |
-                any($schema[0].methods[];
-                    .name == $tool.name and
-                    .component == $tool["x-component-index"] and
-                    .id == $tool["x-method-index"]))
-        ' "$generated" >/dev/null
-        rm -f "$generated"
+        generated_api="$(mktemp)"
+        generated_rust="$(mktemp)"
+        for group in portable settings nan; do
+            python3 "$DMESH_REPO/scripts/dmesh_api.py" "$group" "$generated_api"
+            cargo run -p mesh-api-gen -- --api "$generated_api" --out-tools "$generated"
+            jq -e --slurpfile schema "$DMESH_REPO/crates/lmesh/resources/tools.json" '
+                all(.[]; . as $tool |
+                    any($schema[0].tools[]; . as $installed |
+                        $installed.name == $tool.name and
+                        $installed["x-component-index"] == $tool["x-component-index"] and
+                        $installed["x-method-index"] == $tool["x-method-index"] and
+                        all($tool.inputSchema.properties | to_entries[]; . as $field |
+                            $installed.inputSchema.properties[$field.key]["x-protobuf-index"] ==
+                            $field.value["x-protobuf-index"])))
+            ' "$generated" >/dev/null
+        done
+        python3 "$DMESH_REPO/scripts/dmesh_api.py" linux "$generated_api"
+        cargo run -p mesh-api-gen -- --api "$generated_api" --out-tools "$generated" \
+            --out-rust "$generated_rust"
+        python3 "$DMESH_REPO/scripts/generate-lmesh-tools.py" --check --local-tools "$generated"
+        cmp "$generated_rust" "$DMESH_REPO/crates/lmesh-wifi/src/mesh_core_api.rs"
+        python3 "$DMESH_REPO/scripts/dmesh_api.py" android "$generated_api"
+        cargo run -p mesh-api-gen -- --api "$generated_api" --out-tools "$generated"
+        cmp "$generated" "$DMESH_REPO/crates/dmesh-server/platform/tools.json"
+        rm -f "$generated" "$generated_api" "$generated_rust"
     )
 }
 
@@ -157,41 +166,8 @@ check_lmesh_api() {
 # Keep generation behind the repository harness so contributors never need to
 # invoke the sibling mesh-api-gen Cargo project by hand.
 lmesh_api_generate() {
-    local ssh_mesh_dir="${DMESH_SSH_MESH_DIR:-}"
-    if [ -z "$ssh_mesh_dir" ]; then
-        for candidate in "$DMESH_REPO/../rust/ssh-mesh" "$DMESH_REPO/../ssh-mesh"; do
-            if [ -f "$candidate/crates/mesh-api-gen/Cargo.toml" ]; then
-                ssh_mesh_dir="$candidate"
-                break
-            fi
-        done
-    fi
-    if [ -z "$ssh_mesh_dir" ] || [ ! -f "$ssh_mesh_dir/crates/mesh-api-gen/Cargo.toml" ]; then
-        echo "Missing ssh-mesh mesh-api-gen source; set DMESH_SSH_MESH_DIR" >&2
-        return 1
-    fi
-    (
-        cd "$ssh_mesh_dir"
-        unset CARGO_TARGET_DIR
-        if [ -f ./env.sh ]; then . ./env.sh; fi
-        local generated
-        generated="$(mktemp)"
-        cargo run -p mesh-api-gen -- \
-            --api "$DMESH_REPO/crates/dmesh-server/API.md" \
-            --out-tools "$generated"
-        # `firmware-schema.json` is the checked-in catalog source.  This
-        # command validates the API projection; it must never replace that
-        # schema with a partial generated list.
-        jq -e --slurpfile schema "$DMESH_REPO/crates/lmesh/resources/firmware-schema.json" '
-            all(.[]; . as $tool |
-                any($schema[0].methods[];
-                    .name == $tool.name and
-                    .component == $tool["x-component-index"] and
-                    .id == $tool["x-method-index"]))
-        ' "$generated" >/dev/null
-        echo "lmesh API projection matches firmware-schema.json; no catalog file rewritten"
-        rm -f "$generated"
-    )
+    check_lmesh_api
+    echo "Root API matches the lmesh and Android platform catalogs"
 }
 
 deps() {
@@ -228,18 +204,20 @@ musl() {
     # are not pulled into the static Linux artifact set.
     "$DMESH_CARGO_BIN" build --release --target x86_64-unknown-linux-musl \
         -p lmesh \
-        -p lmesh-wifi \
         -p dmesh-cli \
         -p mesh-tun \
         -p dmeshtui
 
     # Keep mesh-init service homes uniform: /home/<service> is provisioned as
     # a symlink to target/home/<service> during development.
-    for service in lmesh lmesh-wifi; do
+    for service in lmesh; do
         mkdir -p "$DMESH_REPO/target/home/$service/bin"
+        mkdir -p "$DMESH_REPO/target/home/$service/etc/schemas"
         ln -sfn \
             "$DMESH_REPO/target/x86_64-unknown-linux-musl/release/$service" \
             "$DMESH_REPO/target/home/$service/bin/$service"
+        cp "$DMESH_REPO/crates/lmesh/resources/tools.json" \
+            "$DMESH_REPO/target/home/$service/etc/schemas/tools.json"
     done
 
     # `mesh` and `mesh-init` are owned by ssh-mesh. Let its checked-in build
@@ -284,7 +262,6 @@ lmesh_test() {
     require_dmesh_cargo
     configure_ssh_mesh_override
     "$DMESH_CARGO_BIN" test -p lmesh
-    "$DMESH_CARGO_BIN" test -p lmesh-wifi --bin lmesh-wifi
     "$DMESH_CARGO_BIN" test -p lmesh-wifi
     check_lmesh_api
 }
@@ -305,7 +282,6 @@ lmesh_control_test() {
     require_dmesh_cargo
     configure_ssh_mesh_override
     "$DMESH_CARGO_BIN" test -p lmesh --bin lmesh
-    "$DMESH_CARGO_BIN" test -p lmesh-wifi --bin lmesh-wifi
     "$DMESH_CARGO_BIN" test -p lmesh-wifi json_rpc_gateway_flattens_params_for_existing_handlers --lib
     check_host_uart_ownership
     "$DMESH_CARGO_BIN" test -p dmesh-cli --test firmware_e2e host_control_
@@ -398,10 +374,6 @@ object_store_tcp_loopback() {
 
 lmesh_restart() {
     restart_managed_service lmesh
-}
-
-lmesh_wifi_restart() {
-    restart_managed_service lmesh-wifi
 }
 
 
@@ -627,7 +599,6 @@ case "${1:-musl}" in
     transport-compare) transport_compare "$@" ;;
     object-store-tcp-loopback) object_store_tcp_loopback "$@" ;;
     lmesh-restart) lmesh_restart ;;
-    lmesh-wifi-restart) lmesh_wifi_restart ;;
     android-libs|android-native) shift; build_android_libs "${1:-debug}" ;;
-    *) echo "Usage: scripts/build.sh {deps|musl|android-libs|check|lmesh-check|lmesh-test|lmesh-control-test|lmesh-api-generate|object-store-test|transport-test|firmware-e2e|transport-coverage|transport-fuzz-smoke|transport-loopback|transport-tcp-loopback|transport-compare|object-store-tcp-loopback|lmesh-restart|lmesh-wifi-restart}" >&2; exit 2 ;;
+    *) echo "Usage: scripts/build.sh {deps|musl|android-libs|check|lmesh-check|lmesh-test|lmesh-control-test|lmesh-api-generate|object-store-test|transport-test|firmware-e2e|transport-coverage|transport-fuzz-smoke|transport-loopback|transport-tcp-loopback|transport-compare|object-store-tcp-loopback|lmesh-restart}" >&2; exit 2 ;;
 esac

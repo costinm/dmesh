@@ -17,60 +17,7 @@ pub trait TransportBackend: Send + Sync {
 }
 
 pub fn tools_json() -> Value {
-    json!([
-        {
-            "name": "transport.status",
-            "description": "Report the local radio transport snapshot.",
-            "inputSchema": {"type": "object"},
-            "outputSchema": {"type": "object"},
-            "x-ui-visibility": "default"
-        },
-        {
-            "name": "transport.set",
-            "description": "Change the local radio transport mode.",
-            "inputSchema": {
-                "type": "object",
-                "required": ["mode"],
-                "properties": {
-                    "mode": {"type": "string", "enum": ["sta", "uart", "nan", "aware"]},
-                    "ssid": {"type": "string"},
-                    "passphrase": {"type": "string"},
-                    "bssid": {"type": "string"},
-                    "bssid_hex": {"type": "string"},
-                    "channel": {"type": "integer", "minimum": 0, "maximum": 255},
-                    "ap": {"type": "integer", "minimum": 0, "maximum": 1},
-                    "p2p_go": {"type": "integer", "minimum": 0, "maximum": 1},
-                    "now": {"type": "integer", "minimum": 0, "maximum": 2},
-                    "ble": {"type": "integer", "minimum": 0, "maximum": 2},
-                    "uart": {"type": "integer", "minimum": 0, "maximum": 1},
-                    "nan_dw_interval": {"type": "integer", "minimum": 0, "maximum": 16},
-                    "wake_target": {"type": "string"}
-                },
-                "additionalProperties": false
-            },
-            "outputSchema": {"type": "object"},
-            "x-ui-visibility": "default"
-        },
-        {
-            "name": "transport.start",
-            "description": "Send a parameterized NAN wake/activation record to one sleepy device.",
-            "inputSchema": {
-                "type": "object",
-                "required": ["target_mac"],
-                "properties": {
-                    "target_mac": {"type": "string"},
-                    "kind": {"type": "integer", "minimum": 1, "maximum": 6},
-                    "ap": {"type": "integer", "minimum": 0, "maximum": 1},
-                    "now": {"type": "integer", "minimum": 0, "maximum": 2},
-                    "ble": {"type": "integer", "minimum": 0, "maximum": 2},
-                    "nan_dw_interval": {"type": "integer", "minimum": 0, "maximum": 16}
-                },
-                "additionalProperties": false
-            },
-            "outputSchema": {"type": "object"},
-            "x-ui-visibility": "default"
-        }
-    ])
+    crate::platform_catalog::tools_for("transport.")
 }
 
 pub struct TransportService {
@@ -88,7 +35,8 @@ impl TransportService {
     pub fn mesh_service(backend: Arc<dyn TransportBackend>) -> anyhow::Result<MeshService> {
         Ok(MeshService {
             backend: MeshServiceBackend::Direct(Arc::new(Self::new(backend)?)),
-            catalog: Some(tools_json()),
+            encoding: ssh_mesh::mesh_rest::MeshServiceEncoding::TaggedCbor,
+            component: "transport".to_owned(),
         })
     }
 }
@@ -108,10 +56,7 @@ impl TaggedRecordHandler for TransportService {
                 let id = record.id.context("transport service request missing id")?;
                 Ok(Some(match output {
                     Ok(value) => response_ok(id, value),
-                    Err(error) => response_error(
-                        id,
-                        json!({"error": error.to_string()}),
-                    ),
+                    Err(error) => response_error(id, json!({"error": error.to_string()})),
                 }))
             }
             _ => {
@@ -179,20 +124,32 @@ mod tests {
     #[tokio::test]
     async fn transport_service_dispatches_wake_requests() {
         let service = TransportService::new(Arc::new(MockBackend)).unwrap();
-        let response = service.handle_record(TaggedRecord {
-            component: NameOrTag::Name("transport".to_owned()),
-            method: NameOrTag::Name("start".to_owned()),
-            id: Some(json!(9)),
-            env: [
-                (NameOrTag::Name("target_mac".to_owned()), json!("aa:bb:cc:dd:ee:ff")),
-                (NameOrTag::Name("now".to_owned()), json!(1)),
-            ].into_iter().collect(),
-            ..Default::default()
-        }).await.unwrap().unwrap();
-        assert_eq!(response.result, Some(json!({
-            "operation": "start",
-            "params": {"target_mac": "aa:bb:cc:dd:ee:ff", "now": 1}
-        })));
+        let response = service
+            .handle_record(TaggedRecord {
+                component: NameOrTag::Name("transport".to_owned()),
+                method: NameOrTag::Name("start".to_owned()),
+                id: Some(json!(9)),
+                env: [
+                    (
+                        NameOrTag::Name("target_mac".to_owned()),
+                        json!("aa:bb:cc:dd:ee:ff"),
+                    ),
+                    (NameOrTag::Name("now".to_owned()), json!(1)),
+                ]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            response.result,
+            Some(json!({
+                "operation": "start",
+                "params": {"target_mac": "aa:bb:cc:dd:ee:ff", "now": 1}
+            }))
+        );
     }
 
     #[tokio::test]

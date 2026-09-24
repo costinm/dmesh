@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Match Espressif USB Serial/JTAG and UART devices. The Java adapter still
+  requires a bulk IN and OUT interface before opening it, so a vendor match
+  does not make arbitrary Espressif devices usable as a DMesh bearer.
+-->
+<resources>
+    <usb-device vendor-id="12346" />
+</resources>

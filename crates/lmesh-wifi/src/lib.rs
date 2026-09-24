@@ -1,7 +1,7 @@
 //! Shared host Wi-Fi ownership and netd policy.
 //!
-//! The full `lmesh` service and the Wi-Fi-only `lmesh-wifi` service use this
-//! crate. Linux Wi-Fi, host NAN discovery/activation, and AP/STA operations
+//! The `lmesh` daemon uses this internal library for Linux Wi-Fi, host NAN
+//! discovery/activation, and AP/STA operations
 //! live here; direct UART sessions are owned by `dmesh-cli`, not this service.
 
 use anyhow::{Result, bail};
@@ -35,10 +35,7 @@ pub use radio::RadioService;
 
 /// Reusable Wi-Fi service instance.
 ///
-/// The standalone `lmesh-wifi` binary and the experimental `lmesh` binary use
-/// this same library object.  Keeping ownership and radio state together is
-/// important: two processes can own different interfaces without sharing
-/// mutable global state or a control socket.
+/// The `lmesh` daemon owns this library object and its radio state.
 #[derive(Clone)]
 pub struct WifiService {
     netd: WifiNetd,

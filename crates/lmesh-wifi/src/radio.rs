@@ -1585,9 +1585,7 @@ impl RadioService {
         // socket also accepts IPv4-mapped localhost traffic by default, while
         // making the advertised link-local endpoint reachable.
         let bind = bind.unwrap_or_else(|| "::".to_owned());
-        // lmesh-wifi owns the stable wlan0 AP by default.  The development
-        // lmesh/wlan1 service selects its separate listener through
-        // LMESH_OBJECT_SERVER_PORT, so both can run on the same host.
+        // lmesh owns the stable wlan0 AP and its normal object listener.
         let port = port.unwrap_or_else(|| {
             std::env::var("LMESH_OBJECT_SERVER_PORT")
                 .ok()
@@ -2344,8 +2342,7 @@ impl RadioService {
     }
 
     /// Pin an owned interface to a 2.4 GHz channel using nl80211.  This is
-    /// deliberately explicit: it changes only the requested lmesh interface
-    /// and does not touch wlan0 or the lmesh-wifi service.
+    /// deliberately explicit: it changes only the requested owned interface.
     pub fn wifi_interface_set_channel(&self, iface: Option<String>, channel: u8) -> Value {
         let iface = wifi_iface(iface);
         let channel = channel.clamp(1, 13);
@@ -2427,9 +2424,8 @@ impl RadioService {
         result
     }
 
-    /// Stop the experimental monitor VIF owned by lmesh. This never touches
-    /// wlan0 or the lmesh-wifi service; it is needed before changing the
-    /// channel or switching wlan1 into AP/IBSS/P2P mode.
+    /// Stop the monitor VIF owned by lmesh before changing the channel or
+    /// switching the interface into AP/IBSS/P2P mode.
     pub fn wifi_raw_stop(&self, iface: Option<String>) -> Value {
         let iface = wifi_iface(iface);
         let monitor = monitor_iface_name(&iface);
@@ -2529,9 +2525,8 @@ impl RadioService {
     }
 
     /// Publish the stable host AP as a normal unsigned DMesh presence record.
-    /// lmesh-wifi owns wlan0 while lmesh owns the control-plane identity on
-    /// wlan1, so this intentionally uses the AP MAC as its bounded local
-    /// radio identity rather than pretending to be the other service's key.
+    /// lmesh owns wlan0, so this uses the AP MAC as its bounded local radio
+    /// identity.
     /// The record is discovery metadata only; it is not an authentication
     /// assertion and is emitted on the next confirmed NAN discovery window.
     pub fn refresh_ap_presence(&self, uptime_secs: u64) -> Result<Value> {

@@ -8,8 +8,6 @@ use std::{
 
 use crate::mesh_core::{LmeshService, LocalDiscovery};
 use anyhow::{Context, Result};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tokio::time::{Duration, sleep};
 use tracing::{debug, error, warn};
 
@@ -17,8 +15,6 @@ use tracing::{debug, error, warn};
 /// may still override this through `LMESH_ANNOUNCE_INTERVAL_SECS`.
 const DEFAULT_ANNOUNCE_INTERVAL_SECS: u64 = 5 * 60;
 const ANNOUNCE_INTERVAL_ENV: &str = "LMESH_ANNOUNCE_INTERVAL_SECS";
-const WIFI_DISCOVERY_SOCKET_ENV: &str = "LMESH_WIFI_CONTROL_SOCKET";
-const DEFAULT_WIFI_DISCOVERY_SOCKET: &str = "/run/mesh/lmesh-wifi/mesh.sock";
 const RAW_WIFI_CHANNEL_ENV: &str = "LMESH_RAW_WIFI_CHANNEL";
 
 /// Process-local endpoints for a Linux mesh service.
@@ -36,16 +32,9 @@ pub struct RuntimeDefaults {
     pub udp_port: u16,
 }
 
-/// Defaults for the BLE-enabled `lmesh` launcher.
+/// Stable endpoints for the Linux mesh daemon.
 pub const LMESH_DEFAULTS: RuntimeDefaults = RuntimeDefaults {
-    control_socket: "/run/mesh/lmesh/mesh.sock",
-    http_port: 18982,
-    udp_port: dmesh_server::udp::DEVELOPMENT_WIFI_UDP_PORT,
-};
-
-/// Defaults for the privileged `lmesh-wifi` launcher.
-pub const LMESH_WIFI_DEFAULTS: RuntimeDefaults = RuntimeDefaults {
-    control_socket: "/run/mesh/lmesh-wifi/mesh.sock",
+    control_socket: "/run/mesh/lmesh/mesh.sock.cbor",
     http_port: 18981,
     udp_port: dmesh_server::udp::STABLE_WIFI_UDP_PORT,
 };
@@ -56,161 +45,26 @@ static CONTROL_CATALOG: LazyLock<mesh::tagged::TaggedCatalog> = LazyLock::new(||
     mesh::tagged::TaggedCatalog::from_tools_json(&public_tools_json())
         .expect("lmesh tools.json must be a valid tagged catalog")
 });
+static COMMON_REGISTRY: LazyLock<mesh::registry::ServiceRegistry> = LazyLock::new(|| {
+    mesh::registry::ServiceRegistry::new("lmesh").with_tools_json(public_tools_json())
+});
 
-/// Project the canonical firmware method schema into ssh-mesh tool entries.
-/// This keeps CLI and HTTP names, component/method tags, and field tags on one
-/// source of truth without teaching the HTTP adapter about individual DMesh
-/// operations.
-fn firmware_stream_tools() -> Vec<serde_json::Value> {
-    let schema: serde_json::Value =
-        serde_json::from_str(include_str!("../../lmesh/resources/firmware-schema.json"))
-            .expect("firmware-schema.json must be valid JSON");
-    schema["methods"]
-        .as_array()
-        .expect("firmware schema methods must be an array")
-        .iter()
-        .filter_map(|method| {
-            let component = method["component"].as_u64()?;
-            let method_id = method["id"].as_u64()?;
-            let name = method["name"].as_str()?;
-            let mut properties = serde_json::Map::new();
-            for field in method["fields"].as_array().into_iter().flatten() {
-                let field_name = field["name"].as_str()?;
-                let field_id = field["id"].as_u64()?;
-                let value_type = match field["kind"].as_str() {
-                    Some("bool") => "boolean",
-                    Some("text" | "mac" | "hex") => "string",
-                    _ => "integer",
-                };
-                let mut property = serde_json::json!({
-                    "type": value_type,
-                    "x-protobuf-index": field_id,
-                });
-                if field["kind"].as_str() == Some("hex") {
-                    property["format"] = serde_json::json!("hex");
-                }
-                properties.insert(field_name.to_owned(), property);
-            }
-            Some(serde_json::json!({
-                "name": name,
-                "description": format!("Call the {name} QUIC stream handler"),
-                "inputSchema": {"type": "object", "properties": properties},
-                "outputSchema": {"type": "object"},
-                "x-component-index": component,
-                "x-method-index": method_id,
-                "x-ui-visibility": method
-                    .get("x-ui-visibility")
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!("advanced")),
-                // `x-check-all` is deliberately supplied by the versioned
-                // firmware schema.  It makes the fleet report a catalog
-                // consumer: only explicit, side-effect-free request shapes
-                // are run against every discovered address.
-                "x-check-all": method.get("x-check-all").cloned(),
-                "x-check-all-platforms": method.get("x-check-all-platforms").cloned(),
-            }))
-        })
-        .collect()
-}
-
+/// Installed catalog shared by the local daemon and device clients.
 fn public_tools_json() -> serde_json::Value {
-    let mut tools =
-        serde_json::from_str::<serde_json::Value>(include_str!("../../lmesh/resources/tools.json"))
-            .expect("shared tools.json must be valid JSON");
-    // These controller methods terminate locally.  They deliberately have no
-    // numeric wire tags: their operations retain host-owned circuit state and
-    // use normal tagged QUIC streams for every remote relay or endpoint call.
-    // Advertising them here lets the HTTP/UI bridge use the same JSON request
-    // surface as the local UDS client without opening an unauthenticated
-    // direct-message path on any mesh node.
-    let local = serde_json::json!([
-        {
-            "name": "discovery.active",
-            "description": "Send an active broadcast or directed discovery check",
-            "inputSchema": {"type":"object", "properties": {
-                "to":{"type":"string"},
-                "timeout_ms":{"type":"integer", "minimum":100}
-            }},
-            "outputSchema":{"type":"object"}, "x-ui-visibility":"default"
-        },
-        {
-            "name": "probe",
-            "description": "Run the normal QUIC probe stream to a routed node",
-            "inputSchema": {"type":"object", "required":["to"], "properties": {
-                "to":{"type":"string"},
-                "bytes":{"type":"integer", "minimum":1},
-                "packet_size":{"type":"integer", "minimum":8},
-                "timeout_ms":{"type":"integer", "minimum":100}
-            }},
-            "outputSchema":{"type":"object"}, "x-ui-visibility":"advanced"
-        },
-        {
-            "name": "relay.connect",
-            "description": "Create the first relay leg through a directly reachable relay",
-            "inputSchema": {"type":"object", "required":["relay_endpoint", "next_hop_mac"], "properties": {
-                "relay_endpoint":{"type":"string"}, "next_hop_mac":{"type":"string"}
-            }},
-            "outputSchema":{"type":"object"}, "x-ui-visibility":"default"
-        },
-        {
-            "name": "relay.open",
-            "description": "Open and verify the endpoint QUIC connection through a retained relay leg",
-            "inputSchema": {"type":"object", "required":["relay_endpoint"], "properties": {
-                "relay_endpoint":{"type":"string"}
-            }},
-            "outputSchema":{"type":"object"}, "x-ui-visibility":"default"
-        },
-        {
-            "name": "relay.endpoint.status",
-            "description": "Read endpoint status through a completed relay circuit",
-            "inputSchema": {"type":"object", "required":["relay_endpoint"], "properties": {
-                "relay_endpoint":{"type":"string"}
-            }},
-            "outputSchema":{"type":"object"}, "x-ui-visibility":"default"
-        },
-        {
-            "name": "relay.close",
-            "description": "Remove one retained relay circuit and its relay pair",
-            "inputSchema": {"type":"object", "required":["relay_endpoint"], "properties": {
-                "relay_endpoint":{"type":"string"}
-            }},
-            "outputSchema":{"type":"object"}, "x-ui-visibility":"default"
-        },
-        {
-            "name": "relay.status",
-            "description": "List retained local relay circuits",
-            "inputSchema":{"type":"object"}, "outputSchema":{"type":"object"}, "x-ui-visibility":"default"
-        }
-    ]);
-    let tools = tools
-        .as_array_mut()
-        .expect("shared tools.json must be an array");
-    let mut known = tools
-        .iter()
-        .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
-        .collect::<std::collections::BTreeSet<_>>();
-    for tool in firmware_stream_tools().into_iter().chain(
-        local
-            .as_array()
-            .expect("local tool list must be an array")
-            .iter()
-            .cloned(),
-    ) {
-        let Some(name) = tool["name"].as_str() else {
-            continue;
-        };
-        if known.insert(name.to_owned()) {
-            tools.push(tool);
-        }
-    }
-    serde_json::Value::Array(tools.clone())
+    let catalog: serde_json::Value =
+        serde_json::from_str(include_str!("../../lmesh/resources/tools.json"))
+            .expect("lmesh tools.json must be valid JSON");
+    catalog
+        .get("tools")
+        .cloned()
+        .expect("lmesh tools.json must contain tools")
 }
 
 /// Run the shared Linux mesh control plane.
 pub async fn run_mesh_service(defaults: RuntimeDefaults) -> Result<()> {
     let (trace_buffer, _trace_guard) = mesh::local_trace::init("lmesh");
     mesh::local_trace::serve("lmesh", trace_buffer.clone());
-    if let Err(error) = run_server(trace_buffer, defaults).await {
+    if let Err(error) = run_server(defaults).await {
         // mesh-init intentionally discards child stderr in the production
         // service unit. Persist the startup failure in the service log so a
         // stale control socket is diagnosable without changing radio state or
@@ -221,10 +75,7 @@ pub async fn run_mesh_service(defaults: RuntimeDefaults) -> Result<()> {
     Ok(())
 }
 
-async fn run_server(
-    trace_buffer: mesh::local_trace::LogBuffer,
-    defaults: RuntimeDefaults,
-) -> Result<()> {
+async fn run_server(defaults: RuntimeDefaults) -> Result<()> {
     let mut discovery = LocalDiscovery::new(None).await?;
     // The shared LAN label is local configuration only. The wire announce
     // carries the resulting IPv6 address and this service's distinct UDP
@@ -298,26 +149,11 @@ async fn run_server(
     } else {
         warn!(?udp_started, "lmesh_development_quic_start_failed");
     }
-    // The multicast receiver validates a common announce before invoking this
-    // local callback. Its radio-side destination is the same bounded registry
-    // used by raw NAN, so host discovery does not split by bearer. Automatic
-    // Recovery flashing is deliberately disabled in both launchers: observing
-    // or forwarding an announce may update inventory only. An operator must
-    // still start the one explicit object.flash association.
+    // The validated multicast observation updates this daemon's radio inventory.
     let announce_service = service.clone();
-    let wifi_discovery_socket = wifi_discovery_socket();
     discovery
         .set_announce_observer(Arc::new(move |peer, announce| {
             announce_service.observe_multicast_announce(peer, announce);
-            // Mirror the already-validated semantic record to the stable
-            // wlan0 service. The send is intentionally best-effort: its
-            // absence must not stall UDP multicast receive or alter radios.
-            let socket = wifi_discovery_socket.clone();
-            tokio::spawn(async move {
-                if let Err(error) = forward_wifi_discovery_announce(socket, peer, announce).await {
-                    debug!(%error, "lmesh_wifi_discovery_forward_failed");
-                }
-            });
         }))
         .await;
     discovery.announce().await?;
@@ -328,8 +164,7 @@ async fn run_server(
             Err(error) => warn!(%error, "rawnan_active_publish_configure_failed"),
         }
         let channel = raw_wifi_channel();
-        // A Wi-Fi-owning launcher may opt into its local P2P/NAN fixture. The
-        // UDP-only lmesh companion never enters this branch.
+        // A Wi-Fi-owning lmesh launcher may opt into its local P2P/NAN fixture.
         let p2p_started = service.start_default_p2p_go(channel);
         if p2p_started.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
             debug!(?p2p_started, channel, "lmesh_default_p2p_nan_started");
@@ -372,9 +207,27 @@ async fn run_server(
 
     let listen_path = standalone_listen_path(defaults)?;
     let listen_path = listen_path.to_string_lossy().into_owned();
-    start_http_admin(&listen_path, defaults.http_port).await?;
-    let mut listener = mesh::server::MeshListener::new("lmesh", Some(&listen_path))
-        .map_err(|e| anyhow::anyhow!("lmesh listener error: {}", e))?;
+    let cbor_path = listen_path;
+    if std::path::Path::new(&cbor_path).exists() {
+        anyhow::ensure!(
+            mesh::seqpacket::UnixSeqpacket::connect(&cbor_path)
+                .await
+                .is_err(),
+            "lmesh control socket {cbor_path} is already active"
+        );
+    }
+    if let Err(error) = std::fs::remove_file(&cbor_path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(error).with_context(|| format!("remove stale {cbor_path}"));
+    }
+    let listener = mesh::seqpacket::UnixSeqpacketListener::bind(&cbor_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cbor_path, std::fs::Permissions::from_mode(0o660))?;
+    }
+    start_http_admin(&cbor_path, defaults.http_port).await?;
     // lmesh is the local control-plane endpoint.  Once both its UDS and
     // optional HTTP listener are ready, actively ask every enabled bearer for
     // current peer presence.  This complements (rather than replaces) the
@@ -397,94 +250,17 @@ async fn run_server(
             warn!(error = ?response.error, "lmesh_boot_discovery_failed");
         }
     });
-    let mcp = Arc::new(mesh::jsonl::McpRegistry::new("lmesh"));
-    while let Some(stream) = listener
-        .accept()
-        .await
-        .map_err(|e| anyhow::anyhow!("lmesh accept error: {}", e))?
-    {
+    loop {
+        let stream = listener.accept().await.context("lmesh CBOR accept")?;
         let service = service.clone();
-        let mcp = mcp.clone();
-        let trace_buffer = trace_buffer.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, service, mcp, trace_buffer.clone()).await {
-                error!("lmesh JSONL connection error: {}", e);
+            if let Err(error) = handle_seqpacket_connection(stream, service).await {
+                error!(%error, "lmesh_cbor_connection_error");
             }
         });
     }
-
-    Ok(())
 }
 
-async fn dispatch_directed_jsonl(
-    request: &str,
-    service: Arc<LmeshService>,
-) -> Result<Option<serde_json::Value>> {
-    let value = match serde_json::from_str::<serde_json::Value>(request) {
-        Ok(value) => value,
-        Err(_) => return Ok(None),
-    };
-    if value.get("to").is_none() || keeps_to_as_local_argument(&value) {
-        return Ok(None);
-    }
-    let record = tagged_record_from_jsonl(&value)?;
-    let handler = LmeshCborHandler { service };
-    let response = mesh::wire::TaggedRecordHandler::forward_record(&handler, record)
-        .await?
-        .context("directed UDS request produced no response")?;
-    Ok(Some(CONTROL_CATALOG.to_jsonl(&response)))
-}
-
-/// Most `to` fields select a remote QUIC destination at the JSONL boundary.
-/// Active discovery and probe are deliberately different: their `to` selects
-/// the local association path under test, so `LmeshService` must execute the
-/// corresponding client operation rather than forward that controller method
-/// as a remote tagged record.
-fn keeps_to_as_local_argument(value: &serde_json::Value) -> bool {
-    matches!(
-        value.get("method").and_then(serde_json::Value::as_str),
-        Some("discovery.active" | "lmesh.discovery.active" | "probe" | "lmesh.probe")
-    )
-}
-
-fn tagged_record_from_jsonl(value: &serde_json::Value) -> Result<mesh::tagged::TaggedRecord> {
-    let object = value
-        .as_object()
-        .context("directed UDS request must be a JSON object")?;
-    let method = object
-        .get("method")
-        .and_then(serde_json::Value::as_str)
-        .context("directed UDS request lacks method")?;
-    let schema = CONTROL_CATALOG
-        .method(method)
-        .context("directed UDS method is outside the reviewed lmesh catalog")?;
-    let mut record = mesh::tagged::TaggedRecord {
-        component: schema.component.clone(),
-        method: schema.method.clone(),
-        id: object.get("id").cloned(),
-        to: object.get("to").cloned(),
-        ..Default::default()
-    };
-    if record.id.is_none() {
-        anyhow::bail!("directed UDS request requires id");
-    }
-    for (name, field) in object {
-        if matches!(name.as_str(), "id" | "method" | "to" | "jsonrpc") {
-            continue;
-        }
-        let key = schema
-            .fields
-            .get(name)
-            .map(|field| mesh::tagged::NameOrTag::Tag(field.tag))
-            .unwrap_or_else(|| mesh::tagged::NameOrTag::Name(name.clone()));
-        record.env.insert(key, field.clone());
-    }
-    Ok(record)
-}
-
-/// Start the generic ssh-mesh admin REST server only when explicitly enabled.
-/// It talks to this supervised lmesh instance through the existing UDS instead
-/// of constructing another service or taking ownership of any radio.
 async fn start_http_admin(socket: &str, port: u16) -> Result<()> {
     let node = Arc::new(ssh_mesh::MeshNode::new(None, None));
     let manager = Arc::new(ssh_mesh::sshc::SshClientManager::new(
@@ -499,8 +275,7 @@ async fn start_http_admin(socket: &str, port: u16) -> Result<()> {
         client_manager: manager,
         service: dmesh_server::http::HttpService {
             name: "lmesh".to_owned(),
-            backend: ssh_mesh::mesh_rest::MeshServiceBackend::Uds(PathBuf::from(socket)),
-            catalog: Some(public_tools_json()),
+            backend: ssh_mesh::mesh_rest::MeshServiceBackend::UdsSeqpacket(PathBuf::from(socket)),
         },
         web_root: http_web_root("LMESH_HTTP_WEB_DIR"),
     };
@@ -513,23 +288,11 @@ async fn start_http_admin(socket: &str, port: u16) -> Result<()> {
     Ok(())
 }
 
-/// Serve the LMesh-owned dashboard before falling back to generic ssh-mesh
-/// admin assets. Keeping the discovery UI in `crates/lmesh/web` lets DMesh
-/// evolve its device/transport presentation without making ssh-mesh depend on
-/// DMesh or accepting an upstream asset change. `LMESH_HTTP_WEB_DIR` remains
-/// an explicit runtime override for packaged deployments and UI iteration.
+/// Use an operator-supplied dashboard, or upstream ssh-mesh admin assets.
 fn http_web_root(service_env: &str) -> Option<PathBuf> {
     std::env::var_os(service_env)
         .or_else(|| std::env::var_os("MESH_HTTP_WEB_DIR"))
         .map(PathBuf::from)
-        .or_else(|| Some(default_http_web_root()))
-}
-
-fn default_http_web_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("lmesh-wifi crate has a parent directory")
-        .join("lmesh/web")
 }
 
 fn announce_interval() -> Duration {
@@ -556,51 +319,6 @@ fn standalone_listen_path(defaults: RuntimeDefaults) -> Result<PathBuf> {
     resolve_relative_path(PathBuf::from(defaults.control_socket))
 }
 
-fn wifi_discovery_socket() -> PathBuf {
-    std::env::var_os(WIFI_DISCOVERY_SOCKET_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_WIFI_DISCOVERY_SOCKET))
-}
-
-async fn forward_wifi_discovery_announce(
-    socket: PathBuf,
-    peer: std::net::SocketAddr,
-    announce: dmesh_server::announce::Announce,
-) -> Result<()> {
-    let mut wire = [0_u8; 512];
-    let used = dmesh_server::announce::encode(announce, &mut wire)
-        .ok_or_else(|| anyhow::anyhow!("failed to encode validated announce"))?;
-    let request = serde_json::json!({
-        "method": "wifi.discovery.observe",
-        "source": "udp_multicast",
-        "peer": peer.to_string(),
-        "announce_hex": hex_encode(&wire[..used]),
-    });
-    let mut stream = UnixStream::connect(&socket)
-        .await
-        .with_context(|| format!("connect {}", socket.display()))?;
-    stream.write_all(request.to_string().as_bytes()).await?;
-    stream.write_all(b"\n").await?;
-    stream.flush().await?;
-    let mut response = String::new();
-    BufReader::new(stream).read_line(&mut response).await?;
-    let response: serde_json::Value = serde_json::from_str(response.trim())?;
-    if response.get("error").is_some() {
-        anyhow::bail!("lmesh-wifi rejected discovery observation: {response}");
-    }
-    Ok(())
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut text = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        text.push(HEX[(byte >> 4) as usize] as char);
-        text.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    text
-}
-
 fn resolve_relative_path(path: PathBuf) -> Result<PathBuf> {
     let path = if path.is_absolute() {
         path
@@ -616,152 +334,32 @@ fn resolve_relative_path(path: PathBuf) -> Result<PathBuf> {
     Ok(path)
 }
 
-async fn handle_connection(
-    stream: mesh::server::MeshStream,
+async fn handle_seqpacket_connection(
+    stream: mesh::seqpacket::UnixSeqpacket,
     service: Arc<LmeshService>,
-    mcp: Arc<mesh::jsonl::McpRegistry>,
-    trace_buffer: mesh::local_trace::LogBuffer,
 ) -> Result<()> {
-    let mut stream = stream;
-    let mut first = [0_u8; 1];
-    if stream.read(&mut first).await? == 0 {
-        return Ok(());
-    }
-    let mut stream = mesh::wire::PrefixedStream::new(first[0], stream);
-    if first[0] == 0 {
-        return mesh::wire::serve_cbor_session(&mut stream, &LmeshCborHandler { service }).await;
-    }
-    handle_json_connection(&mut stream, service, mcp, trace_buffer).await
-}
-
-/// The JSON/text branch is a gateway-only compatibility path. The stream has
-/// its first byte restored by `PrefixedStream`, so protocol selection never
-/// corrupts a request line.
-async fn handle_json_connection<S>(
-    stream: &mut S,
-    service: Arc<LmeshService>,
-    mcp: Arc<mesh::jsonl::McpRegistry>,
-    trace_buffer: mesh::local_trace::LogBuffer,
-) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let (reader, mut writer) = tokio::io::split(stream);
-    let mut reader = BufReader::new(reader);
-    let mut line = String::new();
-
-    loop {
-        line.clear();
-        let bytes_read = reader
-            .read_line(&mut line)
-            .await
-            .context("failed to read JSONL request")?;
-        if bytes_read == 0 {
-            break;
-        }
-
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        if let Ok(request) = serde_json::from_str::<serde_json::Value>(trimmed)
-            && request
-                .get("method")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|method| {
-                    matches!(method, "subscribe" | "trace.subscribe" | "events.subscribe")
-                        || method.ends_with(".subscribe")
-                })
-        {
-            let mut params = request.get("params").cloned().unwrap_or(request);
-            if let Some(object) = params.as_object_mut() {
-                if let Some(serde_json::Value::Array(values)) = object.remove("params") {
-                    for value in values {
-                        if let Some(value) = value.as_str()
-                            && let Some((key, value)) = value.split_once('=')
-                        {
-                            object.insert(
-                                key.to_owned(),
-                                serde_json::Value::String(value.to_owned()),
-                            );
-                        }
-                    }
-                }
-                if let Some(serde_json::Value::String(targets)) = object.get("targets").cloned() {
-                    object.insert(
-                        "targets".to_owned(),
-                        serde_json::Value::Array(
-                            targets
-                                .split(',')
-                                .filter(|target| !target.is_empty())
-                                .map(|target| serde_json::Value::String(target.to_owned()))
-                                .collect(),
-                        ),
-                    );
-                }
-            }
-            let config: mesh::local_trace::TraceConfig = serde_json::from_value(params)
-                .context("invalid trace subscription configuration")?;
-            let ack = serde_json::json!({
-                "response": {"subscribed": true, "service": "lmesh", "targets": config.targets.clone()}
-            });
-            writer.write_all(ack.to_string().as_bytes()).await?;
-            writer.write_all(b"\n").await?;
-            writer.flush().await?;
-            for entry in trace_buffer.get_all() {
-                if config.matches(&entry) {
-                    writer
-                        .write_all(serde_json::to_string(&entry).unwrap_or_default().as_bytes())
-                        .await?;
-                    writer.write_all(b"\n").await?;
-                }
-            }
-            let mut events = trace_buffer.subscribe();
-            while let Ok(entry) = events.recv().await {
-                if config.matches(&entry) {
-                    writer
-                        .write_all(serde_json::to_string(&entry).unwrap_or_default().as_bytes())
-                        .await?;
-                    writer.write_all(b"\n").await?;
-                    writer.flush().await?;
-                }
-            }
-            break;
-        }
-
-        // Preserve mesh routing metadata on the UDS JSONL surface.  The
-        // generic JSONL dispatcher intentionally deserializes only a local
-        // request, so it cannot be allowed to silently drop `to` and execute
-        // a directed command on this host.  Reuse the same tagged forwarder
-        // used by HTTP/QUIC records instead.
-        if let Some(response) = dispatch_directed_jsonl(trimmed, service.clone()).await? {
-            writer.write_all(response.to_string().as_bytes()).await?;
-            writer.write_all(b"\n").await?;
-            writer.flush().await?;
-            continue;
-        }
-        let service = service.clone();
-        let (format, response) = mesh::jsonl::dispatch_request(trimmed, &mcp, move |request| {
-            let service = service.clone();
-            async move {
-                debug!(?request, "lmesh request");
-                service.handle_request(request).await
-            }
-        })
-        .await;
-        let Some(response) = response else {
-            continue;
+    let handler = LmeshCborHandler { service };
+    while let Some((record, fds)) = stream.recv_cbor_record().await? {
+        anyhow::ensure!(
+            fds.is_empty(),
+            "lmesh control requests do not accept file descriptors"
+        );
+        let kind = record.kind()?;
+        let id = record.id.clone();
+        let response = if record.to.is_some() {
+            mesh::wire::TaggedRecordHandler::forward_record(&handler, record).await?
+        } else {
+            mesh::wire::TaggedRecordHandler::handle_record(&handler, record).await?
         };
-        let response = mesh::jsonl::format_response(response, &format)?;
-        writer
-            .write_all(response.as_bytes())
-            .await
-            .context("failed to write JSONL response")?;
-        writer.write_all(b"\n").await?;
-        writer.flush().await?;
+        match (kind, response) {
+            (mesh::tagged::RecordKind::Request, Some(response)) => {
+                anyhow::ensure!(response.id == id, "uncorrelated lmesh CBOR response");
+                stream.send_cbor_record(&response, &[]).await?;
+            }
+            (mesh::tagged::RecordKind::Message, None) => {}
+            _ => anyhow::bail!("invalid lmesh CBOR request/response pairing"),
+        }
     }
-
     Ok(())
 }
 
@@ -817,6 +415,9 @@ impl mesh::wire::TaggedRecordHandler for LmeshCborHandler {
         &self,
         record: mesh::tagged::TaggedRecord,
     ) -> Result<Option<mesh::tagged::TaggedRecord>> {
+        if let Some(response) = COMMON_REGISTRY.dispatch_tagged(&record).await? {
+            return Ok(Some(response));
+        }
         let id = record
             .id
             .clone()
@@ -928,7 +529,8 @@ fn record_keeps_to_as_local_argument(record: &mesh::tagged::TaggedRecord) -> boo
     matches!(
         decode_lmesh_tagged_request(record),
         Ok(crate::mesh_core::Request::DiscoveryActive { .. }
-            | crate::mesh_core::Request::Probe { .. })
+            | crate::mesh_core::Request::Probe { .. }
+            | crate::mesh_core::Request::NanWakeup { .. })
     )
 }
 
@@ -946,13 +548,17 @@ fn decode_lmesh_tagged_request(
     value["method"] =
         serde_json::Value::String(method.strip_prefix("lmesh.").unwrap_or(&method).to_owned());
     match method.as_str() {
-        "send" => serde_json::from_value::<crate::mesh_core::api::LmeshSendRequest>(value).map(
-            |request| crate::mesh_core::Request::Send {
-                radio: request.radio,
-                destination: request.destination,
-                payload: request.payload,
-            },
-        ),
+        "send" => serde_json::from_value::<crate::mesh_core::api::LmeshSendRequest>(value)
+            .and_then(|request| {
+                let payload = request
+                    .payload
+                    .ok_or_else(|| serde::de::Error::custom("send.payload is required"))?;
+                Ok(crate::mesh_core::Request::Send {
+                    radio: request.radio,
+                    destination: request.destination,
+                    payload,
+                })
+            }),
         "messages.history" => serde_json::from_value::<
             crate::mesh_core::api::LmeshMessagesHistoryRequest,
         >(value)
@@ -990,7 +596,31 @@ fn decode_lmesh_tagged_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::net::UnixListener;
+
+    #[test]
+    fn shared_method_names_keep_linux_fields() {
+        let scan = CONTROL_CATALOG
+            .parse_argv(
+                "wifi.scan",
+                &["--iface=wlan0".into(), "--last_results=true".into()],
+            )
+            .unwrap();
+        assert!(matches!(
+            decode_lmesh_tagged_request(&scan).unwrap(),
+            crate::mesh_core::Request::WifiScan {
+                iface: Some(iface),
+                last_results: Some(true),
+                ..
+            } if iface == "wlan0"
+        ));
+        let transport = CONTROL_CATALOG
+            .parse_argv("transport.set", &["--mode=6".into(), "--iface=wlan0".into()])
+            .unwrap();
+        assert!(matches!(
+            decode_lmesh_tagged_request(&transport).unwrap(),
+            crate::mesh_core::Request::TransportSet { iface: Some(iface), .. } if iface == "wlan0"
+        ));
+    }
 
     #[test]
     fn parse_announce_interval_accepts_positive_seconds() {
@@ -1005,11 +635,12 @@ mod tests {
     }
 
     #[test]
-    fn default_http_assets_are_owned_by_lmesh() {
-        let root = default_http_web_root();
-        assert!(root.ends_with("crates/lmesh/web"));
-        assert!(root.join("index.html").is_file());
-        assert!(root.join("dashboard.html").is_file());
+    fn http_assets_use_upstream_default_without_override() {
+        let unique = "LMESH_UNSET_HTTP_WEB_DIR_TEST";
+        assert!(std::env::var_os(unique).is_none());
+        if std::env::var_os("MESH_HTTP_WEB_DIR").is_none() {
+            assert!(http_web_root(unique).is_none());
+        }
     }
 
     #[test]
@@ -1019,42 +650,6 @@ mod tests {
             resolve_relative_path(PathBuf::from("lmesh/mesh.sock")).unwrap(),
             cwd.join("lmesh").join("mesh.sock")
         );
-    }
-
-    #[tokio::test]
-    async fn validated_multicast_announce_is_forwarded_as_common_wire() {
-        let path = std::env::temp_dir().join(format!(
-            "lmesh-discovery-forward-{}-{}.sock",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-        ));
-        let listener = UnixListener::bind(&path).unwrap();
-        let receiver = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (reader, mut writer) = tokio::io::split(stream);
-            let mut reader = BufReader::new(reader);
-            let mut line = String::new();
-            reader.read_line(&mut line).await.unwrap();
-            writer.write_all(b"{\"success\":true}\n").await.unwrap();
-            serde_json::from_str::<serde_json::Value>(line.trim()).unwrap()
-        });
-        let announce = dmesh_server::announce::Announce::discovery([0xC6; 16], 16, 9);
-        forward_wifi_discovery_announce(
-            path.clone(),
-            std::net::SocketAddr::from(([192, 0, 2, 6], 5_227)),
-            announce,
-        )
-        .await
-        .unwrap();
-        let request = receiver.await.unwrap();
-        assert_eq!(request["method"], "wifi.discovery.observe");
-        assert_eq!(request["source"], "udp_multicast");
-        let bytes = request["announce_hex"].as_str().unwrap();
-        assert!(bytes.len() > 8);
-        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -1342,25 +937,25 @@ mod tests {
     }
 
     #[test]
-    fn active_discovery_keeps_its_explicit_path_local() {
-        assert!(keeps_to_as_local_argument(&serde_json::json!({
-            "method": "discovery.active",
-            "to": "udp://[fe80::44]:3339"
-        })));
-        assert!(keeps_to_as_local_argument(&serde_json::json!({
-            "method": "lmesh.discovery.active",
-            "to": "02:00:00:00:00:44"
-        })));
-        assert!(keeps_to_as_local_argument(&serde_json::json!({
-            "method": "probe",
-            "to": "e7",
-            "bytes": 4096
-        })));
-        assert!(!keeps_to_as_local_argument(&serde_json::json!({
-            "method": "telemetry.nan_metrics",
-            "to": "udp://[fe80::44]:3339"
-        })));
+    fn local_wifi_method_uses_generated_numeric_tags() {
+        let record = CONTROL_CATALOG
+            .record_from_value(
+                "wifi.interface.channel",
+                &serde_json::json!({
+                    "iface": "wlan0", "channel": 6
+                }),
+            )
+            .unwrap();
+        assert_eq!(record.component, mesh::tagged::NameOrTag::Tag(5));
+        assert_eq!(record.method, mesh::tagged::NameOrTag::Tag(32));
+        assert!(matches!(
+            decode_lmesh_tagged_request(&record).unwrap(),
+            crate::mesh_core::Request::WifiInterfaceChannel { channel: 6, .. }
+        ));
+    }
 
+    #[test]
+    fn active_discovery_keeps_its_explicit_path_local() {
         let mut record = CONTROL_CATALOG
             .record_from_value("discovery.active", &serde_json::json!({}))
             .unwrap();
@@ -1381,16 +976,19 @@ mod tests {
         assert_eq!(tool["inputSchema"]["properties"]["frame"]["type"], "string");
         assert_eq!(tool["inputSchema"]["properties"]["frame"]["format"], "hex");
 
-        let record = tagged_record_from_jsonl(&serde_json::json!({
-            "id": 43,
-            "to": "e9",
-            "method": "radio.tx",
-            "frame": "hex:d000ffffffff00112233445566778899aabbccddeeff00112233445566",
-            "channel": 6,
-            "interface": 1,
-            "rate": 6,
-        }))
-        .unwrap();
+        let record = CONTROL_CATALOG
+            .record_from_value(
+                "radio.tx",
+                &serde_json::json!({
+                    "id": 43,
+                    "to": "e9",
+                    "frame": "hex:d000ffffffff00112233445566778899aabbccddeeff00112233445566",
+                    "channel": 6,
+                    "interface": 1,
+                    "rate": 6,
+                }),
+            )
+            .unwrap();
         let wire = raw_wifi_tx_wire(&record, record.id.as_ref().unwrap())
             .unwrap()
             .unwrap();

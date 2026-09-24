@@ -8,6 +8,10 @@
 //! See also:
 //! - Java wrapper: `android/app-dmesh/src/main/java/...`
 
+#[cfg(target_os = "android")]
+use anyhow::Context;
+#[cfg(target_os = "android")]
+use async_trait::async_trait;
 use dmesh_server::discovery::{
     DiscoveryObservation, DiscoveryPacketKind, OBSERVATION_PAYLOAD_FINGERPRINT, OBSERVATION_PEER,
     OBSERVATION_RSSI,
@@ -18,10 +22,6 @@ use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JString};
 use jni::sys::JNI_VERSION_1_6;
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong};
 use jni::{JNIEnv, JavaVM};
-#[cfg(target_os = "android")]
-use anyhow::Context;
-#[cfg(target_os = "android")]
-use async_trait::async_trait;
 use mesh::{
     tagged::{NameOrTag, TaggedRecord},
     wire::response_ok,
@@ -165,7 +165,11 @@ pub(crate) fn ble_scan_results(limit: Option<u64>) -> Value {
         b.get("last_seen_ms")
             .and_then(Value::as_i64)
             .unwrap_or(i64::MIN)
-            .cmp(&a.get("last_seen_ms").and_then(Value::as_i64).unwrap_or(i64::MIN))
+            .cmp(
+                &a.get("last_seen_ms")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(i64::MIN),
+            )
     });
     let entries = entries
         .into_iter()
@@ -509,12 +513,10 @@ fn android_ble_command(method: &str, params: &Value) -> Option<Value> {
 #[async_trait]
 impl dmesh_server::ble_service::BleBackend for AndroidBleBackend {
     async fn status(&self) -> anyhow::Result<Value> {
-        android_ble_command("ble.status", &json!({}))
-            .context("Android BLE callback is unavailable")
+        android_ble_command("ble.status", &json!({})).context("Android BLE callback is unavailable")
     }
     async fn scan(&self) -> anyhow::Result<Value> {
-        android_ble_command("ble.scan", &json!({}))
-            .context("Android BLE callback is unavailable")
+        android_ble_command("ble.scan", &json!({})).context("Android BLE callback is unavailable")
     }
     async fn scan_stop(&self) -> anyhow::Result<Value> {
         android_ble_command("ble.scan_stop", &json!({}))
@@ -527,11 +529,8 @@ impl dmesh_server::ble_service::BleBackend for AndroidBleBackend {
         Ok(ble_scan_clear())
     }
     async fn connect(&self, address: String, psm: u16) -> anyhow::Result<Value> {
-        android_ble_command(
-            "ble.connect",
-            &json!({"address": address, "psm": psm}),
-        )
-        .context("Android BLE callback is unavailable")
+        android_ble_command("ble.connect", &json!({"address": address, "psm": psm}))
+            .context("Android BLE callback is unavailable")
     }
     async fn disconnect(&self) -> anyhow::Result<Value> {
         android_ble_command("ble.disconnect", &json!({}))
@@ -540,9 +539,7 @@ impl dmesh_server::ble_service::BleBackend for AndroidBleBackend {
 }
 
 #[cfg(target_os = "android")]
-pub(crate) fn register_ble_service(
-    services: &ssh_mesh::mesh_rest::MeshServiceRegistry,
-) -> bool {
+pub(crate) fn register_ble_service(services: &ssh_mesh::mesh_rest::MeshServiceRegistry) -> bool {
     match dmesh_server::ble_service::BleService::mesh_service(Arc::new(AndroidBleBackend)) {
         Ok(service) => {
             services.register(dmesh_server::ble_service::SERVICE_NAME, service);
@@ -587,27 +584,22 @@ fn android_usb_command(method: &str, params: &Value) -> Option<Value> {
 #[async_trait]
 impl dmesh_server::usb_service::UsbBackend for AndroidUsbBackend {
     async fn status(&self) -> anyhow::Result<Value> {
-        android_usb_command("usb.status", &json!({}))
-            .context("Android USB callback is unavailable")
+        android_usb_command("usb.status", &json!({})).context("Android USB callback is unavailable")
     }
     async fn devices(&self) -> anyhow::Result<Value> {
         android_usb_command("usb.devices", &json!({}))
             .context("Android USB callback is unavailable")
     }
     async fn open(&self, params: Value) -> anyhow::Result<Value> {
-        android_usb_command("usb.open", &params)
-            .context("Android USB callback is unavailable")
+        android_usb_command("usb.open", &params).context("Android USB callback is unavailable")
     }
     async fn close(&self) -> anyhow::Result<Value> {
-        android_usb_command("usb.close", &json!({}))
-            .context("Android USB callback is unavailable")
+        android_usb_command("usb.close", &json!({})).context("Android USB callback is unavailable")
     }
 }
 
 #[cfg(target_os = "android")]
-pub(crate) fn register_usb_service(
-    services: &ssh_mesh::mesh_rest::MeshServiceRegistry,
-) -> bool {
+pub(crate) fn register_usb_service(services: &ssh_mesh::mesh_rest::MeshServiceRegistry) -> bool {
     match dmesh_server::usb_service::UsbService::mesh_service(Arc::new(AndroidUsbBackend)) {
         Ok(service) => {
             services.register(dmesh_server::usb_service::SERVICE_NAME, service);
@@ -662,12 +654,8 @@ impl dmesh_server::wifi_service::WifiBackend for AndroidWifiBackend {
 }
 
 #[cfg(target_os = "android")]
-pub(crate) fn register_wifi_service(
-    services: &ssh_mesh::mesh_rest::MeshServiceRegistry,
-) -> bool {
-    match dmesh_server::wifi_service::WifiService::mesh_service(Arc::new(
-        AndroidWifiBackend,
-    )) {
+pub(crate) fn register_wifi_service(services: &ssh_mesh::mesh_rest::MeshServiceRegistry) -> bool {
+    match dmesh_server::wifi_service::WifiService::mesh_service(Arc::new(AndroidWifiBackend)) {
         Ok(service) => {
             services.register(dmesh_server::wifi_service::SERVICE_NAME, service);
             true
@@ -691,8 +679,8 @@ fn android_transport_set_projection(params: &Value) -> anyhow::Result<Value> {
         value.is_some_and(|value| value.as_u64() == Some(1) || value.as_str() == Some("1"))
     };
     let p2p_go = enabled(object.get("ap")) || enabled(object.get("p2p_go"));
-    let sta = transport_mode
-        .is_some_and(|mode| mode.as_str() == Some("sta") || mode.as_u64() == Some(1));
+    let sta =
+        transport_mode.is_some_and(|mode| mode.as_str() == Some("sta") || mode.as_u64() == Some(1));
     let radio_off = transport_mode
         .is_some_and(|mode| mode.as_str() == Some("uart") || mode.as_u64() == Some(5));
     let operation = if radio_off {
@@ -749,10 +737,7 @@ pub(crate) fn register_transport_service(
         AndroidTransportBackend,
     )) {
         Ok(service) => {
-            services.register(
-                dmesh_server::transport_service::SERVICE_NAME,
-                service,
-            );
+            services.register(dmesh_server::transport_service::SERVICE_NAME, service);
             true
         }
         Err(error) => {
@@ -763,11 +748,7 @@ pub(crate) fn register_transport_service(
 }
 
 #[cfg(target_os = "android")]
-fn android_radio_history(
-    limit: Option<u64>,
-    since_ms: Option<u64>,
-    keys: Option<String>,
-) -> Value {
+fn android_radio_history(limit: Option<u64>, since_ms: Option<u64>, keys: Option<String>) -> Value {
     let now_ms = chrono::Utc::now().timestamp_millis();
     let cutoff = since_ms
         .map(|value| value as i64)
@@ -865,10 +846,7 @@ fn android_radio_history(
                     .filter(|entry| {
                         matches(&[
                             "ble",
-                            entry
-                                .get("address")
-                                .and_then(Value::as_str)
-                                .unwrap_or(""),
+                            entry.get("address").and_then(Value::as_str).unwrap_or(""),
                         ])
                     })
                     .take(take)
@@ -910,10 +888,7 @@ pub(crate) fn register_history_service(
         AndroidHistoryBackend,
     )) {
         Ok(service) => {
-            services.register(
-                dmesh_server::history_service::SERVICE_NAME,
-                service,
-            );
+            services.register(dmesh_server::history_service::SERVICE_NAME, service);
             true
         }
         Err(error) => {
@@ -1204,6 +1179,7 @@ fn configure_android_mesh_paths(base_dir: &str) {
     let run_base = base.join("run").join("mesh");
     let home_base = base.join("home");
     let opt_base = base.join("opt");
+    let schema_base = base.join("schemas");
 
     for dir in [&run_base, &home_base, &opt_base] {
         if let Err(e) = std::fs::create_dir_all(dir) {
@@ -1215,6 +1191,30 @@ fn configure_android_mesh_paths(base_dir: &str) {
         }
     }
 
+    // The upstream HTTP gateway resolves one generated catalog per service.
+    // Keep these app-private files in sync with the Rust adapters while Java
+    // remains the platform callback boundary.
+    for (component, tools) in [
+        ("ble", dmesh_server::ble_service::tools_json()),
+        ("usb", dmesh_server::usb_service::tools_json()),
+        ("wifi", dmesh_server::wifi_service::tools_json()),
+        ("transport", dmesh_server::transport_service::tools_json()),
+        ("radio", dmesh_server::history_service::tools_json()),
+    ] {
+        let dir = schema_base.join(component);
+        let result = (|| -> std::io::Result<()> {
+            std::fs::create_dir_all(&dir)?;
+            let path = dir.join("tools.json");
+            let temporary = dir.join("tools.json.tmp");
+            let bytes = serde_json::to_vec(&tools).map_err(std::io::Error::other)?;
+            std::fs::write(&temporary, bytes)?;
+            std::fs::rename(temporary, path)
+        })();
+        if let Err(error) = result {
+            log::warn!("Failed to install {component} mesh schema: {error}");
+        }
+    }
+
     // Android has no system mesh runtime directory. Keep any defensive UDS
     // fallback under the app's files/ tree and route web commands by bridge.
     unsafe {
@@ -1222,6 +1222,7 @@ fn configure_android_mesh_paths(base_dir: &str) {
         std::env::set_var("MESH_RUN_BASE", &run_base);
         std::env::set_var("MESH_HOME_BASE", &home_base);
         std::env::set_var("MESH_OPT_BASE", &opt_base);
+        std::env::set_var("MESH_SCHEMA_DIR", &schema_base);
         std::env::set_var("SSH_MESH_HOME_ROOT", &home_base);
         std::env::set_var("LMESH_UDS", run_base.join("lmesh").join("mesh.sock"));
         std::env::set_var(
@@ -1956,9 +1957,23 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
         // records directly; HTTP and embedded mesh dispatch never use it.
         "radio.shell.command" => {
             let line = std::str::from_utf8(payload)?.trim();
-            let schema = mesh::schema::ResourceSchema::from_embedded(include_str!(
-                "../../lmesh/resources/firmware-schema.json"
-            ))?;
+            let tools: Value =
+                serde_json::from_str(include_str!("../../lmesh/resources/tools.json"))?;
+            let methods: Vec<Value> = tools["tools"].as_array().into_iter().flatten()
+                .filter(|tool| tool["x-dmesh-device"] == true)
+                .map(|tool| {
+                    let fields: Vec<Value> = tool["inputSchema"]["properties"].as_object()
+                        .into_iter().flat_map(|properties| properties.iter())
+                        .map(|(name, property)| json!({
+                            "name": name,
+                            "kind": property["x-dmesh-kind"],
+                            "values": property.get("x-dmesh-values").cloned().unwrap_or_else(|| json!({})),
+                        })).collect();
+                    json!({"name": tool["name"], "fields": fields})
+                }).collect();
+            let schema = mesh::schema::ResourceSchema::from_embedded(
+                &json!({"methods": methods}).to_string(),
+            )?;
             let request = schema.parse_shell(line)?;
             let method = request
                 .get("method")

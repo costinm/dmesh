@@ -9,10 +9,9 @@ use crate::{
     device::{
         DeviceProfile, device_catalog_path, load_device, resolve_catalog_target, resolve_udp_peer,
     },
-    l2::UartEgressPacer,
     schema::{
         FirmwareSchema, encode_direct_command, encode_direct_command_with_id,
-        encode_stream_command_with_id, encode_stream_fields_with_id, render_device_record,
+        encode_stream_argv_with_id, encode_stream_command_with_id, render_device_record,
     },
 };
 use dmesh_server::{
@@ -24,18 +23,14 @@ use quic_lite::{
     ClientAssociation, ConnectionLimits, DatagramClient, PathId, StreamFrame,
     path_bridge::{PathBridge, PathBridgeAction},
 };
-use serde::Deserialize;
 use std::{
     collections::{BTreeMap, VecDeque},
     env,
     fs::{File, OpenOptions},
-    io::{BufRead, BufReader, ErrorKind, Read, Write},
+    io::{ErrorKind, Read, Write},
     net::{Ipv6Addr, SocketAddr, SocketAddrV6, UdpSocket},
     os::fd::AsRawFd,
-    os::unix::{
-        fs::{FileTypeExt, OpenOptionsExt},
-        net::{UnixListener, UnixStream},
-    },
+    os::unix::fs::{FileTypeExt, OpenOptionsExt},
     path::{Path, PathBuf},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -677,7 +672,7 @@ fn is_fatal_diagnostic(line: &str) -> bool {
 }
 
 /// Bearer-neutral path policy accepted by the host CLI and the future
-/// `lmesh-wifi` egress handler. The policy chooses among registered paths;
+/// `lmesh` egress handler. The policy chooses among registered paths;
 /// it never changes the command, probe, or log-watch stream protocol.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClientPathPolicy {
@@ -714,7 +709,7 @@ impl ClientPathPolicy {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: dmesh-cli SERIAL|DEVICE --reset\n       dmesh-cli SERIAL|DEVICE --watch [--reset] [--interactive] [--baud PHYSICAL_UART_BAUD] [--timeout-secs N]\n       dmesh-cli NODE SERVICE [field=value ...]\n       dmesh-cli devices check|backfill [--dry-run]\n       dmesh-cli discover\n       dmesh-cli flash TARGET [--target main|recovery|stage2|MODULE] [--file IMAGE]\n       dmesh-cli SERIAL|DEVICE [--msg TEXT | --direct-hex HEX] [--timeout-secs N]\n       dmesh-cli uds:///run/mesh/lmesh[-wifi]/mesh.sock|lmesh://lmesh[-wifi] --method METHOD [--data JSON] [--to NODE]\n       dmesh-cli SERIAL|DEVICE BOOTSTRAP_BIND BACKEND [--baud PHYSICAL_UART_BAUD] [--bearer uart|udp|aggregate|spill] [--msg TEXT | --direct-hex HEX] [--timeout-secs N]\n       dmesh-cli NODE check\n       dmesh-cli udp://HOST:PORT --socket PATH"
+        "usage: dmesh-cli SERIAL|DEVICE --reset\n       dmesh-cli SERIAL|DEVICE --watch [--reset] [--interactive] [--baud PHYSICAL_UART_BAUD] [--timeout-secs N]\n       dmesh-cli DEVICE METHOD [--field=value ...]\n       dmesh-cli devices check|backfill [--dry-run]\n       dmesh-cli discover\n       dmesh-cli flash TARGET [--target main|recovery|stage2|MODULE] [--file IMAGE]\n       dmesh-cli SERIAL|DEVICE [--msg TEXT | --direct-hex HEX] [--timeout-secs N]\n       dmesh-cli lmesh METHOD [--field=value ...]\n       dmesh-cli SERIAL|DEVICE BOOTSTRAP_BIND BACKEND [--baud PHYSICAL_UART_BAUD] [--bearer uart|udp|aggregate|spill] [--msg TEXT | --direct-hex HEX] [--timeout-secs N]\n       dmesh-cli NODE check\n       dmesh-cli udp://HOST:PORT --socket PATH"
     );
     std::process::exit(2)
 }
@@ -899,9 +894,9 @@ pub fn run_dmesh_cli_args(args: impl IntoIterator<Item = String>) -> Result<(), 
     }
     if arguments
         .first()
-        .is_some_and(|target| proxy_socket_target(target).is_some())
+        .is_some_and(|target| lmesh_socket_target(target).is_some())
     {
-        return run_lmesh_proxy_client(&arguments);
+        return run_lmesh_client(&arguments);
     }
     if arguments
         .get(1)
@@ -1075,7 +1070,7 @@ pub fn run_dmesh_cli_args(args: impl IntoIterator<Item = String>) -> Result<(), 
         .set_nonblocking(true)
         .map_err(|error| error.to_string())?;
     let mut serial = open_serial(&path)?;
-    configure_serial(&serial, None)?;
+    configure_serial(&serial, baud)?;
     if let Some(record) = direct {
         send_ppp(&mut serial, &record)?;
     }
@@ -1083,15 +1078,10 @@ pub fn run_dmesh_cli_args(args: impl IntoIterator<Item = String>) -> Result<(), 
     let schema = FirmwareSchema::load();
     let mut bridge = PathBridge::default();
     let mut decoder = Decoder::with_max(quic_lite::DEFAULT_MAX_DATAGRAM_SIZE + 1);
-    // A USB driver accepting a burst is not evidence that the device has
-    // consumed it. Keep the normal initial transport flight outstanding until
-    // validated packets return on this L2 path; that is actual receiver
-    // feedback rather than a made-up USB baud rate. A physical UART gains its
-    // own wire pacing from `--baud` as well.
-    let mut egress = baud.map_or_else(
-        || UartEgressPacer::unpaced(8),
-        |baud| UartEgressPacer::new(baud, 8),
-    );
+    // UART has no private packet backlog. A partial nonblocking write retains
+    // only the remainder of the frame already started on the wire; while that
+    // exists path selection must choose another available bearer.
+    let mut uart_write_remainder: Option<Vec<u8>> = None;
     let mut buffer = [0u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE + 1];
     let mut bootstrap_peer = None;
     let mut established_backend_packets = 0u64;
@@ -1100,36 +1090,36 @@ pub fn run_dmesh_cli_args(args: impl IntoIterator<Item = String>) -> Result<(), 
     let started = Instant::now();
     let deadline = started + timeout;
     while Instant::now() < deadline {
-        // A UART is a slow, bounded datagram bearer. Do not drain a faster
-        // backend into a full serial queue: leave data in the socket so
-        // QUIC-lite ACK/credit applies pressure before local loss occurs.
-        // Keep receiving backend packets when the UART queue is full.  For
-        // `uart-spill-udp` that fullness is the signal to send the packet on
-        // the bootstrap/UDP path; gating this recv behind UART capacity would
-        // turn spillover into an artificial connection-wide stall.
-        // Explicit UART is a comparison mode: retain socket backpressure
-        // rather than changing the selected bearer. Only the spill policy is
-        // allowed to keep receiving once UART reports a full local queue.
-        if host_policy != ClientPathPolicy::Uart || egress.has_capacity() {
+        if let Some(wire) = uart_write_remainder.take() {
+            match serial.write(&wire) {
+                Ok(written) if written == wire.len() => {}
+                Ok(written) => uart_write_remainder = Some(wire[written..].to_vec()),
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    uart_write_remainder = Some(wire)
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+
+        // In explicit-UART comparison mode, leave the next datagram at the
+        // backend while the one wire frame already started is incomplete.
+        // Multipath modes continue receiving so the shared selector can use
+        // the bootstrap/Wi-Fi bearer instead.
+        if host_policy != ClientPathPolicy::Uart || uart_write_remainder.is_none() {
             match socket.recv_from(&mut buffer) {
                 Ok((used, peer)) if peer == backend => {
+                    let uart_ready = uart_write_remainder.is_none();
                     let uart = match host_policy {
                         // Keep most traffic on the faster UDP bearer while
                         // periodically exercising the UART path as well.
                         ClientPathPolicy::HighestMeasuredSpeed => {
                             established_backend_packets =
                                 established_backend_packets.saturating_add(1);
-                            established_backend_packets % 32 == 0
+                            uart_ready && established_backend_packets % 32 == 0
                         }
-                        // Fill a bounded UART egress queue; excess server
-                        // traffic continues over UDP instead of stalling the
-                        // shared connection behind UART wire time.
-                        ClientPathPolicy::Aggregate | ClientPathPolicy::UartSpillover => {
-                            quic_lite::PathCapacity::new(egress.occupied(), egress.capacity())
-                                .has_capacity()
-                        }
+                        ClientPathPolicy::Aggregate | ClientPathPolicy::UartSpillover => uart_ready,
                         ClientPathPolicy::Udp => false,
-                        ClientPathPolicy::Uart => true,
+                        ClientPathPolicy::Uart => uart_ready,
                     };
                     match bridge.on_backend_datagram_on_path(&buffer[..used], uart) {
                         PathBridgeAction::ToBootstrapPath(packet) => {
@@ -1141,7 +1131,6 @@ pub fn run_dmesh_cli_args(args: impl IntoIterator<Item = String>) -> Result<(), 
                             }
                         }
                         PathBridgeAction::ToSecondaryPath(packet) => {
-                            secondary_packets = secondary_packets.saturating_add(1);
                             let mut payload = [0u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE + 1];
                             let used = encode_uart_datagram(packet, &mut payload)
                                 .ok_or("UART packet too large")?;
@@ -1150,7 +1139,44 @@ pub fn run_dmesh_cli_args(args: impl IntoIterator<Item = String>) -> Result<(), 
                                 quic_lite::DEFAULT_MAX_DATAGRAM_SIZE + 1,
                             )
                             .map_err(|error| error.to_string())?;
-                            debug_assert!(egress.enqueue(wire));
+                            match serial.write(&wire) {
+                                Ok(written) if written == wire.len() => {
+                                    secondary_packets = secondary_packets.saturating_add(1);
+                                }
+                                Ok(written) if written != 0 => {
+                                    secondary_packets = secondary_packets.saturating_add(1);
+                                    uart_write_remainder = Some(wire[written..].to_vec());
+                                }
+                                Ok(_) => {
+                                    if host_policy == ClientPathPolicy::Uart {
+                                        uart_write_remainder = Some(wire);
+                                    } else if let Some(peer) = bootstrap_peer {
+                                        primary_packets = primary_packets.saturating_add(1);
+                                        socket
+                                            .send_to(packet, peer)
+                                            .map_err(|error| error.to_string())?;
+                                    } else {
+                                        return Err(
+                                            "UART busy and no alternate path is available".into()
+                                        );
+                                    }
+                                }
+                                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                                    if host_policy == ClientPathPolicy::Uart {
+                                        uart_write_remainder = Some(wire);
+                                    } else if let Some(peer) = bootstrap_peer {
+                                        primary_packets = primary_packets.saturating_add(1);
+                                        socket
+                                            .send_to(packet, peer)
+                                            .map_err(|error| error.to_string())?;
+                                    } else {
+                                        return Err(
+                                            "UART busy and no alternate path is available".into()
+                                        );
+                                    }
+                                }
+                                Err(error) => return Err(error.to_string()),
+                            }
                         }
                         _ => {}
                     }
@@ -1177,7 +1203,6 @@ pub fn run_dmesh_cli_args(args: impl IntoIterator<Item = String>) -> Result<(), 
                 {
                     match classify_uart_payload(&record) {
                         Ok(UartIngress::Transport(packet)) => {
-                            egress.on_path_feedback();
                             if let PathBridgeAction::ToBackend(packet) =
                                 bridge.on_secondary_path(packet)
                             {
@@ -1205,115 +1230,64 @@ pub fn run_dmesh_cli_args(args: impl IntoIterator<Item = String>) -> Result<(), 
             Err(error) if error.kind() == ErrorKind::WouldBlock => {}
             Err(error) => return Err(error.to_string()),
         }
-        let now_us = Instant::now().duration_since(started).as_micros() as u64;
-        if let Some(wire) = egress.take_ready(now_us) {
-            match serial.write(&wire) {
-                Ok(written) if written == wire.len() => egress.completed_write(wire.len(), now_us),
-                Ok(written) if written != 0 => egress.retry_front(wire[written..].to_vec(), now_us),
-                Ok(_) => egress.retry_front(wire, now_us),
-                Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                    egress.retry_front(wire, now_us)
-                }
-                Err(error) => return Err(error.to_string()),
-            }
-        }
-        // Do not turn this packetized USB L2 into a millisecond-paced UART.
-        // `egress.has_capacity()` is the actual bounded receiver feedback;
-        // yield only to avoid monopolizing a host core while both descriptors
-        // are empty.
+        // Yield only to avoid monopolizing a host core while both descriptors
+        // are empty. Driver backpressure, not a fabricated baud timer or peer
+        // packet credit, determines whether UART accepts the next frame.
         thread::yield_now();
     }
     Err("UART L2 bridge timed out".into())
 }
 
-/// Resolve a supervised host-radio control endpoint.  This is intentionally a
-/// control-plane client, not a serial forwarder: `lmesh-wifi` or `lmesh` owns
-/// NOW/NAN selection and returns its receiver-side counters in the response.
-fn proxy_socket_target(target: &str) -> Option<&str> {
+/// Resolve the supervised lmesh control socket.
+fn lmesh_socket_target(target: &str) -> Option<&str> {
     match target {
-        "lmesh://lmesh-wifi" => Some("/run/mesh/lmesh-wifi/mesh.sock"),
-        "lmesh://lmesh" => Some("/run/mesh/lmesh/mesh.sock"),
+        "lmesh" | "lmesh://lmesh" => Some("/run/mesh/lmesh/mesh.sock.cbor"),
         _ => target.strip_prefix("uds://"),
     }
 }
 
-fn proxy_request(
-    method: &str,
-    data: serde_json::Value,
-    to: Option<String>,
-) -> Result<serde_json::Value, String> {
-    let mut data = data;
-    if !data.is_object() {
-        return Err("--data must be a JSON object".into());
+/// Invoke a catalogued lmesh method over its tagged-CBOR control socket.
+fn run_lmesh_client(arguments: &[String]) -> Result<(), String> {
+    let target = arguments.first().ok_or("missing lmesh target")?;
+    let socket = lmesh_socket_target(target).ok_or("invalid lmesh target")?;
+    let method = arguments
+        .get(1)
+        .ok_or("lmesh requires METHOD [--field=value ...]")?;
+    let catalog = mesh::tagged::load_service_catalog("lmesh")
+        .transpose()
+        .map_err(|error| error.to_string())?
+        .ok_or("no installed lmesh tools.json; set MESH_SCHEMA_DIR")?;
+    if catalog.method(method).is_none() {
+        return Err(format!("unknown lmesh method {method}"));
     }
-    let object = data.as_object_mut().expect("checked object");
-    object.insert(
-        "id".into(),
-        serde_json::json!(format!("dmesh-cli-{}", fresh_request_id())),
-    );
-    object.insert(
-        "method".into(),
-        serde_json::Value::String(method.to_owned()),
-    );
-    if let Some(to) = to {
-        object.insert("to".into(), serde_json::Value::String(to));
-    }
-    Ok(data)
-}
-
-/// Invoke one existing reviewed lmesh method over its JSONL UDS.  The CLI does
-/// not interpret a successful host TX as peer success; it prints the service's
-/// complete result, including NOW response/counter fields where applicable.
-fn run_lmesh_proxy_client(arguments: &[String]) -> Result<(), String> {
-    let target = arguments.first().ok_or("missing proxy target")?;
-    let socket = proxy_socket_target(target).ok_or("invalid proxy target")?;
-    let mut method = None;
-    let mut to = None;
-    let mut data = serde_json::json!({});
-    let mut index = 1;
-    while index < arguments.len() {
-        match arguments[index].as_str() {
-            "--method" => {
-                index += 1;
-                method = Some(
-                    arguments
-                        .get(index)
-                        .ok_or("missing --method value")?
-                        .clone(),
-                );
-            }
-            "--data" => {
-                index += 1;
-                data = serde_json::from_str(arguments.get(index).ok_or("missing --data value")?)
-                    .map_err(|error| format!("invalid --data JSON: {error}"))?;
-            }
-            "--to" => {
-                index += 1;
-                to = Some(arguments.get(index).ok_or("missing --to value")?.clone());
-            }
-            unknown => return Err(format!("unknown proxy argument {unknown}")),
-        }
-        index += 1;
-    }
-    let method = method.ok_or("proxy requests require --method METHOD")?;
-    let request = proxy_request(&method, data, to)?;
-    let mut stream =
-        UnixStream::connect(socket).map_err(|error| format!("connect {socket}: {error}"))?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
+    let mut record = catalog
+        .parse_argv(method, &arguments[2..])
         .map_err(|error| error.to_string())?;
-    writeln!(stream, "{request}").map_err(|error| error.to_string())?;
-    stream.flush().map_err(|error| error.to_string())?;
-    let mut response = String::new();
-    BufReader::new(stream)
-        .read_line(&mut response)
+    record.id = Some(serde_json::Value::from(fresh_request_id()));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
         .map_err(|error| error.to_string())?;
-    if response.trim().is_empty() {
-        return Err(format!("proxy {socket} returned no response for {method}"));
-    }
+    let response = runtime
+        .block_on(async {
+            let socket = mesh::seqpacket::UnixSeqpacket::connect(socket).await?;
+            socket.send_cbor_record(&record, &[]).await?;
+            let (response, fds) =
+                tokio::time::timeout(Duration::from_secs(10), socket.recv_cbor_record())
+                    .await??
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("lmesh CBOR socket closed without a response")
+                    })?;
+            anyhow::ensure!(
+                fds.is_empty(),
+                "unexpected file descriptors in lmesh response"
+            );
+            Ok::<_, anyhow::Error>(mesh::tagged::to_json(&response, Some(&catalog)))
+        })
+        .map_err(|error| error.to_string())?;
     println!(
-        "dmesh_cli_proxy_response endpoint={socket} method={method} {}",
-        response.trim()
+        "dmesh_cli_lmesh_response endpoint={socket} method={method} {}",
+        response
     );
     Ok(())
 }
@@ -1469,8 +1443,7 @@ fn run_serial_stream_command(arguments: &[String]) -> Result<(), String> {
         }
         index += 1;
     }
-    let command = service_arguments.join(" ");
-    let body = encode_stream_command_with_id(&command, fresh_request_id())
+    let body = encode_stream_argv_with_id(&service_arguments, fresh_request_id())
         .map_err(|error| error.to_string())?;
     let path = arguments.first().ok_or("missing serial path")?;
     let tagged_probe = dmesh_server::tagged::decode(&body)
@@ -2057,7 +2030,7 @@ fn run_udp_service_client(arguments: &[String]) -> Result<(), String> {
     let tagged_command = arguments
         .get(1)
         .filter(|command| FirmwareSchema::load().is_stream_command_name(command))
-        .map(|_| encode_stream_command_with_id(&arguments[1..].join(" "), fresh_request_id()))
+        .map(|_| encode_stream_argv_with_id(&arguments[1..], fresh_request_id()))
         .transpose()
         .map_err(|error| error.to_string())?;
     let mut index = if tagged_command.is_some() {
@@ -2128,7 +2101,7 @@ fn run_udp_service_client(arguments: &[String]) -> Result<(), String> {
         return serve_udp_session_socket(peer, Path::new(&socket_path));
     }
     let request = tagged_command
-        .ok_or("missing schema service; use dmesh-cli NODE SERVICE [field=value ...]")?;
+        .ok_or("missing schema service; use dmesh-cli DEVICE METHOD [--field=value ...]")?;
     let tagged_probe = dmesh_server::tagged::decode(&request)
         .and_then(dmesh_server::probe::decode_probe_run_record)
         .map(|(_, request)| request);
@@ -4514,24 +4487,8 @@ fn exchange_udp_direct_record_with_timeout(
     Ok(response[..response_len].to_vec())
 }
 
-#[derive(Deserialize)]
-struct LocalSessionRequest {
-    /// Schema service name, identical to `dmesh-cli NODE SERVICE`.
-    service: String,
-    /// Service fields use the same JSON types as the HTTP request body.
-    #[serde(flatten)]
-    fields: serde_json::Map<String, serde_json::Value>,
-}
-
-/// Own a single UDP QUIC-lite connection and expose a deliberately small
-/// local text socket. This replaces the retired byte-forwarding listener: a
-/// local client supplies a schema-backed JSON line such as
-/// `{"service":"log-watch","records":4}` and receives one JSON result.
-/// Requests use distinct QUIC stream IDs on this owned connection.
-///
-/// This is a session/shell helper, not a bearer proxy. It has no TCP path and
-/// it never accepts arbitrary raw UART data. Long-lived log delivery will use
-/// the same endpoint once the service handler publishes framed log records.
+/// Own one UDP QUIC-lite association and expose tagged-CBOR requests over a
+/// mode-0600 seqpacket socket. Every local packet becomes one QUIC stream.
 pub fn serve_udp_session_socket(peer: SocketAddr, socket_path: &Path) -> Result<(), String> {
     if socket_path.exists() {
         let metadata = std::fs::symlink_metadata(socket_path).map_err(|error| error.to_string())?;
@@ -4543,73 +4500,62 @@ pub fn serve_udp_session_socket(peer: SocketAddr, socket_path: &Path) -> Result<
         }
         std::fs::remove_file(socket_path).map_err(|error| error.to_string())?;
     }
-    let listener = UnixListener::bind(socket_path).map_err(|error| error.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|error| error.to_string())?;
-    }
-    listener
-        .set_nonblocking(true)
-        .map_err(|error| error.to_string())?;
     let cid = fresh_connection_id()?;
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
-    let mut client = runtime
-        .block_on(dmesh_server::udp::UdpClient::connect(
-            "0.0.0.0:0".parse().expect("valid UDP bind"),
-            peer,
-            cid,
-        ))
-        .map_err(|error| error.to_string())?;
-    let schema = FirmwareSchema::load();
-    let mut next_stream = quic_lite::FIRST_CLIENT_BIDI_STREAM_ID;
-    eprintln!(
-        "dmesh_device_session target={peer} socket={}",
-        socket_path.display()
-    );
-    loop {
-        match listener.accept() {
-            Ok((mut stream, _)) => {
-                let mut line = String::new();
-                BufReader::new(stream.try_clone().map_err(|error| error.to_string())?)
-                    .read_line(&mut line)
-                    .map_err(|error| error.to_string())?;
-                let response = match serde_json::from_str::<LocalSessionRequest>(&line) {
-                    Ok(request) => match encode_stream_fields_with_id(
-                        &request.service,
-                        &request.fields,
-                        fresh_request_id(),
-                    ) {
-                        Ok(packet) => {
-                            let stream_id = next_stream;
-                            next_stream = next_stream.saturating_add(4);
-                            match runtime.block_on(client.request_stream(stream_id, &packet, true))
-                            {
-                                Ok((stream_id, record, fin)) => serde_json::json!({
-                                    "response": {
-                                        "stream": stream_id, "fin": fin,
-                                        "record": render_device_record(&schema, &record),
-                                        "record_hex": hex_encode(&record),
-                                    }
-                                }),
-                                Err(error) => serde_json::json!({"error": error.to_string()}),
-                            }
-                        }
-                        Err(error) => serde_json::json!({"error": error.to_string()}),
-                    },
-                    Err(error) => {
-                        serde_json::json!({"error": format!("invalid JSON request: {error}")})
-                    }
-                };
-                writeln!(stream, "{response}").map_err(|error| error.to_string())?;
+    runtime
+        .block_on(async {
+            let listener = mesh::seqpacket::UnixSeqpacketListener::bind(socket_path)?;
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;
+            let mut client = dmesh_server::udp::UdpClient::connect(
+                "0.0.0.0:0".parse().expect("valid UDP bind"),
+                peer,
+                cid,
+            )
+            .await?;
+            let mut next_stream = quic_lite::FIRST_CLIENT_BIDI_STREAM_ID;
+            eprintln!(
+                "dmesh_device_session target={peer} socket={}",
+                socket_path.display()
+            );
+            loop {
+                let stream = listener.accept().await?;
+                while let Some((request, fds)) = stream.recv_cbor_record().await? {
+                    anyhow::ensure!(
+                        fds.is_empty(),
+                        "device session does not accept file descriptors"
+                    );
+                    let id = request
+                        .id
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("request id required"))?;
+                    let wire = mesh::cbor::encode_record(&request)?;
+                    let stream_id = next_stream;
+                    next_stream = next_stream.saturating_add(4);
+                    let response = match client.request_stream(stream_id, &wire, true).await {
+                        Ok((_, response, _)) => match mesh::cbor::decode_record(&response) {
+                            Ok(record) if record.id.as_ref() == Some(&id) => record,
+                            Ok(_) => mesh::wire::response_error(
+                                id,
+                                serde_json::json!({"message":"device response id mismatch"}),
+                            ),
+                            Err(error) => mesh::wire::response_error(
+                                id,
+                                serde_json::json!({"message":error.to_string()}),
+                            ),
+                        },
+                        Err(error) => mesh::wire::response_error(
+                            id,
+                            serde_json::json!({"message":error.to_string()}),
+                        ),
+                    };
+                    stream.send_cbor_record(&response, &[]).await?;
+                }
             }
-            Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(10))
-            }
-            Err(error) => return Err(error.to_string()),
-        }
-    }
+            #[allow(unreachable_code)]
+            Ok::<_, anyhow::Error>(())
+        })
+        .map_err(|error| error.to_string())
 }
 
 /// Fresh caller identity for correlation across independent CLI invocations.
@@ -4635,8 +4581,8 @@ fn fresh_connection_id() -> Result<quic_lite::ConnectionId, String> {
 mod tests {
     use super::{
         AutomatedFlashImage, ClientPathPolicy, RawTextTap, WatchTextFilter, is_fatal_diagnostic,
-        object_upload_rejection, observed_nodes, parse_automated_flash_options, parse_udp_peer,
-        proxy_request, proxy_socket_target, same_udp_endpoint,
+        lmesh_socket_target, object_upload_rejection, observed_nodes,
+        parse_automated_flash_options, parse_udp_peer, same_udp_endpoint,
     };
     use dmesh_server::relay::{
         DesiredRule, PairRequest, RelayRoute, RelayState, Request, decode_pair_request,
@@ -5072,26 +5018,32 @@ mod tests {
     }
 
     #[test]
-    fn proxy_targets_and_requests_use_existing_jsonl_contract() {
+    fn lmesh_uses_a_positional_method_and_catalog_field_options() {
         assert_eq!(
-            proxy_socket_target("lmesh://lmesh-wifi"),
-            Some("/run/mesh/lmesh-wifi/mesh.sock")
+            lmesh_socket_target("lmesh"),
+            Some("/run/mesh/lmesh/mesh.sock.cbor")
         );
         assert_eq!(
-            proxy_socket_target("uds:///tmp/lmesh.sock"),
+            lmesh_socket_target("lmesh://lmesh"),
+            Some("/run/mesh/lmesh/mesh.sock.cbor")
+        );
+        assert_eq!(
+            lmesh_socket_target("uds:///tmp/lmesh.sock"),
             Some("/tmp/lmesh.sock")
         );
-        let request = proxy_request(
-            "telemetry.nan_metrics",
-            serde_json::json!({"destination":"14:c1:9f:e4:5d:48"}),
-            Some("14c19fe45d48".to_owned()),
-        )
-        .unwrap();
-        assert_eq!(request["method"], "telemetry.nan_metrics");
-        assert_eq!(request["destination"], "14:c1:9f:e4:5d:48");
-        assert_eq!(request["to"], "14c19fe45d48");
-        assert!(request["id"].as_str().unwrap().starts_with("dmesh-cli-"));
-        assert!(proxy_request("telemetry.nan_metrics", serde_json::json!([]), None).is_err());
+        let catalog = mesh::tagged::load_service_catalog("lmesh")
+            .unwrap()
+            .unwrap();
+        let record = catalog
+            .parse_argv(
+                "wifi.interface.channel",
+                &["--iface=wlan0".to_owned(), "--channel=6".to_owned()],
+            )
+            .unwrap();
+        assert!(matches!(record.component, mesh::tagged::NameOrTag::Tag(5)));
+        assert!(matches!(record.method, mesh::tagged::NameOrTag::Tag(32)));
+        assert_eq!(record.env.len(), 2);
+        assert!(catalog.method("wifi.rawnan.status").is_none());
     }
 
     #[test]

@@ -45,13 +45,13 @@ export ANDROID_HOME="${ANDROID_HOME:-${_dmesh_target_base}/android-sdk}"
 export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME}}"
 export DMESH_ANDROID_SDK="${DMESH_ANDROID_SDK:-${ANDROID_HOME}}"
 
-# Keep the default catalog and the lab lmesh endpoint in one sourced place;
-# callers may override either for another component.
-export MESH_TOOLS="${MESH_TOOLS:-${DMESH_REPO}/crates/lmesh/resources/tools.json}"
+# Use the same per-service tools.json discovery layout as mesh-cli. An
+# explicitly set MESH_TOOLS remains an override for one catalog.
+export MESH_SCHEMA_DIR="${MESH_SCHEMA_DIR:-${DMESH_REPO}/crates/dmesh-cli/schemas}"
 # Service names such as `lmesh` resolve through mesh-init definitions. This is
 # runtime discovery, not a build input; deployments can supply another catalog.
 export MESH_SERVICE_DIR="${MESH_SERVICE_DIR:-/home/system/etc/mesh-init}"
-export LMESH_CONTROL_SOCKET="${LMESH_CONTROL_SOCKET:-/run/mesh/lmesh/mesh.sock}"
+export LMESH_CONTROL_SOCKET="${LMESH_CONTROL_SOCKET:-/run/mesh/lmesh/mesh.sock.cbor}"
 export DMESH_LMESH_CONTROL_ENDPOINT="${DMESH_LMESH_CONTROL_ENDPOINT:-unix://${LMESH_CONTROL_SOCKET}}"
 # NAN gateway routing is experimental/WIP and disabled by default. The
 # role-to-device map is retained only for isolated gateway experiments.

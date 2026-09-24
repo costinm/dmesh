@@ -1,4 +1,4 @@
-//! Host-side probe for the managed lmesh-wifi UDP object service.
+//! Host-side probe for the managed lmesh UDP object service.
 //!
 //! Run explicitly with the service already running:
 //! `cargo test -p quic-lite --features udp --test running_lmesh_wifi -- --ignored --nocapture`
@@ -10,7 +10,7 @@ use tokio::time::Instant;
 use tokio::time::{Duration, timeout};
 
 #[tokio::test]
-#[ignore = "requires the managed lmesh-wifi service and its AP"]
+#[ignore = "requires the managed lmesh service and its AP"]
 async fn running_lmesh_wifi_returns_a_main_manifest() {
     let mut request = [0u8; 64];
     let used = encode_get_request(&mut request, 1, None, 13, 6).expect("encode GET");
@@ -20,7 +20,7 @@ async fn running_lmesh_wifi_returns_a_main_manifest() {
         quic_lite::ConnectionId::new(1).unwrap(),
     )
     .await
-    .expect("connect to managed lmesh-wifi UDP service");
+    .expect("connect to managed lmesh UDP service");
     let (_, response, _) = client
         .request_stream(FIRST_CLIENT_BIDI_STREAM_ID, &request[..used], true)
         .await
@@ -32,7 +32,7 @@ async fn running_lmesh_wifi_returns_a_main_manifest() {
 /// Measures the managed server itself on loopback. This intentionally uses
 /// the same UDP client/ACK path as Recovery rather than a raw socket sender.
 #[tokio::test]
-#[ignore = "requires the managed lmesh-wifi service and its AP"]
+#[ignore = "requires the managed lmesh service and its AP"]
 async fn running_lmesh_wifi_transfers_complete_object_over_loopback() {
     let mut request = [0u8; 64];
     let used = encode_get_request(&mut request, 2, None, 13, 6).expect("encode GET");
@@ -42,7 +42,7 @@ async fn running_lmesh_wifi_transfers_complete_object_over_loopback() {
         quic_lite::ConnectionId::new(2).unwrap(),
     )
     .await
-    .expect("connect to managed lmesh-wifi UDP service");
+    .expect("connect to managed lmesh UDP service");
     let started = Instant::now();
     let (_, first, mut finished) = client
         .request_stream(FIRST_CLIENT_BIDI_STREAM_ID, &request[..used], true)
@@ -57,13 +57,13 @@ async fn running_lmesh_wifi_transfers_complete_object_over_loopback() {
     let elapsed = started.elapsed();
     let mib_per_second = bytes as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0);
     eprintln!(
-        "managed lmesh-wifi loopback object bytes={bytes} elapsed_ms={} speed_mib_s={mib_per_second:.3}",
+        "managed lmesh loopback object bytes={bytes} elapsed_ms={} speed_mib_s={mib_per_second:.3}",
         elapsed.as_millis(),
     );
     assert!(bytes > 1024, "object transfer was unexpectedly small");
 }
 
-/// Hardware-only Recovery command-mode proof. The stable lmesh-wifi AP keeps
+/// Hardware-only Recovery command-mode proof. The stable lmesh AP keeps
 /// port 3336; this test itself owns the diagnostic telemetry port 3338 and
 /// exercises the ESP's separate raw command port 3337. Run after flashing a
 /// Recovery image with `stg2:boot_target=2`:

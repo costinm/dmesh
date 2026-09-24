@@ -11,7 +11,6 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 pub struct HttpService {
     pub name: String,
     pub backend: ssh_mesh::mesh_rest::MeshServiceBackend,
-    pub catalog: Option<serde_json::Value>,
 }
 
 /// Everything needed to serve one host's admin endpoint.
@@ -27,10 +26,11 @@ pub struct HttpConfig {
 pub async fn serve(config: HttpConfig) -> anyhow::Result<()> {
     let services = ssh_mesh::mesh_rest::MeshServiceRegistry::default();
     services.register(
-        config.service.name,
+        config.service.name.clone(),
         ssh_mesh::mesh_rest::MeshService {
             backend: config.service.backend,
-            catalog: config.service.catalog,
+            encoding: ssh_mesh::mesh_rest::MeshServiceEncoding::TaggedCbor,
+            component: config.service.name,
         },
     );
     let app = ssh_mesh::handlers::app(ssh_mesh::AppState {

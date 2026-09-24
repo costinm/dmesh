@@ -18,44 +18,7 @@ pub trait UsbBackend: Send + Sync {
 }
 
 pub fn tools_json() -> Value {
-    json!([
-        {
-            "name": "usb.status",
-            "description": "Report the local USB serial adapter, interface, and bearer state.",
-            "inputSchema": {"type": "object"},
-            "outputSchema": {"type": "object"},
-            "x-ui-visibility": "default"
-        },
-        {
-            "name": "usb.devices",
-            "description": "List USB devices visible to the Android host.",
-            "inputSchema": {"type": "object"},
-            "outputSchema": {"type": "object"},
-            "x-ui-visibility": "default"
-        },
-        {
-            "name": "usb.open",
-            "description": "Open a USB serial device and attach it to the Rust mesh bearer.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "vendor_id": {"type": "integer", "minimum": 1, "maximum": 65535},
-                    "product_id": {"type": "integer", "minimum": 1, "maximum": 65535},
-                    "auto": {"type": "boolean"}
-                },
-                "additionalProperties": false
-            },
-            "outputSchema": {"type": "object"},
-            "x-ui-visibility": "default"
-        },
-        {
-            "name": "usb.close",
-            "description": "Close the active USB serial bearer.",
-            "inputSchema": {"type": "object"},
-            "outputSchema": {"type": "object"},
-            "x-ui-visibility": "default"
-        }
-    ])
+    crate::platform_catalog::tools_for("usb.")
 }
 
 pub struct UsbService {
@@ -73,7 +36,8 @@ impl UsbService {
     pub fn mesh_service(backend: Arc<dyn UsbBackend>) -> anyhow::Result<MeshService> {
         Ok(MeshService {
             backend: MeshServiceBackend::Direct(Arc::new(Self::new(backend)?)),
-            catalog: Some(tools_json()),
+            encoding: ssh_mesh::mesh_rest::MeshServiceEncoding::TaggedCbor,
+            component: "usb".to_owned(),
         })
     }
 }
@@ -93,10 +57,7 @@ impl TaggedRecordHandler for UsbService {
                 let id = record.id.context("usb service request missing id")?;
                 Ok(Some(match output {
                     Ok(value) => response_ok(id, value),
-                    Err(error) => response_error(
-                        id,
-                        json!({"error": error.to_string()}),
-                    ),
+                    Err(error) => response_error(id, json!({"error": error.to_string()})),
                 }))
             }
             _ => {
@@ -186,10 +147,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(response.id, Some(json!(7)));
-        assert_eq!(
-            response.result,
-            Some(json!({"operation": "status"}))
-        );
+        assert_eq!(response.result, Some(json!({"operation": "status"})));
     }
 
     #[tokio::test]

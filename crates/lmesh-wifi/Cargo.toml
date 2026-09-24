@@ -28,7 +28,3 @@ name = "lmesh_wifi"
 
 [dev-dependencies]
 tempfile = "3"
-
-[[bin]]
-name = "lmesh-wifi"
-path = "src/main.rs"

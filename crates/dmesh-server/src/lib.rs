@@ -67,12 +67,12 @@ pub mod stream_server;
 pub mod tagged;
 /// Portable local discovery status and transport-owned metric views.
 pub mod telemetry;
-pub mod transport_state;
 /// Shared QUIC connection/server/client glue above bearer frame I/O.
 pub mod transport;
 /// Common ingress provenance and policy-driven egress selection shared by
 /// QUIC-lite, direct messages, radio adapters, and future relay paths.
 pub mod transport_path;
+pub mod transport_state;
 /// UART framing shared by host and firmware bearer adapters.
 pub mod uart;
 
@@ -83,6 +83,7 @@ pub mod ble_service;
 pub mod history_service;
 #[cfg(feature = "http")]
 pub mod http;
+mod platform_catalog;
 #[cfg(feature = "http")]
 pub mod transport_service;
 #[cfg(feature = "http")]

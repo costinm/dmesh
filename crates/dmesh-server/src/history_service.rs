@@ -20,22 +20,7 @@ pub trait HistoryBackend: Send + Sync {
 }
 
 pub fn tools_json() -> Value {
-    json!([
-        {
-            "name": "radio.history",
-            "description": "Read the bounded local radio event history.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 256},
-                    "since_ms": {"type": "integer", "minimum": 0},
-                    "keys": {"type": "string"}
-                }
-            },
-            "outputSchema": {"type": "object"},
-            "x-ui-visibility": "default"
-        }
-    ])
+    crate::platform_catalog::tools_for("radio.")
 }
 
 pub struct HistoryService {
@@ -53,7 +38,8 @@ impl HistoryService {
     pub fn mesh_service(backend: Arc<dyn HistoryBackend>) -> anyhow::Result<MeshService> {
         Ok(MeshService {
             backend: MeshServiceBackend::Direct(Arc::new(Self::new(backend)?)),
-            catalog: Some(tools_json()),
+            encoding: ssh_mesh::mesh_rest::MeshServiceEncoding::TaggedCbor,
+            component: "history".to_owned(),
         })
     }
 }
@@ -73,10 +59,7 @@ impl TaggedRecordHandler for HistoryService {
                 let id = record.id.context("history service request missing id")?;
                 Ok(Some(match output {
                     Ok(value) => response_ok(id, value),
-                    Err(error) => response_error(
-                        id,
-                        json!({"error": error.to_string()}),
-                    ),
+                    Err(error) => response_error(id, json!({"error": error.to_string()})),
                 }))
             }
             _ => {
@@ -102,9 +85,7 @@ impl HistoryService {
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
             .map(str::to_owned);
-        self.backend
-            .radio_history(limit, since_ms, keys)
-            .await
+        self.backend.radio_history(limit, since_ms, keys).await
     }
 }
 

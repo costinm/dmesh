@@ -1,6 +1,6 @@
 # mod_lora
 
-The module-owned ABI is documented in [API.md](API.md); this file provides
+The module-owned ABI is documented in [root API](../../API.md); this file provides
 implementation and hardware notes.
 
 Service tag `43`, starting at slot `0`, spanning two adjacent 64-KiB slots.

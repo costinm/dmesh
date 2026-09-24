@@ -1,4 +1,4 @@
-# dmesh-fw-transport API
+# dmesh-fw-transport design and implementation notes
 
 `dmesh-fw-transport` is the no-std ESP firmware integration layer shared by
 Recovery and Main. It may contain ESP-IDF/FreeRTOS adapters, UART tasks,

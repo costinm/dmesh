@@ -13,11 +13,9 @@ endpoints. Omitted visibility is intentionally not default-visible; new tools
 must explicitly choose `default` or remain masked until documented, tested, and
 classified.
 
-`firmware-tools.json` is the client-local catalog for direct ESP modem
-services such as `lora1.lmesh`. `mesh FQDN help` reads it locally; firmware
-does not carry or serve command help, so help remains available while a device
-is sleeping or unreachable.
+The [root API](../../../API.md) specifies the Linux radio and shared portable
+handlers. `tools.json` is the one installed catalog used by `lmesh`,
+`mesh`, and `dmesh-cli`; device method tags and legacy diagnostic labels are
+kept in it so a second firmware schema is unnecessary.
 
-`../API.md` is the canonical specification for the managed host services.
-Firmware operations are now dmesh-server stream handlers, not a generated
-direct-command catalog. Do not add retired firmware command methods here.
+Run `scripts/generate-lmesh-tools.py` after changing the Linux handler API.

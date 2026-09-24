@@ -78,7 +78,7 @@ fn udp_path_id(peer: SocketAddr) -> quic_lite::PathId {
     let value = hasher.finish() | (1_u64 << 63);
     quic_lite::PathId::new(value).expect("tagged UDP path ID is nonzero")
 }
-/// Stable `lmesh-wifi`/wlan0 object and PROBE listener.
+/// Stable `lmesh`/wlan0 object and PROBE listener.
 pub const STABLE_WIFI_UDP_PORT: u16 = 3336;
 /// Development `lmesh`/wlan1 listener.  It must not collide with wlan0.
 pub const DEVELOPMENT_WIFI_UDP_PORT: u16 = 3337;

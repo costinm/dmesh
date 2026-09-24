@@ -16,22 +16,7 @@ pub trait WifiBackend: Send + Sync {
 }
 
 pub fn tools_json() -> Value {
-    json!([
-        {
-            "name": "wifi.status",
-            "description": "Report the local Wi-Fi controller, station, and NAN snapshot.",
-            "inputSchema": {"type": "object"},
-            "outputSchema": {"type": "object"},
-            "x-ui-visibility": "default"
-        },
-        {
-            "name": "wifi.scan",
-            "description": "Request a bounded platform Wi-Fi scan.",
-            "inputSchema": {"type": "object"},
-            "outputSchema": {"type": "object"},
-            "x-ui-visibility": "default"
-        }
-    ])
+    crate::platform_catalog::tools_for("wifi.")
 }
 
 pub struct WifiService {
@@ -49,7 +34,8 @@ impl WifiService {
     pub fn mesh_service(backend: Arc<dyn WifiBackend>) -> anyhow::Result<MeshService> {
         Ok(MeshService {
             backend: MeshServiceBackend::Direct(Arc::new(Self::new(backend)?)),
-            catalog: Some(tools_json()),
+            encoding: ssh_mesh::mesh_rest::MeshServiceEncoding::TaggedCbor,
+            component: "wifi".to_owned(),
         })
     }
 }
@@ -69,10 +55,7 @@ impl TaggedRecordHandler for WifiService {
                 let id = record.id.context("wifi service request missing id")?;
                 Ok(Some(match output {
                     Ok(value) => response_ok(id, value),
-                    Err(error) => response_error(
-                        id,
-                        json!({"error": error.to_string()}),
-                    ),
+                    Err(error) => response_error(id, json!({"error": error.to_string()})),
                 }))
             }
             _ => {

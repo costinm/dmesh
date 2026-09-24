@@ -1,1 +1,3145 @@
-[]
+{
+  "tools": [
+    {
+      "name": "settings.get",
+      "description": "Call the settings.get QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string",
+            "x-protobuf-index": 1,
+            "x-dmesh-kind": "text"
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 1,
+      "x-method-index": 1,
+      "x-ui-visibility": "advanced",
+      "x-check-all": {
+        "key": "name"
+      },
+      "x-check-all-platforms": [
+        "esp32",
+        "android"
+      ],
+      "x-dmesh-device": true
+    },
+    {
+      "name": "settings.set",
+      "description": "Call the settings.set QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string",
+            "x-protobuf-index": 1,
+            "x-dmesh-kind": "text"
+          },
+          "value": {
+            "type": "string",
+            "x-protobuf-index": 2,
+            "x-dmesh-kind": "text"
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 1,
+      "x-method-index": 2,
+      "x-ui-visibility": "advanced",
+      "x-check-all": null,
+      "x-check-all-platforms": null,
+      "x-dmesh-device": true
+    },
+    {
+      "name": "settings.list",
+      "description": "Call the settings.list QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 1,
+      "x-method-index": 3,
+      "x-ui-visibility": "advanced",
+      "x-check-all": {},
+      "x-check-all-platforms": [
+        "esp32",
+        "android"
+      ],
+      "x-dmesh-device": true
+    },
+    {
+      "name": "transport.set",
+      "description": "Call the transport.set QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mode": {
+            "type": "integer",
+            "x-protobuf-index": 1,
+            "x-dmesh-kind": "enum",
+            "x-dmesh-values": {
+              "sta": 1,
+              "uart": 5,
+              "nan": 6
+            }
+          },
+          "ssid": {
+            "type": "string",
+            "x-protobuf-index": 2,
+            "x-dmesh-kind": "text"
+          },
+          "bssid": {
+            "type": "string",
+            "x-protobuf-index": 3,
+            "x-dmesh-kind": "mac"
+          },
+          "channel": {
+            "type": "integer",
+            "x-protobuf-index": 4,
+            "x-dmesh-kind": "u8"
+          },
+          "raw_tx_rate": {
+            "type": "integer",
+            "x-protobuf-index": 5,
+            "x-dmesh-kind": "u8"
+          },
+          "sta_driver_tx": {
+            "type": "boolean",
+            "x-protobuf-index": 6,
+            "x-dmesh-kind": "bool"
+          },
+          "sta_bssid_check_disabled": {
+            "type": "boolean",
+            "x-protobuf-index": 7,
+            "x-dmesh-kind": "bool"
+          },
+          "sta_ampdu_enabled": {
+            "type": "boolean",
+            "x-protobuf-index": 8,
+            "x-dmesh-kind": "bool"
+          },
+          "sta_11b_rates_disabled": {
+            "type": "boolean",
+            "x-protobuf-index": 9,
+            "x-dmesh-kind": "bool"
+          },
+          "sta_raw_rx_enabled": {
+            "type": "boolean",
+            "x-protobuf-index": 10,
+            "x-dmesh-kind": "bool"
+          },
+          "espnow_capture": {
+            "type": "boolean",
+            "x-protobuf-index": 13,
+            "x-dmesh-kind": "bool"
+          },
+          "nan_dw_interval": {
+            "type": "integer",
+            "x-protobuf-index": 14,
+            "x-dmesh-kind": "u8"
+          },
+          "now": {
+            "type": "integer",
+            "x-protobuf-index": 15,
+            "x-dmesh-kind": "u8"
+          },
+          "ap": {
+            "type": "integer",
+            "x-protobuf-index": 16,
+            "x-dmesh-kind": "u8"
+          },
+          "passphrase": {
+            "type": "string",
+            "x-protobuf-index": 17,
+            "x-dmesh-kind": "text"
+          },
+          "uart": {
+            "type": "integer",
+            "x-protobuf-index": 18,
+            "x-dmesh-kind": "u8"
+          },
+          "open": {
+            "type": "boolean",
+            "x-protobuf-index": 24,
+            "x-dmesh-kind": "bool"
+          },
+          "wake_target": {
+            "type": "string",
+            "x-protobuf-index": 25,
+            "x-dmesh-kind": "mac"
+          },
+          "ble": {
+            "type": "integer",
+            "x-protobuf-index": 26,
+            "x-dmesh-kind": "u8"
+          },
+          "ndp": {
+            "type": "integer",
+            "x-protobuf-index": 19,
+            "x-dmesh-kind": "u8"
+          },
+          "iface": {
+            "type": "string",
+            "x-protobuf-index": 27,
+            "x-dmesh-kind": "text"
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 1,
+      "x-method-index": 4,
+      "x-ui-visibility": "default",
+      "x-check-all": null,
+      "x-check-all-platforms": null,
+      "x-dmesh-device": true
+    },
+    {
+      "name": "relay.list",
+      "description": "Call the relay.list QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 5,
+      "x-method-index": 3,
+      "x-ui-visibility": "advanced",
+      "x-check-all": {},
+      "x-check-all-platforms": [
+        "esp32"
+      ],
+      "x-dmesh-device": true
+    },
+    {
+      "name": "discovery.nodes",
+      "description": "Call the discovery.nodes QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 6,
+      "x-method-index": 9,
+      "x-ui-visibility": "default",
+      "x-check-all": {},
+      "x-check-all-platforms": [
+        "esp32",
+        "host",
+        "android"
+      ],
+      "x-dmesh-device": true
+    },
+    {
+      "name": "discovery.active",
+      "description": "Call the discovery.active QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "medium": {
+            "type": "string",
+            "x-protobuf-index": 40,
+            "x-dmesh-kind": "text"
+          },
+          "to": {
+            "type": "string",
+            "x-protobuf-index": 41,
+            "x-dmesh-kind": "text"
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 6,
+      "x-method-index": 10,
+      "x-ui-visibility": "default",
+      "x-check-all": null,
+      "x-check-all-platforms": [
+        "esp32",
+        "host",
+        "android"
+      ],
+      "x-dmesh-device": true
+    },
+    {
+      "name": "nan.wakeup",
+      "description": "Call the nan.wakeup QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "to": {
+            "type": "string",
+            "x-protobuf-index": 1,
+            "x-dmesh-kind": "mac"
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 6,
+      "x-method-index": 11,
+      "x-ui-visibility": "default",
+      "x-check-all": null,
+      "x-check-all-platforms": [
+        "esp32",
+        "host",
+        "android"
+      ],
+      "x-dmesh-device": true
+    },
+    {
+      "name": "connection.configure",
+      "description": "Call the connection.configure QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "ack_frequency": {
+            "type": "integer",
+            "x-protobuf-index": 2,
+            "x-dmesh-kind": "u8"
+          },
+          "ack_delay_ms": {
+            "type": "integer",
+            "x-protobuf-index": 3,
+            "x-dmesh-kind": "u8"
+          },
+          "tx_burst_packets": {
+            "type": "integer",
+            "x-protobuf-index": 4,
+            "x-dmesh-kind": "u8"
+          },
+          "path_policy": {
+            "type": "integer",
+            "x-protobuf-index": 11,
+            "x-dmesh-kind": "u8"
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "x-protobuf-index": 12,
+            "x-dmesh-kind": "u32"
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 3,
+      "x-method-index": 1,
+      "x-ui-visibility": "advanced",
+      "x-check-all": null,
+      "x-check-all-platforms": [
+        "esp32",
+        "host",
+        "android"
+      ],
+      "x-dmesh-device": true
+    },
+    {
+      "name": "telemetry.nan_status",
+      "description": "Call the telemetry.nan_status QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 7,
+      "x-method-index": 1,
+      "x-ui-visibility": "advanced",
+      "x-check-all": {},
+      "x-check-all-platforms": [
+        "esp32",
+        "host"
+      ],
+      "x-dmesh-device": true
+    },
+    {
+      "name": "telemetry.now_metrics",
+      "description": "Call the telemetry.now_metrics QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 7,
+      "x-method-index": 2,
+      "x-ui-visibility": "advanced",
+      "x-check-all": {},
+      "x-check-all-platforms": [
+        "esp32",
+        "host"
+      ],
+      "x-dmesh-device": true
+    },
+    {
+      "name": "telemetry.nan_metrics",
+      "description": "Call the telemetry.nan_metrics QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 7,
+      "x-method-index": 3,
+      "x-ui-visibility": "advanced",
+      "x-check-all": {},
+      "x-check-all-platforms": [
+        "esp32",
+        "host"
+      ],
+      "x-dmesh-device": true
+    },
+    {
+      "name": "telemetry.udp6_metrics",
+      "description": "Call the telemetry.udp6_metrics QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 7,
+      "x-method-index": 4,
+      "x-ui-visibility": "advanced",
+      "x-check-all": {},
+      "x-check-all-platforms": [
+        "esp32",
+        "host"
+      ],
+      "x-dmesh-device": true
+    },
+    {
+      "name": "telemetry.wifi_link_metrics",
+      "description": "Call the telemetry.wifi_link_metrics QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 7,
+      "x-method-index": 5,
+      "x-ui-visibility": "advanced",
+      "x-check-all": {},
+      "x-check-all-platforms": [
+        "esp32",
+        "host"
+      ],
+      "x-dmesh-device": true
+    },
+    {
+      "name": "runtime.snapshot",
+      "description": "Call the runtime.snapshot QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "desired_mode": {
+            "type": "integer",
+            "x-protobuf-index": 0,
+            "x-dmesh-kind": "u32"
+          },
+          "desired_generation": {
+            "type": "integer",
+            "x-protobuf-index": 1,
+            "x-dmesh-kind": "u32"
+          },
+          "request_id": {
+            "type": "integer",
+            "x-protobuf-index": 2,
+            "x-dmesh-kind": "u32"
+          },
+          "sleepy": {
+            "type": "boolean",
+            "x-protobuf-index": 3,
+            "x-dmesh-kind": "bool"
+          },
+          "radio_lifecycle": {
+            "type": "integer",
+            "x-protobuf-index": 4,
+            "x-dmesh-kind": "u32"
+          },
+          "applied_generation": {
+            "type": "integer",
+            "x-protobuf-index": 5,
+            "x-dmesh-kind": "u32"
+          },
+          "power_lifecycle": {
+            "type": "integer",
+            "x-protobuf-index": 6,
+            "x-dmesh-kind": "u32"
+          },
+          "sleep_blockers": {
+            "type": "integer",
+            "x-protobuf-index": 7,
+            "x-dmesh-kind": "u32"
+          },
+          "last_error": {
+            "type": "integer",
+            "x-protobuf-index": 8,
+            "x-dmesh-kind": "u32"
+          },
+          "stale_completion_count": {
+            "type": "integer",
+            "x-protobuf-index": 9,
+            "x-dmesh-kind": "u32"
+          },
+          "queue_overflow_count": {
+            "type": "integer",
+            "x-protobuf-index": 10,
+            "x-dmesh-kind": "u32"
+          },
+          "wake_cause": {
+            "type": "integer",
+            "x-protobuf-index": 11,
+            "x-dmesh-kind": "u32"
+          },
+          "cpu_mhz": {
+            "type": "integer",
+            "x-protobuf-index": 12,
+            "x-dmesh-kind": "u32"
+          },
+          "pm_min_mhz": {
+            "type": "integer",
+            "x-protobuf-index": 13,
+            "x-dmesh-kind": "u32"
+          },
+          "pm_max_mhz": {
+            "type": "integer",
+            "x-protobuf-index": 14,
+            "x-dmesh-kind": "u32"
+          },
+          "pm_automatic_light_sleep": {
+            "type": "boolean",
+            "x-protobuf-index": 15,
+            "x-dmesh-kind": "bool"
+          },
+          "pm_configured": {
+            "type": "boolean",
+            "x-protobuf-index": 16,
+            "x-dmesh-kind": "bool"
+          },
+          "light_sleep_attempts": {
+            "type": "integer",
+            "x-protobuf-index": 17,
+            "x-dmesh-kind": "u32"
+          },
+          "light_sleep_entries": {
+            "type": "integer",
+            "x-protobuf-index": 18,
+            "x-dmesh-kind": "u32"
+          },
+          "light_sleep_skipped": {
+            "type": "integer",
+            "x-protobuf-index": 19,
+            "x-dmesh-kind": "u32"
+          },
+          "last_sleep_requested_us": {
+            "type": "integer",
+            "x-protobuf-index": 20,
+            "x-dmesh-kind": "u32"
+          },
+          "last_sleep_duration_us": {
+            "type": "integer",
+            "x-protobuf-index": 21,
+            "x-dmesh-kind": "u32"
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 101,
+      "x-method-index": 1,
+      "x-ui-visibility": "advanced",
+      "x-check-all": {},
+      "x-check-all-platforms": [
+        "esp32"
+      ],
+      "x-dmesh-device": true
+    },
+    {
+      "name": "runtime.reset",
+      "description": "Call the runtime.reset QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 101,
+      "x-method-index": 2,
+      "x-ui-visibility": "advanced",
+      "x-check-all": null,
+      "x-check-all-platforms": [
+        "esp32"
+      ],
+      "x-dmesh-device": true
+    },
+    {
+      "name": "power.snapshot",
+      "description": "Call the power.snapshot QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "cpu_mhz": {
+            "type": "integer",
+            "x-protobuf-index": 0,
+            "x-dmesh-kind": "u32"
+          },
+          "min_mhz": {
+            "type": "integer",
+            "x-protobuf-index": 1,
+            "x-dmesh-kind": "u32"
+          },
+          "max_mhz": {
+            "type": "integer",
+            "x-protobuf-index": 2,
+            "x-dmesh-kind": "u32"
+          },
+          "automatic_light_sleep": {
+            "type": "boolean",
+            "x-protobuf-index": 3,
+            "x-dmesh-kind": "bool"
+          },
+          "configured": {
+            "type": "boolean",
+            "x-protobuf-index": 4,
+            "x-dmesh-kind": "bool"
+          },
+          "light_sleep_attempts": {
+            "type": "integer",
+            "x-protobuf-index": 5,
+            "x-dmesh-kind": "u32"
+          },
+          "light_sleep_entries": {
+            "type": "integer",
+            "x-protobuf-index": 6,
+            "x-dmesh-kind": "u32"
+          },
+          "light_sleep_skipped": {
+            "type": "integer",
+            "x-protobuf-index": 7,
+            "x-dmesh-kind": "u32"
+          },
+          "last_sleep_requested_us": {
+            "type": "integer",
+            "x-protobuf-index": 8,
+            "x-dmesh-kind": "u32"
+          },
+          "last_sleep_duration_us": {
+            "type": "integer",
+            "x-protobuf-index": 9,
+            "x-dmesh-kind": "u32"
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 102,
+      "x-method-index": 1,
+      "x-ui-visibility": "advanced",
+      "x-check-all": {},
+      "x-check-all-platforms": [
+        "esp32"
+      ],
+      "x-dmesh-device": true
+    },
+    {
+      "name": "memory.snapshot",
+      "description": "Call the memory.snapshot QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "packet_slots": {
+            "type": "integer",
+            "x-protobuf-index": 0,
+            "x-dmesh-kind": "u32"
+          },
+          "packet_slots_available": {
+            "type": "integer",
+            "x-protobuf-index": 1,
+            "x-dmesh-kind": "u32"
+          },
+          "packet_drops": {
+            "type": "integer",
+            "x-protobuf-index": 2,
+            "x-dmesh-kind": "u32"
+          },
+          "worker_stack_bytes": {
+            "type": "integer",
+            "x-protobuf-index": 3,
+            "x-dmesh-kind": "u32"
+          },
+          "worker_running": {
+            "type": "boolean",
+            "x-protobuf-index": 4,
+            "x-dmesh-kind": "bool"
+          },
+          "worker_starts": {
+            "type": "integer",
+            "x-protobuf-index": 5,
+            "x-dmesh-kind": "u32"
+          },
+          "worker_create_failures": {
+            "type": "integer",
+            "x-protobuf-index": 6,
+            "x-dmesh-kind": "u32"
+          },
+          "worker_stack_min_free_words": {
+            "type": "integer",
+            "x-protobuf-index": 7,
+            "x-dmesh-kind": "u32"
+          },
+          "free_internal_bytes": {
+            "type": "integer",
+            "x-protobuf-index": 8,
+            "x-dmesh-kind": "u32"
+          },
+          "min_free_internal_bytes": {
+            "type": "integer",
+            "x-protobuf-index": 9,
+            "x-dmesh-kind": "u32"
+          },
+          "largest_internal_block_bytes": {
+            "type": "integer",
+            "x-protobuf-index": 10,
+            "x-dmesh-kind": "u32"
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 103,
+      "x-method-index": 1,
+      "x-ui-visibility": "advanced",
+      "x-check-all": {},
+      "x-check-all-platforms": [
+        "esp32"
+      ],
+      "x-dmesh-device": true
+    },
+    {
+      "name": "probe",
+      "description": "Call the probe QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "bytes": {
+            "type": "integer",
+            "x-protobuf-index": 1,
+            "x-dmesh-kind": "u64"
+          },
+          "packet_size": {
+            "type": "integer",
+            "x-protobuf-index": 2,
+            "x-dmesh-kind": "u16"
+          },
+          "pace_us": {
+            "type": "integer",
+            "x-protobuf-index": 3,
+            "x-dmesh-kind": "u32"
+          },
+          "burst_packets": {
+            "type": "integer",
+            "x-protobuf-index": 4,
+            "x-dmesh-kind": "u8"
+          },
+          "burst_delay_us": {
+            "type": "integer",
+            "x-protobuf-index": 5,
+            "x-dmesh-kind": "u32"
+          },
+          "ack_frequency": {
+            "type": "integer",
+            "x-protobuf-index": 6,
+            "x-dmesh-kind": "u8"
+          },
+          "ack_delay_ms": {
+            "type": "integer",
+            "x-protobuf-index": 7,
+            "x-dmesh-kind": "u8"
+          },
+          "low_priority_bytes": {
+            "type": "integer",
+            "x-protobuf-index": 8,
+            "x-dmesh-kind": "u32"
+          },
+          "high_priority_bytes": {
+            "type": "integer",
+            "x-protobuf-index": 9,
+            "x-dmesh-kind": "u32"
+          },
+          "parallel_streams": {
+            "type": "integer",
+            "x-protobuf-index": 10,
+            "x-dmesh-kind": "u8"
+          },
+          "initial_consume_delay_ms": {
+            "type": "integer",
+            "x-protobuf-index": 11,
+            "x-dmesh-kind": "u32"
+          },
+          "consume_delay_ms": {
+            "type": "integer",
+            "x-protobuf-index": 12,
+            "x-dmesh-kind": "u32"
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 8,
+      "x-method-index": 1,
+      "x-ui-visibility": "advanced",
+      "x-check-all": {
+        "bytes": 65536,
+        "packet_size": 1024,
+        "parallel_streams": 1
+      },
+      "x-check-all-platforms": [
+        "esp32",
+        "host",
+        "android"
+      ],
+      "x-dmesh-device": true
+    },
+    {
+      "name": "object.flash",
+      "description": "Call the object.flash QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "x-protobuf-index": 0,
+            "x-dmesh-kind": "text"
+          },
+          "cpu": {
+            "type": "integer",
+            "x-protobuf-index": 1,
+            "x-dmesh-kind": "u8"
+          },
+          "target": {
+            "type": "integer",
+            "x-protobuf-index": 2,
+            "x-dmesh-kind": "u8"
+          },
+          "address": {
+            "type": "integer",
+            "x-protobuf-index": 3,
+            "x-dmesh-kind": "u32"
+          },
+          "transport": {
+            "type": "integer",
+            "x-protobuf-index": 4,
+            "x-dmesh-kind": "u8"
+          },
+          "dry_run": {
+            "type": "boolean",
+            "x-protobuf-index": 5,
+            "x-dmesh-kind": "bool"
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 10,
+      "x-method-index": 2,
+      "x-ui-visibility": "advanced",
+      "x-check-all": null,
+      "x-check-all-platforms": null,
+      "x-dmesh-device": true
+    },
+    {
+      "name": "module.stop",
+      "description": "Call the module.stop QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 1000,
+      "x-method-index": 3,
+      "x-ui-visibility": "advanced",
+      "x-check-all": null,
+      "x-check-all-platforms": null,
+      "x-dmesh-device": true
+    },
+    {
+      "name": "boot.recovery",
+      "description": "Call the boot.recovery QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 11,
+      "x-method-index": 1,
+      "x-ui-visibility": "advanced",
+      "x-check-all": null,
+      "x-check-all-platforms": null,
+      "x-dmesh-device": true
+    },
+    {
+      "name": "firmware.identity",
+      "description": "Call the firmware.identity QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 12,
+      "x-method-index": 1,
+      "x-ui-visibility": "advanced",
+      "x-check-all": null,
+      "x-check-all-platforms": null,
+      "x-dmesh-device": true
+    },
+    {
+      "name": "ble.start",
+      "description": "Call the ble.start QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 104,
+      "x-method-index": 80,
+      "x-ui-visibility": "advanced",
+      "x-check-all": null,
+      "x-check-all-platforms": null,
+      "x-dmesh-device": true
+    },
+    {
+      "name": "ble.stop",
+      "description": "Call the ble.stop QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 104,
+      "x-method-index": 81,
+      "x-ui-visibility": "advanced",
+      "x-check-all": null,
+      "x-check-all-platforms": null,
+      "x-dmesh-device": true
+    },
+    {
+      "name": "ble.scan",
+      "description": "Call the ble.scan QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "duration_ms": {
+            "type": "integer",
+            "x-protobuf-index": 2,
+            "x-dmesh-kind": "u32"
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 104,
+      "x-method-index": 82,
+      "x-ui-visibility": "advanced",
+      "x-check-all": null,
+      "x-check-all-platforms": null,
+      "x-dmesh-device": true
+    },
+    {
+      "name": "ble.status",
+      "description": "Call the ble.status QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "ready": {
+            "type": "boolean",
+            "x-protobuf-index": 1,
+            "x-dmesh-kind": "bool"
+          },
+          "advertising": {
+            "type": "boolean",
+            "x-protobuf-index": 2,
+            "x-dmesh-kind": "bool"
+          },
+          "connected": {
+            "type": "boolean",
+            "x-protobuf-index": 3,
+            "x-dmesh-kind": "bool"
+          },
+          "coc_connected": {
+            "type": "boolean",
+            "x-protobuf-index": 4,
+            "x-dmesh-kind": "bool"
+          },
+          "generation": {
+            "type": "integer",
+            "x-protobuf-index": 5,
+            "x-dmesh-kind": "u32"
+          },
+          "handle": {
+            "type": "integer",
+            "x-protobuf-index": 6,
+            "x-dmesh-kind": "u16"
+          },
+          "coc_rx": {
+            "type": "integer",
+            "x-protobuf-index": 7,
+            "x-dmesh-kind": "u32"
+          },
+          "coc_rx_rejected": {
+            "type": "integer",
+            "x-protobuf-index": 8,
+            "x-dmesh-kind": "u32"
+          },
+          "scanning": {
+            "type": "boolean",
+            "x-protobuf-index": 9,
+            "x-dmesh-kind": "bool"
+          },
+          "scan_reports": {
+            "type": "integer",
+            "x-protobuf-index": 10,
+            "x-dmesh-kind": "u32"
+          },
+          "scan_matches": {
+            "type": "integer",
+            "x-protobuf-index": 11,
+            "x-dmesh-kind": "u32"
+          },
+          "last_scan_addr": {
+            "type": "string",
+            "x-protobuf-index": 12,
+            "x-dmesh-kind": "mac"
+          },
+          "last_scan_addr_type": {
+            "type": "integer",
+            "x-protobuf-index": 13,
+            "x-dmesh-kind": "u8"
+          },
+          "last_scan_rssi": {
+            "type": "integer",
+            "x-protobuf-index": 14,
+            "x-dmesh-kind": "i32"
+          },
+          "bonded": {
+            "type": "boolean",
+            "x-protobuf-index": 15,
+            "x-dmesh-kind": "bool"
+          },
+          "coc_tx_pending": {
+            "type": "boolean",
+            "x-protobuf-index": 16,
+            "x-dmesh-kind": "bool"
+          },
+          "local_addr": {
+            "type": "string",
+            "x-protobuf-index": 17,
+            "x-dmesh-kind": "hex",
+            "format": "hex"
+          },
+          "local_addr_type": {
+            "type": "integer",
+            "x-protobuf-index": 18,
+            "x-dmesh-kind": "u8"
+          },
+          "ingress_enqueued": {
+            "type": "integer",
+            "x-protobuf-index": 19,
+            "x-dmesh-kind": "u32"
+          },
+          "ingress_accepted": {
+            "type": "integer",
+            "x-protobuf-index": 20,
+            "x-dmesh-kind": "u32"
+          },
+          "ingress_rejected": {
+            "type": "integer",
+            "x-protobuf-index": 21,
+            "x-dmesh-kind": "u32"
+          },
+          "egress_attempts": {
+            "type": "integer",
+            "x-protobuf-index": 22,
+            "x-dmesh-kind": "u32"
+          },
+          "egress_sent": {
+            "type": "integer",
+            "x-protobuf-index": 23,
+            "x-dmesh-kind": "u32"
+          },
+          "egress_send_errors": {
+            "type": "integer",
+            "x-protobuf-index": 24,
+            "x-dmesh-kind": "u32"
+          },
+          "egress_blocked_disconnected": {
+            "type": "integer",
+            "x-protobuf-index": 25,
+            "x-dmesh-kind": "u32"
+          },
+          "egress_blocked_pending": {
+            "type": "integer",
+            "x-protobuf-index": 26,
+            "x-dmesh-kind": "u32"
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 104,
+      "x-method-index": 83,
+      "x-ui-visibility": "advanced",
+      "x-check-all": null,
+      "x-check-all-platforms": null,
+      "x-dmesh-device": true
+    },
+    {
+      "name": "ble.scan_stop",
+      "description": "Call the ble.scan_stop QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 104,
+      "x-method-index": 84,
+      "x-ui-visibility": "advanced",
+      "x-check-all": null,
+      "x-check-all-platforms": null,
+      "x-dmesh-device": true
+    },
+    {
+      "name": "ble.connect",
+      "description": "Call the ble.connect QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "addr": {
+            "type": "string",
+            "x-protobuf-index": 2,
+            "x-dmesh-kind": "hex",
+            "format": "hex"
+          },
+          "addr_type": {
+            "type": "integer",
+            "x-protobuf-index": 3,
+            "x-dmesh-kind": "u8"
+          },
+          "psm": {
+            "type": "integer",
+            "x-protobuf-index": 4,
+            "x-dmesh-kind": "u16"
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 104,
+      "x-method-index": 85,
+      "x-ui-visibility": "advanced",
+      "x-check-all": null,
+      "x-check-all-platforms": null,
+      "x-dmesh-device": true
+    },
+    {
+      "name": "ble.coc.send",
+      "description": "Call the ble.coc.send QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "type": "string",
+            "x-protobuf-index": 2,
+            "x-dmesh-kind": "hex",
+            "format": "hex"
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 104,
+      "x-method-index": 86,
+      "x-ui-visibility": "advanced",
+      "x-check-all": null,
+      "x-check-all-platforms": null,
+      "x-dmesh-device": true
+    },
+    {
+      "name": "status",
+      "description": "Call the status QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 9,
+      "x-method-index": 1,
+      "x-ui-visibility": "advanced",
+      "x-check-all": {},
+      "x-check-all-platforms": [
+        "esp32",
+        "android"
+      ],
+      "x-dmesh-device": true
+    },
+    {
+      "name": "services",
+      "description": "Call the services QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 9,
+      "x-method-index": 2,
+      "x-ui-visibility": "advanced",
+      "x-check-all": {},
+      "x-check-all-platforms": [
+        "esp32"
+      ],
+      "x-dmesh-device": true
+    },
+    {
+      "name": "metrics",
+      "description": "Call the metrics QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 9,
+      "x-method-index": 3,
+      "x-ui-visibility": "advanced",
+      "x-check-all": {},
+      "x-check-all-platforms": [
+        "esp32"
+      ],
+      "x-dmesh-device": true
+    },
+    {
+      "name": "events",
+      "description": "Call the events QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "since": {
+            "type": "integer",
+            "x-protobuf-index": 1,
+            "x-dmesh-kind": "u64"
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 9,
+      "x-method-index": 4,
+      "x-ui-visibility": "advanced",
+      "x-check-all": {
+        "since": 0
+      },
+      "x-check-all-platforms": [
+        "esp32",
+        "host"
+      ],
+      "x-dmesh-device": true
+    },
+    {
+      "name": "log-watch",
+      "description": "Call the log-watch QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "since": {
+            "type": "integer",
+            "x-protobuf-index": 1,
+            "x-dmesh-kind": "u64"
+          },
+          "records": {
+            "type": "integer",
+            "x-protobuf-index": 2,
+            "x-dmesh-kind": "u8"
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 9,
+      "x-method-index": 5,
+      "x-ui-visibility": "advanced",
+      "x-check-all": {
+        "since": 0,
+        "records": 1
+      },
+      "x-check-all-platforms": [
+        "esp32",
+        "host"
+      ],
+      "x-dmesh-device": true
+    },
+    {
+      "name": "radio.tx",
+      "description": "Call the radio.tx QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "frame": {
+            "type": "string",
+            "x-protobuf-index": 1,
+            "x-dmesh-kind": "hex",
+            "format": "hex"
+          },
+          "channel": {
+            "type": "integer",
+            "x-protobuf-index": 2,
+            "x-dmesh-kind": "u8"
+          },
+          "interface": {
+            "type": "integer",
+            "x-protobuf-index": 3,
+            "x-dmesh-kind": "enum",
+            "x-dmesh-values": {
+              "auto": 0,
+              "sta": 1,
+              "ap": 2,
+              "nan": 3
+            }
+          },
+          "system_sequence": {
+            "type": "boolean",
+            "x-protobuf-index": 4,
+            "x-dmesh-kind": "bool"
+          },
+          "rate": {
+            "type": "integer",
+            "x-protobuf-index": 5,
+            "x-dmesh-kind": "enum",
+            "x-dmesh-values": {
+              "auto": 0,
+              "6": 6,
+              "9": 9,
+              "12": 12,
+              "18": 18,
+              "24": 24,
+              "36": 36,
+              "48": 48,
+              "54": 54
+            }
+          },
+          "disable_11b": {
+            "type": "boolean",
+            "x-protobuf-index": 6,
+            "x-dmesh-kind": "bool"
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 4,
+      "x-method-index": 71,
+      "x-ui-visibility": "advanced",
+      "x-check-all": null,
+      "x-check-all-platforms": null,
+      "x-dmesh-device": true
+    },
+    {
+      "name": "radio.control",
+      "description": "Call the radio.control QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "channel": {
+            "type": "integer",
+            "x-protobuf-index": 2,
+            "x-dmesh-kind": "u8"
+          },
+          "interface": {
+            "type": "integer",
+            "x-protobuf-index": 3,
+            "x-dmesh-kind": "enum",
+            "x-dmesh-values": {
+              "auto": 0,
+              "sta": 1,
+              "ap": 2,
+              "nan": 3
+            }
+          },
+          "rate": {
+            "type": "integer",
+            "x-protobuf-index": 5,
+            "x-dmesh-kind": "enum",
+            "x-dmesh-values": {
+              "auto": 0,
+              "6": 6,
+              "9": 9,
+              "12": 12,
+              "18": 18,
+              "24": 24,
+              "36": 36,
+              "48": 48,
+              "54": 54
+            }
+          },
+          "disable_11b": {
+            "type": "boolean",
+            "x-protobuf-index": 6,
+            "x-dmesh-kind": "bool"
+          },
+          "sta_state": {
+            "type": "integer",
+            "x-protobuf-index": 7,
+            "x-dmesh-kind": "enum",
+            "x-dmesh-values": {
+              "reconnect": 0,
+              "disconnect_hold": 1
+            }
+          },
+          "mac_ack": {
+            "type": "boolean",
+            "x-protobuf-index": 16,
+            "x-dmesh-kind": "bool"
+          },
+          "comparator_bssid": {
+            "type": "string",
+            "x-protobuf-index": 8,
+            "x-dmesh-kind": "mac"
+          },
+          "comparator_enabled": {
+            "type": "boolean",
+            "x-protobuf-index": 9,
+            "x-dmesh-kind": "bool"
+          },
+          "promiscuous": {
+            "type": "boolean",
+            "x-protobuf-index": 10,
+            "x-dmesh-kind": "bool"
+          },
+          "dw_policy": {
+            "type": "integer",
+            "x-protobuf-index": 11,
+            "x-dmesh-kind": "enum",
+            "x-dmesh-values": {
+              "normal": 0,
+              "disabled": 1,
+              "manual": 2
+            }
+          },
+          "rx_filter": {
+            "type": "integer",
+            "x-protobuf-index": 12,
+            "x-dmesh-kind": "enum",
+            "x-dmesh-values": {
+              "management": 0,
+              "management_data": 1
+            }
+          },
+          "ap_mode": {
+            "type": "integer",
+            "x-protobuf-index": 13,
+            "x-dmesh-kind": "enum",
+            "x-dmesh-values": {
+              "disabled": 0,
+              "open": 1
+            }
+          },
+          "ap_beacon_tu": {
+            "type": "integer",
+            "x-protobuf-index": 14,
+            "x-dmesh-kind": "u16"
+          },
+          "raw_sta_mode": {
+            "type": "integer",
+            "x-protobuf-index": 15,
+            "x-dmesh-kind": "enum",
+            "x-dmesh-values": {
+              "main_style": 1
+            }
+          },
+          "action_destination_broadcast": {
+            "type": "boolean",
+            "x-protobuf-index": 20,
+            "x-dmesh-kind": "bool"
+          },
+          "applied_channel": {
+            "type": "integer",
+            "x-protobuf-index": 21,
+            "x-dmesh-kind": "u8"
+          },
+          "sta_associated": {
+            "type": "boolean",
+            "x-protobuf-index": 22,
+            "x-dmesh-kind": "bool"
+          },
+          "applied_promiscuous": {
+            "type": "boolean",
+            "x-protobuf-index": 23,
+            "x-dmesh-kind": "bool"
+          },
+          "dw_capturing": {
+            "type": "boolean",
+            "x-protobuf-index": 24,
+            "x-dmesh-kind": "bool"
+          },
+          "applied_comparator_bssid": {
+            "type": "string",
+            "x-protobuf-index": 25,
+            "x-dmesh-kind": "mac"
+          },
+          "comparator_armed": {
+            "type": "boolean",
+            "x-protobuf-index": 26,
+            "x-dmesh-kind": "bool"
+          },
+          "comparator_errors": {
+            "type": "integer",
+            "x-protobuf-index": 27,
+            "x-dmesh-kind": "u32"
+          },
+          "applied_tx_interface": {
+            "type": "integer",
+            "x-protobuf-index": 28,
+            "x-dmesh-kind": "enum"
+          },
+          "applied_tx_rate": {
+            "type": "integer",
+            "x-protobuf-index": 29,
+            "x-dmesh-kind": "enum"
+          },
+          "ap_active": {
+            "type": "boolean",
+            "x-protobuf-index": 30,
+            "x-dmesh-kind": "bool"
+          },
+          "tx_attempted": {
+            "type": "integer",
+            "x-protobuf-index": 40,
+            "x-dmesh-kind": "u32"
+          },
+          "tx_driver_accepted": {
+            "type": "integer",
+            "x-protobuf-index": 41,
+            "x-dmesh-kind": "u32"
+          },
+          "tx_driver_failed": {
+            "type": "integer",
+            "x-protobuf-index": 42,
+            "x-dmesh-kind": "u32"
+          },
+          "rx_driver_dispatch": {
+            "type": "integer",
+            "x-protobuf-index": 43,
+            "x-dmesh-kind": "u32"
+          },
+          "rx_parser_accepted": {
+            "type": "integer",
+            "x-protobuf-index": 44,
+            "x-dmesh-kind": "u32"
+          },
+          "rx_parser_rejected": {
+            "type": "integer",
+            "x-protobuf-index": 45,
+            "x-dmesh-kind": "u32"
+          },
+          "rx_self_echo": {
+            "type": "integer",
+            "x-protobuf-index": 46,
+            "x-dmesh-kind": "u32"
+          },
+          "rx_dropped": {
+            "type": "integer",
+            "x-protobuf-index": 47,
+            "x-dmesh-kind": "u32"
+          },
+          "nan_beacons": {
+            "type": "integer",
+            "x-protobuf-index": 48,
+            "x-dmesh-kind": "u32"
+          },
+          "nan_sdfs": {
+            "type": "integer",
+            "x-protobuf-index": 49,
+            "x-dmesh-kind": "u32"
+          },
+          "nan_followups": {
+            "type": "integer",
+            "x-protobuf-index": 50,
+            "x-dmesh-kind": "u32"
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 4,
+      "x-method-index": 72,
+      "x-ui-visibility": "advanced",
+      "x-check-all": null,
+      "x-check-all-platforms": null,
+      "x-dmesh-device": true
+    },
+    {
+      "name": "radio.snapshot",
+      "description": "Call the radio.snapshot QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "epoch": {
+            "type": "integer",
+            "x-protobuf-index": 20,
+            "x-dmesh-kind": "u32"
+          },
+          "applied_channel": {
+            "type": "integer",
+            "x-protobuf-index": 21,
+            "x-dmesh-kind": "u8"
+          },
+          "sta_associated": {
+            "type": "boolean",
+            "x-protobuf-index": 22,
+            "x-dmesh-kind": "bool"
+          },
+          "applied_promiscuous": {
+            "type": "boolean",
+            "x-protobuf-index": 23,
+            "x-dmesh-kind": "bool"
+          },
+          "dw_capturing": {
+            "type": "boolean",
+            "x-protobuf-index": 24,
+            "x-dmesh-kind": "bool"
+          },
+          "applied_comparator_bssid": {
+            "type": "string",
+            "x-protobuf-index": 25,
+            "x-dmesh-kind": "mac"
+          },
+          "comparator_armed": {
+            "type": "boolean",
+            "x-protobuf-index": 26,
+            "x-dmesh-kind": "bool"
+          },
+          "comparator_errors": {
+            "type": "integer",
+            "x-protobuf-index": 27,
+            "x-dmesh-kind": "u32"
+          },
+          "applied_tx_interface": {
+            "type": "integer",
+            "x-protobuf-index": 28,
+            "x-dmesh-kind": "enum"
+          },
+          "applied_tx_rate": {
+            "type": "integer",
+            "x-protobuf-index": 29,
+            "x-dmesh-kind": "enum"
+          },
+          "ap_active": {
+            "type": "boolean",
+            "x-protobuf-index": 30,
+            "x-dmesh-kind": "bool"
+          },
+          "mac_ack": {
+            "type": "boolean",
+            "x-protobuf-index": 31,
+            "x-dmesh-kind": "bool"
+          },
+          "tx_attempted": {
+            "type": "integer",
+            "x-protobuf-index": 40,
+            "x-dmesh-kind": "u32"
+          },
+          "tx_driver_accepted": {
+            "type": "integer",
+            "x-protobuf-index": 41,
+            "x-dmesh-kind": "u32"
+          },
+          "tx_driver_failed": {
+            "type": "integer",
+            "x-protobuf-index": 42,
+            "x-dmesh-kind": "u32"
+          },
+          "rx_driver_dispatch": {
+            "type": "integer",
+            "x-protobuf-index": 43,
+            "x-dmesh-kind": "u32"
+          },
+          "rx_parser_accepted": {
+            "type": "integer",
+            "x-protobuf-index": 44,
+            "x-dmesh-kind": "u32"
+          },
+          "rx_parser_rejected": {
+            "type": "integer",
+            "x-protobuf-index": 45,
+            "x-dmesh-kind": "u32"
+          },
+          "rx_self_echo": {
+            "type": "integer",
+            "x-protobuf-index": 46,
+            "x-dmesh-kind": "u32"
+          },
+          "rx_dropped": {
+            "type": "integer",
+            "x-protobuf-index": 47,
+            "x-dmesh-kind": "u32"
+          },
+          "nan_beacons": {
+            "type": "integer",
+            "x-protobuf-index": 48,
+            "x-dmesh-kind": "u32"
+          },
+          "nan_sdfs": {
+            "type": "integer",
+            "x-protobuf-index": 49,
+            "x-dmesh-kind": "u32"
+          },
+          "nan_followups": {
+            "type": "integer",
+            "x-protobuf-index": 50,
+            "x-dmesh-kind": "u32"
+          },
+          "tx_duration_us_total": {
+            "type": "integer",
+            "x-protobuf-index": 51,
+            "x-dmesh-kind": "u32"
+          },
+          "tx_duration_us_max": {
+            "type": "integer",
+            "x-protobuf-index": 52,
+            "x-dmesh-kind": "u32"
+          },
+          "tx_duration_le_250us": {
+            "type": "integer",
+            "x-protobuf-index": 53,
+            "x-dmesh-kind": "u32"
+          },
+          "tx_duration_le_750us": {
+            "type": "integer",
+            "x-protobuf-index": 54,
+            "x-dmesh-kind": "u32"
+          },
+          "tx_duration_le_2ms": {
+            "type": "integer",
+            "x-protobuf-index": 55,
+            "x-dmesh-kind": "u32"
+          },
+          "tx_duration_gt_2ms": {
+            "type": "integer",
+            "x-protobuf-index": 56,
+            "x-dmesh-kind": "u32"
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 4,
+      "x-method-index": 73,
+      "x-ui-visibility": "advanced",
+      "x-check-all": {},
+      "x-check-all-platforms": [
+        "esp32"
+      ],
+      "x-dmesh-device": true
+    },
+    {
+      "name": "wifi.scan",
+      "description": "Call the wifi.scan QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "fresh": {
+            "type": "boolean",
+            "x-protobuf-index": 30,
+            "x-dmesh-kind": "bool"
+          },
+          "last_results": {
+            "type": "boolean",
+            "x-protobuf-index": 31,
+            "x-dmesh-kind": "bool"
+          },
+          "configured_sta_auth_mode": {
+            "type": "integer",
+            "x-protobuf-index": 6,
+            "x-dmesh-kind": "u8"
+          },
+          "configured_sta_ssid": {
+            "type": "string",
+            "x-protobuf-index": 7,
+            "x-dmesh-kind": "text"
+          },
+          "iface": {
+            "type": "string",
+            "x-protobuf-index": 40,
+            "x-dmesh-kind": "text"
+          },
+          "ssid": {
+            "type": "string",
+            "x-protobuf-index": 41,
+            "x-dmesh-kind": "text"
+          },
+          "channel": {
+            "type": "integer",
+            "x-protobuf-index": 42,
+            "x-dmesh-kind": "u8"
+          },
+          "passive": {
+            "type": "boolean",
+            "x-protobuf-index": 43,
+            "x-dmesh-kind": "bool"
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 4,
+      "x-method-index": 77,
+      "x-ui-visibility": "advanced",
+      "x-check-all": {
+        "last_results": true
+      },
+      "x-check-all-platforms": [
+        "esp32",
+        "host"
+      ],
+      "x-dmesh-device": true
+    },
+    {
+      "name": "radio.reset_counters",
+      "description": "Call the radio.reset_counters QUIC stream handler",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "epoch": {
+            "type": "integer",
+            "x-protobuf-index": 20,
+            "x-dmesh-kind": "u32"
+          },
+          "applied_channel": {
+            "type": "integer",
+            "x-protobuf-index": 21,
+            "x-dmesh-kind": "u8"
+          },
+          "sta_associated": {
+            "type": "boolean",
+            "x-protobuf-index": 22,
+            "x-dmesh-kind": "bool"
+          },
+          "applied_promiscuous": {
+            "type": "boolean",
+            "x-protobuf-index": 23,
+            "x-dmesh-kind": "bool"
+          },
+          "dw_capturing": {
+            "type": "boolean",
+            "x-protobuf-index": 24,
+            "x-dmesh-kind": "bool"
+          },
+          "applied_comparator_bssid": {
+            "type": "string",
+            "x-protobuf-index": 25,
+            "x-dmesh-kind": "mac"
+          },
+          "comparator_armed": {
+            "type": "boolean",
+            "x-protobuf-index": 26,
+            "x-dmesh-kind": "bool"
+          },
+          "comparator_errors": {
+            "type": "integer",
+            "x-protobuf-index": 27,
+            "x-dmesh-kind": "u32"
+          },
+          "applied_tx_interface": {
+            "type": "integer",
+            "x-protobuf-index": 28,
+            "x-dmesh-kind": "enum"
+          },
+          "applied_tx_rate": {
+            "type": "integer",
+            "x-protobuf-index": 29,
+            "x-dmesh-kind": "enum"
+          },
+          "ap_active": {
+            "type": "boolean",
+            "x-protobuf-index": 30,
+            "x-dmesh-kind": "bool"
+          },
+          "tx_attempted": {
+            "type": "integer",
+            "x-protobuf-index": 40,
+            "x-dmesh-kind": "u32"
+          },
+          "tx_driver_accepted": {
+            "type": "integer",
+            "x-protobuf-index": 41,
+            "x-dmesh-kind": "u32"
+          },
+          "tx_driver_failed": {
+            "type": "integer",
+            "x-protobuf-index": 42,
+            "x-dmesh-kind": "u32"
+          },
+          "rx_driver_dispatch": {
+            "type": "integer",
+            "x-protobuf-index": 43,
+            "x-dmesh-kind": "u32"
+          },
+          "rx_parser_accepted": {
+            "type": "integer",
+            "x-protobuf-index": 44,
+            "x-dmesh-kind": "u32"
+          },
+          "rx_parser_rejected": {
+            "type": "integer",
+            "x-protobuf-index": 45,
+            "x-dmesh-kind": "u32"
+          },
+          "rx_self_echo": {
+            "type": "integer",
+            "x-protobuf-index": 46,
+            "x-dmesh-kind": "u32"
+          },
+          "rx_dropped": {
+            "type": "integer",
+            "x-protobuf-index": 47,
+            "x-dmesh-kind": "u32"
+          },
+          "nan_beacons": {
+            "type": "integer",
+            "x-protobuf-index": 48,
+            "x-dmesh-kind": "u32"
+          },
+          "nan_sdfs": {
+            "type": "integer",
+            "x-protobuf-index": 49,
+            "x-dmesh-kind": "u32"
+          },
+          "nan_followups": {
+            "type": "integer",
+            "x-protobuf-index": 50,
+            "x-dmesh-kind": "u32"
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 4,
+      "x-method-index": 74,
+      "x-ui-visibility": "advanced",
+      "x-check-all": null,
+      "x-check-all-platforms": null,
+      "x-dmesh-device": true
+    },
+    {
+      "description": "Run a bounded QUIC probe through the selected Linux radio path",
+      "inputSchema": {
+        "properties": {
+          "bytes": {
+            "type": "integer",
+            "x-protobuf-index": 2,
+            "x-protobuf-type": "u64"
+          },
+          "consume_delay_ms": {
+            "type": "integer",
+            "x-protobuf-index": 6,
+            "x-protobuf-type": "u32"
+          },
+          "initial_consume_delay_ms": {
+            "type": "integer",
+            "x-protobuf-index": 5,
+            "x-protobuf-type": "u32"
+          },
+          "packet_size": {
+            "type": "integer",
+            "x-protobuf-index": 3,
+            "x-protobuf-type": "u16"
+          },
+          "parallel_streams": {
+            "type": "integer",
+            "x-protobuf-index": 4,
+            "x-protobuf-type": "u8"
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "x-protobuf-index": 7,
+            "x-protobuf-type": "u64"
+          },
+          "to": {
+            "type": "string",
+            "x-protobuf-index": 1,
+            "x-protobuf-type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "lmesh.probe",
+      "outputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "x-component-index": 4,
+      "x-method-index": 30,
+      "x-standard-errors": [
+        "unauthenticated",
+        "permission_denied",
+        "timeout",
+        "remote_exception",
+        "invalid_argument",
+        "not_found",
+        "conflict",
+        "unavailable",
+        "internal"
+      ],
+      "x-ui-visibility": "advanced"
+    },
+    {
+      "description": "Send a payload through the selected mesh radio",
+      "inputSchema": {
+        "properties": {
+          "destination": {
+            "type": "string",
+            "x-protobuf-index": 2,
+            "x-protobuf-type": "string"
+          },
+          "payload": {
+            "type": "string",
+            "x-protobuf-index": 3,
+            "x-protobuf-type": "string"
+          },
+          "radio": {
+            "type": "string",
+            "x-protobuf-index": 1,
+            "x-protobuf-type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "lmesh.send",
+      "outputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "x-component-index": 4,
+      "x-method-index": 8,
+      "x-standard-errors": [
+        "unauthenticated",
+        "permission_denied",
+        "timeout",
+        "remote_exception",
+        "invalid_argument",
+        "not_found",
+        "conflict",
+        "unavailable",
+        "internal"
+      ],
+      "x-ui-visibility": "advanced"
+    },
+    {
+      "description": "Read bounded local message history",
+      "inputSchema": {
+        "properties": {
+          "keys": {
+            "type": "string",
+            "x-protobuf-index": 1,
+            "x-protobuf-type": "string"
+          },
+          "limit": {
+            "type": "integer",
+            "x-protobuf-index": 2,
+            "x-protobuf-type": "u64"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "lmesh.messages.history",
+      "outputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "x-component-index": 4,
+      "x-method-index": 10,
+      "x-standard-errors": [
+        "unauthenticated",
+        "permission_denied",
+        "timeout",
+        "remote_exception",
+        "invalid_argument",
+        "not_found",
+        "conflict",
+        "unavailable",
+        "internal"
+      ],
+      "x-ui-visibility": "advanced"
+    },
+    {
+      "description": "relay.connect on the local Linux mesh daemon",
+      "inputSchema": {
+        "properties": {
+          "next_hop_mac": {
+            "type": "string",
+            "x-protobuf-index": 2,
+            "x-protobuf-type": "string"
+          },
+          "relay_endpoint": {
+            "type": "string",
+            "x-protobuf-index": 1,
+            "x-protobuf-type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "relay.connect",
+      "outputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "x-component-index": 220,
+      "x-method-index": 30,
+      "x-standard-errors": [
+        "unauthenticated",
+        "permission_denied",
+        "timeout",
+        "remote_exception",
+        "invalid_argument",
+        "not_found",
+        "conflict",
+        "unavailable",
+        "internal"
+      ],
+      "x-ui-visibility": "advanced"
+    },
+    {
+      "description": "relay.open on the local Linux mesh daemon",
+      "inputSchema": {
+        "properties": {
+          "relay_endpoint": {
+            "type": "string",
+            "x-protobuf-index": 1,
+            "x-protobuf-type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "relay.open",
+      "outputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "x-component-index": 220,
+      "x-method-index": 31,
+      "x-standard-errors": [
+        "unauthenticated",
+        "permission_denied",
+        "timeout",
+        "remote_exception",
+        "invalid_argument",
+        "not_found",
+        "conflict",
+        "unavailable",
+        "internal"
+      ],
+      "x-ui-visibility": "advanced"
+    },
+    {
+      "description": "relay.endpoint.status on the local Linux mesh daemon",
+      "inputSchema": {
+        "properties": {
+          "relay_endpoint": {
+            "type": "string",
+            "x-protobuf-index": 1,
+            "x-protobuf-type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "relay.endpoint.status",
+      "outputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "x-component-index": 220,
+      "x-method-index": 32,
+      "x-standard-errors": [
+        "unauthenticated",
+        "permission_denied",
+        "timeout",
+        "remote_exception",
+        "invalid_argument",
+        "not_found",
+        "conflict",
+        "unavailable",
+        "internal"
+      ],
+      "x-ui-visibility": "advanced"
+    },
+    {
+      "description": "relay.close on the local Linux mesh daemon",
+      "inputSchema": {
+        "properties": {
+          "relay_endpoint": {
+            "type": "string",
+            "x-protobuf-index": 1,
+            "x-protobuf-type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "relay.close",
+      "outputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "x-component-index": 220,
+      "x-method-index": 33,
+      "x-standard-errors": [
+        "unauthenticated",
+        "permission_denied",
+        "timeout",
+        "remote_exception",
+        "invalid_argument",
+        "not_found",
+        "conflict",
+        "unavailable",
+        "internal"
+      ],
+      "x-ui-visibility": "advanced"
+    },
+    {
+      "description": "relay.status on the local Linux mesh daemon",
+      "inputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "relay.status",
+      "outputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "x-component-index": 220,
+      "x-method-index": 34,
+      "x-standard-errors": [
+        "unauthenticated",
+        "permission_denied",
+        "timeout",
+        "remote_exception",
+        "invalid_argument",
+        "not_found",
+        "conflict",
+        "unavailable",
+        "internal"
+      ],
+      "x-ui-visibility": "advanced"
+    },
+    {
+      "description": "link.steer on the local Linux mesh daemon",
+      "inputSchema": {
+        "properties": {
+          "node": {
+            "type": "string",
+            "x-protobuf-index": 1,
+            "x-protobuf-type": "string"
+          },
+          "radio": {
+            "type": "string",
+            "x-protobuf-index": 2,
+            "x-protobuf-type": "string"
+          },
+          "reason": {
+            "type": "string",
+            "x-protobuf-index": 3,
+            "x-protobuf-type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "link.steer",
+      "outputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "x-component-index": 221,
+      "x-method-index": 30,
+      "x-standard-errors": [
+        "unauthenticated",
+        "permission_denied",
+        "timeout",
+        "remote_exception",
+        "invalid_argument",
+        "not_found",
+        "conflict",
+        "unavailable",
+        "internal"
+      ],
+      "x-ui-visibility": "advanced"
+    },
+    {
+      "description": "object.nan.dry_run on the local Linux mesh daemon",
+      "inputSchema": {
+        "properties": {
+          "image_size": {
+            "type": "integer",
+            "x-protobuf-index": 1,
+            "x-protobuf-type": "u64"
+          },
+          "mtu": {
+            "type": "integer",
+            "x-protobuf-index": 2,
+            "x-protobuf-type": "u64"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "object.nan.dry_run",
+      "outputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "x-component-index": 224,
+      "x-method-index": 30,
+      "x-standard-errors": [
+        "unauthenticated",
+        "permission_denied",
+        "timeout",
+        "remote_exception",
+        "invalid_argument",
+        "not_found",
+        "conflict",
+        "unavailable",
+        "internal"
+      ],
+      "x-ui-visibility": "advanced"
+    },
+    {
+      "description": "wifi.interface.list on the local Linux mesh daemon",
+      "inputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "wifi.interface.list",
+      "outputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "x-component-index": 5,
+      "x-method-index": 30,
+      "x-standard-errors": [
+        "unauthenticated",
+        "permission_denied",
+        "timeout",
+        "remote_exception",
+        "invalid_argument",
+        "not_found",
+        "conflict",
+        "unavailable",
+        "internal"
+      ],
+      "x-ui-visibility": "advanced"
+    },
+    {
+      "description": "wifi.interface.up on the local Linux mesh daemon",
+      "inputSchema": {
+        "properties": {
+          "iface": {
+            "type": "string",
+            "x-protobuf-index": 1,
+            "x-protobuf-type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "wifi.interface.up",
+      "outputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "x-component-index": 5,
+      "x-method-index": 31,
+      "x-standard-errors": [
+        "unauthenticated",
+        "permission_denied",
+        "timeout",
+        "remote_exception",
+        "invalid_argument",
+        "not_found",
+        "conflict",
+        "unavailable",
+        "internal"
+      ],
+      "x-ui-visibility": "advanced"
+    },
+    {
+      "description": "wifi.interface.channel on the local Linux mesh daemon",
+      "inputSchema": {
+        "properties": {
+          "channel": {
+            "type": "integer",
+            "x-protobuf-index": 2,
+            "x-protobuf-type": "u8"
+          },
+          "iface": {
+            "type": "string",
+            "x-protobuf-index": 1,
+            "x-protobuf-type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "wifi.interface.channel",
+      "outputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "x-component-index": 5,
+      "x-method-index": 32,
+      "x-standard-errors": [
+        "unauthenticated",
+        "permission_denied",
+        "timeout",
+        "remote_exception",
+        "invalid_argument",
+        "not_found",
+        "conflict",
+        "unavailable",
+        "internal"
+      ],
+      "x-ui-visibility": "advanced"
+    },
+    {
+      "description": "wifi.ocb.start on the local Linux mesh daemon",
+      "inputSchema": {
+        "properties": {
+          "bandwidth": {
+            "type": "string",
+            "x-protobuf-index": 3,
+            "x-protobuf-type": "string"
+          },
+          "freq": {
+            "type": "integer",
+            "x-protobuf-index": 2,
+            "x-protobuf-type": "u32"
+          },
+          "iface": {
+            "type": "string",
+            "x-protobuf-index": 1,
+            "x-protobuf-type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "wifi.ocb.start",
+      "outputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "x-component-index": 5,
+      "x-method-index": 33,
+      "x-standard-errors": [
+        "unauthenticated",
+        "permission_denied",
+        "timeout",
+        "remote_exception",
+        "invalid_argument",
+        "not_found",
+        "conflict",
+        "unavailable",
+        "internal"
+      ],
+      "x-ui-visibility": "advanced"
+    },
+    {
+      "description": "wifi.rate.profile on the local Linux mesh daemon",
+      "inputSchema": {
+        "properties": {
+          "disable_80211b": {
+            "type": "boolean",
+            "x-protobuf-index": 3,
+            "x-protobuf-type": "bool"
+          },
+          "iface": {
+            "type": "string",
+            "x-protobuf-index": 1,
+            "x-protobuf-type": "string"
+          },
+          "profile": {
+            "type": "string",
+            "x-protobuf-index": 2,
+            "x-protobuf-type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "wifi.rate.profile",
+      "outputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "x-component-index": 5,
+      "x-method-index": 34,
+      "x-standard-errors": [
+        "unauthenticated",
+        "permission_denied",
+        "timeout",
+        "remote_exception",
+        "invalid_argument",
+        "not_found",
+        "conflict",
+        "unavailable",
+        "internal"
+      ],
+      "x-ui-visibility": "advanced"
+    },
+    {
+      "description": "wifi.data.listen on the local Linux mesh daemon",
+      "inputSchema": {
+        "properties": {
+          "iface": {
+            "type": "string",
+            "x-protobuf-index": 1,
+            "x-protobuf-type": "string"
+          },
+          "listen_sec": {
+            "type": "integer",
+            "x-protobuf-index": 2,
+            "x-protobuf-type": "u64"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "wifi.data.listen",
+      "outputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "x-component-index": 5,
+      "x-method-index": 35,
+      "x-standard-errors": [
+        "unauthenticated",
+        "permission_denied",
+        "timeout",
+        "remote_exception",
+        "invalid_argument",
+        "not_found",
+        "conflict",
+        "unavailable",
+        "internal"
+      ],
+      "x-ui-visibility": "advanced"
+    },
+    {
+      "description": "wifi.data.send on the local Linux mesh daemon",
+      "inputSchema": {
+        "properties": {
+          "destination": {
+            "type": "string",
+            "x-protobuf-index": 2,
+            "x-protobuf-type": "string"
+          },
+          "iface": {
+            "type": "string",
+            "x-protobuf-index": 1,
+            "x-protobuf-type": "string"
+          },
+          "payload": {
+            "type": "string",
+            "x-protobuf-index": 3,
+            "x-protobuf-type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "wifi.data.send",
+      "outputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "x-component-index": 5,
+      "x-method-index": 36,
+      "x-standard-errors": [
+        "unauthenticated",
+        "permission_denied",
+        "timeout",
+        "remote_exception",
+        "invalid_argument",
+        "not_found",
+        "conflict",
+        "unavailable",
+        "internal"
+      ],
+      "x-ui-visibility": "advanced"
+    },
+    {
+      "description": "wifi.ap.start_open on the local Linux mesh daemon",
+      "inputSchema": {
+        "properties": {
+          "beacon_interval_tu": {
+            "type": "integer",
+            "x-protobuf-index": 5,
+            "x-protobuf-type": "u16"
+          },
+          "channel": {
+            "type": "integer",
+            "x-protobuf-index": 3,
+            "x-protobuf-type": "u8"
+          },
+          "ht40": {
+            "type": "boolean",
+            "x-protobuf-index": 4,
+            "x-protobuf-type": "bool"
+          },
+          "iface": {
+            "type": "string",
+            "x-protobuf-index": 1,
+            "x-protobuf-type": "string"
+          },
+          "ssid": {
+            "type": "string",
+            "x-protobuf-index": 2,
+            "x-protobuf-type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "wifi.ap.start_open",
+      "outputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "x-component-index": 5,
+      "x-method-index": 37,
+      "x-standard-errors": [
+        "unauthenticated",
+        "permission_denied",
+        "timeout",
+        "remote_exception",
+        "invalid_argument",
+        "not_found",
+        "conflict",
+        "unavailable",
+        "internal"
+      ],
+      "x-ui-visibility": "advanced"
+    },
+    {
+      "description": "wifi.ap.stop on the local Linux mesh daemon",
+      "inputSchema": {
+        "properties": {
+          "iface": {
+            "type": "string",
+            "x-protobuf-index": 1,
+            "x-protobuf-type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "wifi.ap.stop",
+      "outputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "x-component-index": 5,
+      "x-method-index": 38,
+      "x-standard-errors": [
+        "unauthenticated",
+        "permission_denied",
+        "timeout",
+        "remote_exception",
+        "invalid_argument",
+        "not_found",
+        "conflict",
+        "unavailable",
+        "internal"
+      ],
+      "x-ui-visibility": "advanced"
+    },
+    {
+      "description": "wifi.ap.station.add on the local Linux mesh daemon",
+      "inputSchema": {
+        "properties": {
+          "aid": {
+            "type": "integer",
+            "x-protobuf-index": 3,
+            "x-protobuf-type": "u16"
+          },
+          "iface": {
+            "type": "string",
+            "x-protobuf-index": 1,
+            "x-protobuf-type": "string"
+          },
+          "mac": {
+            "type": "string",
+            "x-protobuf-index": 2,
+            "x-protobuf-type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "wifi.ap.station.add",
+      "outputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "x-component-index": 5,
+      "x-method-index": 39,
+      "x-standard-errors": [
+        "unauthenticated",
+        "permission_denied",
+        "timeout",
+        "remote_exception",
+        "invalid_argument",
+        "not_found",
+        "conflict",
+        "unavailable",
+        "internal"
+      ],
+      "x-ui-visibility": "advanced"
+    },
+    {
+      "description": "wifi.sta.join_open on the local Linux mesh daemon",
+      "inputSchema": {
+        "properties": {
+          "iface": {
+            "type": "string",
+            "x-protobuf-index": 1,
+            "x-protobuf-type": "string"
+          },
+          "ssid": {
+            "type": "string",
+            "x-protobuf-index": 2,
+            "x-protobuf-type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "wifi.sta.join_open",
+      "outputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "x-component-index": 5,
+      "x-method-index": 40,
+      "x-standard-errors": [
+        "unauthenticated",
+        "permission_denied",
+        "timeout",
+        "remote_exception",
+        "invalid_argument",
+        "not_found",
+        "conflict",
+        "unavailable",
+        "internal"
+      ],
+      "x-ui-visibility": "advanced"
+    },
+    {
+      "description": "wifi.sta.configure_ipv4 on the local Linux mesh daemon",
+      "inputSchema": {
+        "properties": {
+          "address": {
+            "type": "string",
+            "x-protobuf-index": 2,
+            "x-protobuf-type": "string"
+          },
+          "iface": {
+            "type": "string",
+            "x-protobuf-index": 1,
+            "x-protobuf-type": "string"
+          },
+          "prefix": {
+            "type": "integer",
+            "x-protobuf-index": 3,
+            "x-protobuf-type": "u8"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "wifi.sta.configure_ipv4",
+      "outputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "x-component-index": 5,
+      "x-method-index": 41,
+      "x-standard-errors": [
+        "unauthenticated",
+        "permission_denied",
+        "timeout",
+        "remote_exception",
+        "invalid_argument",
+        "not_found",
+        "conflict",
+        "unavailable",
+        "internal"
+      ],
+      "x-ui-visibility": "advanced"
+    },
+    {
+      "description": "Capture Wi-Fi management frames on an owned monitor interface",
+      "inputSchema": {
+        "properties": {
+          "active": {
+            "type": "boolean",
+            "x-protobuf-index": 5,
+            "x-protobuf-type": "bool"
+          },
+          "capture_ms": {
+            "type": "integer",
+            "x-protobuf-index": 3,
+            "x-protobuf-type": "u64"
+          },
+          "channel": {
+            "type": "integer",
+            "x-protobuf-index": 2,
+            "x-protobuf-type": "u8"
+          },
+          "iface": {
+            "type": "string",
+            "x-protobuf-index": 1,
+            "x-protobuf-type": "string"
+          },
+          "max_frames": {
+            "type": "integer",
+            "x-protobuf-index": 4,
+            "x-protobuf-type": "u64"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "wifi.mgmt.capture",
+      "outputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "x-component-index": 5,
+      "x-method-index": 13,
+      "x-standard-errors": [
+        "unauthenticated",
+        "permission_denied",
+        "timeout",
+        "remote_exception",
+        "invalid_argument",
+        "not_found",
+        "conflict",
+        "unavailable",
+        "internal"
+      ]
+    }
+  ],
+  "x-dmesh-legacy": {
+    "methods": [
+      {
+        "id": 0,
+        "name": "event",
+        "fields": [
+          {
+            "id": 32,
+            "name": "message",
+            "kind": "text"
+          }
+        ]
+      },
+      {
+        "id": 34,
+        "name": "xstatus"
+      },
+      {
+        "id": 35,
+        "name": "stats"
+      },
+      {
+        "id": 36,
+        "name": "logs"
+      },
+      {
+        "id": 37,
+        "name": "messages"
+      },
+      {
+        "id": 38,
+        "name": "local_messages"
+      },
+      {
+        "id": 39,
+        "name": "test"
+      },
+      {
+        "id": 40,
+        "name": "wifi"
+      },
+      {
+        "id": 41,
+        "name": "nan"
+      },
+      {
+        "id": 42,
+        "name": "ble"
+      },
+      {
+        "id": 43,
+        "name": "lora",
+        "kind": "service",
+        "slot_count": 2
+      },
+      {
+        "id": 44,
+        "name": "lorasend"
+      },
+      {
+        "id": 45,
+        "name": "loralisten"
+      },
+      {
+        "id": 46,
+        "name": "loradump"
+      },
+      {
+        "id": 47,
+        "name": "loraprobe"
+      },
+      {
+        "id": 48,
+        "name": "sleep"
+      },
+      {
+        "id": 49,
+        "name": "mode"
+      },
+      {
+        "id": 50,
+        "name": "power"
+      },
+      {
+        "id": 51,
+        "name": "battery"
+      },
+      {
+        "id": 52,
+        "name": "adcprobe"
+      },
+      {
+        "id": 53,
+        "name": "namespace"
+      },
+      {
+        "id": 54,
+        "name": "set"
+      },
+      {
+        "id": 55,
+        "name": "get"
+      },
+      {
+        "id": 56,
+        "name": "list"
+      },
+      {
+        "id": 57,
+        "name": "rgbled"
+      },
+      {
+        "id": 58,
+        "name": "gpio"
+      },
+      {
+        "id": 59,
+        "name": "i2cconfig"
+      },
+      {
+        "id": 60,
+        "name": "i2cprobe"
+      },
+      {
+        "id": 61,
+        "name": "i2cdetect"
+      },
+      {
+        "id": 62,
+        "name": "i2cget"
+      },
+      {
+        "id": 63,
+        "name": "i2cset"
+      },
+      {
+        "id": 64,
+        "name": "i2cdump"
+      },
+      {
+        "id": 65,
+        "name": "button"
+      },
+      {
+        "id": 66,
+        "name": "nvs"
+      },
+      {
+        "id": 67,
+        "name": "radio"
+      },
+      {
+        "id": 68,
+        "name": "recovery"
+      },
+      {
+        "id": 69,
+        "name": "reset"
+      },
+      {
+        "id": 70,
+        "name": "module"
+      }
+    ],
+    "messages": [
+      {
+        "name": "event.boot.state",
+        "format": "kv",
+        "fields": [
+          {
+            "name": "type",
+            "kind": "string"
+          },
+          {
+            "name": "rebooted",
+            "kind": "bool"
+          },
+          {
+            "name": "mode",
+            "kind": "string"
+          },
+          {
+            "name": "active",
+            "kind": "string"
+          },
+          {
+            "name": "infra_active",
+            "kind": "bool"
+          }
+        ]
+      },
+      {
+        "name": "event.mode.state",
+        "format": "kv",
+        "fields": [
+          {
+            "name": "type",
+            "kind": "string"
+          },
+          {
+            "name": "active",
+            "kind": "string"
+          },
+          {
+            "name": "infra_active",
+            "kind": "bool"
+          },
+          {
+            "name": "phase",
+            "kind": "string"
+          }
+        ]
+      }
+    ]
+  }
+}

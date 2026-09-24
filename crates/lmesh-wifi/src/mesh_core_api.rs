@@ -2,219 +2,372 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Replace a node's volatile physical transport profile; NAN DW8 with NOW off is sleepy, while DW1 with NOW on is awake
-/// mesh-api: summary = "Replace a node's volatile physical transport profile; NAN DW8 with NOW off is sleepy, while DW1 with NOW on is awake"
-/// mesh-api: id = "transport.set"
-/// mesh-api: component = "transport"
-/// mesh-api: method = "set"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 1
-/// mesh-api: method-index = 4
+/// Run a bounded QUIC probe through the selected Linux radio path
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TransportSetRequest {
-    /// API field `kind`.
-    /// mesh-api-field: index = 1
-    /// mesh-api-field: required = true
-    pub kind: u8,
-    /// API field `ssid`.
-    /// mesh-api-field: index = 2
-    /// mesh-api-field: required = false
+pub struct LmeshProbeRequest {
+    /// API field `to`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ssid: Option<String>,
-    /// API field `bssid`.
-    /// mesh-api-field: index = 3
-    /// mesh-api-field: required = false
+    pub to: Option<String>,
+    /// API field `bytes`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bssid: Option<String>,
-    /// API field `channel`.
-    /// mesh-api-field: index = 4
-    /// mesh-api-field: required = false
+    pub bytes: Option<u64>,
+    /// API field `packet_size`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub channel: Option<u8>,
-    /// API field `nan_dw_interval`.
-    /// mesh-api-field: index = 14
-    /// mesh-api-field: required = false
+    pub packet_size: Option<u16>,
+    /// API field `parallel_streams`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub nan_dw_interval: Option<u8>,
-    /// API field `now`.
-    /// mesh-api-field: index = 15
-    /// mesh-api-field: required = false
+    pub parallel_streams: Option<u8>,
+    /// API field `initial_consume_delay_ms`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub now: Option<u8>,
-    /// API field `ap`.
-    /// mesh-api-field: index = 16
-    /// mesh-api-field: required = false
+    pub initial_consume_delay_ms: Option<u32>,
+    /// API field `consume_delay_ms`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ap: Option<u8>,
-    /// API field `passphrase`.
-    /// mesh-api-field: index = 17
-    /// mesh-api-field: required = false
+    pub consume_delay_ms: Option<u32>,
+    /// API field `timeout_ms`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub passphrase: Option<String>,
-    /// API field `ndp`.
-    /// mesh-api-field: index = 19
-    /// mesh-api-field: required = false
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ndp: Option<u8>,
-    /// API field `open`.
-    /// mesh-api-field: index = 24
-    /// mesh-api-field: required = false
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub open: Option<bool>,
+    pub timeout_ms: Option<u64>,
 }
 
-/// Replace a node's volatile physical transport profile; NAN DW8 with NOW off is sleepy, while DW1 with NOW on is awake
-/// mesh-api: summary = "Replace a node's volatile physical transport profile; NAN DW8 with NOW off is sleepy, while DW1 with NOW on is awake"
-/// mesh-api: id = "transport.set"
-/// mesh-api: component = "transport"
-/// mesh-api: method = "set"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 1
-/// mesh-api: method-index = 4
-/// mesh-api: shape = "response"
+/// Run a bounded QUIC probe through the selected Linux radio path
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TransportSetResponse;
+pub struct LmeshProbeResponse;
 
-/// Send a mesh payload over the selected radio
-/// mesh-api: summary = "Send a mesh payload over the selected radio"
-/// mesh-api: id = "lmesh.send"
-/// mesh-api: component = "lmesh"
-/// mesh-api: method = "send"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 4
-/// mesh-api: method-index = 8
+/// Send a payload through the selected mesh radio
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct LmeshSendRequest {
     /// API field `radio`.
-    /// mesh-api-field: index = 1
-    /// mesh-api-field: required = false
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub radio: Option<String>,
     /// API field `destination`.
-    /// mesh-api-field: index = 2
-    /// mesh-api-field: required = false
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub destination: Option<String>,
     /// API field `payload`.
-    /// mesh-api-field: index = 3
-    /// mesh-api-field: required = true
-    pub payload: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<String>,
 }
 
-/// Send a mesh payload over the selected radio
-/// mesh-api: summary = "Send a mesh payload over the selected radio"
-/// mesh-api: id = "lmesh.send"
-/// mesh-api: component = "lmesh"
-/// mesh-api: method = "send"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 4
-/// mesh-api: method-index = 8
-/// mesh-api: shape = "response"
+/// Send a payload through the selected mesh radio
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct LmeshSendResponse;
 
-/// Return configured local radio adapters
-/// mesh-api: summary = "Return configured local radio adapters"
-/// mesh-api: id = "lmesh.radios.list"
-/// mesh-api: component = "lmesh"
-/// mesh-api: method = "radios.list"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 4
-/// mesh-api: method-index = 9
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct LmeshRadiosListRequest;
-
-/// Return configured local radio adapters
-/// mesh-api: summary = "Return configured local radio adapters"
-/// mesh-api: id = "lmesh.radios.list"
-/// mesh-api: component = "lmesh"
-/// mesh-api: method = "radios.list"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 4
-/// mesh-api: method-index = 9
-/// mesh-api: shape = "response"
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct LmeshRadiosListResponse;
-
-/// Return recent radio and backend message history
-/// mesh-api: summary = "Return recent radio and backend message history"
-/// mesh-api: id = "lmesh.messages.history"
-/// mesh-api: component = "lmesh"
-/// mesh-api: method = "messages.history"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 4
-/// mesh-api: method-index = 10
+/// Read bounded local message history
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct LmeshMessagesHistoryRequest {
     /// API field `keys`.
-    /// mesh-api-field: index = 1
-    /// mesh-api-field: required = false
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keys: Option<String>,
     /// API field `limit`.
-    /// mesh-api-field: index = 2
-    /// mesh-api-field: required = false
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u64>,
 }
 
-/// Return recent radio and backend message history
-/// mesh-api: summary = "Return recent radio and backend message history"
-/// mesh-api: id = "lmesh.messages.history"
-/// mesh-api: component = "lmesh"
-/// mesh-api: method = "messages.history"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 4
-/// mesh-api: method-index = 10
-/// mesh-api: shape = "response"
+/// Read bounded local message history
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct LmeshMessagesHistoryResponse;
 
-/// Capture a bounded host management-frame sample
-/// mesh-api: summary = "Capture a bounded host management-frame sample"
-/// mesh-api: id = "wifi.mgmt.capture"
-/// mesh-api: component = "wifi"
-/// mesh-api: method = "mgmt.capture"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 5
-/// mesh-api: method-index = 13
+/// relay.connect on the local Linux mesh daemon
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct WifiMgmtCaptureRequest {
+pub struct RelayConnectRequest {
+    /// API field `relay_endpoint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_endpoint: Option<String>,
+    /// API field `next_hop_mac`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_hop_mac: Option<String>,
+}
+
+/// relay.connect on the local Linux mesh daemon
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RelayConnectResponse;
+
+/// relay.open on the local Linux mesh daemon
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RelayOpenRequest {
+    /// API field `relay_endpoint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_endpoint: Option<String>,
+}
+
+/// relay.open on the local Linux mesh daemon
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RelayOpenResponse;
+
+/// relay.endpoint.status on the local Linux mesh daemon
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RelayEndpointStatusRequest {
+    /// API field `relay_endpoint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_endpoint: Option<String>,
+}
+
+/// relay.endpoint.status on the local Linux mesh daemon
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RelayEndpointStatusResponse;
+
+/// relay.close on the local Linux mesh daemon
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RelayCloseRequest {
+    /// API field `relay_endpoint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_endpoint: Option<String>,
+}
+
+/// relay.close on the local Linux mesh daemon
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RelayCloseResponse;
+
+/// relay.status on the local Linux mesh daemon
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RelayStatusRequest;
+
+/// relay.status on the local Linux mesh daemon
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RelayStatusResponse;
+
+/// link.steer on the local Linux mesh daemon
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LinkSteerRequest {
+    /// API field `node`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    /// API field `radio`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radio: Option<String>,
+    /// API field `reason`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// link.steer on the local Linux mesh daemon
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LinkSteerResponse;
+
+/// object.nan.dry_run on the local Linux mesh daemon
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ObjectNanDryRunRequest {
+    /// API field `image_size`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_size: Option<u64>,
+    /// API field `mtu`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtu: Option<u64>,
+}
+
+/// object.nan.dry_run on the local Linux mesh daemon
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ObjectNanDryRunResponse;
+
+/// wifi.interface.list on the local Linux mesh daemon
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WifiInterfaceListRequest;
+
+/// wifi.interface.list on the local Linux mesh daemon
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WifiInterfaceListResponse;
+
+/// wifi.interface.up on the local Linux mesh daemon
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WifiInterfaceUpRequest {
     /// API field `iface`.
-    /// mesh-api-field: index = 1
-    /// mesh-api-field: required = false
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iface: Option<String>,
+}
+
+/// wifi.interface.up on the local Linux mesh daemon
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WifiInterfaceUpResponse;
+
+/// wifi.interface.channel on the local Linux mesh daemon
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WifiInterfaceChannelRequest {
+    /// API field `iface`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub iface: Option<String>,
     /// API field `channel`.
-    /// mesh-api-field: index = 2
-    /// mesh-api-field: required = false
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<u8>,
+}
+
+/// wifi.interface.channel on the local Linux mesh daemon
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WifiInterfaceChannelResponse;
+
+/// wifi.ocb.start on the local Linux mesh daemon
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WifiOcbStartRequest {
+    /// API field `iface`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iface: Option<String>,
+    /// API field `freq`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freq: Option<u32>,
+    /// API field `bandwidth`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bandwidth: Option<String>,
+}
+
+/// wifi.ocb.start on the local Linux mesh daemon
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WifiOcbStartResponse;
+
+/// wifi.rate.profile on the local Linux mesh daemon
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WifiRateProfileRequest {
+    /// API field `iface`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iface: Option<String>,
+    /// API field `profile`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// API field `disable_80211b`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disable_80211b: Option<bool>,
+}
+
+/// wifi.rate.profile on the local Linux mesh daemon
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WifiRateProfileResponse;
+
+/// wifi.data.listen on the local Linux mesh daemon
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WifiDataListenRequest {
+    /// API field `iface`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iface: Option<String>,
+    /// API field `listen_sec`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_sec: Option<u64>,
+}
+
+/// wifi.data.listen on the local Linux mesh daemon
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WifiDataListenResponse;
+
+/// wifi.data.send on the local Linux mesh daemon
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WifiDataSendRequest {
+    /// API field `iface`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iface: Option<String>,
+    /// API field `destination`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
+    /// API field `payload`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<String>,
+}
+
+/// wifi.data.send on the local Linux mesh daemon
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WifiDataSendResponse;
+
+/// wifi.ap.start_open on the local Linux mesh daemon
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WifiApStartOpenRequest {
+    /// API field `iface`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iface: Option<String>,
+    /// API field `ssid`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssid: Option<String>,
+    /// API field `channel`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<u8>,
+    /// API field `ht40`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ht40: Option<bool>,
+    /// API field `beacon_interval_tu`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub beacon_interval_tu: Option<u16>,
+}
+
+/// wifi.ap.start_open on the local Linux mesh daemon
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WifiApStartOpenResponse;
+
+/// wifi.ap.stop on the local Linux mesh daemon
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WifiApStopRequest {
+    /// API field `iface`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iface: Option<String>,
+}
+
+/// wifi.ap.stop on the local Linux mesh daemon
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WifiApStopResponse;
+
+/// wifi.ap.station.add on the local Linux mesh daemon
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WifiApStationAddRequest {
+    /// API field `iface`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iface: Option<String>,
+    /// API field `mac`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac: Option<String>,
+    /// API field `aid`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aid: Option<u16>,
+}
+
+/// wifi.ap.station.add on the local Linux mesh daemon
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WifiApStationAddResponse;
+
+/// wifi.sta.join_open on the local Linux mesh daemon
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WifiStaJoinOpenRequest {
+    /// API field `iface`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iface: Option<String>,
+    /// API field `ssid`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssid: Option<String>,
+}
+
+/// wifi.sta.join_open on the local Linux mesh daemon
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WifiStaJoinOpenResponse;
+
+/// wifi.sta.configure_ipv4 on the local Linux mesh daemon
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WifiStaConfigureIpv4Request {
+    /// API field `iface`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iface: Option<String>,
+    /// API field `address`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    /// API field `prefix`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<u8>,
+}
+
+/// wifi.sta.configure_ipv4 on the local Linux mesh daemon
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WifiStaConfigureIpv4Response;
+
+/// Capture Wi-Fi management frames on an owned monitor interface
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WifiMgmtCaptureRequest {
+    /// API field `iface`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iface: Option<String>,
+    /// API field `channel`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel: Option<u8>,
     /// API field `capture_ms`.
-    /// mesh-api-field: index = 3
-    /// mesh-api-field: required = false
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_ms: Option<u64>,
     /// API field `max_frames`.
-    /// mesh-api-field: index = 4
-    /// mesh-api-field: required = false
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_frames: Option<u64>,
     /// API field `active`.
-    /// mesh-api-field: index = 5
-    /// mesh-api-field: required = false
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active: Option<bool>,
 }
 
-/// Capture a bounded host management-frame sample
-/// mesh-api: summary = "Capture a bounded host management-frame sample"
-/// mesh-api: id = "wifi.mgmt.capture"
-/// mesh-api: component = "wifi"
-/// mesh-api: method = "mgmt.capture"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 5
-/// mesh-api: method-index = 13
-/// mesh-api: shape = "response"
+/// Capture Wi-Fi management frames on an owned monitor interface
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct WifiMgmtCaptureResponse;

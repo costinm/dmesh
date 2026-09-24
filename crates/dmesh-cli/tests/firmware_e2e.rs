@@ -51,7 +51,7 @@ use dmesh_server::{
     udp::{ReceivedStream, UdpClient},
 };
 use mesh::{
-    cbor::{decode_record, decode_stream_frame, encode_record, encode_stream_frame},
+    seqpacket::{UnixSeqpacket, UnixSeqpacketListener},
     tagged::{NameOrTag, TaggedCatalog, TaggedRecord},
 };
 use quic_lite::{ConnectionId, FIRST_CLIENT_BIDI_STREAM_ID};
@@ -60,9 +60,8 @@ use std::{
     any::Any,
     collections::BTreeMap,
     fs::{self, OpenOptions},
-    io::{BufRead, BufReader, Read, Write},
+    io::Write,
     net::{Ipv6Addr, SocketAddr, SocketAddrV6},
-    os::unix::net::{UnixListener, UnixStream},
     process::Command,
     sync::LazyLock,
     thread,
@@ -589,12 +588,12 @@ fn e2e_nan_iface() -> String {
 }
 
 fn e2e_nan_service() -> String {
-    std::env::var("DMESH_E2E_NAN_SERVICE").unwrap_or_else(|_| "lmesh-wifi".to_owned())
+    std::env::var("DMESH_E2E_NAN_SERVICE").unwrap_or_else(|_| "lmesh".to_owned())
 }
 
 /// Service owning the current connection-selected NOW adapter.
 fn e2e_now_service() -> String {
-    std::env::var("DMESH_E2E_NOW_SERVICE").unwrap_or_else(|_| "lmesh-wifi".to_owned())
+    std::env::var("DMESH_E2E_NOW_SERVICE").unwrap_or_else(|_| "lmesh".to_owned())
 }
 
 fn host_nan_peer_seen(status: &serde_json::Value, mac: [u8; 6], started_ms: u64) -> bool {
@@ -1977,58 +1976,12 @@ fn host_to_esp_now_probe(
     }
 }
 
-/// Build the remote stream catalog from the same versioned schema that lmesh
-/// projects at runtime. `tools.json` intentionally contains only local
-/// controller operations, so tests must not turn that implementation detail
-/// into a second, incomplete list of remote handlers.
-fn lmesh_stream_schema_tools() -> Vec<serde_json::Value> {
-    let schema = serde_json::from_str::<serde_json::Value>(include_str!(
-        "../../lmesh/resources/firmware-schema.json"
-    ))
-    .expect("firmware schema must be valid JSON");
-    schema["methods"]
-        .as_array()
-        .expect("firmware schema methods must be an array")
-        .iter()
-        .filter_map(|method| {
-            let component = method["component"].as_u64()?;
-            let method_id = method["id"].as_u64()?;
-            let name = method["name"].as_str()?;
-            let properties = method["fields"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|field| {
-                    Some((
-                        field["name"].as_str()?.to_owned(),
-                        serde_json::json!({"x-protobuf-index": field["id"].as_u64()?}),
-                    ))
-                })
-                .collect::<serde_json::Map<_, _>>();
-            Some(serde_json::json!({
-                "name": name,
-                "x-component-index": component,
-                "x-method-index": method_id,
-                "inputSchema": {"type": "object", "properties": properties},
-            }))
-        })
-        .collect()
-}
-
+/// The installed lmesh catalog contains both device and local methods.
 static LMESH_CATALOG: LazyLock<TaggedCatalog> = LazyLock::new(|| {
-    let mut tools =
+    let tools =
         serde_json::from_str::<serde_json::Value>(include_str!("../../lmesh/resources/tools.json"))
             .expect("lmesh tools catalog must be valid JSON");
-    tools
-        .as_array_mut()
-        .expect("lmesh tools catalog must be an array")
-        .extend(lmesh_stream_schema_tools());
     TaggedCatalog::from_tools_json(&tools).expect("lmesh tools catalog must be valid")
-});
-
-static LMESH_WIFI_CATALOG: LazyLock<TaggedCatalog> = LazyLock::new(|| {
-    TaggedCatalog::from_tools_json(&serde_json::json!(lmesh_stream_schema_tools()))
-        .expect("lmesh-wifi tools catalog must be valid")
 });
 
 fn action_probe_enabled() -> bool {
@@ -2300,13 +2253,13 @@ fn host_now_status(device: &E2eDeviceConfig, nonce: u64) -> Result<serde_json::V
 }
 
 /// Read the stable control plane's durable discovery inventory.  This is
-/// deliberately `lmesh-wifi`/`wlan0` even when a row uses `wlan1` as a test
+/// deliberately `lmesh`/`wlan0` even when a row uses `wlan1` as a test
 /// radio: the test radio may change its own NAN/STA epoch, whereas the stable
 /// control plane must remain observational and must never be mode-switched by
 /// a pair probe.
 fn stable_control_plane_inventory() -> serde_json::Value {
     mesh_rpc_typed(
-        "lmesh-wifi",
+        "lmesh",
         "wifi.rawnan.status",
         &request_json! {
             iface: Some("wlan0".to_owned()),
@@ -2388,7 +2341,7 @@ fn mesh_rpc_typed<T: Serialize>(service: &str, method: &str, request: &T) -> ser
         service,
         method,
         request,
-        &format!("/run/mesh/{service}/mesh.sock"),
+        &format!("/run/mesh/{service}/mesh.sock.cbor"),
     )
 }
 
@@ -2408,11 +2361,11 @@ fn mesh_rpc_typed_at<T: Serialize>(
 }
 
 /// The production AP fixture is externally provisioned. Tests may select the
-/// development AP without changing it: `lmesh-wifi`/`wlan0` remains the
+/// development AP without changing it: `lmesh`/`wlan0` remains the
 /// default, while `DMESH_E2E_AP_SERVICE=lmesh DMESH_E2E_AP_IFACE=wlan1`
 /// selects the independent test service.
 fn e2e_ap_service() -> String {
-    std::env::var("DMESH_E2E_AP_SERVICE").unwrap_or_else(|_| "lmesh-wifi".to_owned())
+    std::env::var("DMESH_E2E_AP_SERVICE").unwrap_or_else(|_| "lmesh".to_owned())
 }
 
 fn e2e_ap_iface() -> String {
@@ -2567,10 +2520,9 @@ fn probe_node_for_peer(
 
 /// Invoke a supervised host service through its existing Unix socket.
 ///
-/// A fully numeric component/method pair uses framed tagged CBOR; everything
-/// else uses JSON-RPC, never the former flat JSONL dialect. This explicit
-/// `Value` variant is only for unreviewed operations that do not yet have a
-/// reviewed Rust request struct. Each request owns a short socket connection
+/// Every registered host method uses one tagged CBOR seqpacket. This explicit
+/// `Value` variant is for operations without a dedicated Rust request struct.
+/// Each request owns a short socket connection
 /// so concurrent capture/probe rows cannot serialize behind one subscription
 /// stream; no AP or service process is created here.
 fn mesh_rpc_value(service: &str, method: &str, params: serde_json::Value) -> serde_json::Value {
@@ -2578,7 +2530,7 @@ fn mesh_rpc_value(service: &str, method: &str, params: serde_json::Value) -> ser
         service,
         method,
         params,
-        &format!("/run/mesh/{service}/mesh.sock"),
+        &format!("/run/mesh/{service}/mesh.sock.cbor"),
     )
 }
 
@@ -2595,62 +2547,35 @@ fn mesh_rpc_value_at(
         .record_from_value(method, &params)
         .unwrap_or_else(|error| panic!("build {service} {method}: {error}"));
     record.id = Some(serde_json::json!(1));
-    let tagged_cbor = uses_tagged_cbor(&record);
-    let encoded = if tagged_cbor {
-        encode_stream_frame(
-            &encode_record(&record)
-                .unwrap_or_else(|error| panic!("encode CBOR {service} {method}: {error}")),
-        )
-        .unwrap_or_else(|error| panic!("frame CBOR {service} {method}: {error}"))
-    } else {
-        let mut flat = catalog.to_jsonl(&record);
-        let flat = flat
-            .as_object_mut()
-            .expect("catalog JSON conversion must be an object");
-        let rpc_method = flat.remove("method").expect("catalog JSON has method");
-        let id = flat.remove("id").expect("catalog JSON has id");
-        serde_json::to_vec(&serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": rpc_method,
-            "params": flat,
-        }))
-        .unwrap_or_else(|error| panic!("encode JSON-RPC {service} {method}: {error}"))
-    };
+    assert!(
+        uses_tagged_cbor(&record),
+        "{service} {method} has no numeric schema"
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("create host control runtime");
     let mut last_error = None;
     for _ in 0..6 {
-        match UnixStream::connect(socket_path) {
-            Ok(mut stream) => {
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(20)))
-                    .expect("set mesh socket read timeout");
-                stream
-                    .set_write_timeout(Some(Duration::from_secs(20)))
-                    .expect("set mesh socket write timeout");
-                let write = if tagged_cbor {
-                    stream.write_all(&encoded).and_then(|_| stream.flush())
-                } else {
-                    stream
-                        .write_all(&encoded)
-                        .and_then(|_| stream.write_all(b"\n"))
-                        .and_then(|_| stream.flush())
-                };
-                if let Err(error) = write {
-                    last_error = Some(format!("write {socket_path}: {error}"));
-                    continue;
-                }
-                let response = if tagged_cbor {
-                    read_cbor_response(&mut stream, service, method)
-                } else {
-                    read_json_rpc_response(&mut stream, service, method)
-                };
-                let response = match response {
-                    Ok(response) => response,
-                    Err(error) => {
-                        last_error = Some(format!("read {socket_path}: {error}"));
-                        continue;
-                    }
-                };
+        let attempt = runtime.block_on(async {
+            let stream = UnixSeqpacket::connect(socket_path).await?;
+            stream.send_cbor_record(&record, &[]).await?;
+            let (response, fds) =
+                tokio::time::timeout(Duration::from_secs(20), stream.recv_cbor_record())
+                    .await??
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("{service} {method} closed without a response")
+                    })?;
+            anyhow::ensure!(fds.is_empty(), "unexpected response descriptors");
+            response.result.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{service} {method} returned CBOR error {}",
+                    response.error.unwrap_or(serde_json::Value::Null)
+                )
+            })
+        });
+        match attempt {
+            Ok(response) => {
                 assert!(
                     response.get("success").and_then(serde_json::Value::as_bool) != Some(false),
                     "mesh {service} {method} failed: {response}"
@@ -2658,7 +2583,7 @@ fn mesh_rpc_value_at(
                 return response;
             }
             Err(error) => {
-                last_error = Some(format!("connect {socket_path}: {error}"));
+                last_error = Some(format!("request {socket_path}: {error}"));
                 thread::sleep(Duration::from_millis(250));
             }
         }
@@ -2669,9 +2594,7 @@ fn mesh_rpc_value_at(
     );
 }
 
-/// Only a catalog-selected pair of numeric identifiers is eligible for CBOR.
-/// Named CBOR would create a third compatibility dialect, so unreviewed
-/// commands intentionally use JSON-RPC until their API.md fields are stable.
+/// Every registered host method must have numeric component and method tags.
 fn uses_tagged_cbor(record: &TaggedRecord) -> bool {
     matches!(
         (&record.component, &record.method),
@@ -2682,59 +2605,12 @@ fn uses_tagged_cbor(record: &TaggedRecord) -> bool {
 fn control_catalog(service: &str) -> &'static TaggedCatalog {
     match service {
         "lmesh" => &LMESH_CATALOG,
-        "lmesh-wifi" => &LMESH_WIFI_CATALOG,
         _ => panic!("no installed generated catalog for host service {service:?}"),
     }
 }
 
-fn read_cbor_response(
-    stream: &mut UnixStream,
-    service: &str,
-    method: &str,
-) -> Result<serde_json::Value, String> {
-    let mut header = [0_u8; 4];
-    stream
-        .read_exact(&mut header)
-        .map_err(|error| format!("read CBOR header: {error}"))?;
-    let len = u32::from_be_bytes(header) as usize;
-    let mut frame = Vec::with_capacity(len + 4);
-    frame.extend_from_slice(&header);
-    frame.resize(len + 4, 0);
-    stream
-        .read_exact(&mut frame[4..])
-        .map_err(|error| format!("read CBOR frame: {error}"))?;
-    let response = decode_record(
-        decode_stream_frame(&frame).map_err(|error| format!("decode CBOR frame: {error}"))?,
-    )
-    .map_err(|error| format!("decode CBOR record: {error}"))?;
-    response.result.ok_or_else(|| {
-        format!(
-            "{service} {method} returned CBOR error {}",
-            response.error.unwrap_or(serde_json::Value::Null)
-        )
-    })
-}
-
-fn read_json_rpc_response(
-    stream: &mut UnixStream,
-    service: &str,
-    method: &str,
-) -> Result<serde_json::Value, String> {
-    let mut line = String::new();
-    BufReader::new(stream)
-        .read_line(&mut line)
-        .map_err(|error| format!("read JSON-RPC line: {error}"))?;
-    let response: serde_json::Value = serde_json::from_str(line.trim()).map_err(|error| {
-        format!("decode JSON-RPC {service} {method}: {error}; response={line:?}")
-    })?;
-    if let Some(error) = response.get("error") {
-        return Err(format!("JSON-RPC error: {error}"));
-    }
-    Ok(response.get("result").cloned().unwrap_or(response))
-}
-
-/// History is returned as the operation object on both reviewed CBOR and
-/// JSON-RPC paths. E2E inspects semantic events rather than treating the
+/// History is returned as the operation object on tagged CBOR. E2E inspects
+/// semantic events rather than treating the
 /// response envelope as delivery evidence.
 fn history_events(response: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
     response
@@ -2746,8 +2622,8 @@ fn history_events(response: &serde_json::Value) -> Option<&Vec<serde_json::Value
 }
 
 #[test]
-fn host_control_catalog_selects_cbor_only_for_reviewed_methods() {
-    let status = control_catalog("lmesh-wifi")
+fn host_control_catalog_assigns_numeric_tags_to_all_methods() {
+    let status = control_catalog("lmesh")
         .record_from_value("status", &serde_json::json!({}))
         .expect("reviewed status method builds");
     assert!(uses_tagged_cbor(&status));
@@ -2757,7 +2633,7 @@ fn host_control_catalog_selects_cbor_only_for_reviewed_methods() {
         .expect("merged lmesh Wi-Fi status method builds");
     assert!(uses_tagged_cbor(&lmesh_status));
 
-    let telemetry = control_catalog("lmesh-wifi")
+    let telemetry = control_catalog("lmesh")
         .record_from_value("telemetry.nan_status", &serde_json::json!({}))
         .expect("reviewed telemetry method builds");
     assert!(uses_tagged_cbor(&telemetry));
@@ -2767,13 +2643,13 @@ fn host_control_catalog_selects_cbor_only_for_reviewed_methods() {
         .expect("reviewed discovery method builds");
     assert!(uses_tagged_cbor(&inventory));
 
-    let unreviewed = control_catalog("lmesh-wifi")
+    let wifi = control_catalog("lmesh")
         .record_from_value(
-            "wifi.experimental.inspect",
+            "wifi.interface.channel",
             &serde_json::json!({"iface": "wlan0"}),
         )
-        .expect("unreviewed inspection method builds");
-    assert!(!uses_tagged_cbor(&unreviewed));
+        .expect("local Wi-Fi method builds");
+    assert!(uses_tagged_cbor(&wifi));
 }
 
 fn codec_test_socket(name: &str) -> std::path::PathBuf {
@@ -2788,35 +2664,43 @@ fn codec_test_socket(name: &str) -> std::path::PathBuf {
 }
 
 #[test]
-fn host_control_cbor_request_and_response_use_framed_numeric_records() {
+fn host_control_cbor_request_and_response_use_seqpacket_numeric_records() {
     let path = codec_test_socket("cbor");
-    let listener = UnixListener::bind(&path).expect("bind local CBOR test socket");
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let server_path = path.clone();
     let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept CBOR test request");
-        let mut header = [0_u8; 4];
-        stream.read_exact(&mut header).expect("read request header");
-        let length = u32::from_be_bytes(header) as usize;
-        let mut frame = header.to_vec();
-        frame.resize(length + 4, 0);
-        stream
-            .read_exact(&mut frame[4..])
-            .expect("read request frame");
-        let record = decode_record(decode_stream_frame(&frame).expect("decode request frame"))
-            .expect("decode request record");
-        assert!(matches!(record.component, NameOrTag::Tag(9)));
-        assert!(matches!(record.method, NameOrTag::Tag(1)));
-        assert!(record.env.is_empty());
-        let response = mesh::wire::response_ok(
-            record.id.expect("request id"),
-            serde_json::json!({"codec": "cbor"}),
-        );
-        let frame = encode_stream_frame(&encode_record(&response).expect("encode response"))
-            .expect("frame response");
-        stream.write_all(&frame).expect("write CBOR response");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let listener =
+                UnixSeqpacketListener::bind(&server_path).expect("bind local CBOR test socket");
+            ready_tx.send(()).expect("signal listener ready");
+            let stream = listener.accept().await.expect("accept CBOR test request");
+            let (record, fds) = stream
+                .recv_cbor_record()
+                .await
+                .expect("receive CBOR request")
+                .expect("request record");
+            assert!(fds.is_empty());
+            assert!(matches!(record.component, NameOrTag::Tag(9)));
+            assert!(matches!(record.method, NameOrTag::Tag(1)));
+            assert!(record.env.is_empty());
+            let response = mesh::wire::response_ok(
+                record.id.expect("request id"),
+                serde_json::json!({"codec": "cbor"}),
+            );
+            stream
+                .send_cbor_record(&response, &[])
+                .await
+                .expect("send CBOR response");
+        });
     });
+    ready_rx.recv().expect("wait for CBOR test listener");
 
     let response = mesh_rpc_typed_at(
-        "lmesh-wifi",
+        "lmesh",
         "status",
         &request_json! {},
         path.to_str().expect("UTF-8 socket path"),
@@ -2827,45 +2711,7 @@ fn host_control_cbor_request_and_response_use_framed_numeric_records() {
 }
 
 #[test]
-fn host_control_unreviewed_inspection_request_and_response_use_json_rpc() {
-    let path = codec_test_socket("json-rpc");
-    let listener = UnixListener::bind(&path).expect("bind local JSON-RPC test socket");
-    let server = thread::spawn(move || {
-        let (stream, _) = listener.accept().expect("accept JSON-RPC test request");
-        let mut line = String::new();
-        let mut reader = BufReader::new(stream.try_clone().expect("clone test stream"));
-        reader.read_line(&mut line).expect("read JSON-RPC request");
-        let request: serde_json::Value =
-            serde_json::from_str(&line).expect("decode JSON-RPC request");
-        assert_eq!(request["jsonrpc"], "2.0");
-        assert_eq!(request["method"], "wifi.experimental.inspect");
-        assert_eq!(request["params"]["iface"], "wlan0");
-        let mut stream = stream;
-        writeln!(
-            stream,
-            "{}",
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": request["id"].clone(),
-                "result": {"codec": "json-rpc"},
-            })
-        )
-        .expect("write JSON-RPC response");
-    });
-
-    let response = mesh_rpc_value_at(
-        "lmesh-wifi",
-        "wifi.experimental.inspect",
-        serde_json::json!({"iface": "wlan0"}),
-        path.to_str().expect("UTF-8 socket path"),
-    );
-    assert_eq!(response["codec"], "json-rpc");
-    server.join().expect("JSON-RPC test server panicked");
-    std::fs::remove_file(path).expect("remove JSON-RPC test socket");
-}
-
-#[test]
-#[ignore = "requires the supervised lmesh/lmesh-wifi host radios"]
+#[ignore = "requires the supervised lmesh/lmesh host radios"]
 fn host_host_nan_sync_and_sd_e2e() {
     // Manual equivalence, for the one-time fixture proof before changing this
     // row. The automated test below is the permanent version: it builds the
@@ -2873,7 +2719,7 @@ fn host_host_nan_sync_and_sd_e2e() {
     // peer's semantic receipt rather than relying on a shell transcript.
     //
     //   mesh lmesh wifi.rawnan.status iface=wlan1
-    //   mesh lmesh-wifi wifi.raw.send iface=wlan0 channel=6 \
+    //   mesh lmesh wifi.raw.send iface=wlan0 channel=6 \
     //     tx_variant=monitor tx_rate_mbps=6 frame_hex=<build_nan_publish_sdf>
     //   mesh lmesh messages.history keys=wifi.rawnan.discovery limit=64
     //
@@ -2884,7 +2730,7 @@ fn host_host_nan_sync_and_sd_e2e() {
     // monitor fixture.  Neither radio is started, stopped, retuned, or
     // otherwise reconfigured here: the receiver only opens a bounded socket
     // on its permanent monitor.
-    require_host_iface_up("lmesh-wifi", "wlan0");
+    require_host_iface_up("lmesh", "wlan0");
     require_host_iface_up("lmesh", "wlan1mon");
     let listen = mesh_rpc_typed(
         "lmesh",
@@ -2990,7 +2836,7 @@ fn host_host_nan_sync_and_sd_e2e() {
     let publish_hex = hex(&frame);
     let send_publish = || {
         mesh_rpc_typed(
-            "lmesh-wifi",
+            "lmesh",
             "wifi.raw.send",
             &request_json! {
                 iface: Some("wlan0".to_owned()),
@@ -3074,7 +2920,7 @@ fn host_host_nan_sync_and_sd_e2e() {
         &command,
     );
     let active_subscribe_tx = mesh_rpc_typed(
-        "lmesh-wifi",
+        "lmesh",
         "wifi.raw.send",
         &request_json! {
             iface: Some("wlan0".to_owned()),
@@ -3121,7 +2967,7 @@ fn host_host_nan_sync_and_sd_e2e() {
     let deadline = Instant::now() + Duration::from_secs(10);
     let (followup_seen, followup_events) = loop {
         let events = mesh_rpc_value(
-            "lmesh-wifi",
+            "lmesh",
             "messages.history",
             serde_json::json!({"keys": "wifi.rawnan.discovery", "limit": 64}),
         );
@@ -3203,7 +3049,7 @@ fn host_observes_android_nan_announce_e2e() {
 }
 
 #[test]
-#[ignore = "requires the supervised lmesh/lmesh-wifi host radios"]
+#[ignore = "requires the supervised lmesh/lmesh host radios"]
 fn host_host_now_probe_reachability_e2e() {
     // Equivalent command:
     //   mesh lmesh probe to=<wlan0 MAC> bytes=1 packet_size=64 timeout_ms=5000
@@ -3216,7 +3062,7 @@ fn host_host_now_probe_reachability_e2e() {
     // The supervised AP and its permanent monitor are fixtures. This test
     // wlan0 is the stable AP fixture; wlan1mon is lmesh's AP-off NOW
     // transport. The test only consumes their existing radio state.
-    require_host_iface_up("lmesh-wifi", "wlan0");
+    require_host_iface_up("lmesh", "wlan0");
     require_host_iface_up("lmesh", "wlan1mon");
     let destination = interface_mac("wlan0");
     let mut last = serde_json::Value::Null;
@@ -3247,11 +3093,11 @@ fn host_host_now_probe_reachability_e2e() {
 }
 
 #[test]
-#[ignore = "requires the supervised lmesh/lmesh-wifi host radios"]
+#[ignore = "requires the supervised lmesh/lmesh host radios"]
 fn host_host_now_monitor_capture_e2e() {
     // RF-level diagnostic equivalent:
     //   mesh lmesh wifi.mgmt.capture iface=wlan1 channel=6 capture_ms=5000
-    //   mesh lmesh-wifi probe to=<wlan1 MAC> bytes=1 packet_size=64
+    //   mesh lmesh probe to=<wlan1 MAC> bytes=1 packet_size=64
     // Run the capture and probe concurrently; this intentionally does not
     // install the QUIC dispatcher, so it isolates monitor RX/TX from service
     // dispatch and reports whether any action frame reached the second radio.
@@ -3266,7 +3112,7 @@ fn host_host_now_monitor_capture_e2e() {
         )
     });
     thread::sleep(Duration::from_millis(500));
-    let probe = probe_node("lmesh-wifi", destination, 1, 64, 3_000);
+    let probe = probe_node("lmesh", destination, 1, 64, 3_000);
     let capture = capture_thread.join().expect("capture thread");
     let frame_count = capture
         .get("data")
@@ -3325,7 +3171,7 @@ fn host_host_now_monitor_capture_e2e() {
 }
 
 #[test]
-#[ignore = "requires the supervised lmesh/lmesh-wifi host radios"]
+#[ignore = "requires the supervised lmesh/lmesh host radios"]
 fn host_host_now_raw_frame_injection_e2e() {
     // Captured valid NOW action frame, with source 00:c0:ca:b8:79:cc and
     // receiver wlan1 as Address-1. This bypasses QUIC and the action builder
@@ -3343,7 +3189,7 @@ fn host_host_now_raw_frame_injection_e2e() {
     });
     thread::sleep(Duration::from_millis(500));
     let send = mesh_rpc_typed(
-        "lmesh-wifi",
+        "lmesh",
         "wifi.raw.send",
         &request_json! {
             iface: Some("wlan0".to_owned()),
@@ -3382,15 +3228,15 @@ fn host_host_now_raw_frame_injection_e2e() {
 }
 
 #[test]
-#[ignore = "requires the supervised lmesh/lmesh-wifi host radios"]
+#[ignore = "requires the supervised lmesh/lmesh host radios"]
 fn host_host_now_probe_e2e() {
     // Equivalent command:
-    //   mesh lmesh-wifi probe to=74:19:f8:17:de:65 \
+    //   mesh lmesh probe to=74:19:f8:17:de:65 \
     //     bytes=65536 packet_size=1100 timeout_ms=10000
     // Keep this as a real completion assertion: a bootstrap ACK plus one
     // stream packet is not a throughput result.
     // AP/channel state is owned by mesh-init and remains untouched.
-    require_host_iface_up("lmesh-wifi", "wlan0");
+    require_host_iface_up("lmesh", "wlan0");
     require_host_iface_up("lmesh", "wlan1mon");
     thread::sleep(Duration::from_secs(2));
     // A QUIC connection is directed. The connection layer selects the NOW
@@ -3398,7 +3244,7 @@ fn host_host_now_probe_e2e() {
     let destination = interface_mac("wlan1");
     thread::sleep(Duration::from_secs(2));
     let result = probe_node(
-        "lmesh-wifi",
+        "lmesh",
         destination,
         e2e_now_bytes(),
         u16::try_from(e2e_now_packet_size()).expect("NOW packet size fits u16"),
@@ -3414,7 +3260,7 @@ fn host_host_now_probe_e2e() {
             },
         );
         let sender_metrics = mesh_rpc_typed(
-            "lmesh-wifi",
+            "lmesh",
             "wifi.raw.metrics",
             &request_json! {
                 iface: Some("wlan0".to_owned()),
@@ -3466,14 +3312,14 @@ fn host_host_now_probe_e2e() {
 }
 
 #[test]
-#[ignore = "requires the supervised lmesh/lmesh-wifi host radios"]
+#[ignore = "requires the supervised lmesh/lmesh host radios"]
 fn host_host_now_reverse_probe_e2e() {
     // Equivalent command:
     //   mesh lmesh probe to=00:c0:ca:b8:79:cc \
     //     bytes=65536 packet_size=1100 timeout_ms=10000
     let destination = interface_mac("wlan0");
     // The reverse row consumes the permanent monitor/AP fixtures only.
-    require_host_iface_up("lmesh-wifi", "wlan0");
+    require_host_iface_up("lmesh", "wlan0");
     require_host_iface_up("lmesh", "wlan1mon");
     thread::sleep(Duration::from_secs(1));
     let result = probe_node(
@@ -3486,7 +3332,7 @@ fn host_host_now_reverse_probe_e2e() {
     let data = result.get("data").unwrap_or(&result);
     if data.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
         let metrics = mesh_rpc_typed(
-            "lmesh-wifi",
+            "lmesh",
             "wifi.raw.metrics",
             &request_json! {
                 iface: Some("wlan0".to_owned()),
@@ -3497,7 +3343,7 @@ fn host_host_now_reverse_probe_e2e() {
     eprintln!(
         "host-host reverse NOW PROBE result={result} receiver_metrics={}",
         mesh_rpc_typed(
-            "lmesh-wifi",
+            "lmesh",
             "wifi.raw.metrics",
             &request_json! {
                 iface: Some("wlan0".to_owned())
@@ -3640,14 +3486,14 @@ async fn udp_probe_row(
 
 async fn host_to_lmesh_wifi_probe() {
     // This exercises the already-running stable host service, rather than
-    // launching a private benchmark listener. It proves lmesh-wifi carries
+    // launching a private benchmark listener. It proves lmesh carries
     // the shared dmesh-server PROBE handler and never restarts its AP.
     udp_probe_row(
-        "host loopback->lmesh-wifi",
+        "host loopback->lmesh",
         "127.0.0.1:0".parse().expect("loopback bind"),
         format!("127.0.0.1:{STABLE_WIFI_UDP_PORT}")
             .parse()
-            .expect("stable lmesh-wifi listener"),
+            .expect("stable lmesh listener"),
         ConnectionId::new(0x48_4F_5354).expect("nonzero host baseline CID"),
         udp6_transfer_bytes(),
     )
@@ -4332,7 +4178,7 @@ async fn host_to_device_udp6_probe_bytes(label: &str, mac: [u8; 6], cid: u64, by
     // This is equivalent to the historic CLI form:
     // dmesh-cli 'udp://[fe80::16c1:9fff:fee5:9800%wlan0]:3339' probe bytes=65536 packet_size=1200
     // The Rust test uses the same UdpClient/service schema directly, so it
-    // does not rely on a retired CLI argument grammar or restart lmesh-wifi.
+    // does not rely on a retired CLI argument grammar or restart lmesh.
     let ifindex = interface_index("wlan0");
     let peer = SocketAddr::V6(SocketAddrV6::new(
         Ipv6Addr::from(quic_lite::raw_udp6::link_local_from_mac(mac)),
@@ -8608,8 +8454,8 @@ fn firmware_transport_matrix() {
     // No PROBE row may run until the same current radio configuration has
     // completed the bounded raw-action discovery check in both directions.
     // Keep the UART sessions open while the host then proves the running
-    // lmesh-wifi service and uses its normal IPv6 socket path to e6. This
-    // avoids restarting lmesh-wifi or leasing another device-console
+    // lmesh service and uses its normal IPv6 socket path to e6. This
+    // avoids restarting lmesh or leasing another device-console
     // connection between the sanity check and throughput measurement.
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()

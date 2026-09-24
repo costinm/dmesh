@@ -1,9 +1,11 @@
-# lmesh Wi-Fi API pointer
+# lmesh Wi-Fi API
 
-The authoritative Wi-Fi library API, ownership policy, request names, startup
-behavior, and tuning notes live in [`lmesh-wifi/API.md`](../lmesh-wifi/API.md).
+`lmesh` is the Linux mesh daemon and owns the selected Wi-Fi interface, raw-NAN
+monitor, BLE adapter, local control socket, and HTTP admin endpoint. Its radio
+implementation currently lives in the internal `lmesh-wifi` library; the
+public Wi-Fi request reference is [root API](../../API.md); adapter details are in
+[the radio README](../lmesh-wifi/README.md).
 
-`lmesh` is the experimental superset: it embeds `lmesh-wifi`, normally owns
-`wlan1`, and retains canary-only discovery, signature, and BLE HCI work. It
-must not duplicate or redefine the Wi-Fi API here; update `lmesh-wifi/API.md`
-when the shared library contract changes.
+The supervised service template is [lmesh.toml](mesh-init/lmesh.toml). Select
+the host interface there. The daemon uses `/run/mesh/lmesh/mesh.sock.cbor`, HTTP
+port 18981, and UDP port 3336.

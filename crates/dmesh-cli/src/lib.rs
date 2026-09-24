@@ -7,7 +7,6 @@
 
 pub mod client;
 mod device;
-mod l2;
 pub mod prober;
 mod schema;
 

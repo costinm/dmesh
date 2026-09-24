@@ -3,15 +3,10 @@ use mesh::tagged::{NameOrTag, TaggedCatalog, TaggedRecord};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
-use std::fs;
-use std::path::PathBuf;
 
 // TODO: move common (device free) to ssh-mesh, evaluate the rest.
 
-// The canonical schema is compiled in. `SCHEMA_DIR` supplies every
-// optional schema that dmesh-cli should translate at runtime.
-const CORE_SCHEMA: &str = include_str!("../../lmesh/resources/firmware-schema.json");
-const SCHEMA_DIRECTORY_RELATIVE_PATH: &str = "schemas";
+const CATALOG_SERVICE: &str = "lmesh";
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub(crate) struct FirmwareSchemaFile {
@@ -75,25 +70,62 @@ pub struct FirmwareSchema {
 
 impl FirmwareSchema {
     pub fn load() -> Self {
+        let resolved = mesh::catalog::service_catalog_resolver()
+            .resolve(CATALOG_SERVICE)
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing {CATALOG_SERVICE} tools.json; set MESH_SCHEMA_DIR or install /opt/{CATALOG_SERVICE}/etc/schemas/tools.json"
+                )
+            })
+            .unwrap_or_else(|error| panic!("load {CATALOG_SERVICE} tools.json: {error}"));
+        let tools = resolved
+            .tools
+            .get("tools")
+            .and_then(Value::as_array)
+            .or_else(|| resolved.tools.as_array())
+            .expect("lmesh tools.json must contain tools");
+        let mut core = FirmwareSchemaFile::default();
+        for tool in tools.iter().filter(|tool| tool["x-dmesh-device"] == true) {
+            let properties = tool["inputSchema"]["properties"]
+                .as_object()
+                .expect("device tool must have inputSchema.properties");
+            let fields = properties
+                .iter()
+                .map(|(name, property)| SchemaField {
+                    id: property["x-protobuf-index"].as_u64().map(|id| id as u16),
+                    name: name.clone(),
+                    kind: property["x-dmesh-kind"].as_str().map(str::to_owned),
+                    values: property
+                        .get("x-dmesh-values")
+                        .and_then(|value| serde_json::from_value(value.clone()).ok())
+                        .unwrap_or_default(),
+                })
+                .collect();
+            core.methods.push(SchemaMethod {
+                id: tool["x-method-index"].as_u64().expect("device method tag") as u16,
+                name: tool["name"]
+                    .as_str()
+                    .expect("device method name")
+                    .to_owned(),
+                component: Some(
+                    tool["x-component-index"]
+                        .as_u64()
+                        .expect("device component tag") as u16,
+                ),
+                fields,
+            });
+        }
+        let legacy = &resolved.tools["x-dmesh-legacy"];
+        core.methods.extend(
+            serde_json::from_value::<Vec<SchemaMethod>>(legacy["methods"].clone())
+                .expect("lmesh legacy methods"),
+        );
+        core.messages =
+            serde_json::from_value(legacy["messages"].clone()).expect("lmesh legacy messages");
         let mut schema = Self::default();
-        if let Ok(core) = serde_json::from_str::<FirmwareSchemaFile>(CORE_SCHEMA) {
-            schema.merge(core);
-        }
-
-        for path in configured_schema_files() {
-            match fs::read_to_string(&path)
-                .with_context(|| format!("read schema {}", path.display()))
-                .and_then(|contents| {
-                    serde_json::from_str::<FirmwareSchemaFile>(&contents)
-                        .with_context(|| format!("parse schema {}", path.display()))
-                }) {
-                Ok(file) => schema.merge(file),
-                Err(error) => {
-                    tracing::warn!(path = %path.display(), error = %error, "schema_load_failed")
-                }
-            }
-        }
+        schema.merge(core);
         schema.refresh_catalog();
+        schema.tagged_catalog = resolved.catalog.as_ref().clone();
         schema
     }
 
@@ -365,9 +397,19 @@ pub fn render_device_record(schema: &FirmwareSchema, payload: &[u8]) -> String {
 fn command_json(command: &str, schema: &FirmwareSchema) -> Result<Value> {
     let mut words = command.split_ascii_whitespace();
     let method = words.next().context("empty firmware command")?;
+    command_json_words(method, words, schema)
+}
+
+fn command_json_words<'a>(
+    method: &str,
+    words: impl Iterator<Item = &'a str>,
+    schema: &FirmwareSchema,
+) -> Result<Value> {
     let mut fields = Map::new();
     for word in words {
         let (key, value) = word.split_once('=').unwrap_or((word, "true"));
+        let key = key.strip_prefix("--").unwrap_or(key);
+        let key = schema.field_name(method, key)?;
         if key == "payload" {
             let hex = value.strip_prefix("hex:").unwrap_or(value);
             fields.insert(
@@ -383,6 +425,17 @@ fn command_json(command: &str, schema: &FirmwareSchema) -> Result<Value> {
 }
 
 impl FirmwareSchema {
+    fn field_name<'a>(&'a self, method: &str, key: &'a str) -> Result<&'a str> {
+        let Some(tag) = key.strip_prefix('@').unwrap_or(key).parse::<u16>().ok() else {
+            return Ok(key);
+        };
+        self.methods
+            .get(method)
+            .and_then(|entry| entry.fields.iter().find(|field| field.id == Some(tag)))
+            .map(|field| field.name.as_str())
+            .with_context(|| format!("unknown command field tag {method}.{tag}"))
+    }
+
     fn command_value(&self, method: &str, name: &str, value: &str) -> Result<Value> {
         let field = self
             .methods
@@ -435,8 +488,8 @@ impl FirmwareSchema {
 /// The installed schema remains the temporary catalog artifact during the
 /// generator migration, but this function no longer creates the retired
 /// compact `{0: method, 6: payload}` map and decodes it again.  Direct records
-/// require numeric component and method tags; an unreviewed schema entry must
-/// use the explicit JSON-RPC compatibility path instead of unnamed CBOR.
+/// require numeric component and method tags; an unreviewed schema entry is
+/// rejected until its numeric identity is declared.
 pub fn encode_direct_command(command: &str) -> Result<Vec<u8>> {
     encode_direct_command_with_id(command, 0)
 }
@@ -454,9 +507,26 @@ pub fn encode_stream_command_with_id(command: &str, id: u64) -> Result<Vec<u8>> 
     encode_schema_command_with_id(command, id, false)
 }
 
+/// Encode a shell-split service invocation without splitting quoted field values.
+pub fn encode_stream_argv_with_id(arguments: &[String], id: u64) -> Result<Vec<u8>> {
+    let schema = FirmwareSchema::load();
+    let method = arguments.first().context("missing firmware method")?;
+    let value = command_json_words(method, arguments[1..].iter().map(String::as_str), &schema)?;
+    encode_schema_value_with_id(&schema, value, id, false)
+}
+
 fn encode_schema_command_with_id(command: &str, id: u64, direct: bool) -> Result<Vec<u8>> {
     let schema = FirmwareSchema::load();
-    let mut value = command_json(command, &schema)?;
+    let value = command_json(command, &schema)?;
+    encode_schema_value_with_id(&schema, value, id, direct)
+}
+
+fn encode_schema_value_with_id(
+    schema: &FirmwareSchema,
+    mut value: Value,
+    id: u64,
+    direct: bool,
+) -> Result<Vec<u8>> {
     let method = value
         .get("method")
         .and_then(Value::as_str)
@@ -559,10 +629,11 @@ fn encode_schema_fields_with_id(
         ..TaggedRecord::default()
     };
     for (name, field_value) in fields {
+        let name = schema.field_name(method, name)?;
         let field = entry
             .fields
             .iter()
-            .find(|field| field.name == *name)
+            .find(|field| field.name == name)
             .with_context(|| format!("unknown command field {method}.{name}"))?;
         let id = field
             .id
@@ -674,48 +745,15 @@ fn firmware_arg_tag(name: &str) -> Option<u16> {
     })
 }
 
-fn configured_schema_files() -> Vec<PathBuf> {
-    let Some(dir) = std::env::var_os("SCHEMA_DIR")
-        .map(PathBuf::from)
-        .and_then(resolve_schema_directory)
-        .or_else(default_schema_directory)
-    else {
-        return Vec::new();
-    };
-    if let Ok(entries) = fs::read_dir(dir) {
-        return entries
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
-            .collect();
-    }
-    Vec::new()
-}
-
-fn default_schema_directory() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(SCHEMA_DIRECTORY_RELATIVE_PATH))
-}
-
-fn resolve_schema_directory(path: PathBuf) -> Option<PathBuf> {
-    if path.is_absolute() {
-        Some(path)
-    } else {
-        std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .map(|home| home.join(path))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         FirmwareSchema, encode_direct_command, encode_direct_command_with_id,
-        encode_stream_command_with_id, render_device_record,
+        encode_stream_argv_with_id, encode_stream_command_with_id, render_device_record,
     };
+    use mesh::tagged::NameOrTag;
     use minicbor::Encoder;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     #[test]
     fn core_schema_names_event_and_message_tag() {
@@ -905,6 +943,32 @@ mod tests {
 
     #[test]
     fn probe_is_a_schema_driven_bearer_neutral_stream() {
+        let named = encode_stream_command_with_id("settings.set key=name value=demo", 77)
+            .expect("named fields");
+        let numeric = encode_stream_command_with_id("settings.set 1=name 2=demo", 77)
+            .expect("numeric field tags");
+        let options = encode_stream_command_with_id("settings.set --key=name --value=demo", 77)
+            .expect("mesh-style field options");
+        let numeric_options = encode_stream_command_with_id("settings.set --1=name --2=demo", 77)
+            .expect("numeric mesh-style field options");
+        assert_eq!(numeric, named);
+        assert_eq!(options, named);
+        assert_eq!(numeric_options, named);
+        let spaced = encode_stream_argv_with_id(
+            &[
+                "settings.set".to_owned(),
+                "--key=name".to_owned(),
+                "--value=two words".to_owned(),
+            ],
+            78,
+        )
+        .expect("quoted field value remains one argument");
+        let spaced_record = mesh::cbor::decode_record(&spaced).unwrap();
+        assert_eq!(
+            spaced_record.env.get(&NameOrTag::Tag(2)),
+            Some(&Value::String("two words".to_owned()))
+        );
+        assert!(encode_stream_command_with_id("settings.set 99=demo", 77).is_err());
         assert!(encode_direct_command("probe bytes=4096 packet_size=512").is_err());
         let command = encode_stream_command_with_id("probe bytes=4096 packet_size=512", 44)
             .expect("stream probe command");

@@ -26,3 +26,5 @@ For ESP32 with Xtensa - Rust doesn't support PIC, so each module must have a spe
 'slot ID', based on their CBOR tag number, and based on that it gets a specific 64k slot in flash and fixed base address in XIP. Large modules can take multiple slots. With RiscV - PIC works so location is flexible, but for now keeping the same model.
 
 
+
+The module request and callback ABI is specified in the [root API](../../API.md).
