@@ -4019,7 +4019,6 @@ mod tests {
         let _guard = RADIO_STATE_TEST_LOCK.lock().unwrap();
         discovered_devices().lock().unwrap().clear();
         ble_scan_results_store().lock().unwrap().clear();
-        *power_state().lock().unwrap() = dmesh_server::power::PowerState::default();
 
         let companion_vip6 = {
             let mut id = [0_u8; 16];
@@ -4056,7 +4055,7 @@ mod tests {
         observe_announce(companion, "aa:bb:cc:dd:ee:01".to_owned(), "nan_sd", b"p");
         let now_ms = chrono::Utc::now().timestamp_millis();
         if let Ok(mut devices) = discovered_devices().lock() {
-            if let Some(device) = devices.get_mut(&bytes_to_hex(&id)) {
+            if let Some(device) = devices.get_mut(&bytes_to_hex(announce_device_id(&id))) {
                 observe_packet(
                     device,
                     "nan",
