@@ -1538,6 +1538,14 @@ pub fn queue_active_discovery() -> bool {
 /// target-checked `transport.set { mode: sta, wake_target }` record so the
 /// receiver has no NAN-only profile parser.
 pub fn queue_nan_wakeup(target: [u8; 6]) -> bool {
+    queue_nan_targeted_wakeup(target, false)
+}
+
+pub fn queue_nan_pair_wakeup(target: [u8; 6]) -> bool {
+    queue_nan_targeted_wakeup(target, true)
+}
+
+fn queue_nan_targeted_wakeup(target: [u8; 6], virgin_only: bool) -> bool {
     if !active_on_nan_channel() {
         return false;
     }
@@ -1553,15 +1561,20 @@ pub fn queue_nan_wakeup(target: [u8; 6]) -> bool {
     if bssid_is_unset(bssid) {
         return false;
     }
-    let request = dmesh_server::control::Request::TransportSet {
-        kind: dmesh_server::control::TransportKind::Sta,
-        config: dmesh_server::control::TransportConfig {
-            wake_target: Some(target),
-            ..dmesh_server::control::TransportConfig::default()
-        },
-    };
     let mut record = [0u8; 96];
-    let Some(used) = dmesh_server::control::encode_request(request, None, &mut record) else {
+    let used = if virgin_only {
+        dmesh_server::announce::encode_nan_pair_wakeup_request(target, 0, &mut record)
+    } else {
+        let request = dmesh_server::control::Request::TransportSet {
+            kind: dmesh_server::control::TransportKind::Sta,
+            config: dmesh_server::control::TransportConfig {
+                wake_target: Some(target),
+                ..dmesh_server::control::TransportConfig::default()
+            },
+        };
+        dmesh_server::control::encode_request(request, None, &mut record)
+    };
+    let Some(used) = used else {
         return false;
     };
     let frame = dmesh_rawnan::build_nan_usd_sdf_with_bssid(

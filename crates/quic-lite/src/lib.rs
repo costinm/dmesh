@@ -1,12 +1,8 @@
 #![no_std]
 
-//! Bounded, bearer-neutral reliable streams.
+//! Bearer-neutral QUIC(-lite) packet transport.
 //!
-//! This crate deliberately knows nothing about UDP, radio security, files, or
-//! flashing.  A bearer supplies datagram boundaries and peer identity; the
-//! caller supplies storage and time.  The wire format follows QUIC's packet
-//! and frame rules, with packet protection deliberately left to a future
-//! bearer/security layer.
+//! See [`bearer`] for the physical packet I/O contract.
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -14,6 +10,7 @@ use alloc::vec::Vec;
 #[cfg(all(feature = "std", not(test)))]
 extern crate std;
 
+pub mod bearer;
 pub mod callback;
 pub mod connection;
 pub mod ledger;
@@ -28,11 +25,15 @@ pub mod ram_budget;
 pub mod raw_udp6;
 pub mod relay;
 
+pub use bearer::{
+    DatagramEgress, DatagramEgressEvents, DatagramIngress, DatagramMeta, DatagramSubmitError,
+    LocalAddress, OwnedDatagram, ReceivedDatagram,
+};
 pub use connection::{
     AssociationProfile, ClientAssociation, ClientBootstrapIngress, ClientConnection,
     ClientStreamConnection, ConnectionCounters, ConnectionDebugState, ConnectionIdDiagnostic,
     ConnectionManager, ConnectionPolicy, DatagramClient, DatagramClientDriver, PathConnection,
-    PathId, ServerAssociationTable, ServerConnection, ServerConnectionIngress, ServerDatagram,
+    ServerAssociationTable, ServerConnection, ServerConnectionIngress, ServerDatagram,
     ServerPacket, ServerStreamConfig, ServerStreamConnection, classify_server_datagram,
     classify_server_packet, drain_datagram_egress, is_server_association_datagram,
     receive_error_code,
@@ -331,20 +332,6 @@ mod recovery_profile_tests {
         assert_eq!(timing.max_gap_us, 10_000);
         assert_eq!(timing.gap_buckets, [1, 0, 0, 1, 0, 0]);
     }
-}
-
-/// Minimal synchronous bearer contract used by deterministic conformance
-/// drivers. UDP, NAN, BLE, and device adapters own the actual I/O and peer
-/// identity; they only need to preserve datagram boundaries and provide a
-/// caller-supplied clock. The transport and stream handlers remain shared.
-pub trait DatagramBearer {
-    type Error;
-
-    /// Queue one opaque datagram for transmission at `now`.
-    fn send_datagram(&mut self, now: u64, payload: &[u8]) -> Result<(), Self::Error>;
-
-    /// Return at most one received datagram, copying it into `out`.
-    fn receive_datagram(&mut self, now: u64, out: &mut [u8]) -> Result<Option<usize>, Self::Error>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4141,10 +4128,11 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
         Ok((header, stream))
     }
 
-    /// Hand one complete bearer datagram to the transport and return every
-    /// admitted application STREAM frame. ACKs and flow control are consumed
-    /// here; a shared association owner uses this result to correlate several
-    /// in-flight streams without asking a bearer to inspect frames.
+    /// Process every QUIC frame carried by one datagram.
+    ///
+    /// This is an endpoint operation, not the bearer receive entry point and
+    /// not a batch of bearer datagrams. The connection owner calls it after
+    /// routing and admission.
     pub fn receive_datagram_batch<'a>(
         &mut self,
         input: &'a [u8],

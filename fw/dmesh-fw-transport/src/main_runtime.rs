@@ -41,6 +41,16 @@ const SECRET_SETTING_KEYS: [&[u8]; 1] = [b"sta"];
 const IDENTITY_NVS_KEY: &[u8] = b"id_p256\0";
 const CONTROL_PLANE_NVS_KEY: &[u8] = b"cp\0";
 const SHARED_SECRET_NVS_KEY: &[u8] = b"key\0";
+const PAIRING_WINDOW_MS: u32 = 60_000;
+static PAIRING_WINDOW_UNTIL_MS: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+fn pairing_window_open() -> bool {
+    let deadline = PAIRING_WINDOW_UNTIL_MS.load(Ordering::Acquire);
+    if deadline == 0 { return false; }
+    let now = (unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) as u64 / 1_000) as u32;
+    deadline.wrapping_sub(now) <= PAIRING_WINDOW_MS
+}
 
 fn settings_key(key: &[u8]) -> Option<&'static [u8]> {
     SETTINGS_KEYS.iter().copied().find(|known| *known == key)
@@ -74,6 +84,26 @@ pub(crate) fn secret_setting_exists(key: &[u8]) -> bool {
     };
     unsafe { nvs_close(handle) };
     result && length > 1
+}
+
+/// Presence only: a virgin-only NAN pairing invitation must never read the
+/// shared secret or infer ownership from a public VIP prefix.
+pub fn shared_secret_exists() -> bool {
+    // An NVS failure must never make an owned device look virgin. This
+    // predicate also selects the BLE advertisement and NAN pairing wake.
+    if unsafe { nvs_flash_init() } != 0 {
+        return true;
+    }
+    let mut handle = 0_u32;
+    if unsafe { nvs_open(b"sec\0".as_ptr().cast(), NVS_READONLY, &mut handle) } != 0 {
+        return true;
+    }
+    let mut length = 0usize;
+    let status = unsafe {
+        nvs_get_blob(handle, SHARED_SECRET_NVS_KEY.as_ptr().cast(), core::ptr::null_mut(), &mut length)
+    };
+    unsafe { nvs_close(handle) };
+    status != esp_idf_sys::ESP_ERR_NVS_NOT_FOUND as i32
 }
 
 /// Persist a reviewed `sec` value without exposing it through a response.
@@ -202,19 +232,16 @@ pub(crate) fn write_setting(key: &[u8], value: &[u8]) -> bool {
     result
 }
 
-/// Store reviewed binary security material without sending it through a text
-/// or base64 settings path. `cp` is public control-plane material; `sec:key`
-/// is the catalog shared secret and is never readable over control.
+/// Store reviewed binary control-plane material. Pairing secrets need a
+/// transport-verified BLE CoC or direct UART handler, never generic settings.
 pub(crate) fn write_binary_setting(key: &[u8], value: &[u8]) -> bool {
-    let (namespace, nvs_key, secret) = match key {
-        b"cp" => (b"dmesh\0".as_slice(), CONTROL_PLANE_NVS_KEY, false),
-        b"sec:key" => (b"sec\0".as_slice(), SHARED_SECRET_NVS_KEY, true),
+    let (namespace, nvs_key) = match key {
+        b"cp" => (b"dmesh\0".as_slice(), CONTROL_PLANE_NVS_KEY),
         _ => return false,
     };
-    if value.is_empty() || value.len() > dmesh_server::announce::MAX_PUBLIC_KEY {
+    if value.len() != 33 {
         return false;
     }
-    let _ = secret; // Documents the read/redaction boundary above.
     let _ = unsafe { nvs_flash_init() };
     let mut handle = 0_u32;
     if unsafe { nvs_open(namespace.as_ptr().cast(), NVS_READWRITE, &mut handle) } != 0 {
@@ -2340,6 +2367,19 @@ pub(crate) fn receive_tagged_discovery_nodes(
 pub(crate) fn receive_tagged_discovery(
     record: dmesh_server::tagged::Record<'_>,
 ) -> Option<alloc::vec::Vec<u8>> {
+    if let Some(target) = dmesh_server::announce::decode_nan_pair_wakeup_request(record) {
+        let id = record.id?;
+        let queued = crate::wifi_nan_dw_capture_esp::queue_nan_pair_wakeup(target);
+        let mut response = [0u8; 32];
+        let used = dmesh_server::tagged::encode_numeric_response(
+            dmesh_server::announce::ANNOUNCE_COMPONENT,
+            dmesh_server::announce::ANNOUNCE_NAN_PAIR_WAKEUP,
+            id,
+            if queued { &[0xa1, 1, 0xf5] } else { &[0xa1, 1, 0xf4] },
+            &mut response,
+        )?;
+        return Some(alloc::vec::Vec::from(&response[..used]));
+    }
     if let Some(target) = dmesh_server::announce::decode_nan_wakeup_request(record) {
         let id = record.id?;
         let queued = crate::wifi_nan_dw_capture_esp::queue_nan_wakeup(target);
@@ -2562,6 +2602,45 @@ where
     F: FnOnce(&[u8]),
 {
     match dmesh_server::direct::classify(packet) {
+        Some(dmesh_server::direct::DirectMessageKind::PairWakeup) => {
+            let Some(record) = dmesh_server::tagged::decode(packet) else { return false; };
+            let Some(target) = dmesh_server::announce::decode_nan_pair_wakeup_request(record) else { return false; };
+            let station = crate::wifi_esp::interface_mac(crate::wifi_esp::RadioInterface::Sta);
+            let ap = crate::wifi_esp::interface_mac(crate::wifi_esp::RadioInterface::Ap);
+            if (station != Some(target) && ap != Some(target)) || shared_secret_exists() {
+                return false;
+            }
+            // Promote through the same target-checked profile handler as an
+            // ordinary NAN wake. No secret or ownership state is changed by
+            // this unauthenticated invitation.
+            let request = dmesh_server::control::Request::TransportSet {
+                kind: dmesh_server::control::TransportKind::Sta,
+                config: dmesh_server::control::TransportConfig {
+                    wake_target: Some(target),
+                    ..dmesh_server::control::TransportConfig::default()
+                },
+            };
+            let mut encoded = [0u8; 96];
+            let Some(used) = dmesh_server::control::encode_request(request, Some(record.id.unwrap_or(0)), &mut encoded) else { return false; };
+            let Some(control_record) = dmesh_server::tagged::decode(&encoded[..used]) else { return false; };
+            let Some(control_response) = receive_direct_tagged_control(control_record) else { return false; };
+            if dmesh_server::tagged::decode(&control_response).is_none_or(|reply| reply.error.is_some()) {
+                return false;
+            }
+            let now = (unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) as u64 / 1_000) as u32;
+            PAIRING_WINDOW_UNTIL_MS.store(now.wrapping_add(PAIRING_WINDOW_MS), Ordering::Release);
+            let mut response = [0u8; 32];
+            if let Some(used) = dmesh_server::tagged::encode_numeric_response(
+                dmesh_server::announce::ANNOUNCE_COMPONENT,
+                dmesh_server::announce::ANNOUNCE_NAN_PAIR_WAKEUP,
+                record.id.unwrap_or(0),
+                &[0xa1, 1, 0xf5],
+                &mut response,
+            ) {
+                send_response(&response[..used]);
+            }
+            true
+        }
         Some(dmesh_server::direct::DirectMessageKind::DiscoveryRequest) => {
             let Some(record) = dmesh_server::tagged::decode(packet) else {
                 return false;

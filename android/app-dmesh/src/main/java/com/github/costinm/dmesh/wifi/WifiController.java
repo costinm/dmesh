@@ -64,7 +64,7 @@ public final class WifiController {
     private static final String NAN_SERVICE = "dmesh";
     /** Shared fixed AP name. It satisfies the Android P2P DIRECT-xy rule. */
     private static final String P2P_SSID = "DIRECT-dmesh";
-    /** Shared default WPA2 key; an absent transport.start PSK selects it. */
+    /** Shared default WPA2 key; an absent transport.set PSK selects it. */
     private static final String DMESH_WPA2_PASSPHRASE = "untrusted-open-mode";
     private static final String LOHS_SSID = "DIRECT-dmesh";
     private static final String LOHS_PASSPHRASE = DMESH_WPA2_PASSPHRASE;
@@ -122,7 +122,7 @@ public final class WifiController {
     private boolean advertiseAfterGroup;
     private Announce announce = Announce.empty();
     private Discover discover = Discover.empty();
-    /** Last successfully applied immutable transport.start declaration. */
+    /** Last successfully applied immutable transport.set declaration. */
     private String appliedTransportKey = "";
     private String lastEvent = "created";
     private Observer observer;
@@ -178,7 +178,7 @@ public final class WifiController {
     }
 
     /**
-     * Apply the Java projection of the canonical Rust transport.start request.
+     * Apply the Java projection of the canonical Rust transport.set request.
      * Infrastructure STA is an app-scoped {@link WifiNetworkSpecifier} lease:
      * it never persists a credential or changes the user's global Wi-Fi
      * selection. It remains distinct from NAN and P2P even when the device

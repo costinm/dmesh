@@ -371,3 +371,57 @@ pub struct WifiMgmtCaptureRequest {
 /// Capture Wi-Fi management frames on an owned monitor interface
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct WifiMgmtCaptureResponse;
+
+/// Show the paired UART companion, visible port count, and modem lines
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct UartStatusRequest;
+
+/// Show the paired UART companion, visible port count, and modem lines
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct UartStatusResponse;
+
+/// List USB serial ports and observed VIPs without opening them
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct UartDevicesRequest;
+
+/// List USB serial ports and observed VIPs without opening them
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct UartDevicesResponse;
+
+/// Temporarily check one or all listed ports for signed identity
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct UartDiscoverRequest {
+    /// API field `path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// API field `baud`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baud: Option<u32>,
+    /// API field `timeout_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+/// Temporarily check one or all listed ports for signed identity
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct UartDiscoverResponse;
+
+/// Set the paired UART port baud rate
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct UartBaudRequest {
+    /// API field `baud`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baud: Option<u32>,
+}
+
+/// Set the paired UART port baud rate
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct UartBaudResponse;
+
+/// Pulse the paired UART reset control lines
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct UartResetRequest;
+
+/// Pulse the paired UART reset control lines
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct UartResetResponse;

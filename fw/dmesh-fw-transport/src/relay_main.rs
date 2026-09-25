@@ -274,10 +274,10 @@ fn encode_next_hop(encoder: &mut Encoder<'_>, next_hop: NextHop) -> Option<()> {
 }
 
 /// Encode one opaque association path only at the ESP adapter boundary.
-/// QUIC-lite owns the path selection and sees only its `PathId`; the response
+/// QUIC-lite owns the path selection and sees only its `LocalAddress`; the response
 /// projects a transport ID and the adapter's six-byte peer fact for operator
 /// diagnostics.
-fn encode_connection_path(encoder: &mut Encoder<'_>, path: quic_lite::PathId) -> Option<()> {
+fn encode_connection_path(encoder: &mut Encoder<'_>, path: quic_lite::LocalAddress) -> Option<()> {
     encoder.map(2)?;
     encoder.uint(1)?;
     encoder.uint(crate::core_runtime::connection_path_transport(path) as u64)?;

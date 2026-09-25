@@ -19,12 +19,13 @@ import org.json.JSONObject;
 import java.util.Arrays;
 
 public final class UsbDmesh {
-    public static final String PERMISSION_ACTION = "com.github.costinm.dmesh.lm.USB_PERMISSION";
+    private static final String PERMISSION_ACTION = "com.github.costinm.dmesh.lm.USB_PERMISSION";
     private static final int ESPRESSIF_VENDOR_ID = 0x303a;
     private final Context context;
     private final Bridge bridge;
     private final UsbManager manager;
     private final Object lock = new Object();
+    private final BroadcastReceiver receiver = new UsbEventsReceiver(this);
     private volatile boolean started;
     private volatile boolean running;
     private volatile String state = "unavailable";
@@ -59,6 +60,7 @@ public final class UsbDmesh {
             IntentFilter filter = new IntentFilter();
             filter.addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED);
             filter.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED);
+            filter.addAction(PERMISSION_ACTION);
             if (Build.VERSION.SDK_INT >= 33) {
                 context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED);
             } else {
@@ -155,11 +157,10 @@ public final class UsbDmesh {
 
     /**
      * Accept only a grant that identifies the device this instance actually
-     * requested. The receiver is exported, so any app can broadcast the
-     * action; without the device match one forged `granted=false` broadcast
-     * would clear the pending request and make the real grant a no-op.
+     * requested. Keep this check even though the dynamically registered
+     * receiver is not exported: stale grants must not clear a newer request.
      */
-    public boolean onPermissionGranted(UsbDevice device, boolean granted) {
+    private boolean onPermissionGranted(UsbDevice device, boolean granted) {
         synchronized (lock) {
             UsbDevice pending = pendingDevice;
             if (pending == null) return false;
@@ -476,25 +477,35 @@ public final class UsbDmesh {
         return out;
     }
 
-    private final BroadcastReceiver receiver = new BroadcastReceiver() {
+    private static final class UsbEventsReceiver extends BroadcastReceiver {
+        private final UsbDmesh owner;
+
+        UsbEventsReceiver(UsbDmesh owner) {
+            this.owner = owner;
+        }
+
         @Override
         public void onReceive(Context context, Intent intent) {
             String action = intent.getAction();
             if (UsbManager.ACTION_USB_DEVICE_ATTACHED.equals(action)) {
                 UsbDevice device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
-                if (device != null && eligible(device) && !state.equals("connected")) {
-                    if (manager != null && manager.hasPermission(device)) {
-                        openDevice(device);
+                if (device != null && owner.eligible(device) && !owner.state.equals("connected")) {
+                    if (owner.manager != null && owner.manager.hasPermission(device)) {
+                        owner.openDevice(device);
                     } else {
-                        requestPermission(device);
+                        owner.requestPermission(device);
                     }
                 }
             } else if (UsbManager.ACTION_USB_DEVICE_DETACHED.equals(action)) {
                 UsbDevice device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
-                if (device != null && device.getDeviceName().equals(currentDeviceName)) {
-                    close();
+                if (device != null && device.getDeviceName().equals(owner.currentDeviceName)) {
+                    owner.close();
                 }
+            } else if (PERMISSION_ACTION.equals(action)) {
+                UsbDevice device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+                boolean granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false);
+                owner.onPermissionGranted(device, granted);
             }
         }
-    };
+    }
 }

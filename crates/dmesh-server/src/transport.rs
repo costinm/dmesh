@@ -11,7 +11,9 @@ use core::mem::MaybeUninit;
 
 pub use quic_lite::Error;
 use quic_lite::{AssociationProfile, ConnectionCounters, ConnectionDebugState, DatagramClient};
-use quic_lite::{ConnectionId, ConnectionLimits, PathId, ServerStreamConfig, TransportPacket};
+use quic_lite::{
+    ConnectionId, ConnectionLimits, LocalAddress, ServerStreamConfig, TransportPacket,
+};
 
 #[cfg(test)]
 use crate::verified_object::ObjectBodyStream as ObjectRecordStream;
@@ -44,7 +46,7 @@ pub struct ObjectUploadClient<const HISTORY: usize, const PACKET: usize> {
     response: [u8; PACKET],
     response_len: usize,
     terminal_before_records: bool,
-    path: PathId,
+    path: LocalAddress,
     last_admission_block: Option<Error>,
 }
 
@@ -57,7 +59,7 @@ impl<const HISTORY: usize, const PACKET: usize> ObjectUploadClient<HISTORY, PACK
         if command.is_empty() || command.len() > PACKET {
             return Err(Error::BufferTooSmall);
         }
-        let path = PathId::new(1).ok_or(Error::Invalid)?;
+        let path = LocalAddress::new(1).ok_or(Error::Invalid)?;
         let mut stored = [0; PACKET];
         stored[..command.len()].copy_from_slice(command);
         let mut association = quic_lite::ClientAssociation::new(client_cid);
@@ -406,8 +408,8 @@ pub struct EgressPumpResult {
 pub struct ActiveConnectionStatus {
     pub receive_cid: ConnectionId,
     pub peer_cid: ConnectionId,
-    pub active_path: Option<PathId>,
-    pub known_paths: [Option<PathId>; 4],
+    pub active_path: Option<LocalAddress>,
+    pub known_paths: [Option<LocalAddress>; 4],
     pub streams: quic_lite::ConnectionStreamStats,
     pub transport: quic_lite::TransportStats,
     /// Monotonic timestamp supplied to [`ConnectionDispatcher::set_time`] at
@@ -636,7 +638,7 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
     /// frame cannot redirect a response or retransmission.
     pub fn receive(
         &mut self,
-        path: PathId,
+        path: LocalAddress,
         packet: &[u8],
         output: &mut [u8; PACKET],
     ) -> Result<Option<usize>, Error> {
@@ -801,7 +803,7 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
     /// Select a live association by its local receive CID and return its
     /// current opaque path. Deferred handler work must use this instead of a
     /// bearer path, because several associations may share one UDP tuple.
-    pub fn select_receive_cid(&mut self, receive_cid: ConnectionId) -> Option<PathId> {
+    pub fn select_receive_cid(&mut self, receive_cid: ConnectionId) -> Option<LocalAddress> {
         self.core
             .select_receive_cid(receive_cid, ConnectionServer::expected_receive_cid)
     }
@@ -879,7 +881,7 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
     /// same-bearer replies while preserving a clean hook for multipath policy.
     pub fn poll_for(
         &mut self,
-        path: PathId,
+        path: LocalAddress,
         output: &mut [u8; PACKET],
     ) -> Result<Option<usize>, Error> {
         if self.core.active_path() != Some(path) {
@@ -900,7 +902,7 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
     /// timer turn for its MAX_* update.
     pub fn finish_receive_turn(
         &mut self,
-        path: PathId,
+        path: LocalAddress,
         immediate: Option<usize>,
         output: &mut [u8; PACKET],
     ) -> Result<Option<usize>, Error> {
@@ -923,7 +925,7 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
     /// the QUIC-lite endpoint ledger owns the retransmittable packet.
     pub fn poll_retransmit_for(
         &mut self,
-        path: PathId,
+        path: LocalAddress,
         now_us: u64,
         pto_us: u64,
         output: &mut [u8; PACKET],
@@ -948,7 +950,7 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
     /// their service order and is independent of bearer and handler.
     pub fn poll_service_for(
         &mut self,
-        path: PathId,
+        path: LocalAddress,
         now_us: u64,
         pto_us: u64,
         output: &mut [u8; PACKET],
@@ -959,14 +961,14 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
         )
     }
 
-    pub fn reply_path(&self) -> Option<PathId> {
+    pub fn reply_path(&self) -> Option<LocalAddress> {
         self.core.active_path()
     }
 
     /// Whether an admitted association still owns this opaque platform path.
     /// Adapters use this only to reclaim stale address bindings; it exposes no
     /// CID, peer address, or transport state.
-    pub fn has_path(&self, path: PathId) -> bool {
+    pub fn has_path(&self, path: LocalAddress) -> bool {
         self.core.association_for_path(path).is_some()
     }
 
@@ -983,7 +985,7 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
     /// This method retains no packet and performs no transport
     /// work, so it is safe for the shared ingress owner to use as its routing
     /// predicate.
-    pub fn owns_packet_for_path(&self, path: PathId, packet: &[u8]) -> bool {
+    pub fn owns_packet_for_path(&self, path: LocalAddress, packet: &[u8]) -> bool {
         let _ = path;
         self.core.owns_packet(packet, |server| {
             server
@@ -1104,7 +1106,7 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
 
     /// Earliest timer target across all live associations. The receive CID
     /// keeps two clients on one physical path distinct.
-    pub fn next_service_target(&self, pto: u64) -> Option<(ConnectionId, PathId, u64)> {
+    pub fn next_service_target(&self, pto: u64) -> Option<(ConnectionId, LocalAddress, u64)> {
         self.core
             .earliest_deadline(ConnectionServer::expected_receive_cid, |server| {
                 server.next_service_deadline(pto)
@@ -1119,7 +1121,7 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
     /// or PTO packet is due.  It only lets a handler start asynchronous work
     /// (for example, a verified-object sink's erase) without waiting for a
     /// further peer datagram to manufacture a QUIC deadline.
-    pub fn service_target_or_active(&self, pto: u64) -> Option<(ConnectionId, PathId, u64)> {
+    pub fn service_target_or_active(&self, pto: u64) -> Option<(ConnectionId, LocalAddress, u64)> {
         self.next_service_target(pto).or_else(|| {
             let path = self.core.active_path()?;
             let server = self.core.association_for_path(path)?;
@@ -1290,7 +1292,7 @@ pub fn receive_server_turn<
     const ASSOCIATIONS: usize,
 >(
     service: &mut ConnectionDispatcher<HISTORY, PACKET, ASSOCIATIONS>,
-    path: PathId,
+    path: LocalAddress,
     packet: &[u8],
     now: u64,
     output: &mut [u8; PACKET],
@@ -1299,7 +1301,8 @@ pub fn receive_server_turn<
 ) -> Result<Option<usize>, Error>
 where
     Before: FnOnce(&mut ConnectionDispatcher<HISTORY, PACKET, ASSOCIATIONS>, u64),
-    After: FnOnce(&mut ConnectionDispatcher<HISTORY, PACKET, ASSOCIATIONS>, PathId, u64, bool),
+    After:
+        FnOnce(&mut ConnectionDispatcher<HISTORY, PACKET, ASSOCIATIONS>, LocalAddress, u64, bool),
 {
     service.set_time(now);
     before_receive(service, now);
@@ -1320,14 +1323,14 @@ pub fn poll_server_turn<
     const ASSOCIATIONS: usize,
 >(
     service: &mut ConnectionDispatcher<HISTORY, PACKET, ASSOCIATIONS>,
-    path: PathId,
+    path: LocalAddress,
     now: u64,
     pto: u64,
     output: &mut [u8; PACKET],
     before_poll: Before,
 ) -> Result<Option<usize>, Error>
 where
-    Before: FnOnce(&mut ConnectionDispatcher<HISTORY, PACKET, ASSOCIATIONS>, PathId, u64),
+    Before: FnOnce(&mut ConnectionDispatcher<HISTORY, PACKET, ASSOCIATIONS>, LocalAddress, u64),
 {
     service.set_time(now);
     before_poll(service, path, now);
@@ -1347,12 +1350,12 @@ pub fn stream_consumer_ready_server_turn<
     pto: u64,
     output: &mut [u8; PACKET],
     consumer_ready: Ready,
-) -> Result<Option<(PathId, usize)>, Error>
+) -> Result<Option<(LocalAddress, usize)>, Error>
 where
     Ready: FnOnce(
         &mut ConnectionDispatcher<HISTORY, PACKET, ASSOCIATIONS>,
         u64,
-    ) -> Result<Option<PathId>, ()>,
+    ) -> Result<Option<LocalAddress>, ()>,
 {
     service.set_time(now);
     let Some(path) = consumer_ready(service, now).map_err(|_| Error::Invalid)? else {
@@ -1628,7 +1631,7 @@ impl<const HISTORY: usize, const PACKET: usize> SharedConnectionRuntime<HISTORY,
 
     pub fn receive_at(
         &self,
-        path: PathId,
+        path: LocalAddress,
         packet: &[u8],
         now: u64,
         output: &mut [u8; PACKET],
@@ -1641,7 +1644,7 @@ impl<const HISTORY: usize, const PACKET: usize> SharedConnectionRuntime<HISTORY,
 
     pub fn poll_for(
         &self,
-        path: PathId,
+        path: LocalAddress,
         output: &mut [u8; PACKET],
     ) -> Result<Option<usize>, Error> {
         self.with(|dispatcher| dispatcher.poll_for(path, output))
@@ -1649,7 +1652,7 @@ impl<const HISTORY: usize, const PACKET: usize> SharedConnectionRuntime<HISTORY,
 
     pub fn poll_retransmit_for(
         &self,
-        path: PathId,
+        path: LocalAddress,
         now: u64,
         pto: u64,
         output: &mut [u8; PACKET],
@@ -1657,7 +1660,7 @@ impl<const HISTORY: usize, const PACKET: usize> SharedConnectionRuntime<HISTORY,
         self.with(|dispatcher| dispatcher.poll_retransmit_for(path, now, pto, output))
     }
 
-    pub fn reply_path(&self) -> Option<PathId> {
+    pub fn reply_path(&self) -> Option<LocalAddress> {
         self.with(|dispatcher| dispatcher.reply_path())
     }
 
@@ -3362,7 +3365,7 @@ mod tests {
             0x00, 0x80, 0x04, 0x00, 0x00, 0x00,
         ];
         let server_cid = ConnectionId::new(0x999).unwrap();
-        let path = PathId::new(1).unwrap();
+        let path = LocalAddress::new(1).unwrap();
         let mut dispatcher = ConnectionDispatcher::<64, 1100, 12>::new(
             server_cid,
             ConnectionLimits::default(),
@@ -3425,7 +3428,7 @@ mod tests {
             Some(response[..used].to_vec())
         });
         let server_cid = ConnectionId::new(0x999).unwrap();
-        let path = PathId::new(1).unwrap();
+        let path = LocalAddress::new(1).unwrap();
         let mut dispatcher =
             ConnectionDispatcher::<64, 1100, 12>::new(server_cid, limits, association);
         dispatcher.set_association_idle_timeout(Some(0));
@@ -3457,7 +3460,7 @@ mod tests {
     fn dispatcher_advertises_and_recovers_a_reset_from_device_secret_branch() {
         let client_cid = ConnectionId::new(0x91).unwrap();
         let server_cid = ConnectionId::new(0x92).unwrap();
-        let path = PathId::new(1).unwrap();
+        let path = LocalAddress::new(1).unwrap();
         let reset_key = quic_lite::StatelessResetKey::from_device_secret(&[0x7c; 32]).unwrap();
         let mut client = quic_lite::ClientAssociation::<4, 1200>::new(client_cid);
         let mut packet = [0u8; 1200];
@@ -3589,7 +3592,7 @@ mod tests {
     fn retained_probe_reuses_the_tagged_association_and_allocates_a_new_stream() {
         let client_cid = ConnectionId::new(0x7101).unwrap();
         let server_cid = ConnectionId::new(0x7102).unwrap();
-        let path = PathId::new(0x7103).unwrap();
+        let path = LocalAddress::new(0x7103).unwrap();
         let request = [0xa3, 1, 0x1a, 0, 0, 0xea, 0x61, 2, 1, 3, 1];
         let mut tagged = TaggedClient::<4, 1200>::new(client_cid, &request).unwrap();
         tagged.set_close_when_complete(false);
@@ -3835,7 +3838,7 @@ mod tests {
 
     #[test]
     fn finish_receive_turn_preserves_an_immediate_transport_packet() {
-        let path = PathId::new(1).unwrap();
+        let path = LocalAddress::new(1).unwrap();
         let mut dispatcher = ConnectionDispatcher::<2, 1200>::new(
             ConnectionId::new(61).unwrap(),
             ConnectionLimits::default(),
@@ -3954,7 +3957,7 @@ mod tests {
     fn flash_object_credit_after_an_immediate_ack_advances_selected_stream() {
         let client = ConnectionId::new(81).unwrap();
         let server = ConnectionId::new(82).unwrap();
-        let path = PathId::new(81).unwrap();
+        let path = LocalAddress::new(81).unwrap();
         let limits = ConnectionLimits {
             max_data: 64,
             max_stream_data: 64,
@@ -4475,7 +4478,7 @@ mod tests {
     fn zero_retention_dispatcher_keeps_open_across_adapter_clock_turn() {
         let client_cid = ConnectionId::new(0x1660).unwrap();
         let server_cid = ConnectionId::new(0x1770).unwrap();
-        let path = PathId::new(1).unwrap();
+        let path = LocalAddress::new(1).unwrap();
         let mut client = status_test_client(client_cid, 0x1235);
         let mut server = ConnectionDispatcher::<4, 1200, 4>::new(
             server_cid,
@@ -4623,8 +4626,8 @@ mod tests {
             raw_tagged_test_handler
         ));
         let request = [0xa3, 1, 0x1a, 0, 0, 0xea, 0x62, 2, 1, 3, 8];
-        let uart_path = PathId::new(0x6001).unwrap();
-        let action_path = PathId::new(0x6002).unwrap();
+        let uart_path = LocalAddress::new(0x6001).unwrap();
+        let action_path = LocalAddress::new(0x6002).unwrap();
         let mut client =
             TaggedClient::<4, 1200>::new(ConnectionId::new(0x168).unwrap(), &request).unwrap();
         let mut dispatcher = ConnectionDispatcher::<4, 1200>::new(
@@ -4668,7 +4671,7 @@ mod tests {
             raw_tagged_test_handler
         ));
         let request = [0xa3, 1, 0x1a, 0, 0, 0xea, 0x67, 2, 1, 3, 9];
-        let path = PathId::new(0x6007).unwrap();
+        let path = LocalAddress::new(0x6007).unwrap();
         let mut client =
             TaggedClient::<4, 1200>::new(ConnectionId::new(0x16d).unwrap(), &request).unwrap();
         let mut dispatcher = ConnectionDispatcher::<4, 1200>::new(
@@ -4717,7 +4720,7 @@ mod tests {
             raw_tagged_test_handler
         ));
         let request = [0xa3, 1, 0x1a, 0, 0, 0xea, 0x68, 2, 1, 3, 10];
-        let path = PathId::new(0x6008).unwrap();
+        let path = LocalAddress::new(0x6008).unwrap();
         let mut client =
             TaggedClient::<4, 1200>::new(ConnectionId::new(0x16e).unwrap(), &request).unwrap();
         client.set_close_when_complete(false);
@@ -4779,7 +4782,7 @@ mod tests {
             raw_tagged_test_handler
         ));
         let first = [0xa3, 1, 0x1a, 0, 0, 0xea, 0x65, 2, 1, 3, 1];
-        let path = PathId::new(0x6005).unwrap();
+        let path = LocalAddress::new(0x6005).unwrap();
         let client_cid = ConnectionId::new(0x16b).unwrap();
         let mut client = TaggedClient::<16, 1200>::new(client_cid, &first).unwrap();
         client.set_close_when_complete(false);
@@ -4877,9 +4880,9 @@ mod tests {
         ));
         let first = [0xa3, 1, 0x1a, 0, 0, 0xea, 0x66, 2, 1, 3, 1];
         let second = [0xa3, 1, 0x1a, 0, 0, 0xea, 0x66, 2, 1, 3, 2];
-        let uart_path = PathId::new(0x6201).unwrap();
-        let now_path = PathId::new(0x6202).unwrap();
-        let udp_path = PathId::new(0x6203).unwrap();
+        let uart_path = LocalAddress::new(0x6201).unwrap();
+        let now_path = LocalAddress::new(0x6202).unwrap();
+        let udp_path = LocalAddress::new(0x6203).unwrap();
         let client_cid = ConnectionId::new(0x16c).unwrap();
         let mut client = TaggedClient::<4, 1200>::new(client_cid, &first).unwrap();
         client.set_close_when_complete(false);
@@ -4964,8 +4967,8 @@ mod tests {
             raw_tagged_test_handler
         ));
         let request = [0xa3, 1, 0x1a, 0, 0, 0xea, 0x64, 2, 1, 3, 10];
-        let uart_path = PathId::new(0x6101).unwrap();
-        let udp_path = PathId::new(0x6102).unwrap();
+        let uart_path = LocalAddress::new(0x6101).unwrap();
+        let udp_path = LocalAddress::new(0x6102).unwrap();
         let client_cid = ConnectionId::new(0x16a).unwrap();
         let mut client = TaggedClient::<4, 1200>::new(client_cid, &request).unwrap();
         let mut dispatcher = ConnectionDispatcher::<4, 1200>::new(
@@ -5028,7 +5031,7 @@ mod tests {
             raw_tagged_test_handler
         ));
         let request = [0xa3, 1, 0x1a, 0, 0, 0xea, 0x63, 2, 1, 3, 9];
-        let path = PathId::new(0x6003).unwrap();
+        let path = LocalAddress::new(0x6003).unwrap();
         let mut client =
             TaggedClient::<4, 1200>::new(ConnectionId::new(0x169).unwrap(), &request).unwrap();
         let mut driver = DatagramClientDriver::start(&mut client, 0).unwrap();
@@ -5260,7 +5263,7 @@ mod tests {
     fn status_test_recovers_a_lost_action_response_from_the_shared_ledger() {
         let client_cid = ConnectionId::new(0x86).unwrap();
         let server_cid = ConnectionId::new(0x97).unwrap();
-        let path = PathId::new(0x0207).unwrap();
+        let path = LocalAddress::new(0x0207).unwrap();
         let mut client = status_test_client(client_cid, 0x2345);
         let mut server = ConnectionDispatcher::<4, 1200>::new(
             server_cid,
@@ -5308,7 +5311,7 @@ mod tests {
         let server_cid = ConnectionId::new(0x9876).unwrap();
         let first_cid = ConnectionId::new(0x9877).unwrap();
         let second_cid = ConnectionId::new(0x9878).unwrap();
-        let path = PathId::new(0x0108).unwrap();
+        let path = LocalAddress::new(0x0108).unwrap();
         let mut dispatcher = ConnectionDispatcher::<8, 1200>::new(
             server_cid,
             ConnectionLimits::default(),
@@ -5371,8 +5374,8 @@ mod tests {
             ConnectionLimits::default(),
             AssociationProfile::conservative(),
         );
-        let first_path = PathId::new(0x0201).unwrap();
-        let foreign_path = PathId::new(0x0202).unwrap();
+        let first_path = LocalAddress::new(0x0201).unwrap();
+        let foreign_path = LocalAddress::new(0x0202).unwrap();
         let mut first =
             ProbeClient::<8, 1200>::new(ConnectionId::new(0x9911).unwrap(), 64).unwrap();
         let mut foreign =
@@ -5439,7 +5442,7 @@ mod tests {
 
     #[test]
     fn multi_association_dispatcher_keeps_two_firmware_peers_live() {
-        let first_path = PathId::new(0x5101).unwrap();
+        let first_path = LocalAddress::new(0x5101).unwrap();
         // Two independent UDP clients can share the same peer tuple when the
         // host falls back to an ephemeral local port. The path is therefore
         // deliberately identical; only each association's CID is unique.
@@ -5519,7 +5522,7 @@ mod tests {
     fn replacing_association_retires_only_quic_state() {
         let server_cid = ConnectionId::new(0x9981).unwrap();
         let client_cid = ConnectionId::new(0x9982).unwrap();
-        let path = PathId::new(0x0209).unwrap();
+        let path = LocalAddress::new(0x0209).unwrap();
         let mut dispatcher = ConnectionDispatcher::<8, 1200>::new(
             server_cid,
             ConnectionLimits::default(),
@@ -5549,8 +5552,8 @@ mod tests {
     fn bearer_profile_change_preserves_live_connection_for_path_migration() {
         let server_cid = ConnectionId::new(0x99a1).unwrap();
         let client_cid = ConnectionId::new(0x99a2).unwrap();
-        let uart_path = PathId::new(0x0301).unwrap();
-        let udp_path = PathId::new(0x0302).unwrap();
+        let uart_path = LocalAddress::new(0x0301).unwrap();
+        let udp_path = LocalAddress::new(0x0302).unwrap();
         let mut dispatcher = ConnectionDispatcher::<8, 1200>::new(
             server_cid,
             ConnectionLimits::default(),
@@ -5590,8 +5593,8 @@ mod tests {
         let server_cid = ConnectionId::new(0x99b1).unwrap();
         let first_client_cid = ConnectionId::new(0x99b2).unwrap();
         let second_client_cid = ConnectionId::new(0x99b3).unwrap();
-        let first_path = PathId::new(0x0311).unwrap();
-        let second_path = PathId::new(0x0312).unwrap();
+        let first_path = LocalAddress::new(0x0311).unwrap();
+        let second_path = LocalAddress::new(0x0312).unwrap();
         let original = AssociationProfile::c6_default();
         let resampled = AssociationProfile::conservative();
         let mut dispatcher =
@@ -5724,8 +5727,8 @@ mod tests {
             recovery_association,
         );
         let mut server_packet = [0u8; 1200];
-        let mut egress = quic_lite::connection::DatagramEgressDriver::<PathId, 1200>::new();
-        let path = PathId::new(1).unwrap();
+        let mut egress = quic_lite::connection::DatagramEgressDriver::<LocalAddress, 1200>::new();
+        let path = LocalAddress::new(1).unwrap();
         let mut callback_queue = std::collections::VecDeque::new();
         let mut callback_drops = 0usize;
         let callback_capacity = recovery_association.initial_window_packets;
@@ -5915,7 +5918,7 @@ mod tests {
         let mut response = [0_u8; 1200];
         assert!(
             dispatcher
-                .receive(PathId::new(1).unwrap(), initial, &mut response)
+                .receive(LocalAddress::new(1).unwrap(), initial, &mut response)
                 .unwrap()
                 .is_some()
         );
@@ -5942,7 +5945,7 @@ mod tests {
         let mut response = [0_u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
         assert!(
             dispatcher
-                .receive(PathId::new(1).unwrap(), initial, &mut response)
+                .receive(LocalAddress::new(1).unwrap(), initial, &mut response)
                 .unwrap()
                 .is_some()
         );
@@ -5963,7 +5966,7 @@ mod tests {
         let mut response = [0_u8; MTU];
         let response_len = dispatcher
             .receive(
-                PathId::new(1).unwrap(),
+                LocalAddress::new(1).unwrap(),
                 &initial[..initial_len],
                 &mut response,
             )
@@ -6015,7 +6018,7 @@ mod tests {
             let mut response = [0_u8; MTU];
             let response_len = dispatcher
                 .receive(
-                    PathId::new(packets).unwrap(),
+                    LocalAddress::new(packets).unwrap(),
                     &initial[..initial_len],
                     &mut response,
                 )
@@ -6116,7 +6119,7 @@ mod tests {
             )
             .unwrap();
             let mut driver = quic_lite::DatagramClientDriver::start(&mut client, 0).unwrap();
-            let path = PathId::new(1).unwrap();
+            let path = LocalAddress::new(1).unwrap();
             let mut listener = ConnectionDispatcher::<8, 1200>::new(
                 server_cid,
                 ConnectionLimits::with_receive_window(1200),
@@ -6195,7 +6198,7 @@ mod tests {
         // stop-and-wait at an ordinary Wi-Fi RTT, which is not a useful
         // baseline for this transport regression.
         let limits = quic_lite::ConnectionLimits::with_receive_profile(8_800, 2_200, 4);
-        let path = PathId::new(1).unwrap();
+        let path = LocalAddress::new(1).unwrap();
         // Keep the real long-lived firmware dispatcher across every client.
         // Each completed client intentionally leaves its final CLOSE pending,
         // reproducing a UART/UDP process exit where that last packet is lost.

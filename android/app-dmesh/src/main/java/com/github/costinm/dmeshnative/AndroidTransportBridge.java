@@ -2,7 +2,6 @@ package com.github.costinm.dmeshnative;
 
 import android.content.Context;
 import android.content.Intent;
-import android.hardware.usb.UsbDevice;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.Build;
@@ -176,7 +175,6 @@ public final class AndroidTransportBridge implements Ble.BearerBridge {
         if ("usb".equals(bearer)) return usb.writeFrame(frame, length);
         return false;
     }
-    public void onUsbPermission(UsbDevice device, boolean granted) { usb.onPermissionGranted(device, granted); }
     public String usbCommand(String method, String params) {
         try {
             JSONObject request = new JSONObject(params == null || params.isEmpty() ? "{}" : params);
@@ -376,6 +374,22 @@ public final class AndroidTransportBridge implements Ble.BearerBridge {
                         ? "{\"status\":\"accepted\",\"operation\":\"ble.connect\"}"
                         : "{\"status\":\"rejected\",\"operation\":\"ble.connect\"}";
             }
+            if ("companion.pair".equals(method)) {
+                if (!"ble".equals(request.optString("kind", "")))
+                    return "{\"status\":\"unsupported\",\"operation\":\"companion.pair\"}";
+                boolean started = ble.pair(request.optString("id", ""), request.optInt("psm", 128));
+                return started
+                        ? "{\"status\":\"accepted\",\"kind\":\"ble\"}"
+                        : "{\"status\":\"rejected\",\"kind\":\"ble\"}";
+            }
+            if ("companion.unpair".equals(method)) {
+                String id = request.optString("id", "");
+                if (!"ble".equals(request.optString("kind", "")) || id.isEmpty()
+                        || !id.equalsIgnoreCase(ble.pairedAddress()))
+                    return "{\"status\":\"rejected\",\"operation\":\"companion.unpair\"}";
+                ble.disconnect();
+                return "{\"status\":\"accepted\",\"kind\":\"ble\"}";
+            }
             if ("ble.disconnect".equals(method)) {
                 ble.disconnect();
                 return "{\"status\":\"accepted\",\"operation\":\"ble.disconnect\"}";
@@ -415,17 +429,10 @@ public final class AndroidTransportBridge implements Ble.BearerBridge {
     public String transportCommand(String method, String params) {
         try {
             JSONObject request = new JSONObject(params == null || params.isEmpty() ? "{}" : params);
-            if ("transport.status".equals(method)) {
-                JSONObject status = new JSONObject();
-                status.put("snapshot", snapshot());
-                status.put("sta_ssid", currentStaSsid());
-                status.put("ap_active", apActive());
-                return status.toString();
-            }
             if ("transport.apply_projection".equals(method)) {
                 return applyRustProjection(request.optString("projection", ""));
             }
-            if ("transport.start".equals(method)) {
+            if ("transport.wake".equals(method)) {
                 return requestNanActivation(request);
             }
             return "{\"status\":\"unsupported\",\"operation\":\"" + method + "\"}";
@@ -440,12 +447,12 @@ public final class AndroidTransportBridge implements Ble.BearerBridge {
             target = macBytes(request.optString("target_mac", ""));
         } catch (Exception e) {
             MeshNode.recordNanEvent("aware.nan_activation_rejected", "", new byte[0]);
-            return "{\"status\":\"rejected\",\"operation\":\"transport.start\",\"reason\":\"invalid_target_mac\"}";
+            return "{\"status\":\"rejected\",\"operation\":\"transport.set\",\"reason\":\"invalid_target_mac\"}";
         }
         if (source == null || source.length < 6 || target.length != 6
                 || baselineNanDiscoverRecord == null) {
             MeshNode.recordNanEvent("aware.nan_activation_rejected", "", new byte[0]);
-            return "{\"status\":\"rejected\",\"operation\":\"transport.start\",\"reason\":\"nan_unready\"}";
+            return "{\"status\":\"rejected\",\"operation\":\"transport.set\",\"reason\":\"nan_unready\"}";
         }
         byte[] activation = MeshNode.buildNanActivation(
                 Arrays.copyOf(source, 6),
@@ -458,7 +465,7 @@ public final class AndroidTransportBridge implements Ble.BearerBridge {
                 request.optInt("nan_dw_interval", 1));
         if (activation.length == 0) {
             MeshNode.recordNanEvent("aware.nan_activation_rejected", "", new byte[0]);
-            return "{\"status\":\"rejected\",\"operation\":\"transport.start\",\"reason\":\"build_failed\"}";
+            return "{\"status\":\"rejected\",\"operation\":\"transport.set\",\"reason\":\"build_failed\"}";
         }
         nanDiscoveryRequestId = (nanDiscoveryRequestId + 1) & 0xffff_ffffL;
         requestTemporaryActiveSubscribe(nanDiscoverRecord(), activation,
@@ -468,7 +475,7 @@ public final class AndroidTransportBridge implements Ble.BearerBridge {
         JSONObject accepted = new JSONObject();
         try {
             accepted.put("status", "accepted");
-            accepted.put("operation", "transport.start");
+            accepted.put("operation", "transport.set");
             accepted.put("target_mac", request.optString("target_mac", ""));
         } catch (Exception ignored) { }
         return accepted.toString();

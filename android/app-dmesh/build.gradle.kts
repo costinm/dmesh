@@ -91,9 +91,6 @@ dependencies {
     //implementation("androidx.core:core:1.17.0")
 
     implementation(project(mapOf("path" to ":android:lib-dmesh")))
-    // The Wi-Fi owner is shared with the standalone P2P/NAN qualifier. DMesh
-    // switches command handling to it during the next migration phase.
-    implementation(project(mapOf("path" to ":android:dmesh-wifi")))
 
     //implementation(libs.androidx.monitor)
 

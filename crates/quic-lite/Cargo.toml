@@ -7,11 +7,13 @@ publish = false
 [features]
 default = []
 std = []
+tokio = ["std", "dep:tokio"]
 
 [dependencies]
 hmac = { version = "0.13", default-features = false }
 mesh-api = { git = "https://github.com/costinm/ssh-mesh", package = "mesh-api" }
 sha2 = { version = "0.11", default-features = false }
+tokio = { version = "1", default-features = false, features = ["sync"], optional = true }
 
 [lib]
 name = "quic_lite"

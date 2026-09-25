@@ -1,8 +1,15 @@
-//! Small reusable Linux HCI boundary for BLE discovery/advertising.
+//! Linux BLE adapter for DMesh discovery, advertising, and HCI access.
 //!
-//! Wi-Fi services may depend on this crate when BLE is explicitly enabled,
-//! but the HCI socket and packet encoding do not belong to the Wi-Fi radio
-//! implementation.
+//! The `lmesh` daemon integrates this crate, but transport mechanics live here
+//! so the mesh integration layer does not implement a platform bearer.
+
+mod coc;
+mod service;
+mod wire;
+
+pub use coc::{COC_FRAME_MAX, CocChannel, DEFAULT_COC_PSM};
+pub use service::BleService;
+pub use wire::{Advertisement, DMESH_BLE_SERVICE_UUID16};
 
 use anyhow::{Context, Result, bail};
 use std::os::fd::{AsRawFd, RawFd};

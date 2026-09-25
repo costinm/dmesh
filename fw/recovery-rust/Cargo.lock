@@ -711,6 +711,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "mesh-api"
 version = "0.1.0"
+source = "git+https://github.com/costinm/ssh-mesh#b9b4b8e5aa26bf177e73e68943297dc806e987ca"
 
 [[package]]
 name = "minimal-lexical"

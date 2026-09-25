@@ -10,7 +10,7 @@ The [root API](../../API.md) defines the method and field tags. Its formal
 sections are projected into the installed tools catalog; HTTP accepts JSON
 and translates requests at the tagged-CBOR service boundary.
 
-Platform integrations (fw/, crates/dmesh, crates/lmesh) are adapters, not
+Platform integrations (fw/, crates/dmesh-android, crates/lmesh) are adapters, not
 command owners. Android, Linux, ESP32 have different implementations and
 may only support a subset of the APIs.
 
@@ -435,8 +435,8 @@ Radio snapshots remain separate observations and do not initiate a connection.
 
 The machine-readable schema is
 [`schemas/radio-lab.schema.json`](schemas/radio-lab.schema.json).  The
-`dmesh-cli` firmware schema catalog imports its method/field tags and types so
-the same records are sent through the normal QUIC hardware-service stream.
+`dmesh-cli` uses the installed `lmesh` tools catalog for method and field tags
+so the same records are sent through the normal QUIC hardware-service stream.
 
 ## Telemetry interpretation
 

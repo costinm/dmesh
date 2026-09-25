@@ -1,376 +1,64 @@
 use anyhow::{Context, Result};
-use mesh::tagged::{NameOrTag, TaggedCatalog, TaggedRecord};
-use serde::Deserialize;
-use serde_json::{Map, Value, json};
-use std::collections::BTreeMap;
-
-// TODO: move common (device free) to ssh-mesh, evaluate the rest.
+use mesh::tagged::{NameOrTag, TaggedSchema};
+use serde_json::{Map, Value};
+use std::sync::Arc;
 
 const CATALOG_SERVICE: &str = "lmesh";
 
-#[derive(Clone, Debug, Default, Deserialize)]
-pub(crate) struct FirmwareSchemaFile {
-    #[serde(default)]
-    pub methods: Vec<SchemaMethod>,
-    #[serde(default)]
-    pub messages: Vec<SchemaMessage>,
+/// The installed service catalog is the source for named and tagged requests.
+pub fn load_tagged_schema() -> Arc<TaggedSchema> {
+    mesh::catalog::service_catalog_resolver()
+        .require(CATALOG_SERVICE)
+        .unwrap_or_else(|error| panic!("load {CATALOG_SERVICE} tools.json: {error}"))
+        .catalog
+        .clone()
 }
 
-#[derive(Clone, Debug, Deserialize)]
-pub(crate) struct SchemaMethod {
-    pub id: u16,
-    pub name: String,
-    /// Optional common tagged component used by stream dispatch and rendering.
-    #[serde(default)]
-    pub component: Option<u16>,
-    #[serde(default)]
-    pub fields: Vec<SchemaField>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub(crate) struct SchemaMessage {
-    pub name: String,
-    #[serde(default)]
-    pub format: Option<String>,
-    #[allow(dead_code)]
-    #[serde(default)]
-    pub fields: Vec<SchemaField>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub(crate) struct SchemaField {
-    #[serde(default)]
-    pub id: Option<u16>,
-    pub name: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub kind: Option<String>,
-    /// Textual enum spelling accepted by `dmesh-cli --msg`, mapped to
-    /// the canonical numeric CBOR value.  This keeps command formatting in
-    /// the generated schema instead of hard-coding radio lab vocabulary in
-    /// the UART bearer client.
-    #[serde(default)]
-    pub values: BTreeMap<String, u64>,
-}
-
-/// Host-side vocabulary for compact firmware CBOR. It is independent of a
-/// particular bearer: device sessions use the same schema over UART, UDP, or
-/// any later QUIC-lite path.
-#[derive(Clone, Debug, Default)]
-pub struct FirmwareSchema {
-    methods: BTreeMap<String, SchemaMethod>,
-    fields: BTreeMap<String, BTreeMap<u16, String>>,
-    messages: BTreeMap<String, SchemaMessage>,
-    catalog: mesh::cbor::Catalog,
-    /// Numeric tagged-CBOR catalog for the direct-record boundary.  It is
-    /// built from the installed schema artifact, so the CLI never needs to
-    /// manufacture the retired compact `{0,6}` map and translate it again.
-    tagged_catalog: TaggedCatalog,
-}
-
-impl FirmwareSchema {
-    pub fn load() -> Self {
-        let resolved = mesh::catalog::service_catalog_resolver()
-            .resolve(CATALOG_SERVICE)
-            .unwrap_or_else(|| {
-                panic!(
-                    "missing {CATALOG_SERVICE} tools.json; set MESH_SCHEMA_DIR or install /opt/{CATALOG_SERVICE}/etc/schemas/tools.json"
-                )
-            })
-            .unwrap_or_else(|error| panic!("load {CATALOG_SERVICE} tools.json: {error}"));
-        let tools = resolved
+/// Only device-advertised methods are sent across the device bearer.
+pub fn is_stream_command_name(name: &str) -> bool {
+    let resolved = mesh::catalog::service_catalog_resolver()
+        .require(CATALOG_SERVICE)
+        .unwrap_or_else(|error| panic!("load {CATALOG_SERVICE} tools.json: {error}"));
+    resolved.catalog.method(name).is_some()
+        && resolved
             .tools
             .get("tools")
             .and_then(Value::as_array)
             .or_else(|| resolved.tools.as_array())
-            .expect("lmesh tools.json must contain tools");
-        let mut core = FirmwareSchemaFile::default();
-        for tool in tools.iter().filter(|tool| tool["x-dmesh-device"] == true) {
-            let properties = tool["inputSchema"]["properties"]
-                .as_object()
-                .expect("device tool must have inputSchema.properties");
-            let fields = properties
-                .iter()
-                .map(|(name, property)| SchemaField {
-                    id: property["x-protobuf-index"].as_u64().map(|id| id as u16),
-                    name: name.clone(),
-                    kind: property["x-dmesh-kind"].as_str().map(str::to_owned),
-                    values: property
-                        .get("x-dmesh-values")
-                        .and_then(|value| serde_json::from_value(value.clone()).ok())
-                        .unwrap_or_default(),
-                })
-                .collect();
-            core.methods.push(SchemaMethod {
-                id: tool["x-method-index"].as_u64().expect("device method tag") as u16,
-                name: tool["name"]
-                    .as_str()
-                    .expect("device method name")
-                    .to_owned(),
-                component: Some(
-                    tool["x-component-index"]
-                        .as_u64()
-                        .expect("device component tag") as u16,
-                ),
-                fields,
-            });
-        }
-        let legacy = &resolved.tools["x-dmesh-legacy"];
-        core.methods.extend(
-            serde_json::from_value::<Vec<SchemaMethod>>(legacy["methods"].clone())
-                .expect("lmesh legacy methods"),
-        );
-        core.messages =
-            serde_json::from_value(legacy["messages"].clone()).expect("lmesh legacy messages");
-        let mut schema = Self::default();
-        schema.merge(core);
-        schema.refresh_catalog();
-        schema.tagged_catalog = resolved.catalog.as_ref().clone();
-        schema
-    }
-
-    /// True when a command name is handled through the normal tagged stream
-    /// plane. This lets the CLI grammar come from the schema rather than a
-    /// second hard-coded subcommand list.
-    pub fn is_stream_command_name(&self, name: &str) -> bool {
-        self.methods
-            .values()
-            .any(|method| method.name == name && method.component.is_some())
-    }
-
-    fn refresh_catalog(&mut self) {
-        let tools = self
-            .methods
-            .values()
-            .map(|method| {
-                let properties = method
-                    .fields
+            .is_some_and(|tools| {
+                tools
                     .iter()
-                    .map(|field| (field.name.clone(), json!({"x-mesh-cbor": {"id": field.id}})))
-                    .collect::<Map<String, Value>>();
-                json!({
-                    "name": method.name,
-                    "x-mesh-cbor": {"id": method.id},
-                    "inputSchema": {"type": "object", "properties": properties},
-                })
+                    .any(|tool| tool["name"] == name && tool["x-dmesh-device"] == true)
             })
-            .collect::<Vec<_>>();
-        self.catalog = mesh::cbor::Catalog::from_tools_json(&Value::Array(tools))
-            .expect("firmware JSON schema has valid u16 CBOR tags");
-        // `TaggedCatalog` is the canonical command encoder. Keep the older
-        // compact catalog above only for rendering historical diagnostic
-        // records until every producer has moved to tagged CBOR.
-        self.tagged_catalog = TaggedCatalog::from_tools_json(&Value::Array(
-            self.methods
-                .values()
-                .map(|method| {
-                    let properties = method
-                        .fields
-                        .iter()
-                        .filter_map(|field| {
-                            field
-                                .id
-                                .map(|id| (field.name.clone(), json!({"x-protobuf-index": id})))
-                        })
-                        .collect::<Map<String, Value>>();
-                    json!({
-                        "name": method.name,
-                        "x-component-index": method.component,
-                        "x-method-index": method.id,
-                        "inputSchema": {"type": "object", "properties": properties},
-                    })
-                })
-                .collect(),
-        ))
-        .expect("firmware JSON schema has valid tagged-CBOR metadata");
-    }
+}
 
-    fn merge(&mut self, file: FirmwareSchemaFile) {
-        for method in file.methods {
-            let name = method.name.clone();
-            self.fields.insert(
-                name.clone(),
-                method
-                    .fields
-                    .iter()
-                    .filter_map(|field| field.id.map(|id| (id, field.name.clone())))
-                    .collect(),
-            );
-            self.methods.insert(name, method);
-        }
-        for message in file.messages {
-            self.messages.insert(message.name.clone(), message);
-        }
+fn decode_tagged_reply(schema: &TaggedSchema, payload: &[u8]) -> Result<Value> {
+    let wire = dmesh_server::tagged::decode(payload).context("not a tagged record")?;
+    let mut record = mesh::cbor::decode_record(payload)?;
+    if let Some(component) = wire.component {
+        record.component = device_name(component)?;
     }
-
-    pub fn rename_decoded(&self, value: Value) -> Value {
-        self.rename_decoded_for_component(value, None)
+    if let Some(method) = wire.method {
+        record.method = device_name(method)?;
     }
+    Ok(schema.to_jsonl(&record))
+}
 
-    fn rename_decoded_for_component(&self, mut value: Value, component: Option<u16>) -> Value {
-        let Some(object) = value.as_object_mut() else {
-            return value;
-        };
-        let method_id = object
-            .get("method")
-            .and_then(Value::as_u64)
-            .and_then(|id| u16::try_from(id).ok())
-            // `mesh::cbor::decode_json` may already have replaced the
-            // numeric method tag with its catalog name.  Keep the field and
-            // message schema lookup working in that normal decoded form.
-            .or_else(|| {
-                object
-                    .get("method")
-                    .and_then(Value::as_str)
-                    .and_then(|name| {
-                        self.methods
-                            .values()
-                            .find_map(|method| (method.name == name).then_some(method.id))
-                    })
-            });
-        let method_name = method_id.and_then(|id| {
-            self.methods
-                .values()
-                .find(|method| {
-                    method.id == id && component.is_none_or(|c| method.component == Some(c))
-                })
-                .map(|method| method.name.clone())
-        });
-        if let Some(name) = method_name {
-            object.insert("method".to_owned(), Value::String(name));
+fn device_name(name: dmesh_server::tagged::Name<'_>) -> Result<NameOrTag> {
+    match name {
+        dmesh_server::tagged::Name::Tag(tag) => Ok(NameOrTag::Tag(u32::try_from(tag)?)),
+        dmesh_server::tagged::Name::Text(text) => {
+            Ok(NameOrTag::Name(String::from_utf8(text.to_vec())?))
         }
-        let Some(payload) = object.get_mut("payload").and_then(Value::as_object_mut) else {
-            return value;
-        };
-        let Some(method_id) = method_id else {
-            return value;
-        };
-        let Some(method_name) = self
-            .methods
-            .values()
-            .find(|method| {
-                method.id == method_id && component.is_none_or(|c| method.component == Some(c))
-            })
-            .map(|method| method.name.as_str())
-        else {
-            return value;
-        };
-        let Some(fields) = self.fields.get(method_name) else {
-            return value;
-        };
-        let mut renamed = Map::new();
-        for (key, item) in std::mem::take(payload) {
-            let name = key
-                .parse::<u16>()
-                .ok()
-                .and_then(|id| fields.get(&id).cloned())
-                .unwrap_or(key);
-            renamed.insert(name, item);
+        dmesh_server::tagged::Name::Bytes(_) => {
+            anyhow::bail!("binary method identity is unsupported")
         }
-        *payload = renamed;
-        if method_id == 0 {
-            if let Some(message) = payload
-                .get("message")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-            {
-                if let Some(data) = self.decode_message(&message) {
-                    payload.insert("data".to_owned(), Value::Object(data));
-                }
-            }
-        }
-        value
-    }
-
-    /// Decode a firmware compact-CBOR payload into a schema-labelled value.
-    /// Unknown method and field IDs remain numeric, so diagnostics stay
-    /// structured and lossless when a host has not yet installed a schema.
-    ///
-    /// Direct firmware controls use the common tagged record envelope
-    /// (`component`, `method`, `id`, `fields`/`result`), not the older compact
-    /// `{0: method, 6: payload}` diagnostic map.  Project that canonical form
-    /// into the compact renderer's input shape first, so `wifi.scan` renders
-    /// exactly like `transport.set`.
-    pub fn decode_packet(&self, payload: &[u8]) -> Result<Value> {
-        if let Some(record) = dmesh_server::tagged::decode(payload) {
-            if let (
-                Some(dmesh_server::tagged::Name::Tag(component)),
-                Some(dmesh_server::tagged::Name::Tag(method)),
-                Some(id),
-                Some(body),
-            ) = (
-                record.component,
-                record.method,
-                record.id,
-                record.result.or(record.error),
-            ) {
-                let mut compact = Vec::with_capacity(payload.len());
-                dmesh_server::cbor::encode::map(3, &mut compact);
-                dmesh_server::cbor::encode::uint(0, &mut compact);
-                dmesh_server::cbor::encode::uint(method, &mut compact);
-                dmesh_server::cbor::encode::uint(1, &mut compact);
-                dmesh_server::cbor::encode::uint(id, &mut compact);
-                dmesh_server::cbor::encode::uint(
-                    if record.result.is_some() { 6 } else { 5 },
-                    &mut compact,
-                );
-                compact.extend_from_slice(body);
-                let mut value = mesh::cbor::decode_json(&compact, &self.catalog)?;
-                if let Some(object) = value.as_object_mut() {
-                    // The legacy compact catalog is keyed only by method ID.
-                    // Restore the wire ID before the component-aware lookup so
-                    // equal method numbers in different tagged components do
-                    // not borrow each other's names or field schemas.
-                    object.insert("method".to_owned(), Value::from(method));
-                }
-                return Ok(self.rename_decoded_for_component(value, u16::try_from(component).ok()));
-            }
-        }
-        let value = mesh::cbor::decode_json(payload, &self.catalog)?;
-        Ok(self.rename_decoded(value))
-    }
-
-    fn decode_message(&self, message: &str) -> Option<Map<String, Value>> {
-        let mut fields = message.split_whitespace();
-        let _kind = fields.next()?;
-        let message_type = fields.find_map(|field| field.strip_prefix("type="))?;
-        let schema = self.messages.get(&format!("event.{message_type}"))?;
-        if schema.format.as_deref() != Some("kv") {
-            return None;
-        }
-        let field_types = schema
-            .fields
-            .iter()
-            .map(|field| {
-                (
-                    field.name.as_str(),
-                    field.kind.as_deref().unwrap_or("string"),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let mut data = Map::new();
-        data.insert("type".to_owned(), Value::String(message_type.to_owned()));
-        for field in message.split_whitespace().skip(1) {
-            let Some((key, raw)) = field.split_once('=') else {
-                continue;
-            };
-            let kind = field_types.get(key).copied().unwrap_or("string");
-            let value = match kind {
-                "bool" => raw.parse::<bool>().map(Value::Bool).ok(),
-                "u64" => raw.parse::<u64>().ok().map(|value| Value::from(value)),
-                "i64" => raw.parse::<i64>().ok().map(|value| Value::from(value)),
-                _ => Some(Value::String(raw.to_owned())),
-            }?;
-            data.insert(key.to_owned(), value);
-        }
-        Some(data)
     }
 }
 
-/// Render a direct device record for a human-facing shell/session. Printable
-/// boot and platform output remains text; compact CBOR is decoded and labelled
-/// by the local schema. Unknown data is retained as hex instead of discarded.
-pub fn render_device_record(schema: &FirmwareSchema, payload: &[u8]) -> String {
+/// Render text diagnostics and tagged service records from a device bearer.
+/// Unknown packet formats remain visible as hex.
+pub fn render_device_record(schema: &TaggedSchema, payload: &[u8]) -> String {
     if payload.is_empty() {
         return "kind=empty".to_owned();
     }
@@ -380,7 +68,7 @@ pub fn render_device_record(schema: &FirmwareSchema, payload: &[u8]) -> String {
             serde_json::to_string(&text_preview(payload)).expect("string JSON")
         );
     }
-    match schema.decode_packet(payload) {
+    match decode_tagged_reply(schema, payload) {
         Ok(decoded) if decoded.get("error").is_none() => cbor_log_fields(&decoded),
         Ok(decoded) => format!("kind=cbor_error value={decoded}"),
         Err(_) => format!(
@@ -391,105 +79,9 @@ pub fn render_device_record(schema: &FirmwareSchema, payload: &[u8]) -> String {
     }
 }
 
-/// Convert a shell-style command to the compact stream frame used only by the
-/// explicitly selected direct-CBOR exception plane. New application operations
-/// should use QUIC-lite service streams, where normal flow control applies.
-fn command_json(command: &str, schema: &FirmwareSchema) -> Result<Value> {
-    let mut words = command.split_ascii_whitespace();
-    let method = words.next().context("empty firmware command")?;
-    command_json_words(method, words, schema)
-}
-
-fn command_json_words<'a>(
-    method: &str,
-    words: impl Iterator<Item = &'a str>,
-    schema: &FirmwareSchema,
-) -> Result<Value> {
-    let mut fields = Map::new();
-    for word in words {
-        let (key, value) = word.split_once('=').unwrap_or((word, "true"));
-        let key = key.strip_prefix("--").unwrap_or(key);
-        let key = schema.field_name(method, key)?;
-        if key == "payload" {
-            let hex = value.strip_prefix("hex:").unwrap_or(value);
-            fields.insert(
-                "data".to_owned(),
-                Value::Array(decode_hex(hex)?.into_iter().map(Value::from).collect()),
-            );
-        } else {
-            fields.insert(key.to_owned(), schema.command_value(method, key, value)?);
-        }
-    }
-    fields.insert("method".to_owned(), Value::String(method.to_owned()));
-    Ok(Value::Object(fields))
-}
-
-impl FirmwareSchema {
-    fn field_name<'a>(&'a self, method: &str, key: &'a str) -> Result<&'a str> {
-        let Some(tag) = key.strip_prefix('@').unwrap_or(key).parse::<u16>().ok() else {
-            return Ok(key);
-        };
-        self.methods
-            .get(method)
-            .and_then(|entry| entry.fields.iter().find(|field| field.id == Some(tag)))
-            .map(|field| field.name.as_str())
-            .with_context(|| format!("unknown command field tag {method}.{tag}"))
-    }
-
-    fn command_value(&self, method: &str, name: &str, value: &str) -> Result<Value> {
-        let field = self
-            .methods
-            .values()
-            .find(|entry| entry.name == method)
-            .and_then(|entry| entry.fields.iter().find(|field| field.name == name));
-        let Some(field) = field else {
-            // Existing firmware commands deliberately retain their text
-            // values for forward compatibility. Typed conversion is enabled
-            // only where the installed JSON schema declares it.
-            return Ok(Value::String(value.to_owned()));
-        };
-        match field.kind.as_deref() {
-            Some("bool") => value
-                .parse::<bool>()
-                .map(Value::Bool)
-                .with_context(|| format!("{method} {name} must be bool")),
-            Some("u8") | Some("u16") | Some("u32") | Some("u64") => value
-                .parse::<u64>()
-                .map(Value::from)
-                .with_context(|| format!("{method} {name} must be integer")),
-            Some("enum") => {
-                if let Some(value) = field.values.get(value) {
-                    Ok(Value::from(*value))
-                } else {
-                    value
-                        .parse::<u64>()
-                        .map(Value::from)
-                        .with_context(|| format!("unknown {method} {name} value={value}"))
-                }
-            }
-            // MAC stays a canonical text spelling on the command line.  The
-            // host-owned radio schema validates and converts it at its CBOR
-            // handler boundary, avoiding a UART-only byte convention.
-            Some("mac") => Ok(Value::String(value.to_ascii_lowercase())),
-            // Text has no byte-string type. Keep the representation marker
-            // local to the JSON/text adapter; firmware and host handlers accept
-            // either the marker text or a CBOR byte string.
-            Some("hex") => {
-                let compact = value.strip_prefix("hex:").unwrap_or(value).replace(':', "");
-                Ok(Value::String(format!("hex:{compact}")))
-            }
-            _ => Ok(Value::String(value.to_owned())),
-        }
-    }
-}
-
 /// Encode a schema-guided direct command as one canonical tagged-CBOR record.
 ///
-/// The installed schema remains the temporary catalog artifact during the
-/// generator migration, but this function no longer creates the retired
-/// compact `{0: method, 6: payload}` map and decodes it again.  Direct records
-/// require numeric component and method tags; an unreviewed schema entry is
-/// rejected until its numeric identity is declared.
+/// Direct records require reviewed numeric component and method tags.
 pub fn encode_direct_command(command: &str) -> Result<Vec<u8>> {
     encode_direct_command_with_id(command, 0)
 }
@@ -509,40 +101,35 @@ pub fn encode_stream_command_with_id(command: &str, id: u64) -> Result<Vec<u8>> 
 
 /// Encode a shell-split service invocation without splitting quoted field values.
 pub fn encode_stream_argv_with_id(arguments: &[String], id: u64) -> Result<Vec<u8>> {
-    let schema = FirmwareSchema::load();
-    let method = arguments.first().context("missing firmware method")?;
-    let value = command_json_words(method, arguments[1..].iter().map(String::as_str), &schema)?;
-    encode_schema_value_with_id(&schema, value, id, false)
+    let schema = load_tagged_schema();
+    let method = arguments.first().context("missing device method")?;
+    let record = schema.parse_argv(method, &arguments[1..])?;
+    let fields = schema.to_jsonl(&record);
+    let fields = fields.as_object().context("command fields")?;
+    let fields = fields
+        .iter()
+        .filter(|(key, _)| *key != "method")
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    encode_schema_fields_with_id(&schema, method, &fields, id, false)
 }
 
 fn encode_schema_command_with_id(command: &str, id: u64, direct: bool) -> Result<Vec<u8>> {
-    let schema = FirmwareSchema::load();
-    let value = command_json(command, &schema)?;
-    encode_schema_value_with_id(&schema, value, id, direct)
-}
-
-fn encode_schema_value_with_id(
-    schema: &FirmwareSchema,
-    mut value: Value,
-    id: u64,
-    direct: bool,
-) -> Result<Vec<u8>> {
+    let schema = load_tagged_schema();
+    let record = schema.parse_text(command)?;
+    let value = schema.to_jsonl(&record);
     let method = value
         .get("method")
         .and_then(Value::as_str)
-        .context("command method")?
-        .to_owned();
-    value
-        .as_object_mut()
-        .context("command object")?
-        .remove("method");
-    encode_schema_fields_with_id(
-        &schema,
-        &method,
-        value.as_object().context("command fields")?,
-        id,
-        direct,
-    )
+        .context("command method")?;
+    let fields = value
+        .as_object()
+        .context("command fields")?
+        .iter()
+        .filter(|(key, _)| key.as_str() != "method")
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    encode_schema_fields_with_id(&schema, method, &fields, id, direct)
 }
 
 /// Encode a JSON request from the local session/HTTP-style surface with the
@@ -552,36 +139,35 @@ pub fn encode_stream_fields_with_id(
     fields: &Map<String, Value>,
     id: u64,
 ) -> Result<Vec<u8>> {
-    encode_schema_fields_with_id(&FirmwareSchema::load(), method, fields, id, false)
+    encode_schema_fields_with_id(&load_tagged_schema(), method, fields, id, false)
 }
 
 fn encode_schema_fields_with_id(
-    schema: &FirmwareSchema,
+    schema: &TaggedSchema,
     method: &str,
     fields: &Map<String, Value>,
     id: u64,
     direct: bool,
 ) -> Result<Vec<u8>> {
-    let entry = schema
-        .methods
-        .values()
-        .find(|entry| entry.name == *method)
-        .context("unknown firmware command")?;
-    if direct && (entry.name != "transport.set" || entry.component != Some(1)) {
+    let entry = schema.validate_fields(method, fields)?;
+    if direct && (method != "transport.set" || entry.component != NameOrTag::Tag(1)) {
         anyhow::bail!("{method} is stream-only; only transport.set has a direct encoding");
     }
-    // The pinned mesh catalog translates text and JSONL but does not expose
-    // the newer `record_from_value` helper. Direct firmware commands already
-    // carry reviewed numeric component/method/field IDs in `FirmwareSchema`,
-    // so construct that tagged record here without a text round trip.
-    let component = entry
-        .component
-        .context("direct firmware command has no component")?;
+    // Firmware handlers with an explicit wire constructor still need the
+    // numeric identity here; ordinary requests use the shared mesh catalog.
+    let component = match entry.component {
+        NameOrTag::Tag(tag) => tag,
+        _ => anyhow::bail!("device command {method} has no numeric component"),
+    };
+    let method_tag = match entry.method {
+        NameOrTag::Tag(tag) => tag,
+        _ => anyhow::bail!("device command {method} has no numeric method"),
+    };
     // The inventory uses the shared correlated *empty* request constructor.
     // It must carry an id for a normal QUIC stream, unlike the older
     // connectionless observation form.
-    if component == dmesh_server::announce::ANNOUNCE_COMPONENT as u16
-        && u64::from(entry.id) == dmesh_server::announce::ANNOUNCE_DEVICES_OBSERVED
+    if component == dmesh_server::announce::ANNOUNCE_COMPONENT as u32
+        && u64::from(method_tag) == dmesh_server::announce::ANNOUNCE_DEVICES_OBSERVED
         && fields.is_empty()
     {
         let mut wire = [0u8; 32];
@@ -599,103 +185,43 @@ fn encode_schema_fields_with_id(
     // generic environment, but that would make the embedded raw handler
     // distinguish this request from its documented `{5:{}}` envelope. Keep
     // CLI, direct UART, and E2E on the one shared constructor.
-    if component == dmesh_server::raw_wifi::RAW_WIFI_COMPONENT as u16
+    if component == dmesh_server::raw_wifi::RAW_WIFI_COMPONENT as u32
         && fields.is_empty()
-        && (u64::from(entry.id) == dmesh_server::raw_wifi::RAW_WIFI_METHOD_SNAPSHOT
-            || u64::from(entry.id) == dmesh_server::raw_wifi::RAW_WIFI_METHOD_RESET_COUNTERS
-            || u64::from(entry.id) == dmesh_server::raw_wifi::RAW_WIFI_METHOD_SCAN)
+        && (u64::from(method_tag) == dmesh_server::raw_wifi::RAW_WIFI_METHOD_SNAPSHOT
+            || u64::from(method_tag) == dmesh_server::raw_wifi::RAW_WIFI_METHOD_RESET_COUNTERS
+            || u64::from(method_tag) == dmesh_server::raw_wifi::RAW_WIFI_METHOD_SCAN)
     {
         let mut wire = [0u8; 24];
         let used = dmesh_server::raw_wifi::encode_raw_wifi_snapshot_request_with_id(
-            u64::from(entry.id),
+            u64::from(method_tag),
             id,
             &mut wire,
         )
         .context("raw radio snapshot request")?;
         return Ok(wire[..used].to_vec());
     }
-    if component == dmesh_server::raw_wifi::RAW_WIFI_COMPONENT as u16
-        && u64::from(entry.id) == dmesh_server::raw_wifi::RAW_WIFI_METHOD_TX
+    if component == dmesh_server::raw_wifi::RAW_WIFI_COMPONENT as u32
+        && u64::from(method_tag) == dmesh_server::raw_wifi::RAW_WIFI_METHOD_TX
     {
         let mut wire = [0u8; dmesh_server::raw_wifi::RAW_WIFI_MAX_FRAME + 64];
         let used = dmesh_server::raw_wifi::encode_raw_wifi_tx_json_request(fields, id, &mut wire)
             .context("radio.tx request")?;
         return Ok(wire[..used].to_vec());
     }
-    let mut record = TaggedRecord {
-        component: NameOrTag::Tag(u32::from(component)),
-        method: NameOrTag::Tag(u32::from(entry.id)),
-        id: Some(Value::from(id)),
-        ..TaggedRecord::default()
-    };
-    for (name, field_value) in fields {
-        let name = schema.field_name(method, name)?;
-        let field = entry
-            .fields
-            .iter()
-            .find(|field| field.name == name)
-            .with_context(|| format!("unknown command field {method}.{name}"))?;
-        let id = field
-            .id
-            .with_context(|| format!("command field {method}.{name} has no numeric ID"))?;
-        record
-            .env
-            .insert(NameOrTag::Tag(u32::from(id)), field_value.clone());
-    }
+    let mut record = schema.record_from_value(method, &Value::Object(fields.clone()))?;
+    record.id = Some(Value::from(id));
     mesh::cbor::encode_record(&record)
 }
 
-/// Compact logfmt renderer shared by the session CLI and the remaining
-/// diagnostics code. `status=ok` is omitted because it is not delivery proof.
+/// Render diagnostic fields, hiding the routine successful status marker.
 pub fn cbor_log_fields(value: &Value) -> String {
-    let mut fields = Vec::new();
-    flatten_cbor_log_value(&mut fields, None, value, true);
-    fields.join(" ")
-}
-
-fn flatten_cbor_log_value(
-    fields: &mut Vec<String>,
-    prefix: Option<&str>,
-    value: &Value,
-    top_level: bool,
-) {
-    match value {
-        Value::Object(values) => {
-            for (key, value) in values {
-                if top_level && key == "status" && value.as_str() == Some("ok") {
-                    continue;
-                }
-                let key = prefix
-                    .map(|prefix| format!("{prefix}.{key}"))
-                    .unwrap_or_else(|| key.clone());
-                flatten_cbor_log_value(fields, Some(&key), value, false);
-            }
-        }
-        Value::Array(_) => {
-            if let Some(key) = prefix {
-                fields.push(format!("{key}={}", logfmt_json_value(value)));
-            }
-        }
-        _ => {
-            if let Some(key) = prefix {
-                fields.push(format!("{key}={}", logfmt_json_value(value)));
-            }
+    let mut value = value.clone();
+    if let Some(object) = value.as_object_mut() {
+        if object.get("status").and_then(Value::as_str) == Some("ok") {
+            object.remove("status");
         }
     }
-}
-
-fn logfmt_json_value(value: &Value) -> String {
-    match value {
-        Value::String(value)
-            if !value.is_empty()
-                && value
-                    .bytes()
-                    .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'=' | b'"')) =>
-        {
-            value.clone()
-        }
-        _ => value.to_string(),
-    }
+    mesh::logfmt::flatten_json(&value)
 }
 
 fn bytes_are_text(bytes: &[u8]) -> bool {
@@ -718,95 +244,31 @@ fn text_preview(bytes: &[u8]) -> String {
         .collect()
 }
 
-fn decode_hex(value: &str) -> Result<Vec<u8>> {
-    if value.len() % 2 != 0 {
-        anyhow::bail!("hex payload must have an even number of characters");
-    }
-    (0..value.len())
-        .step_by(2)
-        .map(|offset| u8::from_str_radix(&value[offset..offset + 2], 16).map_err(Into::into))
-        .collect()
-}
-
 fn hex_encode(value: &[u8]) -> String {
     value.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-#[allow(dead_code)]
-fn firmware_arg_tag(name: &str) -> Option<u16> {
-    Some(match name {
-        "op" => 87,
-        "name" => 409,
-        "server" => 246,
-        "port" => 191,
-        "target" => 346,
-        "object_action_stats" => 272,
-        _ => return None,
-    })
-}
-
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn diagnostic_rendering_hides_only_top_level_success() {
+        assert_eq!(
+            super::cbor_log_fields(
+                &serde_json::json!({"status":"ok", "radio":{"status":"ok", "count":2}})
+            ),
+            "radio.count=2 radio.status=ok"
+        );
+    }
     use super::{
-        FirmwareSchema, encode_direct_command, encode_direct_command_with_id,
-        encode_stream_argv_with_id, encode_stream_command_with_id, render_device_record,
+        encode_direct_command, encode_direct_command_with_id, encode_stream_argv_with_id,
+        encode_stream_command_with_id, load_tagged_schema, render_device_record,
     };
     use mesh::tagged::NameOrTag;
-    use minicbor::Encoder;
-    use serde_json::{Value, json};
-
-    #[test]
-    fn core_schema_names_event_and_message_tag() {
-        let schema = FirmwareSchema::load();
-        let decoded = schema.rename_decoded(json!({
-            "method": 0,
-            "payload": {"32": "event type=mode.state active=infra infra_active=false"},
-            "status": "event"
-        }));
-        assert_eq!(decoded["method"], "event");
-        assert_eq!(
-            decoded["payload"]["message"],
-            "event type=mode.state active=infra infra_active=false"
-        );
-        assert_eq!(decoded["payload"]["data"]["type"], "mode.state");
-        assert_eq!(decoded["payload"]["data"]["infra_active"], false);
-    }
-
-    #[test]
-    fn compact_cbor_is_rendered_with_schema_names() {
-        let mut packet = Vec::new();
-        let mut encoder = Encoder::new(&mut packet);
-        encoder.map(2).unwrap();
-        encoder.u16(0).unwrap().u16(0).unwrap();
-        encoder.u16(6).unwrap().map(1).unwrap();
-        encoder
-            .u16(32)
-            .unwrap()
-            .str("event type=mode.state active=infra infra_active=true")
-            .unwrap();
-
-        let decoded = FirmwareSchema::load().decode_packet(&packet).unwrap();
-        assert_eq!(decoded["method"], "event");
-        assert_eq!(
-            decoded["payload"]["message"],
-            "event type=mode.state active=infra infra_active=true"
-        );
-        assert_eq!(decoded["payload"]["data"]["infra_active"], true);
-    }
-
-    #[test]
-    fn unknown_method_and_tags_remain_structured() {
-        let decoded = FirmwareSchema::load().rename_decoded(json!({
-            "method": 65535,
-            "payload": {"999": true}
-        }));
-        assert_eq!(decoded["method"], 65535);
-        assert_eq!(decoded["payload"]["999"], true);
-    }
+    use serde_json::Value;
 
     #[test]
     fn session_renderer_keeps_text_and_schema_labels() {
-        let schema = FirmwareSchema::load();
+        let schema = load_tagged_schema();
         assert_eq!(
             render_device_record(&schema, b"boot ready\n"),
             "kind=text text=\"boot ready\""
@@ -1181,7 +643,7 @@ mod tests {
 
     #[test]
     fn ble_status_response_uses_the_schema_field_names() {
-        let schema = FirmwareSchema::load();
+        let schema = load_tagged_schema();
         let mut result = [0u8; 16];
         let mut encoder = dmesh_server::cbor::Encoder::new(&mut result);
         encoder.map(2).unwrap();
@@ -1201,8 +663,8 @@ mod tests {
         .expect("bounded BLE status response");
         let rendered = render_device_record(&schema, &wire[..used]);
         assert!(rendered.contains("method=ble.status"), "{rendered}");
-        assert!(rendered.contains("payload.ready=true"), "{rendered}");
-        assert!(rendered.contains("payload.scanning=false"), "{rendered}");
+        assert!(rendered.contains("result.ready=true"), "{rendered}");
+        assert!(rendered.contains("result.scanning=false"), "{rendered}");
     }
 
     #[test]
@@ -1283,7 +745,7 @@ mod tests {
 
     #[test]
     fn tagged_wifi_scan_result_uses_the_common_control_renderer() {
-        let schema = FirmwareSchema::load();
+        let schema = load_tagged_schema();
         let result = [0xa5, 1, 0x80, 2, 4, 3, 0, 4, 0, 5, 0xf5];
         let mut wire = [0u8; 64];
         let used = dmesh_server::tagged::encode_numeric_response(4, 77, 91, &result, &mut wire)
@@ -1291,12 +753,12 @@ mod tests {
         let rendered = render_device_record(&schema, &wire[..used]);
         assert!(rendered.contains("method=wifi.scan"), "{rendered}");
         assert!(rendered.contains("id=91"), "{rendered}");
-        assert!(rendered.contains("payload.2=4"), "{rendered}");
+        assert!(rendered.contains("result.2=4"), "{rendered}");
     }
 
     #[test]
     fn tagged_transport_error_keeps_its_method_and_request_id() {
-        let schema = FirmwareSchema::load();
+        let schema = load_tagged_schema();
         let mut wire = [0u8; 64];
         let used =
             dmesh_server::tagged::encode_numeric_error(1, 4, 92, b"invalid_setting", &mut wire)

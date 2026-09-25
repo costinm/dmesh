@@ -48,7 +48,7 @@ static BLE_COC_EGRESS_PUMP: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
 pub fn install_ble_coc_egress_pump(
-    pump: Option<fn(quic_lite::PathId, &mut [u8; crate::TRANSPORT_MTU], Option<usize>)>,
+    pump: Option<fn(quic_lite::LocalAddress, &mut [u8; crate::TRANSPORT_MTU], Option<usize>)>,
 ) {
     BLE_COC_EGRESS_PUMP.store(
         pump.map(|pump| pump as usize).unwrap_or(0),
@@ -57,13 +57,13 @@ pub fn install_ble_coc_egress_pump(
 }
 
 fn ble_coc_egress_pump(
-    path: quic_lite::PathId,
+    path: quic_lite::LocalAddress,
     response: &mut [u8; crate::TRANSPORT_MTU],
     immediate: Option<usize>,
 ) {
     let pump = BLE_COC_EGRESS_PUMP.load(core::sync::atomic::Ordering::Acquire);
     if pump != 0 {
-        let pump: fn(quic_lite::PathId, &mut [u8; crate::TRANSPORT_MTU], Option<usize>) =
+        let pump: fn(quic_lite::LocalAddress, &mut [u8; crate::TRANSPORT_MTU], Option<usize>) =
             unsafe { core::mem::transmute(pump) };
         pump(path, response, immediate);
     }
@@ -222,8 +222,8 @@ type ConnectionDispatcher = dmesh_server::transport::ConnectionDispatcher<
 
 /// Allocate an opaque connection path handle from adapter-owned metadata.
 /// Only this ESP integration decodes the handle back to a bearer address;
-/// QUIC retains and compares `PathId` without knowing its representation.
-pub const fn connection_path_id(transport_id: u8, peer: [u8; 6]) -> quic_lite::PathId {
+/// QUIC retains and compares `LocalAddress` without knowing its representation.
+pub const fn connection_path_id(transport_id: u8, peer: [u8; 6]) -> quic_lite::LocalAddress {
     let value = ((transport_id as u64) << 48)
         | ((peer[0] as u64) << 40)
         | ((peer[1] as u64) << 32)
@@ -231,7 +231,7 @@ pub const fn connection_path_id(transport_id: u8, peer: [u8; 6]) -> quic_lite::P
         | ((peer[3] as u64) << 16)
         | ((peer[4] as u64) << 8)
         | peer[5] as u64;
-    match quic_lite::PathId::new(value) {
+    match quic_lite::LocalAddress::new(value) {
         Some(path) => path,
         None => panic!("ESP connection path must be nonzero"),
     }
@@ -240,11 +240,11 @@ pub const fn connection_path_id(transport_id: u8, peer: [u8; 6]) -> quic_lite::P
 /// Decode only this platform adapter's opaque path handle for diagnostic
 /// rendering. QUIC-lite keeps the handle opaque and never learns a MAC,
 /// UART port, or raw-UDP tuple.
-pub(crate) const fn connection_path_transport(path: quic_lite::PathId) -> u8 {
+pub(crate) const fn connection_path_transport(path: quic_lite::LocalAddress) -> u8 {
     (path.value() >> 48) as u8
 }
 
-pub(crate) const fn connection_path_peer(path: quic_lite::PathId) -> [u8; 6] {
+pub(crate) const fn connection_path_peer(path: quic_lite::LocalAddress) -> [u8; 6] {
     let value = path.value();
     [
         (value >> 40) as u8,
@@ -418,7 +418,7 @@ pub struct ConnectionFrameIngress {
 }
 
 pub fn receive_connection_frame(
-    path: quic_lite::PathId,
+    path: quic_lite::LocalAddress,
     packet: &[u8],
     response: &mut [u8; crate::TRANSPORT_MTU],
 ) -> Option<usize> {
@@ -430,7 +430,7 @@ pub fn receive_connection_frame(
 /// admission; Wi-Fi/NOW/UART adapters must not parse or peek at QUIC framing
 /// to recreate the result.
 pub fn receive_connection_frame_ingress(
-    path: quic_lite::PathId,
+    path: quic_lite::LocalAddress,
     packet: &[u8],
     response: &mut [u8; crate::TRANSPORT_MTU],
 ) -> ConnectionFrameIngress {
@@ -587,7 +587,7 @@ pub fn receive_connection_frame_ingress(
 }
 
 pub fn poll_connection(
-    path: quic_lite::PathId,
+    path: quic_lite::LocalAddress,
     response: &mut [u8; crate::TRANSPORT_MTU],
 ) -> Option<usize> {
     unsafe {
@@ -725,7 +725,7 @@ fn service_connection_timer() {
 /// handler contains no flash, Wi-Fi, or address policy: those stay outside
 /// the host-tested connection and ESP adapter respectively.
 pub(crate) fn receive_raw_udp6(
-    path: quic_lite::PathId,
+    path: quic_lite::LocalAddress,
     _peer: crate::wifi_raw_udp6_esp::RawUdp6Peer,
     packet: &[u8],
     response: &mut [u8; crate::TRANSPORT_MTU],
@@ -830,7 +830,7 @@ pub(crate) fn receive_udp6_connectionless(
 /// its configured local next hop; every other packet retains the existing raw
 /// endpoint behavior. Recovery continues to call [`receive_raw_udp6`].
 pub(crate) fn receive_main_raw_udp6(
-    path: quic_lite::PathId,
+    path: quic_lite::LocalAddress,
     peer: crate::wifi_raw_udp6_esp::RawUdp6Peer,
     packet: &[u8],
     response: &mut [u8; crate::TRANSPORT_MTU],
@@ -872,17 +872,17 @@ pub(crate) fn receive_main_raw_udp6(
 }
 
 pub(crate) fn poll_raw_udp6(
-    path: quic_lite::PathId,
+    path: quic_lite::LocalAddress,
     response: &mut [u8; crate::TRANSPORT_MTU],
 ) -> Option<usize> {
     poll_connection(path, response)
 }
 
-pub(crate) fn connection_reply_path() -> Option<quic_lite::PathId> {
+pub(crate) fn connection_reply_path() -> Option<quic_lite::LocalAddress> {
     unsafe { connection_dispatcher_if_ready()?.reply_path() }
 }
 
-pub(crate) fn connection_has_path(path: quic_lite::PathId) -> bool {
+pub(crate) fn connection_has_path(path: quic_lite::LocalAddress) -> bool {
     unsafe { connection_dispatcher_if_ready().is_some_and(|service| service.has_path(path)) }
 }
 
@@ -1031,7 +1031,7 @@ pub(crate) fn take_terminal_response_delivered() -> bool {
 /// it produces a datagram, so capacity must be checked before polling rather
 /// than treating a failed enqueue as ordinary packet loss.
 fn pump_uart_egress(
-    path: quic_lite::PathId,
+    path: quic_lite::LocalAddress,
     response: &mut [u8; crate::TRANSPORT_MTU],
     immediate: Option<usize>,
 ) {

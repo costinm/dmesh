@@ -1,9 +1,6 @@
-package com.github.costinm.dmeshnative;
+package com.github.costinm.dmesh;
 
 import android.os.Bundle;
-
-import com.github.costinm.dmesh.DirectBinder;
-import com.github.costinm.dmesh.MeshStream;
 
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;

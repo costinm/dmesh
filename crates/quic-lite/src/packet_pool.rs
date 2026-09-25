@@ -177,6 +177,12 @@ impl<const SLOTS: usize, const MTU: usize> PoolLease<'_, SLOTS, MTU> {
     }
 }
 
+impl<const SLOTS: usize, const MTU: usize> AsRef<[u8]> for PoolLease<'_, SLOTS, MTU> {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes()
+    }
+}
+
 // A caller may access a packet only while it owns the corresponding cleared
 // bit. Firmware queues carry the slot token, never a duplicate MTU payload.
 unsafe impl<const SLOTS: usize, const MTU: usize> Sync for PacketPool<SLOTS, MTU> {}
@@ -192,9 +198,18 @@ impl<const SLOTS: usize, const MTU: usize> PacketPool<SLOTS, MTU> {
     }
 
     pub fn acquire(&self) -> Option<PacketSlot> {
+        self.acquire_reserving(0)
+    }
+
+    /// Acquire one slot while leaving `reserved` slots available.
+    ///
+    /// RX and TX share this pool. A receiver can reserve reply capacity without
+    /// maintaining a separate ingress or egress pool. The availability check
+    /// and acquisition are one atomic operation.
+    pub fn acquire_reserving(&self, reserved: usize) -> Option<PacketSlot> {
         let mut current = self.free.load(Ordering::Acquire);
         loop {
-            if current == 0 {
+            if current.count_ones() as usize <= reserved {
                 return None;
             }
             let bit = current.trailing_zeros();
@@ -377,5 +392,18 @@ mod tests {
         assert_eq!(pool.available(), 0);
         drop(writer);
         assert_eq!(pool.available(), 1);
+    }
+
+    #[test]
+    fn reserved_slots_remain_available_for_the_other_direction() {
+        let pool = PacketPool::<3, 8>::new();
+        let first = pool.acquire_reserving(1).unwrap();
+        let second = pool.acquire_reserving(1).unwrap();
+        assert!(pool.acquire_reserving(1).is_none());
+        let reserved = pool.acquire().unwrap();
+        assert_eq!(pool.available(), 0);
+        assert!(pool.release(first));
+        assert!(pool.release(second));
+        assert!(pool.release(reserved));
     }
 }

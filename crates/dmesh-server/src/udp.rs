@@ -43,6 +43,218 @@ use tokio::time::{Duration, Instant, timeout};
 
 const MTU: usize = quic_lite::DEFAULT_MAX_DATAGRAM_SIZE;
 
+/// Fresh nonzero application correlation ID shared by host UDP adapters.
+pub fn fresh_request_id() -> u64 {
+    loop {
+        let value = rand::random::<u64>();
+        if value != 0 {
+            return value;
+        }
+    }
+}
+
+/// Fresh opaque QUIC connection ID for a new client association.
+pub fn fresh_connection_id() -> quic_lite::ConnectionId {
+    loop {
+        let value = (fresh_request_id() & quic_lite::ConnectionId::MAX_VALUE).max(1);
+        if let Some(cid) = quic_lite::ConnectionId::new(value) {
+            return cid;
+        }
+    }
+}
+
+/// One matching response to a host IPv6 multicast discovery sweep. The
+/// socket endpoint is bearer-local; the announce carries the stable identity.
+#[derive(Clone, Debug)]
+pub struct MulticastDiscoveryPeer {
+    pub peer: SocketAddr,
+    pub announce: crate::announce::Announce,
+    pub facts: Option<crate::announce::DiscoveryFacts>,
+}
+
+/// Send the canonical discovery record on every Linux IPv6 link and collect
+/// matching responses. This owns only the multicast socket mechanics; callers
+/// merge these rows with UART, BLE, NAN, or other transport observations.
+pub fn discover_multicast_ipv6() -> Result<Vec<MulticastDiscoveryPeer>> {
+    use std::net::{Ipv6Addr, SocketAddrV6, UdpSocket as StdUdpSocket};
+    use std::time::{Duration as StdDuration, Instant as StdInstant};
+
+    const DISCOVERY_PORT: u16 = 5227;
+    let request_id = fresh_request_id();
+    let mut record = [0u8; 96];
+    let record_len = crate::announce::encode_discovery_request(request_id, &mut record)
+        .context("encode UDP6 multicast discovery request")?;
+    let mut wire = [0u8; 128];
+    let wire_len = crate::direct::ConnectionlessMessage::encode(&record[..record_len], &mut wire)
+        .context("wrap UDP6 multicast discovery request")?;
+    let socket = StdUdpSocket::bind(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0))?;
+    socket.set_read_timeout(Some(StdDuration::from_millis(250)))?;
+    let group = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x5227);
+    let mut submitted = 0usize;
+    for entry in std::fs::read_dir("/sys/class/net")? {
+        let entry = entry?;
+        if entry.file_name() == "lo" {
+            continue;
+        }
+        let Some(index) = std::fs::read_to_string(entry.path().join("ifindex"))
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let destination = SocketAddrV6::new(group, DISCOVERY_PORT, 0, index);
+        if socket.send_to(&wire[..wire_len], destination).is_ok() {
+            submitted += 1;
+        }
+    }
+    if submitted == 0 {
+        bail!("UDP6 multicast discovery was not submitted on any interface");
+    }
+
+    let deadline = StdInstant::now() + StdDuration::from_secs(5);
+    let mut peers = Vec::new();
+    let mut input = [0u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
+    while StdInstant::now() < deadline {
+        let Ok((used, peer)) = socket.recv_from(&mut input) else {
+            continue;
+        };
+        let Some(payload) = crate::direct::ConnectionlessMessage::decode(&input[..used]) else {
+            continue;
+        };
+        let Some(record) = crate::tagged::decode(payload) else {
+            continue;
+        };
+        if record.id != Some(request_id) {
+            continue;
+        }
+        let facts = crate::announce::discovery_facts(record);
+        let Some(announce) = crate::announce::decode_record(record) else {
+            continue;
+        };
+        let peer = match peer {
+            SocketAddr::V6(value) if announce.udp_port != 0 => SocketAddr::V6(SocketAddrV6::new(
+                *value.ip(),
+                announce.udp_port,
+                value.flowinfo(),
+                value.scope_id(),
+            )),
+            peer => peer,
+        };
+        if !peers
+            .iter()
+            .any(|known: &MulticastDiscoveryPeer| known.peer == peer)
+        {
+            peers.push(MulticastDiscoveryPeer {
+                peer,
+                announce,
+                facts,
+            });
+        }
+    }
+    Ok(peers)
+}
+
+/// Exchange one connectionless control record over UDP.
+pub async fn exchange_direct_record(
+    bind: SocketAddr,
+    peer: SocketAddr,
+    record: &[u8],
+    response_timeout: Duration,
+) -> Result<Vec<u8>> {
+    let mut packet = [0u8; MTU];
+    let used = crate::direct::ConnectionlessMessage::encode(record, &mut packet)
+        .context("connectionless record exceeds UDP MTU")?;
+    let socket = UdpSocket::bind(bind).await?;
+    socket.connect(peer).await?;
+    socket.send(&packet[..used]).await?;
+    let mut response = [0u8; MTU];
+    let used = timeout(response_timeout, socket.recv(&mut response))
+        .await
+        .context("UDP direct record timeout (no reply)")??;
+    Ok(response[..used].to_vec())
+}
+
+/// Execute one complete tagged request on a fresh QUIC association.
+/// A verified peer restart repeats the application request once with a new
+/// CID; callers never select packet numbers, ACK policy, or retry timing.
+pub async fn exchange_stream_record(
+    bind: SocketAddr,
+    peer: SocketAddr,
+    record: &[u8],
+) -> Result<Vec<u8>> {
+    for attempt in 0..2 {
+        let mut client = UdpClient::connect(bind, peer, fresh_connection_id()).await?;
+        match client
+            .request_stream(quic_lite::FIRST_CLIENT_BIDI_STREAM_ID, record, true)
+            .await
+        {
+            Ok((_, response, true)) => return Ok(response),
+            Ok((_, _, false)) => bail!("UDP application stream did not finish"),
+            Err(error)
+                if attempt == 0 && crate::transport::is_fresh_association_retry_error(&error) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("bounded retry loop returns on its final attempt")
+}
+
+/// Expose one UDP QUIC association through a local tagged-CBOR seqpacket
+/// socket. This is shared by CLI, lmesh, and Android/Linux service adapters;
+/// local socket policy stays outside quic-lite's datagram state machine.
+#[cfg(feature = "mesh-session")]
+pub async fn serve_session_socket(peer: SocketAddr, socket_path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+    if socket_path.exists() {
+        let metadata = std::fs::symlink_metadata(socket_path)?;
+        if !metadata.file_type().is_socket() {
+            bail!("refusing to replace non-socket {}", socket_path.display());
+        }
+        std::fs::remove_file(socket_path)?;
+    }
+    let listener = mesh::seqpacket::UnixSeqpacketListener::bind(socket_path)?;
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;
+    let bind = match peer {
+        SocketAddr::V4(_) => "0.0.0.0:0".parse().expect("valid IPv4 wildcard"),
+        SocketAddr::V6(_) => "[::]:0".parse().expect("valid IPv6 wildcard"),
+    };
+    let mut client = UdpClient::connect(bind, peer, fresh_connection_id()).await?;
+    let mut next_stream = quic_lite::FIRST_CLIENT_BIDI_STREAM_ID;
+    loop {
+        let stream = listener.accept().await?;
+        while let Some((request, fds)) = stream.recv_cbor_record().await? {
+            anyhow::ensure!(
+                fds.is_empty(),
+                "device session does not accept file descriptors"
+            );
+            let id = request
+                .id
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("request id required"))?;
+            let wire = mesh::cbor::encode_record(&request)?;
+            let stream_id = next_stream;
+            next_stream = next_stream.saturating_add(4);
+            let response = match client.request_stream(stream_id, &wire, true).await {
+                Ok((_, response, _)) => match mesh::cbor::decode_record(&response) {
+                    Ok(record) if record.id.as_ref() == Some(&id) => record,
+                    Ok(_) => mesh::wire::response_error(
+                        id,
+                        serde_json::json!({"message":"device response id mismatch"}),
+                    ),
+                    Err(error) => mesh::wire::response_error(
+                        id,
+                        serde_json::json!({"message":error.to_string()}),
+                    ),
+                },
+                Err(error) => {
+                    mesh::wire::response_error(id, serde_json::json!({"message":error.to_string()}))
+                }
+            };
+            stream.send_cbor_record(&response, &[]).await?;
+        }
+    }
+}
+
 /// Linux may omit the outgoing interface scope on an inbound IPv6 link-local
 /// source.  Scope selects the local egress interface, not the remote UDP
 /// peer, so association identity is address plus port.
@@ -63,7 +275,7 @@ fn same_udp_peer(received: SocketAddr, expected: SocketAddr) -> bool {
 /// the peer-specific transport identity. IPv6 scope is deliberately excluded:
 /// it selects our local egress interface, whereas the UDP bearer identifies
 /// its peer by address and service port.
-fn udp_path_id(peer: SocketAddr) -> quic_lite::PathId {
+fn udp_path_id(peer: SocketAddr) -> quic_lite::LocalAddress {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     match peer {
         SocketAddr::V4(peer) => {
@@ -76,7 +288,7 @@ fn udp_path_id(peer: SocketAddr) -> quic_lite::PathId {
         }
     }
     let value = hasher.finish() | (1_u64 << 63);
-    quic_lite::PathId::new(value).expect("tagged UDP path ID is nonzero")
+    quic_lite::LocalAddress::new(value).expect("tagged UDP path ID is nonzero")
 }
 /// Stable `lmesh`/wlan0 object and PROBE listener.
 pub const STABLE_WIFI_UDP_PORT: u16 = 3336;
@@ -789,7 +1001,7 @@ pub struct UdpClient {
     /// device manager may retain the same association while selecting another
     /// UART/NOW/UDP path for a later request.
     connection: quic_lite::ClientAssociation<512, MTU>,
-    path: quic_lite::PathId,
+    path: quic_lite::LocalAddress,
     /// Optional adjacent-link wire label. QUIC-lite still creates packets for
     /// the authenticated end-to-end peer CID; the UDP path adapter replaces
     /// only the visible outer DCID before sending to `peer`.
@@ -1483,12 +1695,16 @@ impl UdpClient {
         &mut self,
         command: &[u8],
         records: &mut ObjectBodyStream,
-        scratch: &mut [u8],
         response_timeout: Duration,
     ) -> Result<ReceivedStream> {
-        if scratch.is_empty() || response_timeout.is_zero() {
-            bail!("object upload scratch and response timeout must be non-zero");
+        if response_timeout.is_zero() {
+            bail!("object upload response timeout must be non-zero");
         }
+        // This is an ordinary QUIC stream. Keep application chunks below the
+        // packet MTU so quic-lite can add its short header and STREAM frame;
+        // callers do not select a bearer-specific upload fragment size.
+        const STREAM_PAYLOAD_MAX: usize = MTU - 64;
+        let mut scratch = [0u8; STREAM_PAYLOAD_MAX];
         let started = Instant::now();
         let deadline = started + response_timeout;
         // QUIC-lite allocates the command and object stream IDs for this
@@ -1516,7 +1732,7 @@ impl UdpClient {
             // owns record ordering; packet history, congestion, ACKs and
             // retransmission remain entirely inside quic-lite.
             if command_admitted && !records.is_complete() {
-                if let Some(next) = records.copy_next(scratch) {
+                if let Some(next) = records.copy_next(&mut scratch) {
                     let now_ms = started.elapsed().as_millis() as u64;
                     self.endpoint_mut().set_time(now_ms);
                     match self.connection.encode_stream_payload_at(
@@ -3309,10 +3525,46 @@ mod tests {
     use super::*;
     use quic_lite::CommittedStreamDisposition;
 
+    #[test]
+    fn fresh_host_ids_are_valid_wire_values() {
+        assert_ne!(fresh_request_id(), 0);
+        let cid = fresh_connection_id();
+        assert_ne!(cid.value(), 0);
+        assert!(cid.value() <= quic_lite::ConnectionId::MAX_VALUE);
+    }
+
+    #[tokio::test]
+    async fn shared_direct_exchange_owns_udp_framing_and_timeout() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = server.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut packet = [0u8; MTU];
+            let (used, source) = server.recv_from(&mut packet).await.unwrap();
+            assert_eq!(
+                crate::direct::ConnectionlessMessage::decode(&packet[..used]),
+                Some(&b"direct"[..])
+            );
+            server.send_to(&packet[..used], source).await.unwrap();
+        });
+        let response = exchange_direct_record(
+            "127.0.0.1:0".parse().unwrap(),
+            peer,
+            b"direct",
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::direct::ConnectionlessMessage::decode(&response),
+            Some(&b"direct"[..])
+        );
+        task.await.unwrap();
+    }
+
     fn established_client_connection(
         local: ConnectionId,
         peer: ConnectionId,
-        path: quic_lite::PathId,
+        path: quic_lite::LocalAddress,
     ) -> quic_lite::ClientAssociation<512, MTU> {
         let mut connection = quic_lite::ClientAssociation::new(local);
         let mut packet = [0u8; MTU];

@@ -82,16 +82,6 @@ public class MeshNode implements AutoCloseable {
         }
     }
 
-    /**
-     * Store provisioned DMesh root material in this app's Rust data directory.
-     * The native side validates and writes it atomically; it never exposes the
-     * bytes through settings or a handler. Restart the mesh service afterwards
-     * so its QUIC association owner derives the new reset-key branch.
-     */
-    public boolean provisionDeviceSecret(byte[] secret) {
-        return nativeProvisionDeviceSecret(baseDir, secret);
-    }
-
     private static int openNetworkUdpSocket(Context context, int port) throws IOException {
         DatagramChannel channel = DatagramChannel.open(StandardProtocolFamily.INET6);
         try {
@@ -239,16 +229,6 @@ public class MeshNode implements AutoCloseable {
         return nativeRadioMessage(method, args == null ? "" : args, data == null ? new byte[0] : data, fd);
     }
 
-    /**
-     * Legacy ADB-provider compatibility only. New callers must send the
-     * common tagged control schema through Rust rather than inventing text
-     * commands in Java.
-     */
-    public static String shellTransportCommand(String line) {
-        return radioMessageText("radio.shell.command", "",
-                line == null ? new byte[0] : line.getBytes(StandardCharsets.UTF_8), -1);
-    }
-
     public static byte[] buildNanServiceInfo(String role, byte[] deviceId, int wakeCount) {
         return radioMessage("radio.nan.build_service_info",
                 "role=" + textArg(role)
@@ -303,35 +283,9 @@ public class MeshNode implements AutoCloseable {
                 "peer=" + textArg(peer), serviceInfo, -1);
     }
 
-    /** Rust-owned one-hour inventory across NAN, UDP multicast, and control-plane discovery. */
-    public static String knownDevices() {
-        return radioMessageText("discovery.nodes", "", new byte[0], -1);
-    }
-
-    /** Rust-owned platform snapshot used for routing and local multicast decisions. */
-    public static String localNetworks() {
-        return radioMessageText("discovery.status", "", new byte[0], -1);
-    }
-
-    /** Latest bounded Android power/memory telemetry retained by Rust. */
-    public static String powerState() {
-        return radioMessageText("radio.power.state", "", new byte[0], -1);
-    }
-
-    /** Small Rust-generated status snapshot for the Android status shell. */
+    /** Small Rust-generated snapshot for the Android status activity. */
     public static String statusText() {
         return radioMessageText("radio.status_text", "", new byte[0], -1);
-    }
-
-    /** @deprecated Use {@link #knownDevices()}; the inventory is not NAN-only. */
-    @Deprecated
-    public static String knownNanDevices() {
-        return knownDevices();
-    }
-
-    /** Rust-owned bounded receipt list for NAN follow-ups. */
-    public static String knownNanFollowups() {
-        return radioMessageText("radio.nan.followups", "", new byte[0], -1);
     }
 
     /** Forward one Android Wi-Fi Aware lifecycle/callback event to Rust. */
@@ -479,6 +433,11 @@ public class MeshNode implements AutoCloseable {
 
         default String onTransportCommand(String method, String params) { return ""; }
 
+        /** One bounded record sent to a Rust-selected Android platform handler. */
+        default byte[] onStreamRequest(String handler, byte[] record) throws Exception {
+            throw new UnsupportedOperationException("Android stream handler unavailable");
+        }
+
         void onInboundStream(long clientId, String host, int port, long streamHandle);
         void onForwardedStream(long connId, String host, int port, long streamHandle);
 
@@ -487,7 +446,6 @@ public class MeshNode implements AutoCloseable {
 
     private static native long nativeStartMesh(
             String baseDir, int sshPort, int httpPort, int udpFd, int discoveryFd);
-    private static native boolean nativeProvisionDeviceSecret(String baseDir, byte[] secret);
     private native void nativeStop(long handle);
     private native long nativeConnect(long handle, String host, int port, String user, String serverKey);
     private native String nativeExec(long handle, long connId, String command);

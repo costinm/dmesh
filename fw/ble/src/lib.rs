@@ -66,20 +66,20 @@ const DMESH_BLE_SERVICE_UUID16: u16 = 0x1820;
 const DMESH_BLE_PAIRING_UUID128: [u8; 16] = [
     0x80, 0x6f, 0x6b, 0x5f, 0x2a, 0x4f, 0x4a, 0x6f, 0x8c, 0x42, 0x4d, 0x65, 0x73, 0x68, 0x00, 0x01,
 ];
-fn idle_advertisement() -> [u8; 25] {
+const DMESH_BLE_OPERATIONAL_UUID128: [u8; 16] = [
+    0x80, 0x6f, 0x6b, 0x5f, 0x2a, 0x4f, 0x4a, 0x6f, 0x8c, 0x42, 0x4d, 0x65, 0x73, 0x68, 0x00, 0x02,
+];
+fn idle_advertisement(paired: bool) -> [u8; 25] {
     let uuid16 = DMESH_BLE_SERVICE_UUID16.to_le_bytes();
+    let uuid128 = if paired { DMESH_BLE_OPERATIONAL_UUID128 } else { DMESH_BLE_PAIRING_UUID128 };
     [
         0x02, 0x01, 0x06,
         0x03, 0x02, uuid16[0], uuid16[1],
         0x11, 0x07,
-        DMESH_BLE_PAIRING_UUID128[0], DMESH_BLE_PAIRING_UUID128[1],
-        DMESH_BLE_PAIRING_UUID128[2], DMESH_BLE_PAIRING_UUID128[3],
-        DMESH_BLE_PAIRING_UUID128[4], DMESH_BLE_PAIRING_UUID128[5],
-        DMESH_BLE_PAIRING_UUID128[6], DMESH_BLE_PAIRING_UUID128[7],
-        DMESH_BLE_PAIRING_UUID128[8], DMESH_BLE_PAIRING_UUID128[9],
-        DMESH_BLE_PAIRING_UUID128[10], DMESH_BLE_PAIRING_UUID128[11],
-        DMESH_BLE_PAIRING_UUID128[12], DMESH_BLE_PAIRING_UUID128[13],
-        DMESH_BLE_PAIRING_UUID128[14], DMESH_BLE_PAIRING_UUID128[15],
+        uuid128[0], uuid128[1], uuid128[2], uuid128[3],
+        uuid128[4], uuid128[5], uuid128[6], uuid128[7],
+        uuid128[8], uuid128[9], uuid128[10], uuid128[11],
+        uuid128[12], uuid128[13], uuid128[14], uuid128[15],
     ]
 }
 const ADVERTISING_INTERVAL_MIN_UNITS: c_ushort = 0x20;
@@ -93,9 +93,9 @@ pub fn boot_enabled() -> bool {
     BOOT_ENABLED.load(Ordering::Acquire)
 }
 
-pub fn start_dmesh_service() -> Result<(), i32> {
+pub fn start_dmesh_service(paired: bool) -> Result<(), i32> {
     start_coc_server()?;
-    let advertisement = idle_advertisement();
+    let advertisement = idle_advertisement(paired);
     let rc = unsafe {
         dmesh_nimble_start_advertising(
             advertisement.as_ptr(),

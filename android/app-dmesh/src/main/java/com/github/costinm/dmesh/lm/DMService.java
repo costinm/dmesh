@@ -23,8 +23,6 @@ import android.os.RemoteException;
 import android.os.Handler;
 import android.os.Looper;
 import android.preference.PreferenceManager;
-import android.security.keystore.KeyGenParameterSpec;
-import android.security.keystore.KeyProperties;
 import android.util.Log;
 
 import android.app.RemoteInput;
@@ -33,7 +31,7 @@ import com.github.costinm.dmesh.MeshService;
 import com.github.costinm.dmesh.MeshStream;
 
 import com.github.costinm.dmeshnative.AndroidTransportBridge;
-import com.github.costinm.dmeshnative.CborMessageCodec;
+import com.github.costinm.dmesh.CborMessageCodec;
 import com.github.costinm.dmeshnative.MeshNode;
 import com.github.costinm.dmeshnative.Rust;
 
@@ -43,17 +41,6 @@ import java.nio.charset.StandardCharsets;
 import java.net.InetAddress;
 import java.net.InterfaceAddress;
 import java.net.NetworkInterface;
-import java.security.InvalidAlgorithmParameterException;
-import java.security.KeyPair;
-import java.security.KeyPairGenerator;
-import java.security.KeyStore;
-import java.security.KeyStoreException;
-import java.security.NoSuchAlgorithmException;
-import java.security.NoSuchProviderException;
-import java.security.PrivateKey;
-import java.security.UnrecoverableEntryException;
-import java.security.cert.Certificate;
-import java.security.cert.CertificateException;
 import java.security.MessageDigest;
 import android.os.Process;
 import android.content.pm.Signature;
@@ -86,17 +73,11 @@ public class DMService extends MeshService {
 
     private MeshNode meshNode;
     private MessageStreamGateway messageGateway;
-    private static volatile DMService activeService;
     private BatteryMonitor batteryMonitor;
     private ConnectivityManager connectivityManager;
     private ConnectivityManager.NetworkCallback localNetworksCallback;
 
     private SharedPreferences prefs;
-
-    private static final String ANDROID_KEYSTORE = "AndroidKeyStore";
-    private static final String ATTESTATION_KEY_ALIAS = "attestation_key";
-    private PrivateKey attestationKey;
-    private Certificate[] attestationCerts;
 
     boolean fg = false;
 
@@ -156,7 +137,6 @@ public class DMService extends MeshService {
     @Override
     public void onCreate() {
         super.onCreate();
-        activeService = this;
 
         prefs = PreferenceManager.getDefaultSharedPreferences(this);
         // A foreground-service launch has a short system deadline.  Native
@@ -199,7 +179,6 @@ public class DMService extends MeshService {
     }
 
     public void onDestroy() {
-        activeService = null;
         if (batteryMonitor != null) {
             batteryMonitor.close();
             batteryMonitor = null;
@@ -384,18 +363,6 @@ public class DMService extends MeshService {
         return "";
     }
 
-    static DMService getActiveService() {
-        return activeService;
-    }
-
-    MeshNode shellMeshNode() {
-        return meshNode;
-    }
-
-    String applyShellTransportProjection(String projection) {
-        return transport == null ? "transport_unavailable" : transport.applyRustProjection(projection);
-    }
-
     private synchronized void startRustMesh() {
         if (meshNode != null) {
             return;
@@ -423,6 +390,10 @@ public class DMService extends MeshService {
             node.start(getApplicationContext(), RUST_SSH_PORT, RUST_HTTP_PORT);
             messageGateway = new MessageStreamGateway(this, () -> {
                 if (transport != null) transport.requestActiveNanDiscovery();
+                // discovery.active is a local fan-out, not a request to pick
+                // one preferred QUIC path. Solicit every adapter Android owns.
+                node.triggerAnnounce();
+                AndroidTransportBridge.get(this).bleCommand("ble.scan", "{}");
             }, target -> {
                 if (transport != null) {
                     try {
@@ -432,6 +403,7 @@ public class DMService extends MeshService {
                     }
                 }
             });
+            messageGateway.registerLocalHandler("android.keystore", new AndroidKeystoreHandler());
             node.setCallback(messageGateway);
             if (transport != null) transport.setMeshNode(node);
             meshNode = node;
@@ -523,6 +495,12 @@ public class DMService extends MeshService {
             method = "discovery.nodes";
         } else if ("lmesh.status".equals(method) || "status".equals(method)) {
             method = "discovery.status";
+        }
+
+        // Battery observations originate in this process. The Rust handler is
+        // private even though the same Binder transports third-party streams.
+        if ("battery.state.update".equals(method) && uid != Process.myUid()) {
+            return false;
         }
 
         // Android is a normal controller for sleepy peers. These operations
@@ -694,51 +672,5 @@ public class DMService extends MeshService {
 //        stopSignal.cancel();
 //    }
     // /data/user/0/<app>/files/profiling/profile<tag><datetime>.perfetto-trace
-
-    void generateAttestationKey() {
-        try {
-            KeyStore keyStore = KeyStore.getInstance(ANDROID_KEYSTORE);
-            keyStore.load(null);
-
-            if (keyStore.containsAlias(ATTESTATION_KEY_ALIAS)) {
-                KeyStore.Entry entry = keyStore.getEntry(ATTESTATION_KEY_ALIAS, null);
-                if (entry instanceof KeyStore.PrivateKeyEntry) {
-                    this.attestationKey = ((KeyStore.PrivateKeyEntry) entry).getPrivateKey();
-                    this.attestationCerts = keyStore.getCertificateChain(ATTESTATION_KEY_ALIAS);
-                    Log.d(TAG, "Attestation key already exists. Loaded from Keystore.");
-                    return;
-                }
-            }
-
-            Log.d(TAG, "Generating new attestation key.");
-            KeyPairGenerator keyPairGenerator = KeyPairGenerator.getInstance(
-                    KeyProperties.KEY_ALGORITHM_EC /* "EC" */ , ANDROID_KEYSTORE);
-
-            // This is specific to android keystore - can't avoid the dependency
-            // ( unless calling binder directly from native )
-            KeyGenParameterSpec spec = new KeyGenParameterSpec.Builder(
-                    ATTESTATION_KEY_ALIAS,
-                    KeyProperties.PURPOSE_SIGN /* 4 */)
-                    .setAlgorithmParameterSpec(new java.security.spec.ECGenParameterSpec("secp256r1"))
-                    .setUserAuthenticationRequired(false) // even if user didn't authenticate recently
-                    .setDigests(KeyProperties.DIGEST_SHA256 /* SHA-256 */ )
-                    .setAttestationChallenge("a_test_challenge".getBytes())
-                    .build();
-
-            keyPairGenerator.initialize(spec);
-            KeyPair keyPair = keyPairGenerator.generateKeyPair();
-            this.attestationKey = keyPair.getPrivate();
-            this.attestationCerts = keyStore.getCertificateChain(ATTESTATION_KEY_ALIAS);
-            KeyStore.Entry entry = keyStore.getEntry(ATTESTATION_KEY_ALIAS, null);
-            for (Certificate cert : this.attestationCerts) {
-                Log.d(TAG, "Got  " + cert);
-            }
-
-        } catch (KeyStoreException | CertificateException | IOException | NoSuchAlgorithmException |
-                 InvalidAlgorithmParameterException | NoSuchProviderException |
-                 UnrecoverableEntryException e) {
-            Log.e(TAG, "Failed to generate or load attestation key", e);
-        }
-    }
 
 }

@@ -1,12 +1,12 @@
 [workspace]
 members = [
-    "crates/dmesh",
+    "crates/dmesh-android",
     "crates/dmesh-store",
     "crates/dmesh-cli",
     "crates/dmesh-server",
     "crates/quic-lite",
     "crates/dmeshtui",
-    "crates/dmeshui",
+    "crates/dmeshtui-android",
     "crates/lmesh",
     "crates/lmesh-wifi",
     "crates/uart-codec",

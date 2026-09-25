@@ -1,5 +1,18 @@
 # DMesh Android API helpers
 
+`MeshStream`, `MeshClient`, and `DirectBinder` are the shared app API.
+`CborMessageCodec.encode(MeshStream)` and `decode(byte[])` convert direct
+message records; `encodeBundle(Bundle)` is available for typed platform
+messages. Third-party apps can use these helpers without depending on
+`app-dmesh` Java classes.
+
+An app can consume handlers through `MeshClient.sendStream`. To provide one,
+register its method name and `MeshStreamHandler` in `MeshStreamHandlers`, then
+return `handlers.asDirectBinder()` from a service bound through app-dmesh.
+Handlers receive a typed `MeshStream` and return a correlated reply. The same
+registry accepts bounded CBOR `byte[]` records from Rust through
+`handleRecord`, without adding a JNI method for each Android feature.
+
 ## Old patterns - new patterns
 
 Service.onStartCommand() was simple - but can't handle the modern app management,
@@ -33,4 +46,3 @@ Jobs may show notifications - for importance, with isUserInitiated() on the
 job parameters, and a call to setNotification() in 10 sec. 
 
 Jobs run with a wake lock held by system.
-

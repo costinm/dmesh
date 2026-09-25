@@ -108,8 +108,10 @@ impl Handler for ProfileControl<'_> {
     }
 
     fn settings_set(&mut self, key: &[u8], value: &[u8]) -> Result<(), Self::Error> {
-        if crate::main_runtime::write_binary_setting(key, value) {
-            return Ok(());
+        // Ownership material is written only by a bearer-aware pairing
+        // handler. A generic tagged request does not carry trusted ingress.
+        if key == b"cp" || key == b"sec:key" {
+            return Err(ProfileControlError::Unsupported);
         }
         if let Some(secret_key) = key.strip_prefix(b"sec:") {
             if !crate::main_runtime::write_secret_setting(secret_key, value) {

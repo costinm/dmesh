@@ -6,7 +6,7 @@
 
 use alloc::{boxed::Box, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
-use dmesh_server::verified_object::{ImageSink, BLOCK_SIZE};
+use dmesh_server::verified_object::{BLOCK_SIZE, ImageSink};
 
 /// No application bytes have arrived for this bounded period. This is a
 /// receiver liveness guard, not a transport deadline: QUIC-lite continues to
@@ -469,7 +469,7 @@ pub(crate) unsafe fn expire(service: &mut ConnectionService, now_ms: u64) {
 /// socket fact enters this module.
 pub(crate) unsafe fn after_receive(
     service: &mut ConnectionService,
-    _path: quic_lite::PathId,
+    _path: quic_lite::LocalAddress,
     now_ms: u64,
     closed: bool,
 ) {
@@ -541,7 +541,7 @@ pub(crate) unsafe fn after_receive(
 /// Poll durable completion before a normal QUIC transmit turn.
 pub(crate) unsafe fn before_poll(
     service: &mut ConnectionService,
-    _path: quic_lite::PathId,
+    _path: quic_lite::LocalAddress,
     now_ms: u64,
 ) {
     {

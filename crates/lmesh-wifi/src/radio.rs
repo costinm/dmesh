@@ -3,10 +3,11 @@ use mesh::message::{
     FIELD_IFACE, FIELD_LEN, FIELD_MEDIUM, FIELD_NETWORK, FIELD_NODE, FIELD_PAYLOAD, FIELD_RADIO_ID,
     FIELD_RSSI, FIELD_SNR, FIELD_STATUS, MeshMessage, MeshMessageCodec,
 };
-use p256::ecdsa::signature::Verifier;
-use p256::ecdsa::{Signature, VerifyingKey};
+#[cfg(test)]
+use p256::ecdsa::Signature;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::OpenOptions;
@@ -106,7 +107,7 @@ const PACKET_MR_MULTICAST: libc::c_ushort = 0;
 /// Map action-bearer metadata to the opaque handle retained by QUIC.
 /// Encoding and decoding remain in this adapter; the connection dispatcher
 /// only compares the handle and selects it for egress.
-fn action_path_id(peer: [u8; 6]) -> quic_lite::PathId {
+fn action_path_id(peer: [u8; 6]) -> quic_lite::LocalAddress {
     let value = (2_u64 << 48)
         | ((peer[0] as u64) << 40)
         | ((peer[1] as u64) << 32)
@@ -114,7 +115,7 @@ fn action_path_id(peer: [u8; 6]) -> quic_lite::PathId {
         | ((peer[3] as u64) << 16)
         | ((peer[4] as u64) << 8)
         | peer[5] as u64;
-    quic_lite::PathId::new(value).expect("action path is nonzero")
+    quic_lite::LocalAddress::new(value).expect("action path is nonzero")
 }
 
 /// Direct messages use QUIC-lite's private long-header extension.  Every
@@ -156,7 +157,7 @@ fn next_action_client_cid() -> quic_lite::ConnectionId {
     quic_lite::ConnectionId::new(value).expect("bounded action client CID")
 }
 
-fn action_path_peer(path: quic_lite::PathId) -> Option<[u8; 6]> {
+fn action_path_peer(path: quic_lite::LocalAddress) -> Option<[u8; 6]> {
     let value = path.value();
     if (value >> 48) as u8 != 2 {
         return None;
@@ -1258,27 +1259,84 @@ fn discovered_device_json(entry: &DiscoveredDevice) -> Value {
 /// the radio library prevents UDP, NAN, and local sibling ingress from
 /// gradually accepting different identities.
 fn announce_identity_valid(announce: dmesh_server::announce::Announce) -> bool {
-    if !announce.has_identity() {
-        return true;
-    }
-    let digest = Sha256::digest(announce.public_key());
-    if announce.device_id() != &digest[..announce.device_id().len()] {
-        return false;
-    }
-    let Ok(signature) = Signature::from_slice(announce.signature()) else {
-        return false;
-    };
-    let Ok(key) = VerifyingKey::from_sec1_bytes(announce.public_key()) else {
-        return false;
-    };
-    let mut signed = [0u8; 384];
-    let Some(used) = dmesh_server::announce::signing_bytes(announce, &mut signed) else {
-        return false;
-    };
-    key.verify(&signed[..used], &signature).is_ok()
+    dmesh_server::announce::verify_identity(announce)
 }
 
 impl RadioService {
+    /// Resolve a signed observation to a provisioned controller-owned device.
+    /// The secret remains in the private inventory and is never returned.
+    pub fn require_owned_companion(&self, id: &str, vip6: Option<Ipv6Addr>) -> Result<Ipv6Addr> {
+        let devices = self.discovered_devices.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let candidate = devices.devices.values().find_map(|device| {
+            let key = device.announce.get("public_key")?.as_str()?;
+            if key.is_empty() { return None; }
+            let address = device.announce.get("vip6")?.as_str()?.parse::<Ipv6Addr>().ok()?;
+            let matches_id = device.device_id == id || device.peer.eq_ignore_ascii_case(id)
+                || device.announce.get("device_name").and_then(Value::as_str) == Some(id)
+                || address.to_string() == id;
+            (matches_id && vip6.is_none_or(|expected| expected == address))
+                .then(|| (device.device_id.clone(), address, key.to_owned()))
+        }).ok_or_else(|| anyhow::anyhow!("companion has no matching signed discovery identity"))?;
+        drop(devices);
+        let path = std::env::var_os("DMESH_PAIRED_DEVICES_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/home/system/etc/lmesh/paired"));
+        let owned = dmesh_server::discovery::PairedDevices::load(&path, &candidate.1.to_string())
+            .map_err(anyhow::Error::msg)?
+            .ok_or_else(|| anyhow::anyhow!("companion has no private pairing result"))?;
+        if owned.device_id != candidate.0 { anyhow::bail!("paired device ID differs from signed observation"); }
+        if owned.secret.len() < 16 {
+            anyhow::bail!("owned companion has no provisioned control secret");
+        }
+        if !owned.public_key.is_empty()
+            && owned.public_key.iter().map(|byte| format!("{byte:02x}")).collect::<String>() != candidate.2
+        {
+            anyhow::bail!("owned companion public key differs from its signed observation");
+        }
+        if owned.vip6.as_deref().is_some_and(|stored| stored != candidate.1.to_string()) {
+            anyhow::bail!("owned companion VIP differs from its signed observation");
+        }
+        Ok(candidate.1)
+    }
+    /// Admit a physical console line as the one-way log.record message.
+    pub fn record_uart_log(&self, path: &str, text: &str) {
+        use mesh::tagged::{NameOrTag, TaggedRecord};
+        let mut record = TaggedRecord {
+            component: NameOrTag::Tag(208),
+            method: NameOrTag::Tag(1),
+            ..Default::default()
+        };
+        record.env.insert(NameOrTag::Tag(1), json!(text));
+        record.env.insert(NameOrTag::Tag(2), json!(path));
+        record
+            .env
+            .insert(NameOrTag::Tag(3), json!(now_millis() as u64));
+        push_history_event(
+            &self.history,
+            "log.record",
+            mesh::tagged::to_json(&record, None),
+        );
+    }
+
+    /// Preserve an unsolicited QUIC-lite long packet as a normal message.
+    pub fn record_uart_message(&self, path: &str, packet: &[u8]) {
+        let Some(payload) = dmesh_server::direct::ConnectionlessMessage::decode(packet) else {
+            return;
+        };
+        if let Some(announce) = dmesh_server::announce::decode_announce(payload) {
+            let _ = self.observe_discovered_announce("uart", path.to_owned(), None, announce);
+            return;
+        }
+        if let Ok(record) = mesh::cbor::decode_record(payload) {
+            if matches!(record.kind(), Ok(mesh::tagged::RecordKind::Message)) {
+                push_history_event(
+                    &self.history,
+                    "uart.message",
+                    mesh::tagged::to_json(&record, None),
+                );
+            }
+        }
+    }
     /// Presentation-safe, bearer-neutral discovery inventory. Native peer
     /// handles remain in adapter diagnostics so Android PeerHandle values and
     /// Linux/ESP MAC addresses never become incompatible UI identities.

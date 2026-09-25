@@ -6,6 +6,7 @@
 
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -69,6 +70,15 @@
         android:usesCleartextTraffic="true"
         android:theme="@style/App">
 
+        <service
+            android:name="com.github.costinm.dmesh.wifi.DMeshCompanionService"
+            android:exported="true"
+            android:permission="android.permission.BIND_COMPANION_DEVICE_SERVICE">
+            <intent-filter>
+                <action android:name="android.companion.CompanionDeviceService" />
+            </intent-filter>
+        </service>
+
         <!--             android:process=":dmesh"
         -->
         <service
@@ -85,21 +95,6 @@
                 <action android:name="com.github.costinm.dmesh.wifi.BLE_SCAN" />
             </intent-filter>
         </receiver>
-
-        <receiver
-            android:name=".UsbPermissionReceiver"
-            android:enabled="true"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="com.github.costinm.dmesh.lm.USB_PERMISSION" />
-            </intent-filter>
-        </receiver>
-
-        <provider
-            android:name=".DMeshShellProvider"
-            android:authorities="com.github.costinm.dmesh.lm.shell"
-            android:enabled="true"
-            android:exported="true" />
 
         <service
             android:name=".LMJob"

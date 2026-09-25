@@ -86,6 +86,22 @@ async fn run_server(defaults: RuntimeDefaults) -> Result<()> {
     discovery.start().await?;
     let discovery = Arc::new(discovery);
     let service = Arc::new(LmeshService::new(discovery.clone()));
+    // Hotplug is an advisory inventory edge. It never opens a newly added
+    // UART; only an explicit uart.discover or companion.pair command may do that.
+    let uart = service.uart_controller();
+    std::thread::spawn(move || {
+        let watcher = uart_codec::host::PortWatcher::new().ok();
+        loop {
+            if let Some(watcher) = &watcher {
+                let _ = watcher.wait(std::time::Duration::from_secs(60));
+            } else {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+            }
+            if let Err(error) = uart.reconcile_presence() {
+                warn!(%error, "uart_presence_reconcile_failed");
+            }
+        }
+    });
     // Netlink is only an advisory hint. A base-device event waits for the USB
     // driver to settle, then runs the same presence-edge check as the periodic
     // fallback. AP, monitor, carrier, and P2P events are ignored.
@@ -614,7 +630,10 @@ mod tests {
             } if iface == "wlan0"
         ));
         let transport = CONTROL_CATALOG
-            .parse_argv("transport.set", &["--mode=6".into(), "--iface=wlan0".into()])
+            .parse_argv(
+                "transport.set",
+                &["--mode=6".into(), "--iface=wlan0".into()],
+            )
             .unwrap();
         assert!(matches!(
             decode_lmesh_tagged_request(&transport).unwrap(),

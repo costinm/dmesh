@@ -1,5 +1,634 @@
 [
   {
+    "description": "Return the bounded cross-bearer observed-device inventory",
+    "inputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "name": "discovery.nodes",
+    "outputSchema": {
+      "properties": {
+        "active_publish_rx": {
+          "type": "integer",
+          "x-protobuf-index": 8,
+          "x-protobuf-type": "u32"
+        },
+        "active_subscribe_rx": {
+          "type": "integer",
+          "x-protobuf-index": 9,
+          "x-protobuf-type": "u32"
+        },
+        "available_fields": {
+          "type": "integer",
+          "x-protobuf-index": 4,
+          "x-protobuf-type": "u32"
+        },
+        "bssid": {
+          "type": "string",
+          "x-protobuf-index": 3,
+          "x-protobuf-type": "bytes[6]"
+        },
+        "channel": {
+          "type": "integer",
+          "x-protobuf-index": 15,
+          "x-protobuf-type": "u8"
+        },
+        "device_id": {
+          "type": "string",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "bytes"
+        },
+        "first_seen_ms": {
+          "type": "integer",
+          "x-protobuf-index": 5,
+          "x-protobuf-type": "u32"
+        },
+        "followup_rx": {
+          "type": "integer",
+          "x-protobuf-index": 10,
+          "x-protobuf-type": "u32"
+        },
+        "last_kind": {
+          "type": "integer",
+          "x-protobuf-index": 11,
+          "x-protobuf-type": "u8"
+        },
+        "last_payload_hash": {
+          "type": "integer",
+          "x-protobuf-index": 13,
+          "x-protobuf-type": "u32"
+        },
+        "last_payload_len": {
+          "type": "integer",
+          "x-protobuf-index": 12,
+          "x-protobuf-type": "u16"
+        },
+        "last_seen_ms": {
+          "type": "integer",
+          "x-protobuf-index": 6,
+          "x-protobuf-type": "u32"
+        },
+        "packets": {
+          "type": "integer",
+          "x-protobuf-index": 7,
+          "x-protobuf-type": "u32"
+        },
+        "peer": {
+          "type": "string",
+          "x-protobuf-index": 2,
+          "x-protobuf-type": "bytes[6]"
+        },
+        "unavailable_fields": {
+          "type": "integer",
+          "x-protobuf-index": 14,
+          "x-protobuf-type": "u32"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 6,
+    "x-method-index": 9,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ],
+    "x-ui-visibility": "default"
+  },
+  {
+    "description": "Run one discovery pass on every available local bearer",
+    "inputSchema": {
+      "properties": {
+        "medium": {
+          "type": "string",
+          "x-protobuf-index": 40,
+          "x-protobuf-type": "string"
+        },
+        "to": {
+          "type": "string",
+          "x-protobuf-index": 41,
+          "x-protobuf-type": "string"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "name": "discovery.active",
+    "outputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 6,
+    "x-method-index": 10,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
+  },
+  {
+    "description": "Return local NAN attach, cluster, synchronization, and publish state",
+    "inputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "name": "telemetry.nan_status",
+    "outputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 7,
+    "x-method-index": 1,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ],
+    "x-ui-visibility": "default"
+  },
+  {
+    "description": "Return local ESP-NOW submission, receive, admission, dispatch, drop, and error counters",
+    "inputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "name": "telemetry.now_metrics",
+    "outputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 7,
+    "x-method-index": 2,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
+  },
+  {
+    "description": "Return local NAN beacon, SDF, Service Info, Follow-up, dispatch, drop, and error counters",
+    "inputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "name": "telemetry.nan_metrics",
+    "outputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 7,
+    "x-method-index": 3,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
+  },
+  {
+    "description": "Return local raw IPv6 validation, UDP delivery, NDP, transmit, and failure counters",
+    "inputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "name": "telemetry.udp6_metrics",
+    "outputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 7,
+    "x-method-index": 4,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
+  },
+  {
+    "description": "Return common optional per-peer Wi-Fi link observations",
+    "inputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "name": "telemetry.wifi_link_metrics",
+    "outputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 7,
+    "x-method-index": 5,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
+  },
+  {
+    "description": "Return the latest portable battery and power snapshot",
+    "inputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "name": "telemetry.battery",
+    "outputSchema": {
+      "properties": {
+        "battery_percent": {
+          "type": "integer",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "u8"
+        },
+        "charging": {
+          "type": "boolean",
+          "x-protobuf-index": 2,
+          "x-protobuf-type": "bool"
+        },
+        "charging_ms": {
+          "type": "integer",
+          "x-protobuf-index": 7,
+          "x-protobuf-type": "u64"
+        },
+        "idle": {
+          "type": "boolean",
+          "x-protobuf-index": 4,
+          "x-protobuf-type": "bool"
+        },
+        "idle_ms": {
+          "type": "integer",
+          "x-protobuf-index": 5,
+          "x-protobuf-type": "u64"
+        },
+        "power_save": {
+          "type": "boolean",
+          "x-protobuf-index": 3,
+          "x-protobuf-type": "bool"
+        },
+        "total_idle_ms": {
+          "type": "integer",
+          "x-protobuf-index": 6,
+          "x-protobuf-type": "u64"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 7,
+    "x-method-index": 6,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
+  },
+  {
+    "description": "Replace a node's complete volatile physical transport profile",
+    "inputSchema": {
+      "properties": {
+        "ap": {
+          "type": "integer",
+          "x-protobuf-index": 16,
+          "x-protobuf-type": "u8"
+        },
+        "ble": {
+          "type": "integer",
+          "x-protobuf-index": 26,
+          "x-protobuf-type": "u8"
+        },
+        "bssid": {
+          "type": "string",
+          "x-protobuf-index": 3,
+          "x-protobuf-type": "string"
+        },
+        "channel": {
+          "type": "integer",
+          "x-protobuf-index": 4,
+          "x-protobuf-type": "u8"
+        },
+        "espnow_capture": {
+          "type": "boolean",
+          "x-protobuf-index": 13,
+          "x-protobuf-type": "bool"
+        },
+        "iface": {
+          "type": "string",
+          "x-protobuf-index": 27,
+          "x-protobuf-type": "string"
+        },
+        "mode": {
+          "type": "integer",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "u8"
+        },
+        "nan_dw_interval": {
+          "type": "integer",
+          "x-protobuf-index": 14,
+          "x-protobuf-type": "u8"
+        },
+        "ndp": {
+          "type": "integer",
+          "x-protobuf-index": 19,
+          "x-protobuf-type": "u8"
+        },
+        "now": {
+          "type": "integer",
+          "x-protobuf-index": 15,
+          "x-protobuf-type": "u8"
+        },
+        "open": {
+          "type": "boolean",
+          "x-protobuf-index": 24,
+          "x-protobuf-type": "bool"
+        },
+        "passphrase": {
+          "type": "string",
+          "x-protobuf-index": 17,
+          "x-protobuf-type": "string"
+        },
+        "raw_tx_rate": {
+          "type": "integer",
+          "x-protobuf-index": 5,
+          "x-protobuf-type": "u8"
+        },
+        "ssid": {
+          "type": "string",
+          "x-protobuf-index": 2,
+          "x-protobuf-type": "string"
+        },
+        "sta_11b_rates_disabled": {
+          "type": "boolean",
+          "x-protobuf-index": 9,
+          "x-protobuf-type": "bool"
+        },
+        "sta_ampdu_enabled": {
+          "type": "boolean",
+          "x-protobuf-index": 8,
+          "x-protobuf-type": "bool"
+        },
+        "sta_bssid_check_disabled": {
+          "type": "boolean",
+          "x-protobuf-index": 7,
+          "x-protobuf-type": "bool"
+        },
+        "sta_driver_tx": {
+          "type": "boolean",
+          "x-protobuf-index": 6,
+          "x-protobuf-type": "bool"
+        },
+        "sta_raw_rx_enabled": {
+          "type": "boolean",
+          "x-protobuf-index": 10,
+          "x-protobuf-type": "bool"
+        },
+        "uart": {
+          "type": "integer",
+          "x-protobuf-index": 18,
+          "x-protobuf-type": "u8"
+        },
+        "wake_target": {
+          "type": "string",
+          "x-protobuf-index": 25,
+          "x-protobuf-type": "string"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "name": "transport.set",
+    "outputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 1,
+    "x-method-index": 4,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ],
+    "x-ui-visibility": "default"
+  },
+  {
+    "description": "Replace volatile QUIC-lite association defaults",
+    "inputSchema": {
+      "properties": {
+        "ack_delay_ms": {
+          "type": "integer",
+          "x-protobuf-index": 3,
+          "x-protobuf-type": "u8"
+        },
+        "ack_frequency": {
+          "type": "integer",
+          "x-protobuf-index": 2,
+          "x-protobuf-type": "u8"
+        },
+        "path_policy": {
+          "type": "integer",
+          "x-protobuf-index": 11,
+          "x-protobuf-type": "u8"
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "x-protobuf-index": 12,
+          "x-protobuf-type": "u32"
+        },
+        "tx_burst_packets": {
+          "type": "integer",
+          "x-protobuf-index": 4,
+          "x-protobuf-type": "u8"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "name": "connection.configure",
+    "outputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 3,
+    "x-method-index": 1,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
+  },
+  {
+    "description": "Provision a virgin companion",
+    "inputSchema": {
+      "properties": {
+        "baud": {
+          "type": "integer",
+          "x-protobuf-index": 4,
+          "x-protobuf-type": "u32"
+        },
+        "id": {
+          "type": "string",
+          "x-protobuf-index": 2,
+          "x-protobuf-type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "string"
+        },
+        "name": {
+          "type": "string",
+          "x-protobuf-index": 6,
+          "x-protobuf-type": "string"
+        },
+        "psm": {
+          "type": "integer",
+          "x-protobuf-index": 5,
+          "x-protobuf-type": "u16"
+        },
+        "root_public_key_b64": {
+          "type": "string",
+          "x-protobuf-index": 7,
+          "x-protobuf-type": "string"
+        },
+        "vip6": {
+          "type": "string",
+          "x-protobuf-index": 3,
+          "x-protobuf-type": "string"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "name": "companion.pair",
+    "outputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 209,
+    "x-method-index": 1,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
+  },
+  {
+    "description": "Reset a companion to virgin state",
+    "inputSchema": {
+      "properties": {
+        "id": {
+          "type": "string",
+          "x-protobuf-index": 2,
+          "x-protobuf-type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "string"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "name": "companion.unpair",
+    "outputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 209,
+    "x-method-index": 2,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
+  },
+  {
     "description": "Report local BLE adapter and bearer state",
     "inputSchema": {
       "properties": {},
@@ -146,73 +775,6 @@
     "x-ui-visibility": "default"
   },
   {
-    "description": "Connect to a BLE device over L2CAP CoC",
-    "inputSchema": {
-      "properties": {
-        "address": {
-          "type": "string",
-          "x-protobuf-index": 1,
-          "x-protobuf-type": "string"
-        },
-        "psm": {
-          "type": "integer",
-          "x-protobuf-index": 2,
-          "x-protobuf-type": "u16"
-        }
-      },
-      "required": [],
-      "type": "object"
-    },
-    "name": "ble.connect",
-    "outputSchema": {
-      "properties": {},
-      "required": [],
-      "type": "object"
-    },
-    "x-component-index": 201,
-    "x-method-index": 6,
-    "x-standard-errors": [
-      "unauthenticated",
-      "permission_denied",
-      "timeout",
-      "remote_exception",
-      "invalid_argument",
-      "not_found",
-      "conflict",
-      "unavailable",
-      "internal"
-    ],
-    "x-ui-visibility": "default"
-  },
-  {
-    "description": "Disconnect the local BLE bearer",
-    "inputSchema": {
-      "properties": {},
-      "required": [],
-      "type": "object"
-    },
-    "name": "ble.disconnect",
-    "outputSchema": {
-      "properties": {},
-      "required": [],
-      "type": "object"
-    },
-    "x-component-index": 201,
-    "x-method-index": 7,
-    "x-standard-errors": [
-      "unauthenticated",
-      "permission_denied",
-      "timeout",
-      "remote_exception",
-      "invalid_argument",
-      "not_found",
-      "conflict",
-      "unavailable",
-      "internal"
-    ],
-    "x-ui-visibility": "default"
-  },
-  {
     "description": "Read bounded local radio event history",
     "inputSchema": {
       "properties": {
@@ -243,187 +805,6 @@
     },
     "x-component-index": 202,
     "x-method-index": 1,
-    "x-standard-errors": [
-      "unauthenticated",
-      "permission_denied",
-      "timeout",
-      "remote_exception",
-      "invalid_argument",
-      "not_found",
-      "conflict",
-      "unavailable",
-      "internal"
-    ],
-    "x-ui-visibility": "default"
-  },
-  {
-    "description": "Report the local transport snapshot",
-    "inputSchema": {
-      "properties": {},
-      "required": [],
-      "type": "object"
-    },
-    "name": "transport.status",
-    "outputSchema": {
-      "properties": {},
-      "required": [],
-      "type": "object"
-    },
-    "x-component-index": 203,
-    "x-method-index": 1,
-    "x-standard-errors": [
-      "unauthenticated",
-      "permission_denied",
-      "timeout",
-      "remote_exception",
-      "invalid_argument",
-      "not_found",
-      "conflict",
-      "unavailable",
-      "internal"
-    ],
-    "x-ui-visibility": "default"
-  },
-  {
-    "description": "Change the local radio transport mode",
-    "inputSchema": {
-      "properties": {
-        "ap": {
-          "type": "integer",
-          "x-protobuf-index": 7,
-          "x-protobuf-type": "u8"
-        },
-        "ble": {
-          "type": "integer",
-          "x-protobuf-index": 10,
-          "x-protobuf-type": "u8"
-        },
-        "bssid": {
-          "type": "string",
-          "x-protobuf-index": 4,
-          "x-protobuf-type": "string"
-        },
-        "bssid_hex": {
-          "type": "string",
-          "x-protobuf-index": 5,
-          "x-protobuf-type": "string"
-        },
-        "channel": {
-          "type": "integer",
-          "x-protobuf-index": 6,
-          "x-protobuf-type": "u8"
-        },
-        "mode": {
-          "type": "string",
-          "x-protobuf-index": 1,
-          "x-protobuf-type": "string"
-        },
-        "nan_dw_interval": {
-          "type": "integer",
-          "x-protobuf-index": 12,
-          "x-protobuf-type": "u8"
-        },
-        "now": {
-          "type": "integer",
-          "x-protobuf-index": 9,
-          "x-protobuf-type": "u8"
-        },
-        "p2p_go": {
-          "type": "integer",
-          "x-protobuf-index": 8,
-          "x-protobuf-type": "u8"
-        },
-        "passphrase": {
-          "type": "string",
-          "x-protobuf-index": 3,
-          "x-protobuf-type": "string"
-        },
-        "ssid": {
-          "type": "string",
-          "x-protobuf-index": 2,
-          "x-protobuf-type": "string"
-        },
-        "uart": {
-          "type": "integer",
-          "x-protobuf-index": 11,
-          "x-protobuf-type": "u8"
-        },
-        "wake_target": {
-          "type": "string",
-          "x-protobuf-index": 13,
-          "x-protobuf-type": "string"
-        }
-      },
-      "required": [],
-      "type": "object"
-    },
-    "name": "transport.set",
-    "outputSchema": {
-      "properties": {},
-      "required": [],
-      "type": "object"
-    },
-    "x-component-index": 203,
-    "x-method-index": 2,
-    "x-standard-errors": [
-      "unauthenticated",
-      "permission_denied",
-      "timeout",
-      "remote_exception",
-      "invalid_argument",
-      "not_found",
-      "conflict",
-      "unavailable",
-      "internal"
-    ],
-    "x-ui-visibility": "default"
-  },
-  {
-    "description": "Send a NAN wake or activation record",
-    "inputSchema": {
-      "properties": {
-        "ap": {
-          "type": "integer",
-          "x-protobuf-index": 3,
-          "x-protobuf-type": "u8"
-        },
-        "ble": {
-          "type": "integer",
-          "x-protobuf-index": 5,
-          "x-protobuf-type": "u8"
-        },
-        "kind": {
-          "type": "integer",
-          "x-protobuf-index": 2,
-          "x-protobuf-type": "u8"
-        },
-        "nan_dw_interval": {
-          "type": "integer",
-          "x-protobuf-index": 6,
-          "x-protobuf-type": "u8"
-        },
-        "now": {
-          "type": "integer",
-          "x-protobuf-index": 4,
-          "x-protobuf-type": "u8"
-        },
-        "target_mac": {
-          "type": "string",
-          "x-protobuf-index": 1,
-          "x-protobuf-type": "string"
-        }
-      },
-      "required": [],
-      "type": "object"
-    },
-    "name": "transport.start",
-    "outputSchema": {
-      "properties": {},
-      "required": [],
-      "type": "object"
-    },
-    "x-component-index": 203,
-    "x-method-index": 3,
     "x-standard-errors": [
       "unauthenticated",
       "permission_denied",

@@ -154,19 +154,23 @@
           # (without the musl/Android toolchain: NixOS targets run the GNU
           # build), so deployments can come from the flake like other DMesh
           # dependencies instead of prebuilt `target/` files.
-          dmesh = pkgs.rustPlatform.buildRustPackage {
+          mkDmesh = firmwareRoot: sourceRoot: sshMeshRoot: pkgs.rustPlatform.buildRustPackage {
             pname = "dmesh";
             version = "0.1.0";
-            src = self;
+            src = sourceRoot;
             nativeBuildInputs = [ pkgs.makeWrapper ];
             cargoLock = {
               lockFile = ./Cargo.lock;
-              # costinm/ssh-mesh is a git dependency; importCargoLock needs
-              # the store hash for the mutable git sources.
-              # Hash pinned to the ssh-mesh revision in Cargo.lock; updated
-              # together with the lockfile when the dependency moves.
-              outputHashes."ssh-mesh-0.1.0" = "sha256-5rWzd8kP0CrjXZgaLgVHScsHNY/+lT6RgA8bPN5USk8=";
+              # mesh-api is sourced from the pinned ssh-mesh git revision.
+              outputHashes."mesh-api-0.1.0" = "sha256-5rWzd8kP0CrjXZgaLgVHScsHNY/+lT6RgA8bPN5USk8=";
             };
+            postPatch = pkgs.lib.optionalString (sshMeshRoot != null) ''
+              cat >> Cargo.toml <<'EOF'
+              [patch."https://github.com/costinm/ssh-mesh"]
+              ssh-mesh = { path = "${sshMeshRoot}/crates/ssh-mesh" }
+              mesh = { path = "${sshMeshRoot}/crates/mesh" }
+              EOF
+            '';
             doCheck = false;
             cargoBuildFlags = [
               "-p" "lmesh"
@@ -178,9 +182,66 @@
               install -Dm644 crates/lmesh/resources/tools.json "$out/etc/schemas/tools.json"
               install -Dm644 crates/lmesh/resources/tools.json "$out/etc/schemas/lmesh/tools.json"
               wrapProgram "$out/bin/dmesh-cli" --set-default MESH_SCHEMA_DIR "$out/etc/schemas"
+              ln -s ${pkgs.espflash}/bin/espflash "$out/bin/espflash"
+              install -Dm755 scripts/flash-device.py "$out/libexec/dmesh/flash-device.py"
+              makeWrapper ${pkgs.python3}/bin/python3 "$out/bin/dmesh-flash" \
+                --add-flags "$out/libexec/dmesh/flash-device.py" \
+                --set DMESH_INSTALL_ROOT "$out" \
+                --prefix PATH : "$out/bin"
+              install -Dm644 docs/flashing.md "$out/share/doc/dmesh/flashing.md"
+            '' + pkgs.lib.optionalString (firmwareRoot != null) ''
+              for cpu in esp32 esp32s3 esp32c6; do
+                for image in recovery.bin main-app.bin; do
+                  source="${firmwareRoot}/$cpu/$image"
+                  if [ ! -s "$source" ]; then
+                    echo "missing firmware artifact: $source" >&2
+                    exit 1
+                  fi
+                  install -Dm644 "$source" "$out/share/dmesh/flash/$cpu/$image"
+                done
+                for size in 4mb 8mb; do
+                  for image in stage2.bin partition-table.bin; do
+                    source="${firmwareRoot}/$cpu/$size/$image"
+                    if [ ! -s "$source" ]; then
+                      echo "missing firmware artifact: $source" >&2
+                      exit 1
+                    fi
+                    install -Dm644 "$source" "$out/share/dmesh/flash/$cpu/$size/$image"
+                  done
+                done
+                default_size=4mb
+                if [ "$cpu" = esp32s3 ]; then default_size=8mb; fi
+                for image in stage2.bin partition-table.bin; do
+                  cp "$out/share/dmesh/flash/$cpu/$default_size/$image" \
+                     "$out/share/dmesh/flash/$cpu/$image"
+                done
+              done
             '';
+            passthru.withFirmware = firmware: mkDmesh firmware sourceRoot sshMeshRoot;
             meta.priority = 5;
           };
+          dmesh = mkDmesh null self null;
+          firmwareRoot = builtins.getEnv "DMESH_FIRMWARE_ROOT";
+          localSourceRoot = builtins.getEnv "DMESH_SOURCE_ROOT";
+          sshMeshSourceRoot = builtins.getEnv "DMESH_SSH_MESH_DIR";
+          localSource =
+            if localSourceRoot == "" then self else
+              builtins.path {
+                path = localSourceRoot;
+                name = "dmesh-source";
+                filter = path: type:
+                  let name = builtins.baseNameOf (toString path);
+                  in !(builtins.elem name [ ".git" "target" "result" ".vscode" ".agents" ]);
+              };
+          sshMeshSource =
+            if sshMeshSourceRoot == "" then null else
+              builtins.path {
+                path = sshMeshSourceRoot;
+                name = "ssh-mesh-source";
+                filter = path: type:
+                  let name = builtins.baseNameOf (toString path);
+                  in !(builtins.elem name [ ".git" "target" "result" ".vscode" ".agents" ]);
+              };
           musl-toolchain = pkgs.runCommand "dmesh-musl-toolchain" { } ''
             mkdir -p "$out/bin"
             for tool in ${pkgs.pkgsCross.musl64.stdenv.cc}/bin/*; do
@@ -214,6 +275,11 @@
         in
         {
           inherit deps musl-toolchain wpa-supplicant-nan dmesh;
+          dmesh-with-firmware =
+            if firmwareRoot == "" then
+              throw "Set DMESH_FIRMWARE_ROOT to the flash directory with all three CPUs and 4mb/8mb Stage2 variants, then use nix build --impure .#dmesh-with-firmware"
+            else
+              mkDmesh (builtins.path { path = firmwareRoot; name = "dmesh-firmware"; }) localSource sshMeshSource;
           musl-deps = muslDeps;
           default = deps;
         }

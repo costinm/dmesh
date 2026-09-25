@@ -75,14 +75,19 @@ pub mod transport_path;
 pub mod transport_state;
 /// UART framing shared by host and firmware bearer adapters.
 pub mod uart;
+/// Cross-platform selection of NAN observers for waking a sleepy peer.
+pub mod wake;
 
 /// Shared Tokio HTTP/UI adapter used by Linux and Android host integrations.
 #[cfg(feature = "http")]
 pub mod ble_service;
 #[cfg(feature = "http")]
+pub mod companion_service;
+#[cfg(feature = "http")]
 pub mod history_service;
 #[cfg(feature = "http")]
 pub mod http;
+#[cfg(feature = "std")]
 mod platform_catalog;
 #[cfg(feature = "http")]
 pub mod transport_service;
@@ -191,8 +196,15 @@ mod host {
             }
             let manifest = Self::generate(source)?;
             let temporary = sidecar.with_extension("json.tmp");
-            std::fs::write(&temporary, serde_json::to_vec_pretty(&manifest)?)?;
-            std::fs::rename(temporary, sidecar)?;
+            match std::fs::write(&temporary, serde_json::to_vec_pretty(&manifest)?) {
+                Ok(()) => std::fs::rename(temporary, sidecar)?,
+                // Nix store firmware is immutable. The in-memory cache still
+                // serves the generated manifest for this process.
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::PermissionDenied
+                        || error.raw_os_error() == Some(30) => {}
+                Err(error) => return Err(error.into()),
+            }
             Ok(manifest)
         }
 

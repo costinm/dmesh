@@ -15,10 +15,15 @@ LMesh runs as regular user but with CAP_NET_ADMIN. It may register a monitor
 interface on wifi or take over a wifi interface, based on configuration, and use
 it for NAN discovery, follow-ups and as a non-DS communication medium.
 
-The legacy UART forwarding service is retired. The full lmesh process retains
-the shared dispatcher API but does not open or start USB/UART; `dmesh-cli`
-owns a physical serial interface while it is in use.
-forwards; it can still use the shared raw-NAN code for mesh operations.
+The legacy UART forwarding service is retired. `lmesh` lists USB serial ports
+without opening them, probes a port only on `uart.discover`, and retains it only
+after `companion.pair` names its kind, ID, and signed VIP. The same public
+method also selects an encrypted BLE CoC or an already discovered Wi-Fi route.
+Linux requires a matching secret in the private owned-device inventory before
+reporting a companion paired. `companion.unpair` releases only the selected
+local companion; it does not erase ESP NVS credentials.
+`dmesh-cli` can own an unpaired physical port for direct diagnostics. The
+Linux UART bearer and its hotplug watcher are implemented in `uart-codec`.
 
 Lmesh is only concerned with accepting and sending packets locally, based on 
 control plane and config it may forward packets as well, but is not involved in

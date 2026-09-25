@@ -12,7 +12,24 @@ use crate::{
     cbor::{Decoder, Encoder},
     tagged::{Name, Record, decode},
 };
+use alloc::vec::Vec;
 use sha2::{Digest, Sha256};
+
+/// Verify a host-observed signed identity before promoting it to ownership.
+#[cfg(feature = "std")]
+pub fn verify_identity(announce: Announce) -> bool {
+    use p256::ecdsa::{Signature, VerifyingKey};
+    use p256::ecdsa::signature::Verifier;
+
+    if !announce.has_identity() { return true; }
+    let digest = Sha256::digest(announce.public_key());
+    if announce.device_id() != &digest[..announce.device_id().len()] { return false; }
+    let Ok(signature) = Signature::from_slice(announce.signature()) else { return false; };
+    let Ok(key) = VerifyingKey::from_sec1_bytes(announce.public_key()) else { return false; };
+    let mut signed = [0u8; 384];
+    let Some(used) = signing_bytes(announce, &mut signed) else { return false; };
+    key.verify(&signed[..used], &signature).is_ok()
+}
 
 /// Tagged component reserved for one-way presence records.
 pub const ANNOUNCE_COMPONENT: u64 = 6;
@@ -33,6 +50,7 @@ pub const ANNOUNCE_DISCOVERY_ACTIVE: u64 = 10;
 /// `control.transport.set { mode: sta, wake_target }` record so the target
 /// has one profile parser and one target-admission rule on every bearer.
 pub const ANNOUNCE_NAN_WAKEUP: u64 = 11;
+pub const ANNOUNCE_NAN_PAIR_WAKEUP: u64 = 12;
 /// Transition markers use the same presence schema so every bearer can carry
 /// timing evidence without inventing a UART-only event format.
 pub const ANNOUNCE_TRANSITION_BEGIN: u64 = 5;
@@ -317,6 +335,27 @@ pub struct ObservedDevice<'a> {
     /// It is omitted when the adapter cannot report one.
     pub channel: Option<u8>,
     pub available_fields: u32,
+    pub first_seen_ms: u32,
+    pub last_seen_ms: u32,
+    pub packets: u32,
+    pub active_publish_rx: u32,
+    pub active_subscribe_rx: u32,
+    pub followup_rx: u32,
+    pub last_kind: u8,
+    pub last_payload_len: u16,
+    pub last_payload_hash: u32,
+}
+
+/// Owned form of one canonical `discovery.nodes` row. Bearer adapters and
+/// presentation layers use this after the response buffer has gone away.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObservedDeviceOwned {
+    pub device_id: Vec<u8>,
+    pub peer: Option<[u8; 6]>,
+    pub bssid: Option<[u8; 6]>,
+    pub channel: Option<u8>,
+    pub available_fields: u32,
+    pub unavailable_fields: u32,
     pub first_seen_ms: u32,
     pub last_seen_ms: u32,
     pub packets: u32,
@@ -836,12 +875,21 @@ pub fn encode_devices_observed_request(out: &mut [u8]) -> Option<usize> {
 /// travel to the sleepy peer directly: an Android, ESP32, or host observer
 /// consumes it and emits the established targeted active-Subscribe payload.
 pub fn encode_nan_wakeup_request(target: [u8; 6], id: u64, out: &mut [u8]) -> Option<usize> {
+    encode_nan_target_request(ANNOUNCE_NAN_WAKEUP, target, id, out)
+}
+
+/// Queue a target-checked NAN invitation that only a virgin ESP32 may admit.
+pub fn encode_nan_pair_wakeup_request(target: [u8; 6], id: u64, out: &mut [u8]) -> Option<usize> {
+    encode_nan_target_request(ANNOUNCE_NAN_PAIR_WAKEUP, target, id, out)
+}
+
+fn encode_nan_target_request(method: u64, target: [u8; 6], id: u64, out: &mut [u8]) -> Option<usize> {
     let mut e = Encoder::new(out);
     e.map(4)?;
     e.uint(1)?;
     e.uint(ANNOUNCE_COMPONENT)?;
     e.uint(2)?;
-    e.uint(ANNOUNCE_NAN_WAKEUP)?;
+    e.uint(method)?;
     e.uint(3)?;
     e.uint(id)?;
     e.uint(5)?;
@@ -853,9 +901,17 @@ pub fn encode_nan_wakeup_request(target: [u8; 6], id: u64, out: &mut [u8]) -> Op
 
 /// Decode the local controller action `nan.wakeup {to: MAC}`.
 pub fn decode_nan_wakeup_request(record: Record<'_>) -> Option<[u8; 6]> {
+    decode_nan_target_request(record, ANNOUNCE_NAN_WAKEUP)
+}
+
+pub fn decode_nan_pair_wakeup_request(record: Record<'_>) -> Option<[u8; 6]> {
+    decode_nan_target_request(record, ANNOUNCE_NAN_PAIR_WAKEUP)
+}
+
+fn decode_nan_target_request(record: Record<'_>, method: u64) -> Option<[u8; 6]> {
     if record.to.is_some()
         || record.component != Some(Name::Tag(ANNOUNCE_COMPONENT))
-        || record.method != Some(Name::Tag(ANNOUNCE_NAN_WAKEUP))
+        || record.method != Some(Name::Tag(method))
     {
         return None;
     }
@@ -1029,6 +1085,74 @@ pub fn encode_devices_observed_response(
         ))?;
     }
     Some(e.len())
+}
+
+/// Decode the result of a correlated `discovery.nodes` stream response.
+/// Unknown fields are skipped so an older host can inspect newer firmware.
+pub fn decode_devices_observed_response(packet: &[u8]) -> Option<Vec<ObservedDeviceOwned>> {
+    let record = decode(packet)?;
+    if record.component != Some(Name::Tag(ANNOUNCE_COMPONENT))
+        || record.method != Some(Name::Tag(ANNOUNCE_DEVICES_OBSERVED))
+    {
+        return None;
+    }
+    let mut result = Decoder::new(record.result?);
+    if result.head()? != (5, 1) || result.uint()? != 1 {
+        return None;
+    }
+    let (major, count) = result.head()?;
+    if major != 4 {
+        return None;
+    }
+    let mut devices = Vec::new();
+    for _ in 0..count {
+        let (major, fields) = result.head()?;
+        if major != 5 {
+            return None;
+        }
+        let mut device = ObservedDeviceOwned {
+            device_id: Vec::new(),
+            peer: None,
+            bssid: None,
+            channel: None,
+            available_fields: 0,
+            unavailable_fields: 0,
+            first_seen_ms: 0,
+            last_seen_ms: 0,
+            packets: 0,
+            active_publish_rx: 0,
+            active_subscribe_rx: 0,
+            followup_rx: 0,
+            last_kind: 0,
+            last_payload_len: 0,
+            last_payload_hash: 0,
+        };
+        for _ in 0..fields {
+            match result.uint()? {
+                1 => device.device_id.extend_from_slice(result.bytes_ref()?),
+                2 => {
+                    let peer: [u8; 6] = result.bytes_ref()?.try_into().ok()?;
+                    device.peer = (peer != [0; 6]).then_some(peer);
+                }
+                3 => device.bssid = Some(result.bytes_ref()?.try_into().ok()?),
+                4 => device.available_fields = u32::try_from(result.uint()?).ok()?,
+                5 => device.first_seen_ms = u32::try_from(result.uint()?).ok()?,
+                6 => device.last_seen_ms = u32::try_from(result.uint()?).ok()?,
+                7 => device.packets = u32::try_from(result.uint()?).ok()?,
+                8 => device.active_publish_rx = u32::try_from(result.uint()?).ok()?,
+                9 => device.active_subscribe_rx = u32::try_from(result.uint()?).ok()?,
+                10 => device.followup_rx = u32::try_from(result.uint()?).ok()?,
+                11 => device.last_kind = u8::try_from(result.uint()?).ok()?,
+                12 => device.last_payload_len = u16::try_from(result.uint()?).ok()?,
+                13 => device.last_payload_hash = u32::try_from(result.uint()?).ok()?,
+                14 => device.unavailable_fields = u32::try_from(result.uint()?).ok()?,
+                15 => device.channel = Some(u8::try_from(result.uint()?).ok()?),
+                _ => result.skip()?,
+            }
+        }
+        devices.push(device);
+    }
+    result.is_finished().then_some(devices)
 }
 
 pub fn decode_record(record: Record<'_>) -> Option<Announce> {
@@ -1365,8 +1489,26 @@ mod tests {
             last_payload_hash: 0x1234_5678,
         };
         let entries = [entry; 10];
+        let mut direct = [0; 1_100];
+        let direct_len = encode_devices_observed_response(&entries, &mut direct).unwrap();
+        let fields = crate::tagged::decode(&direct[..direct_len])
+            .unwrap()
+            .fields
+            .unwrap();
         let mut response = [0; 1_100];
-        assert!(encode_devices_observed_response(&entries, &mut response).is_some());
+        let response_len = crate::tagged::encode_numeric_response(
+            ANNOUNCE_COMPONENT,
+            ANNOUNCE_DEVICES_OBSERVED,
+            7,
+            fields,
+            &mut response,
+        )
+        .unwrap();
+        let decoded = decode_devices_observed_response(&response[..response_len]).unwrap();
+        assert_eq!(decoded.len(), 10);
+        assert_eq!(decoded[0].peer, Some(entry.peer));
+        assert_eq!(decoded[0].channel, entry.channel);
+        assert_eq!(decoded[0].last_payload_hash, entry.last_payload_hash);
     }
 
     #[test]

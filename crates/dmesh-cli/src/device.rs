@@ -99,12 +99,21 @@ pub fn load_device(name: &str) -> Result<DeviceProfile, String> {
 /// Resolve either a VIP6 identity or an exact catalog device name. Other
 /// address literals deliberately remain explicit bearer targets.
 pub fn resolve_catalog_target(target: &str) -> Result<Option<DeviceProfile>, String> {
-    let path = device_catalog_path();
-    let catalog = E2eConfig::from_path(&path)?;
-    if let Ok(vip6) = target.parse::<Ipv6Addr>() {
+    // Explicit bearer endpoints do not depend on an operator inventory. This
+    // also keeps the installed CLI usable from a firmware package without a
+    // checkout-specific device catalog.
+    let vip6 = target.parse::<Ipv6Addr>().ok();
+    if target.is_empty() || target.contains('/') || (target.contains(':') && vip6.is_none()) {
+        return Ok(None);
+    }
+    if let Some(vip6) = vip6 {
         if vip6.octets()[0] != 0xfc {
             return Ok(None);
         }
+    }
+    let path = device_catalog_path();
+    let catalog = E2eConfig::from_path(&path)?;
+    if let Some(vip6) = vip6 {
         let device = catalog
             .devices
             .iter()
@@ -122,9 +131,6 @@ pub fn resolve_catalog_target(target: &str) -> Result<Option<DeviceProfile>, Str
                 )
             })?;
         return profile_from_device(device).map(Some);
-    }
-    if target.is_empty() || target.contains('/') || target.contains(':') {
-        return Ok(None);
     }
     catalog
         .devices

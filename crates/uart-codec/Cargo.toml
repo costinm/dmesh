@@ -6,3 +6,9 @@ publish = false
 
 [lib]
 name = "uart_codec"
+
+[features]
+host = ["dep:libc"]
+
+[dependencies]
+libc = { version = "0.2", optional = true }

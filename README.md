@@ -3,6 +3,26 @@
 The [DMesh API](API.md) is the single schema and request reference for device,
 Linux, Android, and optional module services.
 
+## Pairing implementation status
+
+The API defines device ownership across USB/UART, BLE, and Wi-Fi. Initial
+provisioning uses direct USB/UART or an encrypted BLE CoC; Wi-Fi provisioning
+is deferred. Pairing a
+virgin ESP32 starts with a targeted NAN pairing wake, then provisions one
+shared secret on the device and in the
+controller's private inventory; authenticated unpair must clear that secret
+and BLE pairing data on both sides. UART alone may unlock a device without
+the current secret. The current host `companion.pair` handlers only check an
+existing private pairing result and retain a bearer. `companion.unpair` currently
+releases a local bearer; neither handler completes the device ownership
+lifecycle. Firmware source now has a virgin-only NAN wake and distinct virgin
+BLE advertising, but it has not been deployed or tested end to end. Generic
+`settings.set` refuses pairing secrets and the control-plane root; a dedicated
+handler that verifies encrypted CoC or direct UART ingress is still needed.
+The optional device-name and root-key pairing fields are schema only until
+that handler and the platform provisioning clients are complete. Do not treat
+a local pair/unpair response as evidence of durable device pairing or reset.
+
 The project goal is to provide communication paths across ad-hoc,
 untrusted device-to-device links. Unlike other mesh projects it is 
 not tied to a protocol, medium or device type - but attempts to use

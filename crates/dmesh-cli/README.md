@@ -8,8 +8,23 @@ Use your own names and addresses; the examples are syntax, not lab targets.
 
 UART and BLE are intended for companion devices that add radios or protocols
 to a Linux host or Android device. UART also provides local boot logs and
-repair diagnostics. dmesh-cli opens a serial port or UDP to send commands; lmesh owns
-the Linux Wi-Fi radio.
+repair diagnostics. UART remains a normal QUIC-lite packet transport for
+service requests, checks, probes, and log streams, but firmware object upload
+is Wi-Fi-only. dmesh-cli opens a serial port or UDP to send commands; lmesh
+owns the Linux Wi-Fi radio.
+
+For Android's local HTTP gateway, forward the app's HTTP port and use the same
+service method names. The gateway converts JSON records to the registered
+tagged-CBOR handlers; adb carries only the TCP forward, not a control command.
+If the HTTP service requires an API key, set `DMESH_HTTP_API_KEY` for the call.
+HTTP fields infer booleans and unsigned integers; prefix a numeric-looking
+text value with `text:` (for example `--ssid=text:1234`).
+
+~~~sh
+adb -s SERIAL forward tcp:18480 tcp:18480
+dmesh-cli http://127.0.0.1:18480 radio.history --limit=32
+dmesh-cli http://127.0.0.1:18480 transport.set --mode=6
+~~~
 
 ~~~sh
 . ./env.sh
@@ -160,8 +175,9 @@ dmesh-cli flash DEVICE --target MODULE              # Update a named module arti
 flash discovers the target, wakes it over NAN if needed, hands off to
 Recovery, transfers the object, then checks reboot identity and fresh Main
 health. object.flash is the underlying tagged service operation; a direct
-call requires matching artifact and target metadata. For initial
-provisioning or physical repair, use scripts/flash-device.py.
+call requires matching artifact and target metadata and a Wi-Fi/UDP target.
+It is rejected on UART. For initial provisioning or physical repair, use
+scripts/flash-device.py.
 
 ## Companion BLE and lmesh radio requests
 
@@ -197,5 +213,5 @@ For a direct bootstrap diagnostic while owning a local serial port:
 dmesh-cli SERIAL --msg 'transport.set mode=nan now=1' # Send one direct tagged control record.
 ~~~
 
-Normal API calls use service streams. Legacy names without numeric components
-in the catalog only decode old diagnostics; they are not callable methods.
+Normal API calls use tagged service streams over QUIC, including relay paths.
+The direct tagged control record is reserved for bootstrap diagnostics.

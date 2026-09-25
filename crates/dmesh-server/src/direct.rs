@@ -15,6 +15,8 @@ pub enum DirectMessageKind {
     DiscoveryRequest,
     /// Complete volatile bearer configuration, including all-off.
     TransportSet,
+    /// Targeted wake admitted only while the device has no owner secret.
+    PairWakeup,
 }
 
 /// Classify one tagged-CBOR payload against the shared direct allowlist.
@@ -39,6 +41,11 @@ pub fn classify(payload: &[u8]) -> Option<DirectMessageKind> {
             Some(crate::control::Request::TransportSet { .. })
         )
         .then_some(DirectMessageKind::TransportSet),
+        (
+            crate::tagged::Name::Tag(crate::announce::ANNOUNCE_COMPONENT),
+            crate::tagged::Name::Tag(crate::announce::ANNOUNCE_NAN_PAIR_WAKEUP),
+        ) => crate::announce::decode_nan_pair_wakeup_request(record)
+            .map(|_| DirectMessageKind::PairWakeup),
         _ => None,
     }
 }
@@ -263,7 +270,7 @@ mod tests {
     use alloc::sync::Arc;
 
     #[test]
-    fn allowlist_accepts_only_discovery_and_transport_set() {
+    fn allowlist_accepts_discovery_transport_and_virgin_pair_wake() {
         let mut request = [0u8; 96];
         let used = crate::announce::encode_discovery_request(7, &mut request).unwrap();
         assert_eq!(
@@ -284,6 +291,13 @@ mod tests {
             classify(&request[..used]),
             Some(DirectMessageKind::TransportSet)
         );
+
+        let target = [1, 2, 3, 4, 5, 6];
+        let used = crate::announce::encode_nan_pair_wakeup_request(target, 9, &mut request).unwrap();
+        assert_eq!(classify(&request[..used]), Some(DirectMessageKind::PairWakeup));
+        let record = crate::tagged::decode(&request[..used]).unwrap();
+        assert_eq!(crate::announce::decode_nan_pair_wakeup_request(record), Some(target));
+        assert_eq!(crate::announce::decode_nan_wakeup_request(record), None);
 
         let used = crate::tagged::encode_numeric_empty_request(7, 1, 9, &mut request).unwrap();
         assert_eq!(classify(&request[..used]), None);

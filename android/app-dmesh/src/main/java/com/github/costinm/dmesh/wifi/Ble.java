@@ -32,6 +32,7 @@ import java.util.UUID;
 public final class Ble {
     public static final String ACTION_SCAN_RESULT = "com.github.costinm.dmesh.wifi.BLE_SCAN";
     public static final ParcelUuid DMESH_PAIRING = new ParcelUuid(UUID.fromString("5f6b6f80-4f2a-4a6f-8c42-4d6573680001"));
+    public static final ParcelUuid DMESH_OPERATIONAL = new ParcelUuid(UUID.fromString("5f6b6f80-4f2a-4a6f-8c42-4d6573680002"));
     public static final ParcelUuid DMESH_IPSP = ParcelUuid.fromString("00001820-0000-1000-8000-00805f9b34fb");
     public interface BearerBridge {
         void onBearerConnected(String bearer);
@@ -63,7 +64,7 @@ public final class Ble {
     private volatile boolean cocClosing;
     // The channel mid-connect(), exposed so disconnect() can unblock it.
     private volatile BluetoothSocket cocPendingChannel;
-    // Matches Rust's COC_FRAME_MAX (PACKET + 2) in crates/dmesh/src/bearer.rs.
+    // Matches Rust's COC_FRAME_MAX (PACKET + 2) in crates/dmesh-android/src/bearer.rs.
     // The Rust bearer never emits a larger frame; rejecting here keeps Java
     // and Rust length-framing synchronized.
     private static final int COC_FRAME_MAX = 1102;
@@ -76,10 +77,15 @@ public final class Ble {
             if (data == null) data = new byte[0];
             String address = "";
             try { address = device == null ? "" : device.getAddress(); } catch (SecurityException ignored) { }
+            String mode = "unknown";
+            if (record != null && record.getServiceUuids() != null) {
+                if (record.getServiceUuids().contains(DMESH_PAIRING)) mode = "virgin";
+                else if (record.getServiceUuids().contains(DMESH_OPERATIONAL)) mode = "operational";
+            }
             // BLE discovery and future pairing/CoC ownership remain inside
-            // dmesh-wifi. Do not project advertisement bytes as a mesh API:
+            // Do not project advertisement bytes as a mesh API:
             // once paired, CoC presents the shared UART byte stream directly.
-            emit("scan_result:rssi=" + result.getRssi() + ":addr=" + address, data);
+            emit("scan_result:rssi=" + result.getRssi() + ":addr=" + address + ":mode=" + mode, data);
         }
         @Override public void onScanFailed(int errorCode) { emit("scan_failed:code=" + errorCode, new byte[0]); }
     };
@@ -137,6 +143,12 @@ public final class Ble {
     }
     public void setBearerBridge(BearerBridge bridge) { this.bridge = bridge; }
     public boolean connect(String address, int psm) {
+        return connectChannel(address, psm, false);
+    }
+    public boolean pair(String address, int psm) {
+        return connectChannel(address, psm, true);
+    }
+    private boolean connectChannel(String address, int psm, boolean requireBond) {
         if (address == null || address.isEmpty()) { emit("coc_connect_invalid", new byte[0]); return false; }
         if (!has(Manifest.permission.BLUETOOTH_CONNECT)) { emit("coc_connect_denied", new byte[0]); return false; }
         BluetoothManager manager = context.getSystemService(BluetoothManager.class);
@@ -148,7 +160,7 @@ public final class Ble {
             return false;
         }
         final int channelPsm = psm > 0 ? psm : 128;
-        Thread thread = new Thread(() -> runCoc(device, address, channelPsm), "dmesh-ble-coc");
+        Thread thread = new Thread(() -> runCoc(device, address, channelPsm, requireBond), "dmesh-ble-coc");
         // Validation, ownership, and start share one lock: two concurrent
         // binder calls must not both pass an alive check and interleave two
         // sockets and read loops into the same bearer state.
@@ -171,9 +183,20 @@ public final class Ble {
         emit("coc_connecting:address=" + address + ":psm=" + channelPsm, new byte[0]);
         return true;
     }
-    private void runCoc(BluetoothDevice device, String address, int channelPsm) {
+    private void runCoc(BluetoothDevice device, String address, int channelPsm, boolean requireBond) {
         BluetoothSocket channel = null;
         try {
+            if (requireBond && device.getBondState() != BluetoothDevice.BOND_BONDED) {
+                if (!device.createBond()) { emit("coc_bond_rejected", new byte[0]); return; }
+                long deadline = android.os.SystemClock.elapsedRealtime() + 30_000;
+                while (!cocClosing && device.getBondState() != BluetoothDevice.BOND_BONDED
+                        && android.os.SystemClock.elapsedRealtime() < deadline) {
+                    Thread.sleep(250);
+                }
+                if (cocClosing || device.getBondState() != BluetoothDevice.BOND_BONDED) {
+                    emit("coc_bond_failed", new byte[0]); return;
+                }
+            }
             if (scanner != null && has(Manifest.permission.BLUETOOTH_SCAN)) {
                 // Dedicated callback: the persistent scan() callback may
                 // already be registered, and reusing it here would either
@@ -191,7 +214,8 @@ public final class Ble {
                 }
             }
             if (cocClosing) { emit("coc_connect_aborted", new byte[0]); return; }
-            channel = device.createInsecureL2capChannel(channelPsm);
+            channel = requireBond ? device.createL2capChannel(channelPsm)
+                    : device.createInsecureL2capChannel(channelPsm);
             cocPendingChannel = channel;
             channel.connect();
             synchronized (this) {
@@ -259,6 +283,9 @@ public final class Ble {
         // connect(), and interrupt() unblocks the prescan sleep.
         if (channel != null) closeQuietly(channel);
         if (pending != null) pending.interrupt();
+    }
+    public synchronized String pairedAddress() {
+        return (cocConnected || (cocThread != null && cocThread.isAlive())) ? cocAddress : "";
     }
     private void readLoop() throws IOException {
         InputStream in;

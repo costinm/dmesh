@@ -15,7 +15,7 @@ classified.
 
 The [root API](../../../API.md) specifies the Linux radio and shared portable
 handlers. `tools.json` is the one installed catalog used by `lmesh`,
-`mesh`, and `dmesh-cli`; device method tags and legacy diagnostic labels are
-kept in it so a second firmware schema is unnecessary.
+`mesh`, and `dmesh-cli`. Device method and field tags come from this catalog;
+there is no separate firmware schema.
 
 Run `scripts/generate-lmesh-tools.py` after changing the Linux handler API.

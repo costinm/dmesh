@@ -61,7 +61,6 @@ build_one() {
     local image_flash_size="${DMESH_FLASH_HEADER_SIZE:-$flash_size}"
     local elf_path="$CARGO_TARGET_DIR/$target/$BUILD_MODE/dmesh-rs"
     local boot_path="$CARGO_TARGET_DIR/$target/$BUILD_MODE/bootloader.bin"
-    local partition_table_path="$CARGO_TARGET_DIR/$target/$BUILD_MODE/partition-table.bin"
     # ESP-IDF's generated CMake/bindings are target-specific.  A shared stamp
     # made a previous ESP32/S3 build invalidate the C6 cache (and vice versa),
     # needlessly rebuilding the SDK when the selected target was unchanged.
@@ -70,10 +69,6 @@ build_one() {
     # Stage2 partition table.  Recovery transfers the extracted raw app,
     # while provisioning tools use this offset for a direct Main write.
     local app_offset=0x110000
-    local boot_offset=0x0
-    if [ "$chip" = esp32 ]; then
-        boot_offset=0x1000
-    fi
 
     case "$BUILD_MODE" in
         release) args+=(--release) ;;
@@ -153,14 +148,13 @@ build_one() {
         cd "$FIRMWARE_DIR"
         export ESP_IDF_SDKCONFIG_DEFAULTS="$sdkconfig;$partition_overlay"
         cargo "${args[@]}"
-        # Package the application with the repo's esptool lane. This creates
-        # an image; it never opens a serial port or flashes a board.
-        "$DMESH_PYTHON" -m esptool --chip "$chip" elf2image \
-            --flash_mode dio --flash_freq 40m --flash_size "${image_flash_size^^}" \
-            --output "$image_dir/main-app-image.bin" "$elf_path"
-        "$DMESH_PYTHON" -m esptool --chip "$chip" merge_bin --output "$image_path" \
-            "$boot_offset" "$boot_path" 0x8000 "$partition_table_path" \
-            "$app_offset" "$image_dir/main-app-image.bin"
+        # espflash packages the ELF without opening a serial port. Keep the
+        # partition offsets selected by the shared Stage2 table.
+        espflash --skip-update-check save-image --chip "$chip" \
+            --flash-mode dio --flash-freq 40mhz --flash-size "$image_flash_size" \
+            --target-app-partition main --partition-table "$partition_file" \
+            --bootloader "$boot_path" --merge --skip-padding \
+            "$elf_path" "$image_path"
     )
     printf '=== Merged image: %s ===\n' "$image_path"
     # Recovery/DRS2 always transfers the raw Main app, never the padded merged
@@ -169,6 +163,7 @@ build_one() {
     # only in historical flash evidence and must not be regenerated here.
     "$DMESH_PYTHON" "$DMESH_REPO/scripts/extract-esp-app.py" "$image_path" \
         "$image_dir/main-app.bin" --offset "$app_offset"
+    cp "$image_dir/main-app.bin" "$image_dir/main-app-image.bin"
 }
 
 case "$REQUESTED_TARGET" in

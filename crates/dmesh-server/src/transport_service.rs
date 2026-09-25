@@ -11,13 +11,21 @@ pub const SERVICE_NAME: &str = "transport";
 
 #[async_trait]
 pub trait TransportBackend: Send + Sync {
-    async fn status(&self) -> anyhow::Result<Value>;
     async fn set(&self, params: Value) -> anyhow::Result<Value>;
-    async fn start(&self, params: Value) -> anyhow::Result<Value>;
 }
 
 pub fn tools_json() -> Value {
-    crate::platform_catalog::tools_for("transport.")
+    let catalog: Value = serde_json::from_str(include_str!("../../lmesh/resources/tools.json"))
+        .expect("lmesh tools catalog must be valid JSON");
+    Value::Array(
+        catalog["tools"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|tool| tool["name"] == "transport.set")
+            .cloned()
+            .collect(),
+    )
 }
 
 pub struct TransportService {
@@ -70,7 +78,6 @@ impl TaggedRecordHandler for TransportService {
 impl TransportService {
     async fn execute(&self, method: &str, fields: &Value) -> anyhow::Result<Value> {
         match method {
-            "transport.status" => self.backend.status().await,
             "transport.set" => {
                 let mut params = fields.clone();
                 if let Some(object) = params.as_object_mut() {
@@ -81,20 +88,6 @@ impl TransportService {
                     bail!("transport.set requires mode");
                 }
                 self.backend.set(params).await
-            }
-            "transport.start" => {
-                let target = fields
-                    .get("target_mac")
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.is_empty())
-                    .context("transport.start requires target_mac")?;
-                let mut params = json!({"target_mac": target});
-                for key in ["kind", "ap", "now", "ble", "nan_dw_interval"] {
-                    if let Some(value) = fields.get(key) {
-                        params[key] = value.clone();
-                    }
-                }
-                self.backend.start(params).await
             }
             other => bail!("unsupported transport service method {other}"),
         }
@@ -110,46 +103,9 @@ mod tests {
 
     #[async_trait]
     impl TransportBackend for MockBackend {
-        async fn status(&self) -> anyhow::Result<Value> {
-            Ok(json!({"operation": "status"}))
-        }
         async fn set(&self, params: Value) -> anyhow::Result<Value> {
             Ok(json!({"operation": "set", "params": params}))
         }
-        async fn start(&self, params: Value) -> anyhow::Result<Value> {
-            Ok(json!({"operation": "start", "params": params}))
-        }
-    }
-
-    #[tokio::test]
-    async fn transport_service_dispatches_wake_requests() {
-        let service = TransportService::new(Arc::new(MockBackend)).unwrap();
-        let response = service
-            .handle_record(TaggedRecord {
-                component: NameOrTag::Name("transport".to_owned()),
-                method: NameOrTag::Name("start".to_owned()),
-                id: Some(json!(9)),
-                env: [
-                    (
-                        NameOrTag::Name("target_mac".to_owned()),
-                        json!("aa:bb:cc:dd:ee:ff"),
-                    ),
-                    (NameOrTag::Name("now".to_owned()), json!(1)),
-                ]
-                .into_iter()
-                .collect(),
-                ..Default::default()
-            })
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            response.result,
-            Some(json!({
-                "operation": "start",
-                "params": {"target_mac": "aa:bb:cc:dd:ee:ff", "now": 1}
-            }))
-        );
     }
 
     #[tokio::test]
@@ -160,7 +116,7 @@ mod tests {
                 component: NameOrTag::Name("transport".to_owned()),
                 method: NameOrTag::Name("set".to_owned()),
                 id: Some(json!(8)),
-                env: [(NameOrTag::Name("mode".to_owned()), json!("nan"))]
+                env: [(NameOrTag::Name("mode".to_owned()), json!(6))]
                     .into_iter()
                     .collect(),
                 ..Default::default()
@@ -170,7 +126,15 @@ mod tests {
             .unwrap();
         assert_eq!(
             response.result,
-            Some(json!({"operation": "set", "params": {"mode": "nan"}}))
+            Some(json!({"operation": "set", "params": {"mode": 6}}))
         );
+    }
+
+    #[test]
+    fn transport_service_uses_common_component_and_method_tags() {
+        let catalog = TaggedCatalog::from_tools_json(&tools_json()).unwrap();
+        let tool = catalog.method("transport.set").unwrap();
+        assert_eq!(tool.component, NameOrTag::Tag(1));
+        assert_eq!(tool.method, NameOrTag::Tag(4));
     }
 }

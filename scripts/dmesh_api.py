@@ -59,4 +59,4 @@ def check_additional_device_methods(catalog: dict) -> None:
 if __name__ == '__main__':
     if len(sys.argv) != 3:
         raise SystemExit('usage: scripts/dmesh_api.py GROUP OUTPUT')
-    Path(sys.argv[2]).write_text(extract(sys.argv[1]))
+    Path(sys.argv[2]).write_text('\n'.join(extract(group) for group in sys.argv[1].split('+')))

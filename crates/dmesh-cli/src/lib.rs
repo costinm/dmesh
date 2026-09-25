@@ -2,14 +2,16 @@
 //!
 //! `dmesh-cli` is the host-facing shell and library for QUIC-lite sessions
 //! over a selected UART, UDP endpoint, or named device profile.  It owns no
-//! managed UART forwarding. The direct UART L2 implementation lives here and
-//! has no standalone forwarding service or control socket.
+//! managed UART forwarding. Physical UART ownership and diagnostics live in
+//! `uart`; there is no standalone forwarding service or control socket.
 
 pub mod client;
 mod device;
+mod flash;
+mod http;
 pub mod prober;
 mod schema;
+pub mod uart;
 
-pub use client::{
-    ClientPathPolicy, DeviceSession, DeviceSessionEvent, run_dmesh_cli, run_dmesh_cli_args,
-};
+pub use client::{run_dmesh_cli, run_dmesh_cli_args};
+pub use uart::{DeviceSession, DeviceSessionEvent};

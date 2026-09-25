@@ -21,19 +21,16 @@ case "$REQUESTED_TARGET" in
         IDF_TARGET_NAME="esp32"
         RUST_TARGET="xtensa-esp32-espidf"
         CHIP="esp32"
-        BOOT_OFFSET="0x1000"
         ;;
     esp32c6|c6|e6|riscv)
         IDF_TARGET_NAME="esp32c6"
         RUST_TARGET="riscv32imac-esp-espidf"
         CHIP="esp32c6"
-        BOOT_OFFSET="0x0"
         ;;
     esp32s3|s3)
         IDF_TARGET_NAME="esp32s3"
         RUST_TARGET="xtensa-esp32s3-espidf"
         CHIP="esp32s3"
-        BOOT_OFFSET="0x0"
         ;;
     *)
         usage >&2
@@ -96,20 +93,19 @@ IMAGE_DIR="$TARGET_DIR/flash/$IDF_TARGET_NAME"
 mkdir -p "$IMAGE_DIR"
 ELF="$TARGET_DIR/$RUST_TARGET/release/dmesh-recovery-rs"
 BOOT="$TARGET_DIR/$RUST_TARGET/release/bootloader.bin"
-PARTITION_TABLE="$TARGET_DIR/$RUST_TARGET/release/partition-table.bin"
 APP_IMAGE="$IMAGE_DIR/dmesh-recovery-rs-app.bin"
-# esptool is used here only to turn the ELF into a flash image and package the
-# build artifacts. It never opens a serial port or flashes a board.
+# espflash packages the ELF without opening a serial port.
 FLASH_SIZE="4MB"
 if [[ "$IDF_TARGET_NAME" == "esp32s3" ]]; then
     FLASH_SIZE="8MB"
 fi
-"$DMESH_PYTHON" -m esptool --chip "$CHIP" elf2image \
-    --flash_mode dio --flash_freq 40m --flash_size "$FLASH_SIZE" \
-    --output "$APP_IMAGE" "$ELF"
-"$DMESH_PYTHON" -m esptool --chip "$CHIP" merge_bin \
-    --output "$IMAGE_DIR/dmesh-recovery-rs-merged.bin" \
-    "$BOOT_OFFSET" "$BOOT" 0x8000 "$PARTITION_TABLE" 0x10000 "$APP_IMAGE"
+espflash --skip-update-check save-image --chip "$CHIP" \
+    --flash-mode dio --flash-freq 40mhz --flash-size "${FLASH_SIZE,,}" \
+    --target-app-partition recovery_app \
+    --partition-table "$ROOT/fw/boot/partitions.csv" --bootloader "$BOOT" \
+    --merge --skip-padding "$ELF" "$IMAGE_DIR/dmesh-recovery-rs-merged.bin"
+"$DMESH_PYTHON" "$ROOT/scripts/extract-esp-app.py" \
+    "$IMAGE_DIR/dmesh-recovery-rs-merged.bin" "$APP_IMAGE" --offset 0x10000
 
 # ObjectServer serves every update target from one CPU-qualified artifact
 # root. Publish Recovery beside Main so `object.flash target=3` exercises the

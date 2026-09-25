@@ -9,7 +9,7 @@
 use alloc::{boxed::Box, vec::Vec};
 use core::{
     ffi::c_void,
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU8, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicUsize, Ordering},
 };
 
 use quic_lite::packet_pool::{PacketPool, PacketSlot};
@@ -548,11 +548,7 @@ fn release_slot(slot: IngressSlot) {
 }
 
 fn zero_if_unset(value: u32) -> u32 {
-    if value == u32::MAX {
-        0
-    } else {
-        value
-    }
+    if value == u32::MAX { 0 } else { value }
 }
 
 fn record_lowest(slot: &AtomicU32, value: u32) {
@@ -654,10 +650,11 @@ pub fn enqueue_on_link(
         None
     }
     .or_else(|| {
-        if kind != IngressKind::EspNowTx && PACKETS.available() <= EGRESS_RESERVED_SLOTS {
-            return None;
-        }
-        let slot = PACKETS.acquire()?;
+        let slot = if kind == IngressKind::EspNowTx {
+            PACKETS.acquire()
+        } else {
+            PACKETS.acquire_reserving(EGRESS_RESERVED_SLOTS)
+        }?;
         PACKETS
             .write(slot, bytes)
             .then_some(IngressSlot::Bootstrap(slot))

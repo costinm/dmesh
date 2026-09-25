@@ -52,7 +52,7 @@ fn start_ble_after_radio_ready() {
     if !dmesh_ble::boot_enabled() {
         return;
     }
-    match dmesh_ble::start_dmesh_service() {
+    match dmesh_ble::start_dmesh_service(dmesh_fw_transport::main_runtime::shared_secret_exists()) {
         Ok(()) => unsafe {
             esp_idf_sys::esp_rom_printf(b"DMESH main: BLE auto start\n\0".as_ptr().cast());
         },

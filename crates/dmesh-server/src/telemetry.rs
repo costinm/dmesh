@@ -6,6 +6,7 @@
 
 use crate::{
     cbor::{Decoder, Encoder},
+    power::BatteryState,
     raw_wifi::WifiLinkMetrics,
     tagged::{Name, decode},
 };
@@ -16,6 +17,7 @@ pub const NOW_METRICS_METHOD: u64 = 2;
 pub const NAN_METRICS_METHOD: u64 = 3;
 pub const UDP6_METRICS_METHOD: u64 = 4;
 pub const WIFI_LINK_METRICS_METHOD: u64 = 5;
+pub const BATTERY_METHOD: u64 = 6;
 pub const TELEMETRY_RESPONSE_MAX_BYTES: usize = 512;
 /// A complete NAN snapshot currently has 35 scalar counters.  Leave bounded
 /// room for additions while retaining one compact response inside the shared
@@ -155,6 +157,7 @@ pub fn encode_request(method: u64, id: u64, out: &mut [u8]) -> Option<usize> {
             | NAN_METRICS_METHOD
             | UDP6_METRICS_METHOD
             | WIFI_LINK_METRICS_METHOD
+            | BATTERY_METHOD
     ) {
         return None;
     }
@@ -198,6 +201,7 @@ pub fn decode_request_record(record: crate::tagged::Record<'_>) -> Option<(u64, 
                     | NAN_METRICS_METHOD
                     | UDP6_METRICS_METHOD
                     | WIFI_LINK_METRICS_METHOD
+                    | BATTERY_METHOD
             ) =>
         {
             method
@@ -212,6 +216,49 @@ pub fn decode_request_record(record: crate::tagged::Record<'_>) -> Option<(u64, 
         }
     }
     Some((method, record.id?))
+}
+
+/// Encode the optional portable battery snapshot. Omitted fields remain
+/// unknown; an empty map is valid on a device without a battery observer.
+pub fn encode_battery_status(state: BatteryState, out: &mut [u8]) -> Option<usize> {
+    let mut e = Encoder::new(out);
+    let count = usize::from(state.battery_percent.is_some())
+        + usize::from(state.charging.is_some())
+        + usize::from(state.power_save.is_some())
+        + usize::from(state.idle.is_some())
+        + usize::from(state.idle_ms.is_some())
+        + usize::from(state.total_idle_ms.is_some())
+        + usize::from(state.charging_ms.is_some());
+    e.map(count as u64)?;
+    if let Some(value) = state.battery_percent {
+        e.uint(1)?;
+        e.uint(value as u64)?;
+    }
+    if let Some(value) = state.charging {
+        e.uint(2)?;
+        e.boolean(value)?;
+    }
+    if let Some(value) = state.power_save {
+        e.uint(3)?;
+        e.boolean(value)?;
+    }
+    if let Some(value) = state.idle {
+        e.uint(4)?;
+        e.boolean(value)?;
+    }
+    if let Some(value) = state.idle_ms {
+        e.uint(5)?;
+        e.uint(value)?;
+    }
+    if let Some(value) = state.total_idle_ms {
+        e.uint(6)?;
+        e.uint(value)?;
+    }
+    if let Some(value) = state.charging_ms {
+        e.uint(7)?;
+        e.uint(value)?;
+    }
+    Some(e.len())
 }
 
 pub fn encode_nan_status(status: NanStatus<'_>, out: &mut [u8]) -> Option<usize> {
@@ -353,6 +400,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(&wire[..used], &[0xa2, 1, 0xf5, 2, 0x46, 1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn battery_snapshot_uses_shared_optional_tags() {
+        let mut wire = [0u8; 32];
+        let used = encode_battery_status(
+            BatteryState {
+                battery_percent: Some(67),
+                charging: Some(true),
+                ..BatteryState::default()
+            },
+            &mut wire,
+        )
+        .unwrap();
+        assert_eq!(&wire[..used], &[0xa2, 1, 0x18, 67, 2, 0xf5]);
+        let mut request = [0u8; 32];
+        let used = encode_request(BATTERY_METHOD, 9, &mut request).unwrap();
+        assert_eq!(decode_request(&request[..used]), Some((BATTERY_METHOD, 9)));
     }
 
     #[test]

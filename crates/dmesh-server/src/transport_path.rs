@@ -76,12 +76,12 @@ pub struct PacketPath {
 /// path handle.
 ///
 /// Small adapters cannot squeeze a complete UDP6 address, port, interface and
-/// MAC into `PathId` without collisions. They use this table to allocate a
+/// MAC into `LocalAddress` without collisions. They use this table to allocate a
 /// handle and retain the complete return address outside QUIC. Host socket
 /// code naturally retains the same tuple in its connection task; tests use
 /// this table to exercise the bounded firmware ownership rule.
 pub struct PathBindingTable<K, const N: usize> {
-    entries: [Option<(quic_lite::PathId, K)>; N],
+    entries: [Option<(quic_lite::LocalAddress, K)>; N],
     next: u64,
 }
 
@@ -96,7 +96,7 @@ impl<K: Copy + Eq, const N: usize> PathBindingTable<K, N> {
     /// Return the stable handle for an exact address, allocating one empty
     /// slot when first observed. A full table applies bounded backpressure;
     /// it never aliases or evicts another live return address.
-    pub fn bind(&mut self, key: K) -> Option<quic_lite::PathId> {
+    pub fn bind(&mut self, key: K) -> Option<quic_lite::LocalAddress> {
         if let Some((path, _)) = self
             .entries
             .iter()
@@ -107,7 +107,7 @@ impl<K: Copy + Eq, const N: usize> PathBindingTable<K, N> {
         }
         let slot = self.entries.iter().position(Option::is_none)?;
         let path = loop {
-            let candidate = quic_lite::PathId::new(self.next)?;
+            let candidate = quic_lite::LocalAddress::new(self.next)?;
             self.next = self.next.checked_add(1)?;
             if !self
                 .entries
@@ -122,14 +122,14 @@ impl<K: Copy + Eq, const N: usize> PathBindingTable<K, N> {
         Some(path)
     }
 
-    pub fn get(&self, path: quic_lite::PathId) -> Option<K> {
+    pub fn get(&self, path: quic_lite::LocalAddress) -> Option<K> {
         self.entries
             .iter()
             .flatten()
             .find_map(|(known, key)| (*known == path).then_some(*key))
     }
 
-    pub fn remove(&mut self, path: quic_lite::PathId) -> bool {
+    pub fn remove(&mut self, path: quic_lite::LocalAddress) -> bool {
         let Some(entry) = self
             .entries
             .iter_mut()
@@ -143,7 +143,7 @@ impl<K: Copy + Eq, const N: usize> PathBindingTable<K, N> {
 
     /// Reclaim one platform binding only after its connection owner confirms
     /// the opaque path is no longer live.
-    pub fn reclaim_one(&mut self, reclaimable: impl Fn(quic_lite::PathId) -> bool) -> bool {
+    pub fn reclaim_one(&mut self, reclaimable: impl Fn(quic_lite::LocalAddress) -> bool) -> bool {
         let Some(entry) = self
             .entries
             .iter_mut()

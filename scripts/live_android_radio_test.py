@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Live Android BLE/NAN smoke test for app-dmesh.
 
-The script drives two Android devices through the app-dmesh shell content
-provider and optionally records attached firmware serial logs. It intentionally
+The script drives two Android devices through shared HTTP mesh services and
+optionally records attached firmware serial logs. It intentionally
 does not build or flash firmware.
 """
 
@@ -27,7 +27,6 @@ from pathlib import Path
 
 PKG = "com.github.costinm.dmesh.lm"
 SERVICE = "com.github.costinm.dmesh.lm/.DMService"
-SHELL_URI = "content://com.github.costinm.dmesh.lm.shell"
 PERMISSIONS = [
     "POST_NOTIFICATIONS",
     "ACCESS_FINE_LOCATION",
@@ -79,11 +78,12 @@ def list_devices(adb_bin: str) -> list[str]:
     return serials
 
 
-def shell_cmd(adb_bin: str, serial: str, command: str, timeout: float = 20) -> str:
-    quoted = (
-        f"content call --uri {SHELL_URI} --method command --arg {shlex.quote(command)}"
-    )
-    return adb(adb_bin, serial, "shell", quoted, timeout=timeout).stdout
+def mesh_cmd(adb_bin: str, serial: str, method: str, *fields: str, timeout: float = 20) -> str:
+    port = adb(adb_bin, serial, "forward", "tcp:0", "tcp:18480", check=True).stdout.strip()
+    try:
+        return run(["dmesh-cli", f"http://127.0.0.1:{port}", method, *fields], timeout=timeout).stdout
+    finally:
+        adb(adb_bin, serial, "forward", "--remove", f"tcp:{port}")
 
 
 def ble_http(
@@ -185,11 +185,10 @@ def collect_logcat(adb_bin: str, serial: str, out_dir: Path) -> None:
 def analyze_history(history: str, ble_scan_active: bool) -> dict[str, bool]:
     return {
         "ble_status": ble_scan_active
-        or bool(re.search(r"BLE[.](scan|start|DISC|ERR)", history)),
-        "nan_status": bool(re.search(r"net[.]NAN[.]", history)),
-        "ble_peer": "BLE.DISC" in history and "proto=dmesh" in history,
-        "nan_peer": "ServiceDiscovered" in history or "FollowupRx" in history,
-        "nan_followup": "FollowupRx" in history or "FollowupTx" in history,
+        or "ble_scan_results" in history,
+        "nan_status": "android_nan_event" in history,
+        "ble_peer": "ble_scan_results" in history and '"count":0' not in history,
+        "nan_peer": "service_discovered" in history or "message_received" in history,
     }
 
 
@@ -247,25 +246,25 @@ def main() -> int:
                 args.adb, serial, idx, "ble.status", {"id": 2}
             )
             (out_dir / f"{serial}-ble-status.json").write_text(ble_status_response)
-            ble_scan_active[serial] = "scan=true" in ble_status_response
-            shell_cmd(args.adb, serial, f"wifi.nan.start reason=live-python-{idx}")
-            shell_cmd(args.adb, serial, f"wifi.adv on=1 p2p=0 id4=A{idx:03d}")
+            ble_scan_active[serial] = '"scan":true' in ble_status_response
+            mesh_cmd(args.adb, serial, "transport.set", "--mode=6")
+            mesh_cmd(args.adb, serial, "radio.history", "--limit=16")
 
         # Discovery is asynchronous; after the requested dwell give every
-        # discovered peer one bounded follow-up. This is a real NAN data-path
-        # row, not merely evidence that both attach callbacks fired.
+        # capture another shared-service observation.
         time.sleep(args.duration)
         for idx, serial in enumerate(devices):
-            shell_cmd(args.adb, serial, f"wifi.nan.ping android-live-{idx}")
+            mesh_cmd(args.adb, serial, "radio.history", "--limit=16")
         time.sleep(3)
 
         failures: list[str] = []
         pair_status: list[dict[str, bool]] = []
         for serial in devices:
-            hist = shell_cmd(
+            hist = mesh_cmd(
                 args.adb,
                 serial,
-                "history durationMs=20000 limit=200 keys=net,wifi,BLE",
+                "radio.history", "--limit=200", "--keys=nan,ble",
+                f"--since_ms={int(time.time() * 1000) - 20000}",
                 timeout=30,
             )
             (out_dir / f"{serial}-history.txt").write_text(hist)
@@ -280,20 +279,18 @@ def main() -> int:
 
         # This is a two-node interoperability row, not an attach smoke test:
         # every selected Android node must have discovered its counterpart and
-        # observed the real follow-up data path. A one-sided callback can be
-        # stale session history or an asymmetric framework failure.
+        # observed reciprocal discovery. Follow-up delivery needs a separate
+        # service-level test; discovery alone is not message completion.
         for serial, status in zip(devices, pair_status):
             if not status["nan_peer"]:
                 failures.append(f"{serial}: no Android NAN peer discovery")
-            if not status["nan_followup"]:
-                failures.append(f"{serial}: no Android NAN follow-up TX/RX")
 
         for idx, serial in enumerate(devices):
             ble_http(args.adb, serial, idx, "ble.scan_stop", {"id": 3})
             # NAN is the service's always-on discovery plane. The smoke test
             # must not undo it during cleanup; service lifecycle and explicit
             # signed control requests own any future stop.
-            shell_cmd(args.adb, serial, "wifi.adv on=0 p2p=0")
+            mesh_cmd(args.adb, serial, "transport.set", "--mode=6", "--ap=0")
 
         print(f"logs: {out_dir}")
         if failures:

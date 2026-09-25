@@ -19,7 +19,7 @@ else:
     upstream = Path(os.environ.get('DMESH_SSH_MESH_DIR', '/ws/rust/ssh-mesh'))
     with tempfile.NamedTemporaryFile(suffix='.json') as output:
         with tempfile.NamedTemporaryFile(suffix='.md') as api:
-            Path(api.name).write_text(extract('linux'))
+            Path(api.name).write_text(extract('portable') + '\n' + extract('linux'))
             upstream_env = os.environ.copy()
             upstream_env.pop('CARGO_TARGET_DIR', None)
             subprocess.run([

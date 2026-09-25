@@ -19,8 +19,9 @@ import androidx.test.platform.app.InstrumentationRegistry;
 
 import com.github.costinm.dmesh.DirectBinder;
 import com.github.costinm.dmesh.MeshStream;
+import com.github.costinm.dmesh.MeshStreamHandlers;
 import com.github.costinm.dmesh.lm.MessageStreamGateway;
-import com.github.costinm.dmeshnative.CborMessageCodec;
+import com.github.costinm.dmesh.CborMessageCodec;
 
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -35,6 +36,31 @@ public final class DirectBinderWebTest {
     private static final ComponentName WEB_SERVICE = new ComponentName(
             "com.github.costinm.dmesh.web",
             "com.github.costinm.dmesh.web.WebBridgeService");
+
+    @Test
+    public void sharedStreamHandlerUsesTheSameRecordAcrossJniAndBinder() throws Exception {
+        MeshStreamHandlers handlers = new MeshStreamHandlers();
+        handlers.register("app.echo", request -> {
+            MeshStream response = new MeshStream("app.echo.result");
+            response.data.putByteArray("bytes", request.data.getByteArray("bytes"));
+            return response;
+        });
+        MeshStream request = new MeshStream("app.echo");
+        request.id = "handler-test";
+        request.data.putByteArray("bytes", new byte[] { 1, 2, 3 });
+
+        MeshStream fromRecord = CborMessageCodec.decode(
+                handlers.handleRecord("app.echo", CborMessageCodec.encode(request)));
+        assertEquals(request.id, fromRecord.replyTo);
+        assertEquals(3, fromRecord.data.getByteArray("bytes").length);
+
+        MeshStream[] fromBinder = new MeshStream[1];
+        assertTrue(DirectBinder.transactSync(handlers.asDirectBinder(),
+                DirectBinder.TRANSACT_MESSAGE, request, null, fromBinder));
+        assertNotNull(fromBinder[0]);
+        assertEquals(request.id, fromBinder[0].replyTo);
+        assertEquals(3, fromBinder[0].data.getByteArray("bytes").length);
+    }
 
     @Test
     public void preservesTypedBundleValuesAndRejectsUnsupportedValues() {

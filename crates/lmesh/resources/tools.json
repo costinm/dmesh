@@ -451,6 +451,23 @@
       "x-dmesh-device": true
     },
     {
+      "name": "telemetry.battery",
+      "description": "Return the latest optional battery and power snapshot",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "x-component-index": 7,
+      "x-method-index": 6,
+      "x-ui-visibility": "advanced",
+      "x-check-all": null,
+      "x-check-all-platforms": null,
+      "x-dmesh-device": true
+    },
+    {
       "name": "runtime.snapshot",
       "description": "Call the runtime.snapshot QUIC stream handler",
       "inputSchema": {
@@ -1988,6 +2005,141 @@
       "x-dmesh-device": true
     },
     {
+      "description": "Invite only a virgin device into a bounded pairing window",
+      "inputSchema": {
+        "properties": {
+          "to": {
+            "type": "string",
+            "x-protobuf-index": 1,
+            "x-protobuf-type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "nan.pair_wakeup",
+      "outputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "x-component-index": 6,
+      "x-method-index": 12,
+      "x-standard-errors": [
+        "unauthenticated",
+        "permission_denied",
+        "timeout",
+        "remote_exception",
+        "invalid_argument",
+        "not_found",
+        "conflict",
+        "unavailable",
+        "internal"
+      ],
+      "x-dmesh-device": true
+    },
+    {
+      "description": "Provision a virgin companion",
+      "inputSchema": {
+        "properties": {
+          "baud": {
+            "type": "integer",
+            "x-protobuf-index": 4,
+            "x-protobuf-type": "u32"
+          },
+          "id": {
+            "type": "string",
+            "x-protobuf-index": 2,
+            "x-protobuf-type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "x-protobuf-index": 1,
+            "x-protobuf-type": "string"
+          },
+          "name": {
+            "type": "string",
+            "x-protobuf-index": 6,
+            "x-protobuf-type": "string"
+          },
+          "psm": {
+            "type": "integer",
+            "x-protobuf-index": 5,
+            "x-protobuf-type": "u16"
+          },
+          "root_public_key_b64": {
+            "type": "string",
+            "x-protobuf-index": 7,
+            "x-protobuf-type": "string"
+          },
+          "vip6": {
+            "type": "string",
+            "x-protobuf-index": 3,
+            "x-protobuf-type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "companion.pair",
+      "outputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "x-component-index": 209,
+      "x-method-index": 1,
+      "x-standard-errors": [
+        "unauthenticated",
+        "permission_denied",
+        "timeout",
+        "remote_exception",
+        "invalid_argument",
+        "not_found",
+        "conflict",
+        "unavailable",
+        "internal"
+      ]
+    },
+    {
+      "description": "Reset a companion to virgin state",
+      "inputSchema": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "x-protobuf-index": 2,
+            "x-protobuf-type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "x-protobuf-index": 1,
+            "x-protobuf-type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "companion.unpair",
+      "outputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "x-component-index": 209,
+      "x-method-index": 2,
+      "x-standard-errors": [
+        "unauthenticated",
+        "permission_denied",
+        "timeout",
+        "remote_exception",
+        "invalid_argument",
+        "not_found",
+        "conflict",
+        "unavailable",
+        "internal"
+      ]
+    },
+    {
       "description": "Run a bounded QUIC probe through the selected Linux radio path",
       "inputSchema": {
         "properties": {
@@ -2925,221 +3077,163 @@
         "unavailable",
         "internal"
       ]
+    },
+    {
+      "description": "Show the paired UART companion, visible port count, and modem lines",
+      "inputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "uart.status",
+      "outputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "x-component-index": 206,
+      "x-method-index": 1,
+      "x-standard-errors": [
+        "unauthenticated",
+        "permission_denied",
+        "timeout",
+        "remote_exception",
+        "invalid_argument",
+        "not_found",
+        "conflict",
+        "unavailable",
+        "internal"
+      ]
+    },
+    {
+      "description": "List USB serial ports and observed VIPs without opening them",
+      "inputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "uart.devices",
+      "outputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "x-component-index": 206,
+      "x-method-index": 2,
+      "x-standard-errors": [
+        "unauthenticated",
+        "permission_denied",
+        "timeout",
+        "remote_exception",
+        "invalid_argument",
+        "not_found",
+        "conflict",
+        "unavailable",
+        "internal"
+      ]
+    },
+    {
+      "description": "Temporarily check one or all listed ports for signed identity",
+      "inputSchema": {
+        "properties": {
+          "baud": {
+            "type": "integer",
+            "x-protobuf-index": 2,
+            "x-protobuf-type": "u32"
+          },
+          "path": {
+            "type": "string",
+            "x-protobuf-index": 1,
+            "x-protobuf-type": "string"
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "x-protobuf-index": 3,
+            "x-protobuf-type": "u64"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "uart.discover",
+      "outputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "x-component-index": 206,
+      "x-method-index": 3,
+      "x-standard-errors": [
+        "unauthenticated",
+        "permission_denied",
+        "timeout",
+        "remote_exception",
+        "invalid_argument",
+        "not_found",
+        "conflict",
+        "unavailable",
+        "internal"
+      ]
+    },
+    {
+      "description": "Set the paired UART port baud rate",
+      "inputSchema": {
+        "properties": {
+          "baud": {
+            "type": "integer",
+            "x-protobuf-index": 1,
+            "x-protobuf-type": "u32"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "uart.baud",
+      "outputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "x-component-index": 206,
+      "x-method-index": 4,
+      "x-standard-errors": [
+        "unauthenticated",
+        "permission_denied",
+        "timeout",
+        "remote_exception",
+        "invalid_argument",
+        "not_found",
+        "conflict",
+        "unavailable",
+        "internal"
+      ]
+    },
+    {
+      "description": "Pulse the paired UART reset control lines",
+      "inputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "uart.reset",
+      "outputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "x-component-index": 206,
+      "x-method-index": 5,
+      "x-standard-errors": [
+        "unauthenticated",
+        "permission_denied",
+        "timeout",
+        "remote_exception",
+        "invalid_argument",
+        "not_found",
+        "conflict",
+        "unavailable",
+        "internal"
+      ]
     }
-  ],
-  "x-dmesh-legacy": {
-    "methods": [
-      {
-        "id": 0,
-        "name": "event",
-        "fields": [
-          {
-            "id": 32,
-            "name": "message",
-            "kind": "text"
-          }
-        ]
-      },
-      {
-        "id": 34,
-        "name": "xstatus"
-      },
-      {
-        "id": 35,
-        "name": "stats"
-      },
-      {
-        "id": 36,
-        "name": "logs"
-      },
-      {
-        "id": 37,
-        "name": "messages"
-      },
-      {
-        "id": 38,
-        "name": "local_messages"
-      },
-      {
-        "id": 39,
-        "name": "test"
-      },
-      {
-        "id": 40,
-        "name": "wifi"
-      },
-      {
-        "id": 41,
-        "name": "nan"
-      },
-      {
-        "id": 42,
-        "name": "ble"
-      },
-      {
-        "id": 43,
-        "name": "lora",
-        "kind": "service",
-        "slot_count": 2
-      },
-      {
-        "id": 44,
-        "name": "lorasend"
-      },
-      {
-        "id": 45,
-        "name": "loralisten"
-      },
-      {
-        "id": 46,
-        "name": "loradump"
-      },
-      {
-        "id": 47,
-        "name": "loraprobe"
-      },
-      {
-        "id": 48,
-        "name": "sleep"
-      },
-      {
-        "id": 49,
-        "name": "mode"
-      },
-      {
-        "id": 50,
-        "name": "power"
-      },
-      {
-        "id": 51,
-        "name": "battery"
-      },
-      {
-        "id": 52,
-        "name": "adcprobe"
-      },
-      {
-        "id": 53,
-        "name": "namespace"
-      },
-      {
-        "id": 54,
-        "name": "set"
-      },
-      {
-        "id": 55,
-        "name": "get"
-      },
-      {
-        "id": 56,
-        "name": "list"
-      },
-      {
-        "id": 57,
-        "name": "rgbled"
-      },
-      {
-        "id": 58,
-        "name": "gpio"
-      },
-      {
-        "id": 59,
-        "name": "i2cconfig"
-      },
-      {
-        "id": 60,
-        "name": "i2cprobe"
-      },
-      {
-        "id": 61,
-        "name": "i2cdetect"
-      },
-      {
-        "id": 62,
-        "name": "i2cget"
-      },
-      {
-        "id": 63,
-        "name": "i2cset"
-      },
-      {
-        "id": 64,
-        "name": "i2cdump"
-      },
-      {
-        "id": 65,
-        "name": "button"
-      },
-      {
-        "id": 66,
-        "name": "nvs"
-      },
-      {
-        "id": 67,
-        "name": "radio"
-      },
-      {
-        "id": 68,
-        "name": "recovery"
-      },
-      {
-        "id": 69,
-        "name": "reset"
-      },
-      {
-        "id": 70,
-        "name": "module"
-      }
-    ],
-    "messages": [
-      {
-        "name": "event.boot.state",
-        "format": "kv",
-        "fields": [
-          {
-            "name": "type",
-            "kind": "string"
-          },
-          {
-            "name": "rebooted",
-            "kind": "bool"
-          },
-          {
-            "name": "mode",
-            "kind": "string"
-          },
-          {
-            "name": "active",
-            "kind": "string"
-          },
-          {
-            "name": "infra_active",
-            "kind": "bool"
-          }
-        ]
-      },
-      {
-        "name": "event.mode.state",
-        "format": "kv",
-        "fields": [
-          {
-            "name": "type",
-            "kind": "string"
-          },
-          {
-            "name": "active",
-            "kind": "string"
-          },
-          {
-            "name": "infra_active",
-            "kind": "bool"
-          },
-          {
-            "name": "phase",
-            "kind": "string"
-          }
-        ]
-      }
-    ]
-  }
+  ]
 }

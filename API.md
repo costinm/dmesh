@@ -32,7 +32,56 @@ flash, reset, logs, and NAN wake examples.
 
 **UI:** default
 
-## 10. `active` — Activate a discovered device through the available bearer
+### Response
+
+The binary QUIC response contains a result map whose field `1` is an array of
+observer-local device rows. HTTP returns the same information as
+`{"devices":[...]}`. A stable `device_id` is the merge key; `peer` is an
+optional bearer-local correlation address and is never a device identity.
+
+| Tag | Field | Type | Description |
+|---:|---|---|---|
+| 1 | `device_id` | `bytes` | Stable signed identity hint; empty for a provisional observation. |
+| 2 | `peer` | `bytes[6]` | Optional observer-local radio address; all-zero means unavailable. |
+| 3 | `bssid` | `bytes[6]` | Optional receiver-side BSSID. |
+| 4 | `available_fields` | `u32` | Observation capability bitset: peer=1, BSSID=2, channel=4, RSSI=8, payload fingerprint=16. |
+| 5 | `first_seen_ms` | `u32` | Observer-local first receipt time; zero or max means unavailable. |
+| 6 | `last_seen_ms` | `u32` | Observer-local last receipt time; zero or max means unavailable. |
+| 7 | `packets` | `u32` | Total admitted discovery packets. |
+| 8 | `active_publish_rx` | `u32` | Active Publish receipts. |
+| 9 | `active_subscribe_rx` | `u32` | Active Subscribe receipts. |
+| 10 | `followup_rx` | `u32` | Follow-up receipts. |
+| 11 | `last_kind` | `u8` | Last discovery packet kind. |
+| 12 | `last_payload_len` | `u16` | Bounded length metadata; payload is not retained here. |
+| 13 | `last_payload_hash` | `u32` | Non-secret payload fingerprint. |
+| 14 | `unavailable_fields` | `u32` | Explicit complement of `available_fields`. |
+| 15 | `channel` | `u8` | Optional receiver-side capture channel. |
+
+### Controller-owned device record
+
+Linux and Android persist one private `OwnedDevice` pairing result per signed
+`device_id`; each record contains optional `name`, radio `mac`,
+signed `public_key`, `vip6`, transport `endpoints`, and controller/device `secret`. The secret is
+stored only in the mode-0600 private device file, is redacted from debug
+output, and is never returned by `discovery.nodes` or an HTTP/UI handler.
+Android BLE pairing is one producer of this record; it is not an alternate
+device schema.
+
+The advertised `vip6` is always the complete 16-byte ULA. RFC 4193 allocates
+`fc00::/7`: the following `L` bit selects centrally assigned (`0`) or locally
+assigned (`1`, conventionally `fd00::/8`) space. For locally provisioned DMesh
+devices, the next 40-bit Global ID is derived from the provisioned owner root
+CA, the following 16-bit subnet ID is initially zero, and the low 64 bits are
+the device identity hint. An all-zero 40-bit owner ID marks an unconfigured
+device; receivers must not infer common ownership from the fixed ULA bits.
+
+## 10. `active` — Run one discovery pass on every available local bearer
+
+The handler fans out locally to all currently owned discovery adapters (for
+example UDP multicast, NAN, BLE, or UART). It is not a path-selection hint for
+QUIC and does not queue application traffic behind a busy bearer. Each adapter
+only reports observations it actually received; callers subsequently read the
+merged `discovery.nodes` inventory.
 
 ### Request
 
@@ -55,6 +104,27 @@ flash, reset, logs, and NAN wake examples.
 ## 4. `udp6_metrics` — Return local raw IPv6 validation, UDP delivery, NDP, transmit, and failure counters
 
 ## 5. `wifi_link_metrics` — Return common optional per-peer Wi-Fi link observations
+
+## 6. `battery` — Return the latest portable battery and power snapshot
+
+`BatteryState` is the shared optional state for Android, ESP32, and Linux.
+Android currently produces it; the other adapters may leave fields absent
+until they implement an observer. Unknown values are omitted, not replaced
+with zero or false. Durations are measured in milliseconds by the reporting
+adapter; `idle_ms` and `charging_ms` describe the current interval, while
+`total_idle_ms` accumulates since that adapter started.
+
+### Response
+
+| Tag | Field | Type | Description |
+|---:|---|---|---|
+| 1 | `battery_percent` | `u8` | Charge level from 0 to 100. |
+| 2 | `charging` | `bool` | Power source is charging the battery. |
+| 3 | `power_save` | `bool` | Platform power-saving mode is active. |
+| 4 | `idle` | `bool` | Platform idle or sleep mode is active. |
+| 5 | `idle_ms` | `u64` | Elapsed time in the current idle interval. |
+| 6 | `total_idle_ms` | `u64` | Accumulated idle time since observer start. |
+| 7 | `charging_ms` | `u64` | Elapsed time in the current charging interval. |
 
 # `transport` API (1)
 
@@ -101,6 +171,118 @@ flash, reset, logs, and NAN wake examples.
 | 4 | `tx_burst_packets` | `u8` | Transmit burst ceiling. |
 | 11 | `path_policy` | `u8` | Path selection policy. |
 | 12 | `timeout_ms` | `u32` | Association timeout. |
+
+# `companion` API (209)
+
+Pairing makes a virgin ESP32 a companion of one Linux or Android controller.
+Every pairing attempt first sends `nan.pair_wakeup` through a nearby observer,
+even when the provisioning exchange will use USB, BLE, or Wi-Fi. A sleepy
+virgin device may then open a bounded pairing window. A device that already
+has `sec:key` ignores this invitation.
+`kind` selects the bearer used for this operation. Initial provisioning is
+currently limited to direct UART/USB and encrypted BLE CoC. It does
+not bind ownership to that bearer or disable the other transports. `id` is
+its adapter-local identifier, such as a serial path, BLE address, or signed
+Wi-Fi discovery identity. The host verifies the signed device identity,
+generates a new shared secret, writes it to the device, and durably stores the
+secret with the device MAC and public key in its private owned-device file.
+The signed `device_id` is stable across bearers. A Bluetooth bond alone does
+not grant access to privileged handlers; the shared secret does. Once paired,
+the same ownership works over any available transport. A second pair attempt
+must reject the device until an authorized unpair resets it. Firmware never
+returns the raw secret over control.
+
+Linux stores one pairing result per signed device VIP6 in
+`DMESH_PAIRED_DEVICES_DIR` (default `/home/system/etc/lmesh/paired`). The
+directory is mode 0700 and each JSON result is mode 0600. Android uses the
+same layout under its app-private `files/ssh-mesh/paired` directory. A result is
+created from signed discovery, the device's NVS name (or the name set during
+pairing), the installed control-plane root public key, and the newly generated secret. Its filename is the final eight
+VIP6 bytes as 16 lowercase hexadecimal digits plus `.json`;
+the old catalog inventory is not pairing authority. The secret must not appear in normal
+discovery, logs, HTTP responses, or command history.
+
+BLE advertisements use a distinct DMesh pairing service while virgin. Once
+paired they use the operational service and may include a short owner hint,
+such as the last four bytes of the owner's VIP, to help a controller match its
+private inventory. The hint is public metadata, not authorization; signed
+identity and shared-secret proof remain required.
+
+## 1. `pair` — Provision a virgin companion
+
+For UART, `vip6` must match a signed discovery check; physical access is the
+trust boundary, as with esp-tool, so no link encryption is required. BLE uses
+an address from scan results and provisions the secret only after bonding and
+an encrypted CoC connection; `psm` defaults to 128. Wi-Fi pairing is deferred.
+Pairing reads the device name from NVS through signed discovery. Optional
+`name` replaces it, or supplies an initial name, and must be written to NVS
+before the local pairing result is committed.
+Pairing also installs a control-plane root public key into `dmesh:cp` NVS.
+By default this is the controller's own public key. If a root CA is configured,
+the controller uses that CA's public key; `root_public_key_b64` can select an
+explicit compressed P-256 public key for this pairing. The selected root key
+is saved in the private pairing result and is not a shared secret.
+Android's native
+Bluetooth API owns permission and bonding. A successful pair response means
+the device accepted the new secret and the host saved the matching identity
+and secret durably; starting an asynchronous bond is not completion.
+
+```sh
+mesh lmesh companion.pair --kind=uart --id=/dev/ttyUSB0 --vip6=fd00::1234
+mesh lmesh companion.pair --kind=ble --id=AA:BB:CC:DD:EE:FF --psm=128
+mesh lmesh companion.unpair --kind=wifi --id=fd00::1234
+mesh lmesh companion.unpair --kind=uart --id=/dev/ttyUSB0
+```
+
+### Request
+
+| Tag | Field | Type | Description |
+|---:|---|---|---|
+| 1 | `kind` | `string` | Provisioning bearer: `uart` or `ble`. |
+| 2 | `id` | `string` | Adapter-local identifier from discovery. |
+| 3 | `vip6` | `string` | Signed discovered VIP, required for UART. |
+| 4 | `baud` | `u32` | Optional UART physical baud rate. |
+| 5 | `psm` | `u16` | Optional BLE CoC PSM; default 128. |
+| 6 | `name` | `string` | Optional new device name, persisted in NVS during pairing. |
+| 7 | `root_public_key_b64` | `string` | Optional base64 compressed P-256 control-plane root public key (33 bytes). |
+
+## 2. `unpair` — Reset a companion to virgin state
+
+`kind` names the bearer carrying this operation; it does not identify the
+bearer on which pairing happened. Unpair removes its shared secret and
+BLE pairing data on the ESP32, removes its owned-device entry and BLE bond on
+Linux or Android, and releases its bearer. Afterwards the ESP32 behaves like
+a virgin device. Over Wi-Fi or BLE, unpair requires proof of the current
+shared secret and must reject devices owned by another controller. UART alone
+may unlock a device without that proof, including one paired to someone else.
+Physical UART access already permits Linux to flash the ESP32; future eFuse
+policy may restrict that ability. The UART exception must never apply to a
+request that arrives over Wi-Fi or BLE, even if its `kind` field says `uart`.
+
+### Request
+
+| Tag | Field | Type | Description |
+|---:|---|---|---|
+| 1 | `kind` | `string` | Bearer carrying the unpair request. |
+| 2 | `id` | `string` | Target identifier on that bearer. |
+
+# `log` API (208)
+
+## 1. `record` — One-way diagnostic message from a companion bearer
+
+**Visibility:** private
+
+This tagged message has no request ID or response. A host UART adapter wraps
+unframed boot and crash text in this message after receiving it; normal QUIC
+frames remain unchanged. `log-watch` remains the device pull interface.
+
+### Request
+
+| Tag | Field | Type | Description |
+|---:|---|---|---|
+| 1 | `text` | `string` | One bounded UTF-8 log line. |
+| 2 | `source` | `string` | Observer-local bearer path or name. |
+| 3 | `timestamp_ms` | `u64` | Observer receipt time. |
 
 <!-- dmesh-api:end -->
 
@@ -157,6 +339,23 @@ dmesh-cli DEVICE telemetry.nan_status
 |---:|---|---|---|
 | 1 | `to` | `string` | Target radio MAC address. |
 
+## 12. `pair_wakeup` — Invite only a virgin device into a bounded pairing window
+
+An observer sends this targeted NAN request before pairing over any bearer.
+The device accepts it only while `sec:key` is empty; an owned device ignores
+it. The observer response means the wake was queued, not that the device
+entered pairing mode or that pairing completed.
+
+```sh
+dmesh-cli OBSERVER nan.pair_wakeup --to=aa:bb:cc:dd:ee:ff
+```
+
+### Request
+
+| Tag | Field | Type | Description |
+|---:|---|---|---|
+| 1 | `to` | `string` | Target radio MAC address from discovery. |
+
 <!-- dmesh-api:end -->
 
 <!-- dmesh-api:linux -->
@@ -211,6 +410,7 @@ mesh lmesh wifi.mgmt.capture --iface=wlan0 --channel=6 --capture_ms=200
 |---:|---|---|---|
 | 1 | `keys` | `string` | keys parameter. |
 | 2 | `limit` | `u64` | limit parameter. |
+
 
 # `relay` API (220)
 
@@ -431,6 +631,50 @@ mesh lmesh wifi.mgmt.capture --iface=wlan0 --channel=6 --capture_ms=200
 | 4 | `max_frames` | `u64` | max frames parameter. |
 | 5 | `active` | `bool` | active parameter. |
 
+# `uart` API (206)
+
+Linux USB serial ports are listed without opening them. `discover` briefly
+opens a selected port to request its signed identity and VIP, then closes it.
+`companion.pair` retains the port as a companion bearer only after that check.
+Removal releases ownership. QUIC-lite streams use complete PPP framed datagrams;
+connectionless checks use QUIC-lite long packets. Boot text becomes `log.record`.
+
+```sh
+mesh lmesh uart.devices
+mesh lmesh uart.discover --path=/dev/serial/by-id/DEVICE
+mesh lmesh companion.pair --kind=uart --id=/dev/serial/by-id/DEVICE --vip6=fd00::1234
+mesh lmesh uart.baud --baud=921600
+mesh lmesh uart.reset
+mesh lmesh companion.unpair --kind=uart --id=/dev/serial/by-id/DEVICE
+```
+
+## 1. `status` — Show the paired UART companion, visible port count, and modem lines
+
+The paired status reports DTR and RTS output levels plus the read-only CTS
+input when the adapter supports modem-line inspection.
+
+## 2. `devices` — List USB serial ports and observed VIPs without opening them
+
+## 3. `discover` — Temporarily check one or all listed ports for signed identity
+
+### Request
+
+| Tag | Field | Type | Description |
+|---:|---|---|---|
+| 1 | `path` | `string` | Optional listed port path; omission checks all. |
+| 2 | `baud` | `u32` | Optional baud rate for the temporary check. |
+| 3 | `timeout_ms` | `u64` | Per-port check timeout. |
+
+## 4. `baud` — Set the paired UART port baud rate
+
+### Request
+
+| Tag | Field | Type | Description |
+|---:|---|---|---|
+| 1 | `baud` | `u32` | Supported baud rate. |
+
+## 5. `reset` — Pulse the paired UART reset control lines
+
 <!-- dmesh-api:end -->
 
 <!-- dmesh-api:android -->
@@ -467,7 +711,10 @@ Android BLE adapter operations. The service uses tagged CBOR; the Android framew
 
 ## 6. `connect` — Connect to a BLE device over L2CAP CoC
 
-**UI:** default
+**Visibility:** private
+
+Platform adapter operation used by `companion.pair`. Public clients use the
+companion API so the same method applies to BLE, UART, and Wi-Fi.
 
 ### Request
 
@@ -478,7 +725,7 @@ Android BLE adapter operations. The service uses tagged CBOR; the Android framew
 
 ## 7. `disconnect` — Disconnect the local BLE bearer
 
-**UI:** default
+**Visibility:** private
 
 # `radio` API (202)
 
@@ -493,49 +740,6 @@ Android BLE adapter operations. The service uses tagged CBOR; the Android framew
 | 1 | `limit` | `u64` | Maximum event count, capped at 256. |
 | 2 | `since_ms` | `u64` | Earliest event timestamp. |
 | 3 | `keys` | `string` | Event key selector. |
-
-# `transport` API (203)
-
-## 1. `status` — Report the local transport snapshot
-
-**UI:** default
-
-## 2. `set` — Change the local radio transport mode
-
-**UI:** default
-
-### Request
-
-| Tag | Field | Type | Description |
-|---:|---|---|---|
-| 1 | `mode` | `string` | Requested mode: sta, uart, nan, or aware. |
-| 2 | `ssid` | `string` | Station SSID. |
-| 3 | `passphrase` | `string` | Station passphrase. |
-| 4 | `bssid` | `string` | Station BSSID. |
-| 5 | `bssid_hex` | `string` | Hex BSSID spelling. |
-| 6 | `channel` | `u8` | Radio channel. |
-| 7 | `ap` | `u8` | AP setting. |
-| 8 | `p2p_go` | `u8` | P2P group owner setting. |
-| 9 | `now` | `u8` | ESP-NOW setting. |
-| 10 | `ble` | `u8` | BLE setting. |
-| 11 | `uart` | `u8` | UART setting. |
-| 12 | `nan_dw_interval` | `u8` | NAN discovery window interval. |
-| 13 | `wake_target` | `string` | Device to wake. |
-
-## 3. `start` — Send a NAN wake or activation record
-
-**UI:** default
-
-### Request
-
-| Tag | Field | Type | Description |
-|---:|---|---|---|
-| 1 | `target_mac` | `string` | Target device MAC. |
-| 2 | `kind` | `u8` | Activation kind. |
-| 3 | `ap` | `u8` | AP setting. |
-| 4 | `now` | `u8` | ESP-NOW setting. |
-| 5 | `ble` | `u8` | BLE setting. |
-| 6 | `nan_dw_interval` | `u8` | NAN discovery window interval. |
 
 # `usb` API (204)
 

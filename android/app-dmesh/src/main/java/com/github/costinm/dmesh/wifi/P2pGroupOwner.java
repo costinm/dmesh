@@ -1,4 +1,4 @@
-package com.github.costinm.dmesh.lm3;
+package com.github.costinm.dmesh.wifi;
 
 import android.content.Context;
 import android.os.Handler;

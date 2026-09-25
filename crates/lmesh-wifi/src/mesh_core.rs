@@ -1831,6 +1831,36 @@ fn default_rate_profile() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method")]
 pub enum Request {
+    #[serde(rename = "uart.status")]
+    UartStatus,
+    #[serde(rename = "uart.devices")]
+    UartDevices,
+    #[serde(rename = "uart.discover")]
+    UartDiscover {
+        #[serde(default)]
+        path: Option<PathBuf>,
+        #[serde(default)]
+        baud: Option<u32>,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+    },
+    #[serde(rename = "companion.pair")]
+    Pair {
+        kind: String,
+        id: String,
+        #[serde(default)]
+        vip6: Option<Ipv6Addr>,
+        #[serde(default)]
+        baud: Option<u32>,
+        #[serde(default)]
+        psm: Option<u16>,
+    },
+    #[serde(rename = "companion.unpair")]
+    Unpair { kind: String, id: String },
+    #[serde(rename = "uart.baud")]
+    UartBaud { baud: u32 },
+    #[serde(rename = "uart.reset")]
+    UartReset,
     /// Run the normal QUIC probe service to a routed node. The destination
     /// selects a connection path; callers never select a Wi-Fi-specific
     /// probe implementation.
@@ -2189,6 +2219,9 @@ impl dmesh_server::udp::TaggedStreamHandler for UdpDiscoveryIngressHandler {
 
 pub struct LmeshService {
     discovery: Arc<LocalDiscovery>,
+    uart: crate::uart_service::UartController,
+    ble_companion: crate::ble_companion::BleCompanion,
+    wifi_companion: Arc<std::sync::Mutex<Option<(String, Ipv6Addr)>>>,
     /// Optional embedded Wi-Fi instance. It is constructed through the same
     /// reusable library object as the standalone lmesh-wifi launcher, but an
     /// empty `LMESH_INTERFACES` makes this process UDP-only. When non-empty,
@@ -2360,6 +2393,9 @@ struct RelayControlSession {
 }
 
 impl LmeshService {
+    pub fn uart_controller(&self) -> crate::uart_service::UartController {
+        self.uart.clone()
+    }
     /// Create a service around an initialized discovery instance.
     pub fn new(discovery: Arc<LocalDiscovery>) -> Self {
         let wifi_service = lmesh_wifi::WifiService::from_environment_with_discovery_log(
@@ -2372,6 +2408,9 @@ impl LmeshService {
         // transport/AP operation owns its own explicit transition.
         Self {
             discovery,
+            uart: crate::uart_service::UartController::new(radio.clone()),
+            ble_companion: crate::ble_companion::BleCompanion::new(radio.clone()),
+            wifi_companion: Arc::new(std::sync::Mutex::new(None)),
             wifi_service,
             radio,
             wifi,
@@ -2648,9 +2687,7 @@ impl LmeshService {
     /// A host without an owned Wi-Fi interface cannot route a NOW request.
     fn require_owned_wifi_for_now(&self) -> Result<()> {
         if self.wifi_owned_interfaces().names().is_empty() {
-            anyhow::bail!(
-                "unsupported/no_quic_route: lmesh has no owned Wi-Fi interface for NOW"
-            );
+            anyhow::bail!("unsupported/no_quic_route: lmesh has no owned Wi-Fi interface for NOW");
         }
         Ok(())
     }
@@ -2793,6 +2830,21 @@ impl LmeshService {
         destination: &str,
         record: &[u8],
     ) -> Result<mesh::tagged::TaggedRecord> {
+        if self.uart.paired_with(destination) {
+            let uart = self.uart.clone();
+            let record = record.to_vec();
+            let response = tokio::task::spawn_blocking(move || uart.forward(&record))
+                .await
+                .context("paired UART worker")??;
+            return decode_stream_response(&response).context("decode paired UART tagged response");
+        }
+        if self.ble_companion.paired_with(destination) {
+            let ble = self.ble_companion.clone();
+            let record = record.to_vec();
+            let response = tokio::task::spawn_blocking(move || ble.forward(&record))
+                .await.context("paired BLE worker")??;
+            return decode_stream_response(&response).context("decode paired BLE tagged response");
+        }
         if is_now_mac(destination) {
             self.require_owned_wifi_for_now()?;
             let request_id = mesh::cbor::decode_record(record)
@@ -3404,6 +3456,88 @@ impl LmeshService {
     /// Handle a single JSON-lines request.
     pub async fn handle_request(&self, request: Request) -> mesh::protocol::Response {
         match request {
+            Request::UartStatus => match self.uart.status() {
+                Ok(value) => mesh::protocol::Response::ok_with_data(value),
+                Err(error) => mesh::protocol::Response::err(error.to_string()),
+            },
+            Request::UartDevices => match self.uart.devices() {
+                Ok(value) => mesh::protocol::Response::ok_with_data(value),
+                Err(error) => mesh::protocol::Response::err(error.to_string()),
+            },
+            Request::UartDiscover {
+                path,
+                baud,
+                timeout_ms,
+            } => {
+                let uart = self.uart.clone();
+                let timeout =
+                    std::time::Duration::from_millis(timeout_ms.unwrap_or(1_000).clamp(100, 5_000));
+                match tokio::task::spawn_blocking(move || uart.discover(path, baud, timeout)).await
+                {
+                    Ok(Ok(value)) => mesh::protocol::Response::ok_with_data(value),
+                    Ok(Err(error)) => mesh::protocol::Response::err(error.to_string()),
+                    Err(error) => mesh::protocol::Response::err(error.to_string()),
+                }
+            }
+            Request::Pair { kind, id, vip6, baud, psm } => {
+                // TODO(pairing): This retains a bearer after checking an
+                // existing secret. It does not provision a virgin ESP32 or
+                // persist a new device ownership record. `kind` is only the
+                // transport for this operation, not a permanent owner type.
+                if kind == "ble" {
+                    let ble = self.ble_companion.clone();
+                    return match tokio::task::spawn_blocking(move || ble.pair(&id, vip6, psm)).await {
+                        Ok(Ok(value)) => mesh::protocol::Response::ok_with_data(value),
+                        Ok(Err(error)) => mesh::protocol::Response::err(error.to_string()),
+                        Err(error) => mesh::protocol::Response::err(error.to_string()),
+                    };
+                }
+                let result = match kind.as_str() {
+                    "uart" => match vip6 {
+                        Some(vip6) => self.uart.pair(std::path::Path::new(&id), vip6, baud),
+                        None => Err(anyhow::anyhow!("uart pairing requires the discovered vip6")),
+                    },
+                    "wifi" => Err(anyhow::anyhow!("Wi-Fi companion provisioning is not implemented; use BLE or direct UART")),
+                    _ => Err(anyhow::anyhow!("unsupported companion kind: {kind}")),
+                };
+                match result {
+                    Ok(value) => mesh::protocol::Response::ok_with_data(value),
+                    Err(error) => mesh::protocol::Response::err(error.to_string()),
+                }
+            }
+            Request::Unpair { kind, id } => {
+                // TODO(pairing): This only releases a local bearer. The
+                // device secret and BLE bonds remain. Authenticated unpair
+                // over any transport, and credential-free UART unlock, need
+                // device-side handling before this fulfills the API.
+                let result = match kind.as_str() {
+                    "uart" => self.uart.unpair_matching(std::path::Path::new(&id)),
+                    "ble" => self.ble_companion.unpair(&id),
+                    "wifi" => {
+                        let mut paired = self.wifi_companion.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        match paired.as_ref() {
+                            Some((current, _)) if current == &id => {
+                                *paired = None;
+                                Ok(serde_json::json!({"paired": false, "kind": "wifi", "released": id}))
+                            }
+                            _ => Err(anyhow::anyhow!("Wi-Fi companion ID is not locally paired")),
+                        }
+                    }
+                    _ => Err(anyhow::anyhow!("unsupported companion kind: {kind}")),
+                };
+                match result {
+                    Ok(value) => mesh::protocol::Response::ok_with_data(value),
+                    Err(error) => mesh::protocol::Response::err(error.to_string()),
+                }
+            }
+            Request::UartBaud { baud } => match self.uart.set_baud(baud) {
+                Ok(value) => mesh::protocol::Response::ok_with_data(value),
+                Err(error) => mesh::protocol::Response::err(error.to_string()),
+            },
+            Request::UartReset => match self.uart.reset() {
+                Ok(value) => mesh::protocol::Response::ok_with_data(value),
+                Err(error) => mesh::protocol::Response::err(error.to_string()),
+            },
             Request::Probe {
                 to,
                 bytes,

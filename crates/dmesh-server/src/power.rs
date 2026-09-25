@@ -20,7 +20,7 @@ pub struct PowerObservation {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PowerState {
+pub struct BatteryState {
     pub battery_percent: Option<u8>,
     pub charging: Option<bool>,
     pub power_save: Option<bool>,
@@ -28,6 +28,11 @@ pub struct PowerState {
     pub idle_ms: Option<u64>,
     pub total_idle_ms: Option<u64>,
     pub charging_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PowerState {
+    pub battery: BatteryState,
     pub memory_available_bytes: Option<u64>,
     pub memory_low: Option<bool>,
     pub memory_threshold_bytes: Option<u64>,
@@ -45,6 +50,23 @@ impl PowerState {
                 }
             };
         }
+        self.battery.apply(update);
+        apply!(memory_available_bytes);
+        apply!(memory_low);
+        apply!(memory_threshold_bytes);
+        apply!(trim_level);
+    }
+}
+
+impl BatteryState {
+    pub fn apply(&mut self, update: PowerObservation) {
+        macro_rules! apply {
+            ($field:ident) => {
+                if update.$field.is_some() {
+                    self.$field = update.$field;
+                }
+            };
+        }
         apply!(battery_percent);
         apply!(charging);
         apply!(power_save);
@@ -52,11 +74,74 @@ impl PowerState {
         apply!(idle_ms);
         apply!(total_idle_ms);
         apply!(charging_ms);
-        apply!(memory_available_bytes);
-        apply!(memory_low);
-        apply!(memory_threshold_bytes);
-        apply!(trim_level);
     }
+}
+
+/// Decode the private Android CBOR update into the portable battery fields.
+/// Public telemetry uses the numeric tags in API.md; this ingress uses field
+/// names so Android can use the shared Bundle/CBOR stream codec.
+pub fn decode_battery_cbor_observation(input: &[u8]) -> Result<PowerObservation, &'static str> {
+    use crate::cbor::Decoder;
+
+    if input.len() > 512 {
+        return Err("battery observation exceeds byte bound");
+    }
+    let mut decoder = Decoder::new(input);
+    let (major, count) = decoder.head().ok_or("invalid battery CBOR")?;
+    if major != 5 || count == 0 || count > 7 {
+        return Err("battery observation must be a bounded map");
+    }
+    let mut observation = PowerObservation::default();
+    let mut seen = 0u8;
+    for _ in 0..count {
+        let key = decoder.text_ref().ok_or("battery field must be text")?;
+        let bit: u8 = match key {
+            b"battery_percent" => {
+                let value = decoder.uint().ok_or("invalid battery percentage")?;
+                observation.battery_percent = Some(
+                    u8::try_from(value)
+                        .ok()
+                        .filter(|value| *value <= 100)
+                        .ok_or("battery percentage must be 0..100")?,
+                );
+                1
+            }
+            b"charging" => {
+                observation.charging = Some(decoder.boolean().ok_or("invalid charging flag")?);
+                2
+            }
+            b"power_save" => {
+                observation.power_save = Some(decoder.boolean().ok_or("invalid power-save flag")?);
+                4
+            }
+            b"idle" => {
+                observation.idle = Some(decoder.boolean().ok_or("invalid idle flag")?);
+                8
+            }
+            b"idle_ms" => {
+                observation.idle_ms = Some(decoder.uint().ok_or("invalid idle duration")?);
+                16
+            }
+            b"total_idle_ms" => {
+                observation.total_idle_ms =
+                    Some(decoder.uint().ok_or("invalid total idle duration")?);
+                32
+            }
+            b"charging_ms" => {
+                observation.charging_ms = Some(decoder.uint().ok_or("invalid charging duration")?);
+                64
+            }
+            _ => return Err("unsupported battery field"),
+        };
+        if seen & bit != 0 {
+            return Err("duplicate battery field");
+        }
+        seen |= bit;
+    }
+    if !decoder.is_finished() {
+        return Err("trailing battery CBOR data");
+    }
+    Ok(observation)
 }
 
 /// Decode the bounded platform-fact JSON projection used by Android, host
@@ -162,6 +247,23 @@ fn boolean(
 #[cfg(feature = "std")]
 pub fn json_status(state: PowerState) -> serde_json::Value {
     serde_json::json!({
+        "battery_percent": state.battery.battery_percent,
+        "charging": state.battery.charging,
+        "power_save": state.battery.power_save,
+        "idle": state.battery.idle,
+        "idle_ms": state.battery.idle_ms,
+        "total_idle_ms": state.battery.total_idle_ms,
+        "charging_ms": state.battery.charging_ms,
+        "memory_available_bytes": state.memory_available_bytes,
+        "memory_low": state.memory_low,
+        "memory_threshold_bytes": state.memory_threshold_bytes,
+        "trim_level": state.trim_level,
+    })
+}
+
+#[cfg(feature = "std")]
+pub fn battery_json_status(state: BatteryState) -> serde_json::Value {
+    serde_json::json!({
         "battery_percent": state.battery_percent,
         "charging": state.charging,
         "power_save": state.power_save,
@@ -169,10 +271,6 @@ pub fn json_status(state: PowerState) -> serde_json::Value {
         "idle_ms": state.idle_ms,
         "total_idle_ms": state.total_idle_ms,
         "charging_ms": state.charging_ms,
-        "memory_available_bytes": state.memory_available_bytes,
-        "memory_low": state.memory_low,
-        "memory_threshold_bytes": state.memory_threshold_bytes,
-        "trim_level": state.trim_level,
     })
 }
 
@@ -193,8 +291,8 @@ mod tests {
             memory_low: Some(false),
             ..PowerObservation::default()
         });
-        assert_eq!(state.battery_percent, Some(54));
-        assert_eq!(state.power_save, Some(true));
+        assert_eq!(state.battery.battery_percent, Some(54));
+        assert_eq!(state.battery.power_save, Some(true));
         assert_eq!(state.memory_available_bytes, Some(1024));
     }
 
@@ -209,5 +307,37 @@ mod tests {
         state.apply(observation);
         assert_eq!(json_status(state)["battery_percent"], 67);
         assert!(decode_json_observation(br#"{"unknown":true}"#).is_err());
+    }
+
+    #[test]
+    fn battery_cbor_update_is_bounded_and_rejects_duplicate_fields() {
+        use crate::cbor::Encoder;
+
+        let mut wire = [0u8; 128];
+        let mut encoder = Encoder::new(&mut wire);
+        encoder.map(3).unwrap();
+        encoder.text_value(b"battery_percent").unwrap();
+        encoder.uint(67).unwrap();
+        encoder.text_value(b"charging").unwrap();
+        encoder.boolean(true).unwrap();
+        encoder.text_value(b"idle_ms").unwrap();
+        encoder.uint(1200).unwrap();
+        let used = encoder.len();
+        let observation = decode_battery_cbor_observation(&wire[..used]).unwrap();
+        let mut state = BatteryState::default();
+        state.apply(observation);
+        assert_eq!(state.battery_percent, Some(67));
+        assert_eq!(state.charging, Some(true));
+        assert_eq!(state.idle_ms, Some(1200));
+
+        let mut duplicate = [0u8; 80];
+        let mut encoder = Encoder::new(&mut duplicate);
+        encoder.map(2).unwrap();
+        for _ in 0..2 {
+            encoder.text_value(b"battery_percent").unwrap();
+            encoder.uint(67).unwrap();
+        }
+        let used = encoder.len();
+        assert!(decode_battery_cbor_observation(&duplicate[..used]).is_err());
     }
 }

@@ -35,6 +35,10 @@ static const uint8_t DMESH_BLE_PAIRING_UUID128[16] = {
     0x4a, 0x6f,
     0x8c, 0x42, 0x4d, 0x65, 0x73, 0x68, 0x00, 0x01,
 };
+static const uint8_t DMESH_BLE_OPERATIONAL_UUID128[16] = {
+    0x80, 0x6f, 0x6b, 0x5f, 0x2a, 0x4f, 0x4a, 0x6f,
+    0x8c, 0x42, 0x4d, 0x65, 0x73, 0x68, 0x00, 0x02,
+};
 
 static volatile TaskHandle_t s_button_irq_task;
 static volatile TaskHandle_t s_lora_irq_task;
@@ -522,7 +526,8 @@ static bool dmesh_adv_contains_dmesh_uuid(const uint8_t *adv, uint8_t len) {
         if ((field_type == BLE_HS_ADV_TYPE_INCOMP_UUIDS128 ||
              field_type == BLE_HS_ADV_TYPE_COMP_UUIDS128) &&
             data_len == 16 &&
-            memcmp(data, DMESH_BLE_PAIRING_UUID128, 16) == 0) {
+            (memcmp(data, DMESH_BLE_PAIRING_UUID128, 16) == 0 ||
+             memcmp(data, DMESH_BLE_OPERATIONAL_UUID128, 16) == 0)) {
             return true;
         }
         offset += field_len + 1;

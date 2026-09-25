@@ -14,5 +14,11 @@ tool catalogs. Bearer lifecycle uses common `transport.set`; discovery uses
 service from the common `dmesh-server` schema.
 
 The shared NAN frame/state implementation is documented in
-[`dmesh-rawnan/README.md`](../rawnan/README.md). Direct UART sessions remain owned by
-`dmesh-cli`; this crate does not open or proxy board serial devices.
+[`dmesh-rawnan/README.md`](../rawnan/README.md). The Linux `lmesh` daemon
+lists USB serial ports without opening them and owns one only after an
+explicit `companion.pair`. BLE CoC uses the same public pairing
+method. Pairing is device ownership across all available transports; `kind`
+selects only the transport used for the operation. The current implementation
+checks signed discovery and an existing private per-device pairing result;
+secret provisioning and device reset remain incomplete (see root `API.md`).
+`dmesh-cli` can still own an unpaired physical UART for direct diagnostics.

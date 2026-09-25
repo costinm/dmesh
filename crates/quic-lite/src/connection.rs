@@ -13,6 +13,8 @@
 
 use alloc::vec::Vec;
 
+use crate::bearer::LocalAddress;
+
 /// Partial policy applied when a QUIC-lite association is created.
 ///
 /// Omitted fields preserve the connection manager's existing/default values.
@@ -26,27 +28,6 @@ pub struct ConnectionPolicy {
     pub tx_burst_packets: Option<u8>,
     pub path_policy: Option<u8>,
     pub timeout_ms: Option<u32>,
-}
-
-/// Opaque identifier assigned by a frame-I/O adapter to one usable path.
-///
-/// The value deliberately carries no MAC address, socket address, UART port,
-/// or bearer kind. The adapter retains those facts and resolves this handle
-/// when the connection selects an outgoing frame. A single logical
-/// connection can therefore move between unlike bearers without changing its
-/// DCID or stream state.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-#[repr(transparent)]
-pub struct PathId(u64);
-
-impl PathId {
-    pub const fn new(value: u64) -> Option<Self> {
-        if value == 0 { None } else { Some(Self(value)) }
-    }
-
-    pub const fn value(self) -> u64 {
-        self.0
-    }
 }
 
 /// Verified overlay identity for association lifecycle.
@@ -82,13 +63,13 @@ pub struct PathConnection<T> {
     /// Paths that have carried a valid packet for this association.  The
     /// adapter resolves these opaque handles to UART ports, UDP tuples, or
     /// NOW peers; QUIC never learns or chooses bearer-specific addresses.
-    known_paths: [Option<PathId>; 4],
+    known_paths: [Option<LocalAddress>; 4],
     /// A caller-selected egress path, for example the exact address named by
     /// a `to` field.  This is deliberately distinct from `active_path`: an
     /// unverified outbound attempt must not claim that the peer has migrated
     /// to that path.
-    selected_path: Option<PathId>,
-    active_path: Option<PathId>,
+    selected_path: Option<LocalAddress>,
+    active_path: Option<LocalAddress>,
 }
 
 /// Bounded packet-number evidence for connection diagnostics.
@@ -720,7 +701,7 @@ impl<T> PathConnection<T> {
         self.last_activity_at
     }
 
-    pub const fn active_path(&self) -> Option<PathId> {
+    pub const fn active_path(&self) -> Option<LocalAddress> {
         self.active_path
     }
 
@@ -728,14 +709,14 @@ impl<T> PathConnection<T> {
     /// Once a packet is accepted, [`Self::receive`] makes its ingress path
     /// active and that path takes precedence for ordinary ACK/retransmit
     /// traffic.
-    pub const fn selected_path(&self) -> Option<PathId> {
+    pub const fn selected_path(&self) -> Option<LocalAddress> {
         self.selected_path
     }
 
     /// Preferred egress path. A caller-specified path wins for its immediate
     /// operation; otherwise a connection returns traffic on its most recent
     /// valid ingress path.
-    pub const fn egress_path(&self) -> Option<PathId> {
+    pub const fn egress_path(&self) -> Option<LocalAddress> {
         match self.selected_path {
             Some(path) => Some(path),
             None => self.active_path,
@@ -744,7 +725,7 @@ impl<T> PathConnection<T> {
 
     /// Select an adapter-owned path for the next outbound operation. This
     /// does not validate, remember, or migrate the association.
-    pub fn select_path(&mut self, path: PathId) {
+    pub fn select_path(&mut self, path: LocalAddress) {
         self.selected_path = Some(path);
     }
 
@@ -758,7 +739,7 @@ impl<T> PathConnection<T> {
     /// first. The final path is not removed merely because the connection
     /// temporarily sends over another bearer; expiry and explicit close are
     /// connection-manager policy above this no-std state.
-    pub const fn known_paths(&self) -> [Option<PathId>; 4] {
+    pub const fn known_paths(&self) -> [Option<LocalAddress>; 4] {
         self.known_paths
     }
 
@@ -782,7 +763,7 @@ impl<T> PathConnection<T> {
     /// not alter either the active or remembered paths.
     pub fn receive<R, E>(
         &mut self,
-        path: PathId,
+        path: LocalAddress,
         receive: impl FnOnce(&mut T) -> Result<R, E>,
     ) -> Result<R, E> {
         let result = receive(&mut self.connection)?;
@@ -796,7 +777,7 @@ impl<T> PathConnection<T> {
         self.active_path = None;
     }
 
-    fn remember_path(&mut self, path: PathId) {
+    fn remember_path(&mut self, path: LocalAddress) {
         if self.known_paths[0] == Some(path) {
             return;
         }
@@ -912,7 +893,7 @@ pub struct ConnectionIdDiagnostic {
 ///
 /// `T` is application glue supplied by the caller. This owner parses only the
 /// QUIC short header and never sees tagged records, services, peers, or bearer
-/// addresses; those remain behind the caller's opaque [`PathId`] mapping.
+/// addresses; those remain behind the caller's opaque [`LocalAddress`] mapping.
 pub struct ServerConnection<T> {
     local_cid: crate::ConnectionId,
     cid_epoch: u32,
@@ -924,7 +905,7 @@ pub struct ServerConnection<T> {
 /// This is the server equivalent of a real QUIC endpoint's connection table.
 /// It belongs in QUIC-lite because CID admission, packet-number state and
 /// multi-path state are QUIC concerns; UART, UDP and NOW adapters supply only
-/// an opaque [`PathId`] plus a complete frame.  Each entry is one logical,
+/// an opaque [`LocalAddress`] plus a complete frame.  Each entry is one logical,
 /// bidirectional association and may remember several validated paths.
 ///
 /// The table is intentionally bounded and allocation-free.  `T` may itself
@@ -939,7 +920,7 @@ pub struct ServerAssociationTable<T, const ASSOCIATIONS: usize> {
     // OPEN. It is consumed by that one receive turn, so it cannot leak to a
     // later packet or become a bearer-derived identity.
     verified_identity_for_next_open: Option<VerifiedPeerIdentity>,
-    last_active_path: Option<PathId>,
+    last_active_path: Option<LocalAddress>,
     // A bearer path is not an association identity: after a client restart,
     // several retained associations can legitimately remember the same UDP
     // path. Deferred egress must therefore retain the selected slot as well
@@ -981,7 +962,7 @@ impl<T, const ASSOCIATIONS: usize> ServerAssociationTable<T, ASSOCIATIONS> {
     /// Bind one already-verified VIP to the immediately following receive
     /// turn. The authentication layer must call this adjacent to submitting a
     /// fresh OPEN; a replayed OPEN consumes the value but keeps its matching
-    /// CID association. IP, MAC and `PathId` are never acceptable inputs.
+    /// CID association. IP, MAC and `LocalAddress` are never acceptable inputs.
     pub fn verify_next_open_for(&mut self, identity: VerifiedPeerIdentity) {
         self.verified_identity_for_next_open = Some(identity);
     }
@@ -991,7 +972,7 @@ impl<T, const ASSOCIATIONS: usize> ServerAssociationTable<T, ASSOCIATIONS> {
     /// peer.  A retransmitted Initial replays only its own OPEN_ACK.
     pub fn receive_admitted<R, C>(
         &mut self,
-        path: PathId,
+        path: LocalAddress,
         packet: &[u8],
         context: &mut C,
         accept: impl FnOnce(crate::ConnectionId, &mut C) -> Result<(T, R), crate::Error>,
@@ -1137,7 +1118,7 @@ impl<T, const ASSOCIATIONS: usize> ServerAssociationTable<T, ASSOCIATIONS> {
         }
     }
 
-    pub fn association_for_path_mut(&mut self, path: PathId) -> Option<&mut T> {
+    pub fn association_for_path_mut(&mut self, path: LocalAddress) -> Option<&mut T> {
         if let Some(slot) = self.last_active_slot {
             if self.associations[slot]
                 .as_ref()
@@ -1155,7 +1136,7 @@ impl<T, const ASSOCIATIONS: usize> ServerAssociationTable<T, ASSOCIATIONS> {
             .map(PathConnection::connection_mut)
     }
 
-    pub fn association_for_path(&self, path: PathId) -> Option<&T> {
+    pub fn association_for_path(&self, path: LocalAddress) -> Option<&T> {
         if let Some(slot) = self.last_active_slot {
             if self.associations[slot]
                 .as_ref()
@@ -1183,7 +1164,7 @@ impl<T, const ASSOCIATIONS: usize> ServerAssociationTable<T, ASSOCIATIONS> {
         &mut self,
         destination: crate::ConnectionId,
         receive_cid: impl Fn(&T) -> Option<crate::ConnectionId>,
-    ) -> Option<PathId> {
+    ) -> Option<LocalAddress> {
         let slot = self.associations.iter().position(|association| {
             association.as_ref().is_some_and(|association| {
                 receive_cid(association.connection()) == Some(destination)
@@ -1201,7 +1182,7 @@ impl<T, const ASSOCIATIONS: usize> ServerAssociationTable<T, ASSOCIATIONS> {
         &self,
         receive_cid: impl Fn(&T) -> Option<crate::ConnectionId>,
         deadline: impl Fn(&T) -> Option<u64>,
-    ) -> Option<(crate::ConnectionId, PathId, u64)> {
+    ) -> Option<(crate::ConnectionId, LocalAddress, u64)> {
         self.associations
             .iter()
             .filter_map(Option::as_ref)
@@ -1259,11 +1240,11 @@ impl<T, const ASSOCIATIONS: usize> ServerAssociationTable<T, ASSOCIATIONS> {
             .and_then(|path| self.association_for_path_mut(path))
     }
 
-    pub fn active_path(&self) -> Option<PathId> {
+    pub fn active_path(&self) -> Option<LocalAddress> {
         self.last_active_path
     }
 
-    pub fn known_paths_for(&self, path: PathId) -> [Option<PathId>; 4] {
+    pub fn known_paths_for(&self, path: LocalAddress) -> [Option<LocalAddress>; 4] {
         if let Some(slot) = self.last_active_slot {
             if let Some(association) = self.associations[slot].as_ref() {
                 if association.active_path() == Some(path) {
@@ -1424,7 +1405,7 @@ impl<T> ServerConnection<T> {
     /// the live peer. Only `receive` sees established traffic.
     pub fn receive_admitted<R, C>(
         &mut self,
-        path: PathId,
+        path: LocalAddress,
         packet: &[u8],
         context: &mut C,
         accept: impl FnOnce(crate::ConnectionId, &mut C) -> Result<(T, R), crate::Error>,
@@ -1498,7 +1479,7 @@ impl<T> ServerConnection<T> {
         self.local_cid
     }
 
-    pub const fn active_path(&self) -> Option<PathId> {
+    pub const fn active_path(&self) -> Option<LocalAddress> {
         match self.association.as_ref() {
             Some(association) => association.active_path(),
             None => None,
@@ -1510,7 +1491,7 @@ impl<T> ServerConnection<T> {
     /// managers that apply idle expiry, explicit path retirement, or future
     /// authenticated path validation without making those bearer concerns
     /// part of stream handling.
-    pub const fn known_paths(&self) -> [Option<PathId>; 4] {
+    pub const fn known_paths(&self) -> [Option<LocalAddress>; 4] {
         match self.association.as_ref() {
             Some(association) => association.known_paths(),
             None => [None; 4],
@@ -1541,7 +1522,7 @@ impl<T> ServerConnection<T> {
     /// a connection to the bearer on which it bootstrapped.
     pub fn owns_packet_for_path(
         &self,
-        _path: PathId,
+        _path: LocalAddress,
         packet: &[u8],
         receive_cid: impl FnOnce(&T) -> Option<crate::ConnectionId>,
     ) -> bool {
@@ -1585,7 +1566,7 @@ impl<T> ServerConnection<T> {
     /// established traffic still requires the active connection ID.
     pub fn receive<R>(
         &mut self,
-        path: PathId,
+        path: LocalAddress,
         packet: &[u8],
         create: impl FnOnce(crate::ConnectionId) -> T,
         is_live: impl Fn(&T) -> bool,
@@ -2342,7 +2323,7 @@ impl<const HISTORY: usize, const PACKET: usize> ClientConnection<HISTORY, PACKET
 ///
 /// A connection manager keys this object by a stable device identity once
 /// discovery/authentication has supplied one.  A UDP tuple, NOW MAC, or UART
-/// port is only a [`PathId`]: choosing one with [`Self::select_path`] sends a
+/// port is only a [`LocalAddress`]: choosing one with [`Self::select_path`] sends a
 /// particular operation there, but does not create another CID or another
 /// handshake.  Any subsequently accepted QUIC packet makes its ingress path
 /// the normal return path.  The manager above this no-std core owns path I/O,
@@ -2399,26 +2380,26 @@ impl<const HISTORY: usize, const PACKET: usize> ClientAssociation<HISTORY, PACKE
         self.state.connection_mut()
     }
 
-    pub const fn active_path(&self) -> Option<PathId> {
+    pub const fn active_path(&self) -> Option<LocalAddress> {
         self.state.active_path()
     }
 
-    pub const fn selected_path(&self) -> Option<PathId> {
+    pub const fn selected_path(&self) -> Option<LocalAddress> {
         self.state.selected_path()
     }
 
-    pub const fn egress_path(&self) -> Option<PathId> {
+    pub const fn egress_path(&self) -> Option<LocalAddress> {
         self.state.egress_path()
     }
 
-    pub const fn known_paths(&self) -> [Option<PathId>; 4] {
+    pub const fn known_paths(&self) -> [Option<LocalAddress>; 4] {
         self.state.known_paths()
     }
 
     /// Select the exact adapter path for a caller's next outbound operation.
     /// This is the core representation of a `to` selector; it is not a new
     /// connection and is not treated as validated peer-path evidence.
-    pub fn select_path(&mut self, path: PathId) {
+    pub fn select_path(&mut self, path: LocalAddress) {
         self.state.select_path(path);
     }
 
@@ -2512,7 +2493,10 @@ impl<const HISTORY: usize, const PACKET: usize> ClientAssociation<HISTORY, PACKE
 
     /// Encode the client Initial for the selected path. The returned path is
     /// deliberately explicit so a frame adapter cannot infer CID ownership.
-    pub fn start(&mut self, output: &mut [u8; PACKET]) -> Result<(PathId, usize), crate::Error> {
+    pub fn start(
+        &mut self,
+        output: &mut [u8; PACKET],
+    ) -> Result<(LocalAddress, usize), crate::Error> {
         let path = self.egress_path().ok_or(crate::Error::Invalid)?;
         let used = self.connection_mut().start(output)?;
         Ok((path, used))
@@ -2527,7 +2511,7 @@ impl<const HISTORY: usize, const PACKET: usize> ClientAssociation<HISTORY, PACKE
         &mut self,
         packet_number: u32,
         output: &mut [u8; PACKET],
-    ) -> Result<(PathId, usize), crate::Error> {
+    ) -> Result<(LocalAddress, usize), crate::Error> {
         let path = self.egress_path().ok_or(crate::Error::Invalid)?;
         let used = self
             .connection_mut()
@@ -2540,7 +2524,7 @@ impl<const HISTORY: usize, const PACKET: usize> ClientAssociation<HISTORY, PACKE
     /// policy; the frame adapter supplies only the complete packet.
     pub fn receive_open_ack(
         &mut self,
-        path: PathId,
+        path: LocalAddress,
         input: &[u8],
         now_ms: u64,
     ) -> Result<(), crate::Error> {
@@ -2558,7 +2542,7 @@ impl<const HISTORY: usize, const PACKET: usize> ClientAssociation<HISTORY, PACKE
         data: &[u8],
         fin: bool,
         output: &mut [u8; PACKET],
-    ) -> Result<(PathId, usize), crate::Error> {
+    ) -> Result<(LocalAddress, usize), crate::Error> {
         self.encode_stream_payload_at(stream_id, 0, data, fin, output)
     }
 
@@ -2573,7 +2557,7 @@ impl<const HISTORY: usize, const PACKET: usize> ClientAssociation<HISTORY, PACKE
         data: &[u8],
         fin: bool,
         output: &mut [u8; PACKET],
-    ) -> Result<(PathId, usize), crate::Error> {
+    ) -> Result<(LocalAddress, usize), crate::Error> {
         let path = self.egress_path().ok_or(crate::Error::Invalid)?;
         let connection = self.connection_mut();
         let destination = connection
@@ -2590,7 +2574,7 @@ impl<const HISTORY: usize, const PACKET: usize> ClientAssociation<HISTORY, PACKE
     /// facts. No bearer caller decodes QUIC frames or packet headers.
     pub fn receive_stream_payload<'a>(
         &mut self,
-        path: PathId,
+        path: LocalAddress,
         input: &'a [u8],
     ) -> Result<Option<(u64, u64, bool, &'a [u8])>, crate::Error> {
         self.receive(path, input, |connection| {
@@ -2613,7 +2597,7 @@ impl<const HISTORY: usize, const PACKET: usize> ClientAssociation<HISTORY, PACKE
     /// between UART, NOW, and UDP preserves the same response sequence.
     pub fn receive_serial_response_payload<'a>(
         &mut self,
-        path: PathId,
+        path: LocalAddress,
         input: &'a [u8],
         deferred_credit: bool,
     ) -> Result<Option<AssociationStreamPayload<'a>>, crate::Error> {
@@ -2691,7 +2675,7 @@ impl<const HISTORY: usize, const PACKET: usize> ClientAssociation<HISTORY, PACKE
     /// unchanged.
     pub fn receive<R>(
         &mut self,
-        path: PathId,
+        path: LocalAddress,
         input: &[u8],
         receive: impl FnOnce(&mut ClientConnection<HISTORY, PACKET>) -> Result<R, crate::Error>,
     ) -> Result<R, crate::Error> {
@@ -2710,7 +2694,7 @@ impl<const HISTORY: usize, const PACKET: usize> ClientAssociation<HISTORY, PACKE
     pub fn poll_transmit(
         &mut self,
         output: &mut [u8; PACKET],
-    ) -> Result<Option<(PathId, usize)>, crate::Error> {
+    ) -> Result<Option<(LocalAddress, usize)>, crate::Error> {
         let Some(path) = self.egress_path() else {
             return Ok(None);
         };
@@ -2726,7 +2710,7 @@ impl<const HISTORY: usize, const PACKET: usize> ClientAssociation<HISTORY, PACKE
     pub fn poll_close(
         &mut self,
         output: &mut [u8; PACKET],
-    ) -> Result<Option<(PathId, usize)>, crate::Error> {
+    ) -> Result<Option<(LocalAddress, usize)>, crate::Error> {
         let Some(path) = self.egress_path() else {
             return Ok(None);
         };
@@ -2751,7 +2735,7 @@ impl<const HISTORY: usize, const PACKET: usize> ClientAssociation<HISTORY, PACKE
         now_us: u64,
         pto_us: u64,
         output: &mut [u8; PACKET],
-    ) -> Result<Option<(PathId, usize)>, crate::Error> {
+    ) -> Result<Option<(LocalAddress, usize)>, crate::Error> {
         let Some(path) = self.egress_path() else {
             return Ok(None);
         };
@@ -2766,7 +2750,7 @@ impl<const HISTORY: usize, const PACKET: usize> mesh_api::MeshAssociation
     for ClientAssociation<HISTORY, PACKET>
 {
     type Error = crate::Error;
-    type Path = PathId;
+    type Path = LocalAddress;
 
     fn selected_path(&self) -> Option<Self::Path> {
         self.selected_path()
@@ -3002,8 +2986,8 @@ mod tests {
         use mesh_api::MeshAssociation;
 
         let cid = crate::ConnectionId::new(0x61).unwrap();
-        let uart = PathId::new(1).unwrap();
-        let udp = PathId::new(2).unwrap();
+        let uart = LocalAddress::new(1).unwrap();
+        let udp = LocalAddress::new(2).unwrap();
         let mut association = ClientAssociation::<4, 256>::new(cid);
         assert_eq!(MeshAssociation::selected_path(&association), None);
         assert_eq!(MeshAssociation::active_path(&association), None);
@@ -3035,8 +3019,8 @@ mod tests {
 
     #[test]
     fn latest_valid_frame_changes_path_without_replacing_connection() {
-        let uart = PathId::new(1).unwrap();
-        let udp = PathId::new(2).unwrap();
+        let uart = LocalAddress::new(1).unwrap();
+        let udp = LocalAddress::new(2).unwrap();
         let mut connection = PathConnection::new(40_u64);
 
         connection
@@ -3058,8 +3042,8 @@ mod tests {
 
     #[test]
     fn rejected_frame_cannot_redirect_return_path() {
-        let uart = PathId::new(1).unwrap();
-        let hostile = PathId::new(9).unwrap();
+        let uart = LocalAddress::new(1).unwrap();
+        let hostile = LocalAddress::new(9).unwrap();
         let mut connection = PathConnection::new(7_u64);
         connection
             .receive(uart, |_| Ok::<_, &'static str>(()))
@@ -3222,7 +3206,7 @@ mod tests {
     fn association_reports_peer_restart_before_a_timeout() {
         let client_cid = crate::ConnectionId::new(0x41).unwrap();
         let server_cid = crate::ConnectionId::new(0x42).unwrap();
-        let path = PathId::new(7).unwrap();
+        let path = LocalAddress::new(7).unwrap();
         let reset_key = crate::StatelessResetKey::from_device_secret(&[0x33; 32]).unwrap();
         let mut association = ClientAssociation::<4, 1200>::new(client_cid);
         let mut packet = [0u8; 1200];
@@ -3300,8 +3284,8 @@ mod tests {
     fn client_association_keeps_one_cid_while_an_ack_migrates_the_return_path() {
         let client_cid = crate::ConnectionId::new(0x61).unwrap();
         let server_cid = crate::ConnectionId::new(0x62).unwrap();
-        let uart = PathId::new(1).unwrap();
-        let udp = PathId::new(2).unwrap();
+        let uart = LocalAddress::new(1).unwrap();
+        let udp = LocalAddress::new(2).unwrap();
         let mut association = ClientAssociation::<4, 1200>::new(client_cid);
         let mut packet = [0u8; 1200];
 
@@ -3341,7 +3325,7 @@ mod tests {
     fn client_association_preserves_explicit_stream_offsets() {
         let client_cid = crate::ConnectionId::new(0x51).unwrap();
         let server_cid = crate::ConnectionId::new(0x52).unwrap();
-        let path = PathId::new(1).unwrap();
+        let path = LocalAddress::new(1).unwrap();
         let mut client = ClientAssociation::<4, 256>::new(client_cid);
         client.select_path(path);
         let mut open = [0u8; 256];
@@ -3399,9 +3383,9 @@ mod tests {
     fn client_association_owns_client_bidi_stream_sequence_across_paths() {
         let mut association =
             ClientAssociation::<4, 1200>::new(crate::ConnectionId::new(0x63).unwrap());
-        let uart = PathId::new(1).unwrap();
-        let now = PathId::new(2).unwrap();
-        let udp = PathId::new(3).unwrap();
+        let uart = LocalAddress::new(1).unwrap();
+        let now = LocalAddress::new(2).unwrap();
+        let udp = LocalAddress::new(3).unwrap();
 
         association.select_path(uart);
         assert_eq!(
@@ -3424,8 +3408,8 @@ mod tests {
     fn client_association_keeps_response_correlation_when_a_request_changes_path() {
         let mut association =
             ClientAssociation::<4, 1200>::new(crate::ConnectionId::new(0x64).unwrap());
-        let uart = PathId::new(1).unwrap();
-        let udp = PathId::new(2).unwrap();
+        let uart = LocalAddress::new(1).unwrap();
+        let udp = LocalAddress::new(2).unwrap();
         association.select_path(uart);
 
         let first = crate::FIRST_SERVER_BIDI_STREAM_ID;
@@ -3464,9 +3448,9 @@ mod tests {
     fn one_association_accepts_concurrent_streams_across_paths_and_uses_latest_valid_return_path() {
         let client_cid = crate::ConnectionId::new(0x81).unwrap();
         let server_cid = crate::ConnectionId::new(0x82).unwrap();
-        let uart = PathId::new(1).unwrap();
-        let udp = PathId::new(2).unwrap();
-        let now = PathId::new(3).unwrap();
+        let uart = LocalAddress::new(1).unwrap();
+        let udp = LocalAddress::new(2).unwrap();
+        let now = LocalAddress::new(3).unwrap();
         let mut client = ClientAssociation::<4, 1200>::new(client_cid);
         let mut initial = [0u8; 1200];
         client.select_path(uart);
@@ -3553,8 +3537,8 @@ mod tests {
         let initial = crate::ConnectionId::new(0x51).unwrap();
         let peer = crate::ConnectionId::new(0x52).unwrap();
         let replacement_peer = crate::ConnectionId::new(0x53).unwrap();
-        let first_path = PathId::new(1).unwrap();
-        let second_path = PathId::new(2).unwrap();
+        let first_path = LocalAddress::new(1).unwrap();
+        let second_path = LocalAddress::new(2).unwrap();
         let mut server = ServerConnection::new(initial);
         let mut open = [0u8; 64];
         let open_len = crate::encode_bootstrap_open_packet(peer, 0, &mut open).unwrap();
@@ -3663,7 +3647,7 @@ mod tests {
         let initial = crate::ConnectionId::new(0x61).unwrap();
         let first_peer = crate::ConnectionId::new(0x62).unwrap();
         let second_peer = crate::ConnectionId::new(0x63).unwrap();
-        let path = PathId::new(7).unwrap();
+        let path = LocalAddress::new(7).unwrap();
         let mut server = ServerConnection::new(initial);
         let mut packet = [0u8; 64];
         let first_len = crate::encode_bootstrap_open_packet(first_peer, 0, &mut packet).unwrap();
@@ -3715,8 +3699,8 @@ mod tests {
 
         let first_peer = crate::ConnectionId::new(0x71).unwrap();
         let second_peer = crate::ConnectionId::new(0x72).unwrap();
-        let first_path = PathId::new(0x101).unwrap();
-        let second_path = PathId::new(0x202).unwrap();
+        let first_path = LocalAddress::new(0x101).unwrap();
+        let second_path = LocalAddress::new(0x202).unwrap();
         let mut table =
             ServerAssociationTable::<Association, 2>::new(crate::ConnectionId::new(0x70).unwrap());
         let mut packet = [0u8; 64];
@@ -3796,7 +3780,7 @@ mod tests {
 
         let first_peer = crate::ConnectionId::new(0x761).unwrap();
         let second_peer = crate::ConnectionId::new(0x762).unwrap();
-        let path = PathId::new(0x303).unwrap();
+        let path = LocalAddress::new(0x303).unwrap();
         let mut table =
             ServerAssociationTable::<Association, 2>::new(crate::ConnectionId::new(0x760).unwrap());
         let mut packet = [0_u8; 64];
@@ -3882,7 +3866,7 @@ mod tests {
         }
 
         let peers = [0x771, 0x772].map(|cid| crate::ConnectionId::new(cid).unwrap());
-        let paths = [0x401, 0x402].map(|path| PathId::new(path).unwrap());
+        let paths = [0x401, 0x402].map(|path| LocalAddress::new(path).unwrap());
         let vip = VerifiedPeerIdentity::new([0x77; 16]);
         let mut table =
             ServerAssociationTable::<Association, 2>::new(crate::ConnectionId::new(0x770).unwrap());
@@ -3936,7 +3920,7 @@ mod tests {
         let mut packet = [0u8; 64];
         let mut context = ();
         let peers = [0x81, 0x82, 0x83].map(|cid| crate::ConnectionId::new(cid).unwrap());
-        let paths = [0x181, 0x182, 0x183].map(|path| PathId::new(path).unwrap());
+        let paths = [0x181, 0x182, 0x183].map(|path| LocalAddress::new(path).unwrap());
 
         for index in 0..2 {
             table.set_time(10 + index as u64);
@@ -4009,8 +3993,8 @@ mod tests {
         let mut context = ();
         let first = crate::ConnectionId::new(0x91).unwrap();
         let second = crate::ConnectionId::new(0x92).unwrap();
-        let path = PathId::new(0x191).unwrap();
-        let unrelated_path = PathId::new(0x192).unwrap();
+        let path = LocalAddress::new(0x191).unwrap();
+        let unrelated_path = LocalAddress::new(0x192).unwrap();
         let used = crate::encode_bootstrap_open_packet(first, 0, &mut packet).unwrap();
         table
             .receive_admitted(
@@ -4063,8 +4047,8 @@ mod tests {
         table.set_time(5);
         let first = crate::ConnectionId::new(0xa1).unwrap();
         let second = crate::ConnectionId::new(0xa2).unwrap();
-        let first_path = PathId::new(0x1a1).unwrap();
-        let second_path = PathId::new(0x1a2).unwrap();
+        let first_path = LocalAddress::new(0x1a1).unwrap();
+        let second_path = LocalAddress::new(0x1a2).unwrap();
         let mut packet = [0u8; 64];
         let mut context = ();
         let used = crate::encode_bootstrap_open_packet(first, 0, &mut packet).unwrap();
@@ -4125,8 +4109,8 @@ mod tests {
         table.set_idle_timeout(Some(0));
         let first = crate::ConnectionId::new(0xb1).unwrap();
         let second = crate::ConnectionId::new(0xb2).unwrap();
-        let first_path = PathId::new(0x1b1).unwrap();
-        let second_path = PathId::new(0x1b2).unwrap();
+        let first_path = LocalAddress::new(0x1b1).unwrap();
+        let second_path = LocalAddress::new(0x1b2).unwrap();
         let mut packet = [0_u8; 64];
         let mut context = ();
         let used = crate::encode_bootstrap_open_packet(first, 0, &mut packet).unwrap();
@@ -4221,8 +4205,8 @@ mod tests {
 
         let server_cid = crate::ConnectionId::new(0x71).unwrap();
         let peer_cid = crate::ConnectionId::new(0x72).unwrap();
-        let first_path = PathId::new(11).unwrap();
-        let other_path = PathId::new(12).unwrap();
+        let first_path = LocalAddress::new(11).unwrap();
+        let other_path = LocalAddress::new(12).unwrap();
         let mut server = ServerConnection::new(server_cid);
         let mut packet = [0u8; 64];
 

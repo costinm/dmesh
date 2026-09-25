@@ -17,9 +17,7 @@ def main() -> int:
     data = args.merged.read_bytes()
     if args.offset >= len(data) or data[args.offset] != 0xE9:
         raise SystemExit(f"no ESP image header at 0x{args.offset:x} in {args.merged}")
-    app = data[args.offset:]
-    while app and app[-1] == 0xFF:
-        app = app[:-1]
+    app = data[args.offset:].rstrip(b"\xff")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_bytes(app)
     print(f"extracted {len(app)} bytes: {args.output}")

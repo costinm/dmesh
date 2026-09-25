@@ -63,9 +63,7 @@ static OBSERVERS: [ObserverSlot; 4] = [
     ObserverSlot::new(),
 ];
 
-pub fn register_transport_state_observer(
-    observer: &'static dyn TransportStateObserver,
-) -> bool {
+pub fn register_transport_state_observer(observer: &'static dyn TransportStateObserver) -> bool {
     for slot in OBSERVERS.iter() {
         if slot.set(observer) {
             return true;

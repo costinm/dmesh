@@ -122,7 +122,7 @@
         else { input.type = type === 'integer' || type === 'number' ? 'number' : 'text'; if (schema.default !== undefined) input.value = schema.default; }
         input.dataset.type = type || 'string'; label.append(input); root.append(label);
       }
-      if (tool?.name === 'transport.start') {
+      if (tool?.name === 'transport.set') {
         const presets = document.createElement('div'); presets.className = 'row';
         const note = document.createElement('span'); note.className = 'muted'; note.textContent = 'ESP NAN profiles:'; presets.append(note);
         for (const [label, profile] of [

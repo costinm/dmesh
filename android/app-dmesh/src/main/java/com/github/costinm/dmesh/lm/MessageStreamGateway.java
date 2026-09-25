@@ -13,8 +13,10 @@ import android.util.Log;
 import com.github.costinm.dmesh.DirectBinder;
 import com.github.costinm.dmesh.MeshClient;
 import com.github.costinm.dmesh.MeshStream;
+import com.github.costinm.dmesh.MeshStreamHandler;
+import com.github.costinm.dmesh.MeshStreamHandlers;
 import com.github.costinm.dmeshnative.AndroidTransportBridge;
-import com.github.costinm.dmeshnative.CborMessageCodec;
+import com.github.costinm.dmesh.CborMessageCodec;
 import com.github.costinm.dmeshnative.MeshNode;
 import com.github.costinm.dmeshnative.MeshNativeStream;
 
@@ -50,6 +52,7 @@ public final class MessageStreamGateway implements MeshNode.MeshCallback {
     private final Context context;
     private final Runnable activeDiscovery;
     private final NanWakeup nanWakeup;
+    private final MeshStreamHandlers localHandlers = new MeshStreamHandlers();
     private final Map<String, AppLease> appConnections = new HashMap<>();
     private final Map<Long, NativeEndpoint> nativeEndpoints = new HashMap<>();
 
@@ -122,6 +125,15 @@ public final class MessageStreamGateway implements MeshNode.MeshCallback {
     @Override
     public String onTransportCommand(String method, String params) {
         return AndroidTransportBridge.get(context).transportCommand(method, params);
+    }
+
+    @Override
+    public byte[] onStreamRequest(String handler, byte[] record) throws Exception {
+        return localHandlers.handleRecord(handler, record);
+    }
+
+    public void registerLocalHandler(String name, MeshStreamHandler handler) {
+        localHandlers.register(name, handler);
     }
 
     @Override

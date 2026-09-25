@@ -84,17 +84,17 @@ public final class TransportStart {
     }
 
     /**
-     * Typed Bundle projection of the canonical common transport.start fields.
+     * Typed Bundle projection of the canonical common transport.set fields.
      * This accepts Android's transport container only; it is not a second
      * command schema.  -1 preserves an omitted optional numeric field.
      */
     public static TransportStart fromBundle(Bundle values) {
         Bundle source = values == null ? Bundle.EMPTY : values;
-        String mode = source.getString("mode", "nan");
+        int mode = intValue(source, "mode", 6);
         Kind kind;
-        if ("sta".equals(mode)) kind = Kind.STA;
-        else if ("nan".equals(mode) || "aware".equals(mode)) kind = Kind.NAN;
-        else throw new IllegalArgumentException("transport.start mode must be sta or nan");
+        if (mode == 1) kind = Kind.STA;
+        else if (mode == 6) kind = Kind.NAN;
+        else throw new IllegalArgumentException("transport.set mode must be 1 (sta) or 6 (nan)");
         return new TransportStart(
                 source.getString("id", ""),
                 longValue(source, "generation", 0),

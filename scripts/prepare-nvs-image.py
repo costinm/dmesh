@@ -46,6 +46,7 @@ STA_SECRET_KEY = "sta"
 STA_SECRET_PROFILE_KEY = "__sec_sta"
 CONTROL_PLANE_KEY = "cp"
 SHARED_SECRET_KEY = "key"
+NIMBLE_BOND_NAMESPACE = "nimble_bond"
 CONTROL_PLANE_PROFILE_KEY = "__blob_cp"
 SHARED_SECRET_PROFILE_KEY = "__blob_sec_key"
 DEVICE_NAME = "name"
@@ -187,7 +188,7 @@ def write_csv(
     entries: list[dict], destination: Path,
     boot_target: int | None = None, device_profile: dict[str, str] | None = None,
     clear_boot_target: bool = False, mode: str | None = None,
-    clear_sta_profile: bool = False,
+    clear_sta_profile: bool = False, clear_pairing: bool = False,
 ) -> int:
     # nvs_partition_gen assigns a numeric namespace id at each `namespace`
     # row. A decoded dump can revisit `phy` later for blob chunks; emitting it
@@ -208,6 +209,11 @@ def write_csv(
         writer = csv.writer(stream)
         writer.writerow(("key", "type", "encoding", "value"))
         for current, grouped_entries in namespaces.items():
+            # Espressif NimBLE persists peer keys and CCCD state in this
+            # namespace. A physical unpair leaves none of those records.
+            if clear_pairing and current == NIMBLE_BOND_NAMESPACE:
+                removed += len(grouped_entries)
+                continue
             writer.writerow((current, "namespace", "", ""))
             if current == "dmesh":
                 saw_dmesh = True
@@ -244,6 +250,9 @@ def write_csv(
                     removed += 1
                     continue
                 if current == STA_SECRET_NAMESPACE and clear_sta_profile and entry["key"] == STA_SECRET_KEY:
+                    removed += 1
+                    continue
+                if current == STA_SECRET_NAMESPACE and clear_pairing and entry["key"] == SHARED_SECRET_KEY:
                     removed += 1
                     continue
                 if current == "dmesh" and device_profile is not None and entry["key"] in device_profile:
@@ -360,6 +369,8 @@ def main() -> int:
                         help="set dmesh:mode next-boot policy (sleepy-soft keeps the radio awake for transition tests)")
     parser.add_argument("--clear-sta-profile", action="store_true",
                         help="remove the persisted dmesh STA selector and its private credential")
+    parser.add_argument("--clear-pairing", action="store_true",
+                        help="remove sec:key and all NimBLE bond records; preserve device identity")
     parser.add_argument("--server")
     parser.add_argument("--ip")
     parser.add_argument("--gw")
@@ -401,6 +412,8 @@ def main() -> int:
         device_profile.update(sta_profile)
     if (args.device_catalog is None) != (args.device_role is None):
         parser.error("--device-catalog and --device-role must be used together")
+    if args.clear_pairing and args.device_catalog is not None:
+        parser.error("--clear-pairing cannot be combined with catalog secret provisioning")
     if args.device_catalog is not None:
         try:
             device_profile.update(load_device_security(args.device_catalog, args.device_role))
@@ -408,7 +421,7 @@ def main() -> int:
             parser.error(str(error))
     removed = write_csv(
         entries, args.csv, args.boot_target, device_profile or None,
-        args.clear_boot_target, args.mode, args.clear_sta_profile,
+        args.clear_boot_target, args.mode, args.clear_sta_profile, args.clear_pairing,
     )
     size = args.size or args.source.stat().st_size
     python = os.environ.get("DMESH_PYTHON", sys.executable)
@@ -428,7 +441,7 @@ def main() -> int:
         setting += f"; dmesh:mode={args.mode}"
     if args.clear_sta_profile:
         setting += "; STA profile cleared"
-    print(f"removed {removed} transient Recovery keys{setting}; generated {args.image} ({size} bytes)")
+    print(f"removed {removed} NVS entries{setting}; generated {args.image} ({size} bytes)")
     return 0
 
 

@@ -6,13 +6,13 @@
 
 use core::{
     ffi::c_void,
-    sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering},
 };
 
 use quic_lite::raw_udp6::{
-    encode_neighbor_advertisement, encode_station_ipv6_data_frame, encode_station_udp6_data_frame,
-    encode_udp6, link_local_from_mac, parse_neighbor_solicitation, parse_udp6,
-    parse_udp6_for_destination, Error,
+    Error, encode_neighbor_advertisement, encode_station_ipv6_data_frame,
+    encode_station_udp6_data_frame, encode_udp6, link_local_from_mac, parse_neighbor_solicitation,
+    parse_udp6, parse_udp6_for_destination,
 };
 
 pub const RAW_UDP6_PORT: u16 = 3339;
@@ -55,7 +55,7 @@ pub struct RawUdp6Peer {
 /// The handler owns QUIC-lite/DCID/service state. It receives one complete
 /// UDP payload and writes at most one response payload into `response`.
 pub type RawUdp6Handler = fn(
-    quic_lite::PathId,
+    quic_lite::LocalAddress,
     RawUdp6Peer,
     &[u8],
     &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
@@ -79,7 +79,7 @@ pub type ConnectionlessUdp6Handler = fn(
 /// bearer queue: the connection retains the packet ledger and the adapter
 /// immediately transmits each returned datagram.
 pub type RawUdp6PollHandler =
-    fn(quic_lite::PathId, &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE]) -> Option<usize>;
+    fn(quic_lite::LocalAddress, &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE]) -> Option<usize>;
 
 static HANDLER: AtomicUsize = AtomicUsize::new(0);
 static CONNECTIONLESS_HANDLER: AtomicUsize = AtomicUsize::new(0);
@@ -238,7 +238,7 @@ static mut RESPONSE_BUFFER: [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE] =
 // queue; quic-lite owns packet history and this driver retries the exact
 // physically-unsubmitted bytes before polling for anything new.
 static mut EGRESS_DRIVER: quic_lite::connection::DatagramEgressDriver<
-    quic_lite::PathId,
+    quic_lite::LocalAddress,
     { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE },
 > = quic_lite::connection::DatagramEgressDriver::new();
 /// Snapshot counters for status/log adapters.  The counters are deliberately
@@ -915,7 +915,7 @@ pub(crate) fn poll_connection_timer() {
     let _ = submitted;
 }
 
-fn bind_udp_peer(peer: RawUdp6Peer) -> Option<quic_lite::PathId> {
+fn bind_udp_peer(peer: RawUdp6Peer) -> Option<quic_lite::LocalAddress> {
     unsafe {
         let bindings = &mut *core::ptr::addr_of_mut!(UDP_PATH_BINDINGS);
         if let Some(path) = bindings.bind(peer) {

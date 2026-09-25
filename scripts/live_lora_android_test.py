@@ -4,8 +4,8 @@
 Flow:
   ESP32 LoRa TX -> ESP32 LoRa RX/repeater -> Android receives via BLE/NAN.
 
-This script uses the shared Android BLE HTTP service, the app-dmesh shell
-history, and firmware console logs/messages. It does not use logcat, pyserial,
+This script uses shared Android HTTP mesh services and firmware console
+logs/messages. It does not use logcat, pyserial,
 or firmware flashing tools.
 """
 
@@ -28,7 +28,6 @@ from pathlib import Path
 PROMPT = b"dm-rs> "
 PKG = "com.github.costinm.dmesh.lm"
 SERVICE = "com.github.costinm.dmesh.lm/.DMService"
-SHELL_URI = "content://com.github.costinm.dmesh.lm.shell"
 
 
 def run(cmd: list[str], timeout: float = 20, check: bool = False) -> subprocess.CompletedProcess:
@@ -62,9 +61,12 @@ def adb(adb_bin: str, serial: str, *args: str, timeout: float = 20) -> str:
     return run([adb_bin, "-s", serial, *args], timeout=timeout).stdout
 
 
-def shell_cmd(adb_bin: str, serial: str, command: str, timeout: float = 20) -> str:
-    quoted = f"content call --uri {SHELL_URI} --method command --arg {shlex.quote(command)}"
-    return adb(adb_bin, serial, "shell", quoted, timeout=timeout)
+def mesh_cmd(adb_bin: str, serial: str, method: str, *fields: str, timeout: float = 20) -> str:
+    port = adb(adb_bin, serial, "forward", "tcp:0", "tcp:18480").strip()
+    try:
+        return run(["dmesh-cli", f"http://127.0.0.1:{port}", method, *fields], timeout=timeout).stdout
+    finally:
+        adb(adb_bin, serial, "forward", "--remove", f"tcp:{port}")
 
 
 def ble_http(
@@ -225,7 +227,7 @@ def main() -> int:
             {"id": 1},
             out_dir,
         )
-        shell_cmd(args.adb, serial, "wifi.nan.start reason=lora-android")
+        mesh_cmd(args.adb, serial, "transport.set", "--mode=6")
 
     tx = Console(args.tx, args.baud, args.timeout)
     rx = Console(args.rx, args.baud, args.timeout)
@@ -270,10 +272,11 @@ def main() -> int:
 
         android_histories: dict[str, str] = {}
         for serial in args.android:
-            hist = shell_cmd(
+            hist = mesh_cmd(
                 args.adb,
                 serial,
-                "history durationMs=30000 limit=240 keys=net,wifi,BLE",
+                "radio.history", "--limit=240", "--keys=nan,ble",
+                f"--since_ms={int(time.time() * 1000) - 30000}",
                 timeout=30,
             )
             android_histories[serial] = hist
@@ -287,8 +290,8 @@ def main() -> int:
         if "transport=nan" not in rx_transcript and "t=nan" not in rx_transcript:
             failures.append("receiver did not log LoRa forwarding to NAN")
 
-        any_android_ble = any("BLE.DISC" in h and "proto=dmesh" in h for h in android_histories.values())
-        any_android_nan = any("FollowupRx" in h or "ServiceDiscovered" in h for h in android_histories.values())
+        any_android_ble = any("ble_scan_results" in h and '"count":0' not in h for h in android_histories.values())
+        any_android_nan = any("service_discovered" in h or "message_received" in h for h in android_histories.values())
         if not any_android_ble:
             failures.append("Android did not record DMesh BLE discovery from receiver")
         if not any_android_nan:
@@ -296,8 +299,8 @@ def main() -> int:
 
         print(f"logs: {out_dir}")
         for serial, hist in android_histories.items():
-            ble = "BLE.DISC" in hist and "proto=dmesh" in hist
-            nan = "FollowupRx" in hist or "ServiceDiscovered" in hist
+            ble = "ble_scan_results" in hist and '"count":0' not in hist
+            nan = "service_discovered" in hist or "message_received" in hist
             print(f"[android {serial}] ble_dmesh={ble} nan_peer_or_followup={nan}")
 
         if failures:

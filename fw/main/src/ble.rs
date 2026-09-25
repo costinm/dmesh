@@ -1,19 +1,18 @@
 use alloc::vec::Vec;
 
+use dmesh_fw_transport::{
+    TRANSPORT_MTU, core_runtime,
+    shared_ingress_esp::{self, IngressKind, IngressPacket},
+};
+use dmesh_server::firmware_profile::TransportProfile;
+use dmesh_server::main_runtime_state::RadioLifecycle;
+use dmesh_server::transport_state::TransportStateObserver;
 use dmesh_server::{
     cbor::{Decoder, Encoder},
     services,
     tagged::{self, Name, Record},
 };
-use dmesh_fw_transport::{
-    core_runtime,
-    shared_ingress_esp::{self, IngressKind, IngressPacket},
-    TRANSPORT_MTU,
-};
-use dmesh_server::firmware_profile::TransportProfile;
-use dmesh_server::main_runtime_state::RadioLifecycle;
-use dmesh_server::transport_state::TransportStateObserver;
-use quic_lite::PathId;
+use quic_lite::LocalAddress;
 
 pub const BLE_COMPONENT: u64 = 104;
 
@@ -39,7 +38,7 @@ impl TransportStateObserver for BleTransportObserver {
         let live = snapshot.advertising || snapshot.connected || snapshot.coc_connected;
         match requested.ble {
             1 => {
-                if !live && !dmesh_ble::start_dmesh_service().is_ok() {
+                if !live && !dmesh_ble::start_dmesh_service(dmesh_fw_transport::main_runtime::shared_secret_exists()).is_ok() {
                     return;
                 }
                 BLE_PROFILE_ACTIVE.store(true, core::sync::atomic::Ordering::Release);
@@ -83,8 +82,7 @@ static BLE_INGRESS_REJECTED: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 static BLE_EGRESS_ATTEMPTS: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
-static BLE_EGRESS_SENT: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
+static BLE_EGRESS_SENT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 static BLE_EGRESS_SEND_ERRORS: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 static BLE_EGRESS_BLOCKED_DISCONNECTED: core::sync::atomic::AtomicUsize =
@@ -93,10 +91,13 @@ static BLE_EGRESS_BLOCKED_PENDING: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
 pub fn register() {
-    assert!(services::register_tagged_component(BLE_COMPONENT, handle_ble));
-    assert!(dmesh_server::transport_state::register_transport_state_observer(
-        &BLE_TRANSPORT_OBSERVER
+    assert!(services::register_tagged_component(
+        BLE_COMPONENT,
+        handle_ble
     ));
+    assert!(
+        dmesh_server::transport_state::register_transport_state_observer(&BLE_TRANSPORT_OBSERVER)
+    );
 }
 
 pub fn install() {
@@ -107,11 +108,8 @@ pub fn install() {
     core_runtime::install_ble_coc_egress_pump(Some(pump_ble_coc_egress));
 }
 
-fn ble_coc_path() -> PathId {
-    core_runtime::connection_path_id(
-        dmesh_server::transport_path::TransportId::BLE.0,
-        [0; 6],
-    )
+fn ble_coc_path() -> LocalAddress {
+    core_runtime::connection_path_id(dmesh_server::transport_path::TransportId::BLE.0, [0; 6])
 }
 
 fn reset_ble_coc_rx() {
@@ -201,7 +199,7 @@ fn receive_ble_coc_ingress(_item: IngressPacket, packet: &[u8]) {
 }
 
 fn pump_ble_coc_egress(
-    path: PathId,
+    path: LocalAddress,
     response: &mut [u8; TRANSPORT_MTU],
     immediate: Option<usize>,
 ) {
@@ -449,15 +447,18 @@ fn status_result(record: Record<'_>) -> Option<Vec<u8>> {
             .and_then(|()| encoder.uint(snapshot.local_addr_type as u64))
             .and_then(|()| encoder.uint(19))
             .and_then(|()| {
-                encoder.uint(BLE_INGRESS_ENQUEUED.load(core::sync::atomic::Ordering::Relaxed) as u64)
+                encoder
+                    .uint(BLE_INGRESS_ENQUEUED.load(core::sync::atomic::Ordering::Relaxed) as u64)
             })
             .and_then(|()| encoder.uint(20))
             .and_then(|()| {
-                encoder.uint(BLE_INGRESS_ACCEPTED.load(core::sync::atomic::Ordering::Relaxed) as u64)
+                encoder
+                    .uint(BLE_INGRESS_ACCEPTED.load(core::sync::atomic::Ordering::Relaxed) as u64)
             })
             .and_then(|()| encoder.uint(21))
             .and_then(|()| {
-                encoder.uint(BLE_INGRESS_REJECTED.load(core::sync::atomic::Ordering::Relaxed) as u64)
+                encoder
+                    .uint(BLE_INGRESS_REJECTED.load(core::sync::atomic::Ordering::Relaxed) as u64)
             })
             .and_then(|()| encoder.uint(22))
             .and_then(|()| {
@@ -469,9 +470,8 @@ fn status_result(record: Record<'_>) -> Option<Vec<u8>> {
             })
             .and_then(|()| encoder.uint(24))
             .and_then(|()| {
-                encoder.uint(
-                    BLE_EGRESS_SEND_ERRORS.load(core::sync::atomic::Ordering::Relaxed) as u64,
-                )
+                encoder
+                    .uint(BLE_EGRESS_SEND_ERRORS.load(core::sync::atomic::Ordering::Relaxed) as u64)
             })
             .and_then(|()| encoder.uint(25))
             .and_then(|()| {
@@ -532,7 +532,7 @@ fn handle_ble(record: Record<'_>) -> Option<Vec<u8>> {
     };
     let _id = record.id?;
     match method {
-        BLE_START => bool_result(record, dmesh_ble::start_dmesh_service().is_ok()),
+        BLE_START => bool_result(record, dmesh_ble::start_dmesh_service(dmesh_fw_transport::main_runtime::shared_secret_exists()).is_ok()),
         BLE_STOP => bool_result(record, dmesh_ble::stop_dmesh_service().is_ok()),
         BLE_SCAN => {
             let duration = scan_duration(record.fields);

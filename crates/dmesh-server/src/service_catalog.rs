@@ -43,6 +43,7 @@ pub const fn stream_service(component: u64, method: u64) -> Option<ServiceIdenti
         (telemetry::TELEMETRY_COMPONENT, telemetry::WIFI_LINK_METRICS_METHOD) => {
             "telemetry.wifi_link_metrics"
         }
+        (telemetry::TELEMETRY_COMPONENT, telemetry::BATTERY_METHOD) => "telemetry.battery",
         (raw_wifi::RAW_WIFI_COMPONENT, raw_wifi::RAW_WIFI_METHOD_SCAN) => "wifi.scan",
         _ => return None,
     };
@@ -116,6 +117,7 @@ pub fn stream_service_by_name(name: &str) -> Option<ServiceIdentity> {
             telemetry::TELEMETRY_COMPONENT,
             telemetry::WIFI_LINK_METRICS_METHOD,
         ),
+        "telemetry.battery" => (telemetry::TELEMETRY_COMPONENT, telemetry::BATTERY_METHOD),
         "wifi.scan" => (raw_wifi::RAW_WIFI_COMPONENT, raw_wifi::RAW_WIFI_METHOD_SCAN),
         _ => return None,
     };
@@ -162,6 +164,7 @@ pub const fn is_read_only_stream_service(component: u64, method: u64) -> bool {
                 telemetry::TELEMETRY_COMPONENT,
                 telemetry::WIFI_LINK_METRICS_METHOD
             )
+            | (telemetry::TELEMETRY_COMPONENT, telemetry::BATTERY_METHOD)
             | (raw_wifi::RAW_WIFI_COMPONENT, raw_wifi::RAW_WIFI_METHOD_SCAN)
             | (
                 services::FIRMWARE_COMPONENT,

@@ -1,6 +1,6 @@
 package com.github.costinm.dmesh.wifi;
 
-/** Terminal state of one immutable transport.start epoch. */
+/** Terminal state of one immutable transport.set epoch. */
 public final class TransportResult {
     public enum Outcome { APPLIED, UNCHANGED, ERROR }
     public final Outcome outcome;

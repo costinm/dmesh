@@ -16,7 +16,7 @@ pub(crate) unsafe fn before_receive(service: &mut ConnectionService, now_ms: u64
 
 pub(crate) unsafe fn after_receive(
     service: &mut ConnectionService,
-    path: quic_lite::PathId,
+    path: quic_lite::LocalAddress,
     now_ms: u64,
     closed: bool,
 ) {
@@ -25,7 +25,7 @@ pub(crate) unsafe fn after_receive(
 
 pub(crate) unsafe fn before_poll(
     service: &mut ConnectionService,
-    path: quic_lite::PathId,
+    path: quic_lite::LocalAddress,
     now_ms: u64,
 ) {
     crate::flash::expire(service, now_ms);

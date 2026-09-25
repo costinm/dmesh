@@ -2,7 +2,7 @@
 //!
 //! The `lmesh` daemon uses this internal library for Linux Wi-Fi, host NAN
 //! discovery/activation, and AP/STA operations
-//! live here; direct UART sessions are owned by `dmesh-cli`, not this service.
+//! live here; the UART device adapter is opt-in and owns only paired ports.
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -19,7 +19,9 @@ mod radio;
 /// Host-side JSON/compatibility conversion for raw NAN and legacy BLE commands.
 /// The byte/state core remains in `dmesh-rawnan`.
 pub mod radio_protocol;
+pub mod ble_companion;
 pub mod recovery;
+pub mod uart_service;
 
 // The shared Linux mesh discovery/routing core. `lmesh` re-exports this
 // module and contributes only its BLE launcher integration.

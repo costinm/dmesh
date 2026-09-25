@@ -6,7 +6,23 @@ use std::vec;
 use std::vec::Vec;
 
 use crate::mux::StreamMux;
-use crate::{ConnectionId, ConnectionLimits, DatagramBearer, Error, Role};
+use crate::{ConnectionId, ConnectionLimits, Error, Role};
+
+/// Test-harness-only link between deterministic packet queues and the real
+/// mux/endpoint receive APIs. This is intentionally private: production
+/// adapters use the borrowed association/driver interfaces documented at the
+/// crate root, not this copying poll contract. Scripted retries below do not
+/// test production loss scheduling, physical readiness, or multipath fallback.
+trait DatagramBearer {
+    type Error;
+
+    /// Enqueue an opaque packet in the simulated link at the supplied tick.
+    fn send_datagram(&mut self, now: u64, payload: &[u8]) -> Result<(), Self::Error>;
+
+    /// Copy at most one simulated packet into scratch storage for the harness.
+    /// Production receive does not require this extra ownership-transfer copy.
+    fn receive_datagram(&mut self, now: u64, out: &mut [u8]) -> Result<Option<usize>, Self::Error>;
+}
 
 const TEST_SERVICE_ECHO: u8 = 2;
 const TEST_SERVICE_STREAM: u8 = 4;
@@ -51,20 +67,16 @@ pub struct OperationResult {
     pub response: Vec<u8>,
 }
 
-/// Errors returned by the bearer-neutral operation harness.  Transport
-/// failures are kept separate from adapter failures so a NAN/UDP/remote test
-/// runner can preserve its native I/O error type and still use the same
-/// operation script.
+/// Keep simulated link failures distinct from core transport failures.
 #[derive(Debug)]
-pub enum OperationHarnessError<C, S> {
+enum OperationHarnessError<C, S> {
     ClientBearer(C),
     ServerBearer(S),
     Transport(Error),
 }
 
-/// Drive stream operations through the same mux/handler path used by a
-/// bearer adapter. A NAN or remote-device runner can replace this fake link
-/// while retaining the operation list and response assertions.
+/// Exercise real mux/endpoint stream processing over deterministic fake links.
+/// The scripted retry loop is not the production connection/egress driver.
 pub fn run_stream_operations(
     operations: &[StreamOperation],
     faults: FaultConfig,
@@ -74,11 +86,8 @@ pub fn run_stream_operations(
     run_stream_operations_with_bearers(operations, &mut c2s, &mut s2c, faults.latency_ticks.max(1))
 }
 
-/// Run the operation script over caller-supplied datagram bearers. This is
-/// the seam used by NAN, device, and remote test runners: they replace only
-/// the two bearer values while retaining the same stream IDs, handlers,
-/// event polling, and response assertions.
-pub fn run_stream_operations_with_bearers<C2S, S2C>(
+/// Internal seam for instrumented fake links used by the tests below.
+fn run_stream_operations_with_bearers<C2S, S2C>(
     operations: &[StreamOperation],
     c2s: &mut C2S,
     s2c: &mut S2C,
@@ -104,10 +113,9 @@ where
     })
 }
 
-/// Run the same operation script with explicitly selected directional CIDs.
-/// Remote and multi-connection conformance harnesses use this entry point to
-/// prove that two simultaneous sessions cannot cross-deliver stream responses.
-pub fn run_stream_operations_with_bearers_and_cids<C2S, S2C>(
+/// Vary directional CIDs to check isolation in the simulated stream harness.
+#[cfg(test)]
+fn run_stream_operations_with_bearers_and_cids<C2S, S2C>(
     operations: &[StreamOperation],
     c2s: &mut C2S,
     s2c: &mut S2C,
@@ -127,11 +135,8 @@ where
         })
 }
 
-/// Generic operation runner for adapters whose native client/server errors
-/// differ from the core transport error (for example NAN uses `anyhow::Error`
-/// while a remote test bridge may use a command/RPC error).  The operation
-/// sequence and response assertions remain identical across bearers.
-pub fn run_stream_operations_with_external_bearers<C2S, S2C>(
+/// Internal runner preserving fake-link error types for error-propagation tests.
+fn run_stream_operations_with_external_bearers<C2S, S2C>(
     operations: &[StreamOperation],
     c2s: &mut C2S,
     s2c: &mut S2C,
@@ -380,7 +385,7 @@ impl FakeDatagramLink {
     }
 }
 
-impl crate::DatagramBearer for FakeDatagramLink {
+impl DatagramBearer for FakeDatagramLink {
     type Error = crate::Error;
 
     fn send_datagram(&mut self, now: u64, payload: &[u8]) -> Result<(), Self::Error> {
@@ -650,18 +655,18 @@ mod tests {
             duplicate: true,
             ..FaultConfig::default()
         });
-        crate::DatagramBearer::send_datagram(&mut link, 0, b"first").unwrap();
+        DatagramBearer::send_datagram(&mut link, 0, b"first").unwrap();
         let mut out = [0u8; 16];
         assert!(
-            crate::DatagramBearer::receive_datagram(&mut link, 1, &mut out)
+            DatagramBearer::receive_datagram(&mut link, 1, &mut out)
                 .unwrap()
                 .is_none()
         );
-        let used = crate::DatagramBearer::receive_datagram(&mut link, 2, &mut out)
+        let used = DatagramBearer::receive_datagram(&mut link, 2, &mut out)
             .unwrap()
             .unwrap();
         assert_eq!(&out[..used], b"first");
-        let duplicate = crate::DatagramBearer::receive_datagram(&mut link, 2, &mut out)
+        let duplicate = DatagramBearer::receive_datagram(&mut link, 2, &mut out)
             .unwrap()
             .unwrap();
         assert_eq!(&out[..duplicate], b"first");

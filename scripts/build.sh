@@ -153,9 +153,11 @@ check_lmesh_api() {
         python3 "$DMESH_REPO/scripts/dmesh_api.py" linux "$generated_api"
         cargo run -p mesh-api-gen -- --api "$generated_api" --out-tools "$generated" \
             --out-rust "$generated_rust"
-        python3 "$DMESH_REPO/scripts/generate-lmesh-tools.py" --check --local-tools "$generated"
         cmp "$generated_rust" "$DMESH_REPO/crates/lmesh-wifi/src/mesh_core_api.rs"
-        python3 "$DMESH_REPO/scripts/dmesh_api.py" android "$generated_api"
+        python3 "$DMESH_REPO/scripts/dmesh_api.py" portable+linux "$generated_api"
+        cargo run -p mesh-api-gen -- --api "$generated_api" --out-tools "$generated"
+        python3 "$DMESH_REPO/scripts/generate-lmesh-tools.py" --check --local-tools "$generated"
+        python3 "$DMESH_REPO/scripts/dmesh_api.py" portable+android "$generated_api"
         cargo run -p mesh-api-gen -- --api "$generated_api" --out-tools "$generated"
         cmp "$generated" "$DMESH_REPO/crates/dmesh-server/platform/tools.json"
         rm -f "$generated" "$generated_api" "$generated_rust"
@@ -266,13 +268,12 @@ lmesh_test() {
     check_lmesh_api
 }
 
-# Only dmesh-cli may own a physical board UART. Keep this as a dependency
-# gate, rather than trusting that retired forwarding code stays unused at
-# runtime: lmesh and lmesh-wifi must not regain the old client or codec.
+# lmesh uses uart-codec for explicitly paired companion ports. Keep the
+# retired forwarding daemon and CLI from becoming service dependencies.
 check_host_uart_ownership() {
     for package in lmesh lmesh-wifi; do
-        if "$DMESH_CARGO_BIN" tree -p "$package" -e normal | grep -Eq '(^| )((dmesh-cli|lmesh-uart|uart-codec) v)'; then
-            echo "$package must not link a host UART owner or codec; dmesh-cli owns direct UART sessions" >&2
+        if "$DMESH_CARGO_BIN" tree -p "$package" -e normal | grep -Eq '(^| )((dmesh-cli|lmesh-uart) v)'; then
+            echo "$package must not link dmesh-cli or the retired lmesh-uart daemon" >&2
             return 1
         fi
     done
@@ -505,7 +506,7 @@ copy_dmeshui_android_lib() {
         ui_apps=" app-chat"
     fi
 
-    DMESH_JNILIB_APPS="$ui_apps"         build_rust_android_package dmeshui dmeshui "$1" "$2"
+    DMESH_JNILIB_APPS="$ui_apps"         build_rust_android_package dmeshtui-android dmeshui "$1" "$2"
 }
 
 build_rust_android_package() {
@@ -551,7 +552,7 @@ build_android_libs() {
     echo ""
     configure_ssh_mesh_override
     clean_app_dmesh_dmeshui
-    build_rust_android_package dmesh dmesh "$build_type" "${DMESH_ANDROID_ABIS:-arm64-v8a}"
+    build_rust_android_package dmesh-android dmesh "$build_type" "${DMESH_ANDROID_ABIS:-arm64-v8a}"
     copy_dmeshui_android_lib "$build_type" "${DMESH_UI_ANDROID_ABIS:-arm64-v8a}"
     clean_app_dmesh_dmeshui
 }

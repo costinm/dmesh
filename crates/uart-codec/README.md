@@ -15,6 +15,9 @@ UART records use an HDLC/PPP-style delimiter and escaping:
 fragmented input, resynchronizes on delimiters, drops oversized records until
 the next delimiter, and reports raw payloads plus frame activity.
 
-The codec deliberately does not depend on `mesh`, JSON, ESP-IDF, or the host
-runtime; it uses only `core` and `alloc`. This lets the host adapter and ESP32
-firmware use the same framing implementation.
+The framing core uses only `core` and `alloc`, so firmware and host share it.
+The optional Linux `host` feature adds USB serial enumeration without opening
+ports, inotify hotplug hints, explicit port ownership, baud and modem-line
+control, and complete QUIC-lite frame or connectionless message records.
+Unframed boot text is surfaced as a log record for the service layer to encode
+as the one-way `log.record` message in the [root API](../../API.md).

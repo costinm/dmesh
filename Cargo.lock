@@ -1464,7 +1464,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "dmesh"
+name = "dmesh-android"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1508,7 +1508,6 @@ dependencies = [
  "mesh",
  "minicbor",
  "quic-lite",
- "rand 0.10.3",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -1535,7 +1534,9 @@ dependencies = [
  "hex",
  "libc",
  "mesh",
+ "p256",
  "quic-lite",
+ "rand 0.10.3",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -1573,7 +1574,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "dmeshui"
+name = "dmeshtui-android"
 version = "0.1.0"
 dependencies = [
  "android_logger",
@@ -3329,6 +3330,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "libc",
+ "serde_json",
 ]
 
 [[package]]
@@ -3340,6 +3342,7 @@ dependencies = [
  "dmesh-rawnan",
  "dmesh-server",
  "libc",
+ "lmesh-ble-hci",
  "lmesh-wpa",
  "mesh",
  "minicbor",
@@ -3354,6 +3357,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "uart-codec",
 ]
 
 [[package]]
@@ -3460,13 +3464,14 @@ dependencies = [
 [[package]]
 name = "mesh"
 version = "0.1.0"
+source = "git+https://github.com/costinm/ssh-mesh#b9b4b8e5aa26bf177e73e68943297dc806e987ca"
 dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
  "clap",
  "libc",
- "mesh-api 0.1.0",
+ "mesh-api",
  "minicbor",
  "nix 0.29.0",
  "parking_lot",
@@ -3483,18 +3488,15 @@ dependencies = [
 [[package]]
 name = "mesh-api"
 version = "0.1.0"
+source = "git+https://github.com/costinm/ssh-mesh#b9b4b8e5aa26bf177e73e68943297dc806e987ca"
 dependencies = [
  "serde",
 ]
 
 [[package]]
-name = "mesh-api"
-version = "0.1.0"
-source = "git+https://github.com/costinm/ssh-mesh#b9b4b8e5aa26bf177e73e68943297dc806e987ca"
-
-[[package]]
 name = "mesh-mcp"
 version = "0.1.0"
+source = "git+https://github.com/costinm/ssh-mesh#b9b4b8e5aa26bf177e73e68943297dc806e987ca"
 dependencies = [
  "mesh",
  "serde",
@@ -4763,8 +4765,9 @@ name = "quic-lite"
 version = "0.1.0"
 dependencies = [
  "hmac 0.13.0",
- "mesh-api 0.1.0 (git+https://github.com/costinm/ssh-mesh)",
+ "mesh-api",
  "sha2 0.11.0",
+ "tokio",
 ]
 
 [[package]]
@@ -5655,6 +5658,7 @@ dependencies = [
 [[package]]
 name = "sftp-server"
 version = "0.1.0"
+source = "git+https://github.com/costinm/ssh-mesh#b9b4b8e5aa26bf177e73e68943297dc806e987ca"
 dependencies = [
  "anyhow",
  "bytes",
@@ -6154,6 +6158,7 @@ dependencies = [
 [[package]]
 name = "ssh-config"
 version = "0.57.0"
+source = "git+https://github.com/costinm/ssh-mesh#b9b4b8e5aa26bf177e73e68943297dc806e987ca"
 dependencies = [
  "futures",
  "glob",
@@ -6216,6 +6221,7 @@ dependencies = [
 [[package]]
 name = "ssh-mesh"
 version = "0.1.0"
+source = "git+https://github.com/costinm/ssh-mesh#b9b4b8e5aa26bf177e73e68943297dc806e987ca"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6232,7 +6238,7 @@ dependencies = [
  "libc",
  "log",
  "mesh",
- "mesh-api 0.1.0",
+ "mesh-api",
  "mesh-mcp",
  "mime_guess",
  "nix 0.29.0",
@@ -6919,6 +6925,9 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 [[package]]
 name = "uart-codec"
 version = "0.1.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "ucd-trie"
@@ -8098,6 +8107,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 [[package]]
 name = "ws"
 version = "0.1.0"
+source = "git+https://github.com/costinm/ssh-mesh#b9b4b8e5aa26bf177e73e68943297dc806e987ca"
 dependencies = [
  "async-trait",
  "axum",

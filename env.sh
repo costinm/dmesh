@@ -158,9 +158,8 @@ if [ -n "${IDF_PYTHON_ENV_PATH:-}" ] && [ -x "$IDF_PYTHON_ENV_PATH/bin/python" ]
     export PATH="$IDF_PYTHON_ENV_PATH/bin:$PATH"
     export PYTHON="$IDF_PYTHON_ENV_PATH/bin/python"
 fi
-# Firmware scripts use one explicit interpreter for esptool, pyserial, and
-# the Recovery TCP helpers.  Source env.sh instead of rediscovering it in each
-# script.
+# Firmware scripts use one explicit interpreter for ESP-IDF's Python helpers
+# and image extraction. Source env.sh instead of rediscovering it in each script.
 if [ -z "${DMESH_PYTHON:-}" ] && [ -n "${IDF_PYTHON_ENV_PATH:-}" ] \
     && [ -x "$IDF_PYTHON_ENV_PATH/bin/python" ]; then
     export DMESH_PYTHON="$IDF_PYTHON_ENV_PATH/bin/python"

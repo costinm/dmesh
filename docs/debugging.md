@@ -1,7 +1,7 @@
 
 # Debugging
 
-Most difficult part is keeping the network alive in doze/idle mode - most popular commands:
+Most difficult part is waking up doze/idle mode - most popular commands:
 
 ## Repo-local tooling
 
@@ -45,16 +45,6 @@ mesh mesh-init stop SERVICE
 mesh mesh-init reload
 ```
 
-Do not invoke `mesh-init start`, `stop`, or `reload` directly. `mesh-init` is
-the supervisor daemon; `mesh` is the operator-facing CLI.
-
-Do not use the ESP-IDF/ESP toolchain for Android APK work. Firmware work has
-its own local build context under `fw/esp32`; only rebuild or flash
-firmware when that is the task.
-
-Install the current release APK on a USB device and start the foreground
-service:
-
 ```sh
 adb -s SERIAL install -r target/apk/release/app-dmesh-release.apk
 adb -s SERIAL shell am start-foreground-service \
@@ -79,14 +69,13 @@ adb -s SERIAL shell pm grant --user 0 \
 ```
 
 Prefer the app's command provider and in-memory history over `logcat` for normal
-radio debugging. `logcat` is useful as a last resort for framework WiFi Aware,
+lmesh debugging. `logcat` is useful as a last resort for framework WiFi Aware,
 Bluetooth, permission, or crash failures, but it is too noisy for routine
 message-level checks.
 
-JNI should follow the same message style. Rust modules should be reached through
-small generic command surfaces with text command/args, raw `byte[]` payloads,
-and an FD slot when needed. Keep local binary payloads as bytes; reserve CBOR
-for future structured binary frames rather than adding protobuf or base64.
+JNI follows the same 'structured message' style as all transports. Rust modules should be 
+reached through small generic handlers, with CBOR `byte[]` payloads,
+and an FD slot when needed. 
 
 ## Tcpdump
 
@@ -171,29 +160,21 @@ does not parse CBOR or shell text; it forwards record bytes. JNI also passes
 only `byte[]`. `dmeshnative` maps those bytes to/from `MeshStream` and the typed
 Bundle API before an Android service sees them.
 
-Plain SSH exec is intentionally not a message ingress. Use the root-only
-`DMeshShellProvider` for local shell text, or an explicit message client for
-`dmesh-msg:1`.
+Plain SSH exec is intentionally not a message ingress. Use `dmesh-cli` for
+shared controls or an explicit message client for `dmesh-msg:1`.
 
 ## app-dmesh REST admin bridge
 
-The Android web UI uses the embedded ssh-mesh REST admin server. It is bound
-to `127.0.0.1` on the configured HTTP port and dispatches directly to the
+The Android web UI uses the embedded ssh-mesh REST admin server. It listens
+on the configured HTTP port and dispatches directly to the
 Rust handler registry: it does not use the retired JSONL Java bridge or a
 host-style `/mesh/run/mesh/...` UDS path.
 
-The initial Android HTTP catalog is intentionally read-only:
-
-- `radio.status_text`
-- `discovery.nodes`
-- `discovery.status`
-- `radio.power.state`
-
-All four take no fields or opaque payload. Framework callbacks, NAN/BLE
-adapter events, probes, storage, and the legacy shell bridge are not HTTP
-methods. Mutating operations are added only after they have a common
-`dmesh-server` tagged schema and an Android adapter that reports its
-capability/result.
+Registered Android HTTP services include `ble`, `wifi`, `transport`, `usb`,
+and `history`. `dmesh-cli http://... SERVICE.METHOD` sends a tagged record
+through their shared handler boundary. QUIC-lite on port `3336` exposes the
+portable discovery and telemetry methods, including `telemetry.battery`.
+Framework callbacks and JNI diagnostics are not separate HTTP commands.
 
 If a defensive UDS fallback is ever needed on Android, JNI configures mesh paths
 under the app files tree:
@@ -218,9 +199,9 @@ curl -sS -X POST \
   -d '{"id":1}'
 
 curl -sS -X POST \
-  'http://127.0.0.1:18480/_m/mesh/services/transport/call/transport.start' \
+  'http://127.0.0.1:18480/_m/mesh/services/transport/call/transport.set' \
   -H 'content-type: application/json' \
-  -d '{"id":2,"target_mac":"10:BD:A3:AC:5A:20","kind":6,"ap":1,"now":1,"ble":1,"nan_dw_interval":1}'
+  -d '{"id":2,"wake_target":"10:BD:A3:AC:5A:20","mode":6,"ap":1,"now":1,"ble":1,"nan_dw_interval":1}'
 
 curl -sS -o /dev/null -L -w '%{http_code} %{url_effective}\n' \
   'http://127.0.0.1:18480/_m/adm/ble.html'
@@ -243,7 +224,7 @@ curl -sS -X POST \
   -d '{"id":3,"auto":true}'
 ```
 
-`transport.start.target_mac` is the sleepy device's STA or AP radio MAC, not
+`transport.set.wake_target` is the sleepy device's STA or AP radio MAC, not
 its BLE address. The firmware admits a targeted NAN wake only when the MAC
 matches one of its local radio interfaces.
 
@@ -256,106 +237,39 @@ SSH exec text and JSON Lines are not command APIs. `dmesh-msg:1` accepts a
 four-byte big-endian record length followed by one bounded opaque message record;
 `dmeshnative` maps the record to/from the typed Android Bundle adapter.
 
-## app-dmesh ADB shell commands
+## app-dmesh control with dmesh-cli
 
-`app-dmesh` also exposes a local command surface through a `ContentProvider`:
-
-```sh
-content://com.github.costinm.dmesh.lm.shell
-```
-
-The provider checks `Binder.getCallingUid()` and only accepts callers with UID
-`0` or `2000`, so it is intended for root or `adb shell` use.
-
-Show the installed root CA keys:
+Use the shared Rust service handlers. ADB may forward the HTTP port, but it no
+longer carries commands through a ContentProvider. The direct Wi-Fi address
+can instead be used as a `udp://HOST:3336` target for shared QUIC-lite methods.
 
 ```sh
-adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
-  --method command --arg 'key show'"
+adb -s SERIAL forward tcp:18480 tcp:18480
+dmesh-cli http://127.0.0.1:18480 transport.set --mode=6
+dmesh-cli http://127.0.0.1:18480 wifi.scan
+dmesh-cli http://127.0.0.1:18480 radio.history --limit=80 --keys=net,wifi,BLE
+dmesh-cli udp://[ANDROID_LINK_LOCAL%IFACE]:3336 discovery.nodes
 ```
 
-Provision a root public key directly:
-
-```sh
-adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
-  --method command --arg 'key add ssh-ed25519 AAAA... test-root'"
-```
-
-Provision a root public key by URL:
-
-```sh
-adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
-  --method command --arg 'key add-url url=https://example.test/ca.pub'"
-```
-
-Send a local command through the same simple command grammar used for SSH
-testing:
-
-```sh
-adb shell am start-foreground-service -n com.github.costinm.dmesh.lm/.DMService
-adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
-  --method command --arg 'wifi.scan reason=manual-adb'"
-```
-
-Send one bounded request to an explicitly named app service through
-DirectBinder. The Java shell adapter maps `id`, `to`, and typed `i:`/`l:`/
-`f:`/`d:`/boolean values into `MeshStream`/Bundle; the result contains the
-correlated response Bundle. No app receives shell text or raw CBOR.
-
-```sh
-adb shell am start-foreground-service -n com.github.costinm.dmesh.lm/.DMService
-adb shell 'content call --uri content://com.github.costinm.dmesh.lm.shell \
-  --method message --arg "/web/echo id=adb-shell typed=i:7 \
-  to=intent:#Intent;component=com.github.costinm.dmesh.web/.WebBridgeService;end"'
-```
-
-Subscribe to live message frames for a few seconds:
-
-```sh
-adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
-  --method command --arg 'subscribe durationMs=5000 limit=64 keys=net,wifi,BLE'"
-```
-
-Pull the recent in-memory message buffer without needing to subscribe before
-the event happened:
-
-```sh
-adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
-  --method command --arg 'history durationMs=1500 limit=80 keys=net,wifi,BLE'"
-
-adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
-  --method command --arg 'history durationMs=1500 limit=60 keys=net.NAN,wifi.nan,wifi.p2p,wifi.ERR'"
-```
+The retired root-only provider and its device-secret provisioning command have
+no replacement. Do not send secret material through the generic HTTP gateway.
 
 ## Radio Scan Debugging
 
-Trigger BLE through the shared `ble` HTTP service and WiFi/NAN through the
-remaining local shell surface, wait a few seconds, then pull the message
-history:
+Trigger BLE and Wi-Fi through the shared HTTP services, wait a few seconds,
+then pull the bounded message history:
 
 ```sh
 adb -s SERIAL forward tcp:18480 tcp:18480
 
-curl -sS -X POST \
-  'http://127.0.0.1:18480/_m/mesh/services/ble/call/ble.scan' \
-  -H 'content-type: application/json' \
-  -d '{"id":1}'
-
-adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
-  --method command --arg 'wifi.scan reason=manual-debug'"
-
-adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
-  --method command --arg 'transport.set mode=nan'"
+dmesh-cli http://127.0.0.1:18480 ble.scan
+dmesh-cli http://127.0.0.1:18480 wifi.scan
+dmesh-cli http://127.0.0.1:18480 transport.set --mode=6
 
 sleep 6
 
-curl -sS -X POST \
-  'http://127.0.0.1:18480/_m/mesh/services/ble/call/ble.scan_results' \
-  -H 'content-type: application/json' \
-  -d '{"id":2,"limit":32}'
-
-adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
-  --method command --arg 'history durationMs=1500 limit=80 keys=net,wifi,BLE'"
+dmesh-cli http://127.0.0.1:18480 ble.status
+dmesh-cli http://127.0.0.1:18480 radio.history --limit=80 --keys=net,wifi,BLE
 ```
 
 Expected message patterns:
@@ -408,8 +322,8 @@ with bearer ID `7`.
 
 Use this when two Android devices are connected over ADB and `app-dmesh` is
 installed. The script starts `DMService`, starts a BLE scan through the shared
-`ble` HTTP service, waits for NAN discovery, sends a NAN follow-up, then reads
-the remaining in-memory history buffer through the app content provider. It
+`ble` HTTP service, waits for NAN discovery, then reads
+the remaining in-memory history buffer through the shared history service. It
 leaves NAN running: the service, rather than test cleanup, owns the persistent
 cluster.
 
@@ -536,11 +450,8 @@ allocate a NAN interface while a P2P interface exists. Stop app-owned P2P before
 retrying NAN:
 
 ```sh
-adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
-  --method command --arg 'wifi.con.stop reason=nan-debug'"
-
-adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
-  --method command --arg 'wifi.con.cancel reason=nan-debug'"
+adb -s SERIAL forward tcp:18480 tcp:18480
+dmesh-cli http://127.0.0.1:18480 transport.set --mode=6 --ap=0
 ```
 
 Inspect the current WiFi HAL interface state and WiFi Aware counters:

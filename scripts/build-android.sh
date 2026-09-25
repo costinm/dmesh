@@ -386,56 +386,46 @@ setup_device() {
     capture_android_evidence "$serial" "post-start"
 }
 
-android_shell_command() {
+android_mesh_command() {
     local serial="$1"
-    local command="$2"
-    # `adb shell` joins argv before Android's shell sees it. Quote the command
-    # as one remote-shell argument or `wifi.nan.role sub-active` becomes two
-    # content arguments and is silently rejected by the provider CLI.
-    local escaped_command
-    escaped_command="${command//\'/\'\\\'\'}"
-    timeout "${DMESH_ADB_COMMAND_TIMEOUT:-30}" adb -s "$serial" shell \
-        "content call --uri content://$APP_DMESH_PKG.shell --method command --arg '$escaped_command'"
+    shift
+    local port status
+    port="$(adb -s "$serial" forward tcp:0 tcp:18480)" || return 1
+    if timeout "${DMESH_ADB_COMMAND_TIMEOUT:-30}" dmesh-cli "http://127.0.0.1:$port" "$@"; then
+        status=0
+    else
+        status=$?
+    fi
+    adb -s "$serial" forward --remove "tcp:$port" >/dev/null || true
+    return "$status"
 }
 
 nan_role_for_device() {
-    local serial="$1"
-    local entry key value
-    local role="${DMESH_NAN_ROLE:-both}"
-    local mapping="${DMESH_NAN_ROLE_MAP:-}"
-    local -a entries
-    IFS=',' read -r -a entries <<<"$mapping"
-    for entry in "${entries[@]}"; do
-        key="${entry%%=*}"
-        value="${entry#*=}"
-        if [ -n "$key" ] && [ "$key" = "$serial" ] && [ "$value" != "$entry" ]; then
-            role="$value"
-            break
-        fi
-    done
-    printf '%s\n' "$role"
+    printf '%s\n' "${DMESH_NAN_ROLE:-both}"
 }
 
 configure_nan_role() {
     local serial="$1"
     local role
     role="$(nan_role_for_device "$serial")"
-    case "$role" in
-        both|sub-active|sub-passive|sub-passive-empty-ssi|pub-solicited|pub-unsolicited) ;;
-        *)
-            echo "ERROR: [$serial] invalid NAN role '$role'" >&2
-            return 1
-            ;;
-    esac
-    echo "=== [$serial] NAN role: $role ==="
-    android_shell_command "$serial" "wifi.nan.role role=$role" >/dev/null
-    android_shell_command "$serial" "wifi.nan.status" >/dev/null
+    if [ "$role" != both ]; then
+        echo "ERROR: [$serial] legacy NAN role '$role' has no shared transport.set equivalent" >&2
+        return 1
+    fi
+    echo "=== [$serial] NAN transport profile ==="
+    local attempt
+    for attempt in 1 2 3 4 5; do
+        if android_mesh_command "$serial" transport.set --mode=6 >/dev/null; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
 }
 
 capture_android_evidence() {
     local serial="$1"
     local label="${2:-snapshot}"
-    local history_duration_ms="${DMESH_NAN_HISTORY_DURATION_MS:-5000}"
     local safe_serial="${serial//[^A-Za-z0-9_.-]/_}"
     local out_dir="${DMESH_ANDROID_EVIDENCE_DIR:-$SCRIPT_DIR/target/android-evidence/$ANDROID_EVIDENCE_STAMP}/$safe_serial"
     mkdir -p "$out_dir"
@@ -448,10 +438,9 @@ capture_android_evidence() {
     adb -s "$serial" shell dumpsys wifi aware >"$out_dir/$label-wifi-aware.txt" 2>&1 || true
     adb -s "$serial" shell dumpsys deviceidle >"$out_dir/$label-deviceidle.txt" 2>&1 || true
     adb -s "$serial" shell dumpsys package "$APP_DMESH_PKG" >"$out_dir/$label-package.txt" 2>&1 || true
-    android_shell_command "$serial" \
-        "history durationMs=$history_duration_ms limit=240 keys=net.NAN,wifi.nan" \
+    android_mesh_command "$serial" radio.history --limit=240 --since_ms=0 --keys=nan,ble \
         >"$out_dir/$label-nan-history.txt" 2>&1 || true
-    android_shell_command "$serial" "wifi.nan.status" \
+    android_mesh_command "$serial" wifi.status \
         >"$out_dir/$label-nan-status-command.txt" 2>&1 || true
     cat >"$out_dir/$label-meta.env" <<EOF
 DMESH_ADB_SERIAL=$serial
@@ -575,64 +564,6 @@ capture_all_android_evidence() {
     done
 }
 
-send_nan_message() {
-    local peer="${1:-${DMESH_NAN_PEER:-}}"
-    local text="${2:-${DMESH_NAN_TEXT:-}}"
-    if [ -z "$peer" ] || [ -z "$text" ]; then
-        echo "Usage: $0 nan-message <peer-id> <text>" >&2
-        echo "Or set DMESH_NAN_PEER and DMESH_NAN_TEXT." >&2
-        return 2
-    fi
-
-    local serial safe_serial out_dir result failures=0
-    local -a devices
-    mapfile -t devices < <(require_android_devices)
-    for serial in "${devices[@]}"; do
-        safe_serial="${serial//[^A-Za-z0-9_.-]/_}"
-        out_dir="${DMESH_ANDROID_EVIDENCE_DIR:-$SCRIPT_DIR/target/android-evidence/$ANDROID_EVIDENCE_STAMP}/$safe_serial"
-        mkdir -p "$out_dir"
-        capture_android_evidence "$serial" "nan-message-before"
-        echo "=== [$serial] NAN follow-up to $peer ==="
-        if ! result="$(android_shell_command "$serial" "wifi.nan.msg peer=$peer text=$text")"; then
-            printf '%s\n' "$result" >"$out_dir/nan-message-command.txt"
-            echo "ERROR: [$serial] NAN follow-up command failed." >&2
-            failures=1
-        else
-            printf '%s\n' "$result" >"$out_dir/nan-message-command.txt"
-        fi
-        # WifiAware callbacks are asynchronous. Preserve both the command
-        # acknowledgement and the bounded post-command history so `sent` is
-        # never mistaken for ON_MESSAGE_SEND_SUCCEEDED or ESP receipt.
-        sleep "${DMESH_NAN_FOLLOWUP_SETTLE_SEC:-3}"
-        capture_android_evidence "$serial" "nan-message-after"
-    done
-    return "$failures"
-}
-
-arm_nan_followup() {
-    local peer="${1:-${DMESH_NAN_PEER:-}}"
-    local text="${2:-${DMESH_NAN_TEXT:-}}"
-    if [ -z "$peer" ] || [ -z "$text" ]; then
-        echo "Usage: $0 nan-arm <peer-id> <text>" >&2
-        return 2
-    fi
-    local serial safe_serial out_dir failures=0
-    local -a devices
-    mapfile -t devices < <(require_android_devices)
-    for serial in "${devices[@]}"; do
-        safe_serial="${serial//[^A-Za-z0-9_.-]/_}"
-        out_dir="${DMESH_ANDROID_EVIDENCE_DIR:-$SCRIPT_DIR/target/android-evidence/$ANDROID_EVIDENCE_STAMP}/$safe_serial"
-        mkdir -p "$out_dir"
-        echo "=== [$serial] arming immediate NAN follow-up for $peer ==="
-        if ! android_shell_command "$serial" "wifi.nan.arm peer=$peer text=$text" \
-            >"$out_dir/nan-arm-command.txt"; then
-            echo "ERROR: [$serial] NAN follow-up arm failed." >&2
-            failures=1
-        fi
-    done
-    return "$failures"
-}
-
 configure_all_nan_roles() {
     local serial failures=0
     local -a devices
@@ -656,7 +587,7 @@ reset_all_nan_sessions() {
     mapfile -t devices < <(require_android_devices)
     for serial in "${devices[@]}"; do
         echo "=== [$serial] restarting NAN attachment and discovery sessions ==="
-        if ! android_shell_command "$serial" "wifi.nan.stop" >/dev/null; then
+        if ! android_mesh_command "$serial" transport.set --mode=5 >/dev/null; then
             echo "ERROR: [$serial] NAN stop failed." >&2
             failures=1
             continue
@@ -678,7 +609,7 @@ stop_all_nan_sessions() {
     mapfile -t devices < <(require_android_devices)
     for serial in "${devices[@]}"; do
         echo "=== [$serial] stopping NAN attachment and discovery sessions ==="
-        if ! android_shell_command "$serial" "wifi.nan.stop" >/dev/null; then
+        if ! android_mesh_command "$serial" transport.set --mode=5 >/dev/null; then
             echo "ERROR: [$serial] NAN stop failed." >&2
             failures=1
             continue
@@ -773,12 +704,9 @@ Commands:
   install-all [debug|release] Remove old DMesh apps, install all apps, and set permissions.
   forwards                Create and record SSH/HTTP/lmesh host forwards for selected devices.
   nan-configure           Apply the selected NAN discovery role to each selected device.
-  nan-evidence            Save per-device NAN counters, shell history, and dumpsys snapshots.
+  nan-evidence            Save per-device NAN history and dumpsys snapshots.
   nan-reset               Restart selected NAN sessions, apply their configured roles, and save evidence.
   nan-stop                Stop selected NAN sessions and save evidence; use nan-reset to restore.
-  nan-message <peer> <text>
-                          Send one NAN follow-up and save pre/post callback evidence.
-  nan-arm <peer> <text>   Arm one follow-up for the peer's next discovery callback.
   test                    Build and run JVM tests plus connected Android tests.
   native-health           Run the app-dmesh JNI health test on selected devices.
   ssh-forward-smoke       Build/install app-dmesh and verify every selected adb SSH forward.
@@ -797,14 +725,9 @@ Environment:
   DMESH_CONFIRM_UNINSTALL Set to 1 to allow install-all to remove existing app data.
   DMESH_SERVICE_START_TIMEOUT Foreground-service startup timeout in seconds. Default: 15.
   DMESH_ADB_INSTALL_TIMEOUT Per-APK adb install timeout in seconds. Default: 120.
-  DMESH_ADB_COMMAND_TIMEOUT ADB shell control/evidence timeout in seconds. Default: 30.
+  DMESH_ADB_COMMAND_TIMEOUT Forwarded mesh command timeout in seconds. Default: 30.
   DMESH_USB_PERMISSION_TIMEOUT USB permission approval timeout in seconds. Default: 30.
-  DMESH_NAN_ROLE          Default Android NAN role: both, sub-active, sub-passive, sub-passive-empty-ssi, pub-solicited, or pub-unsolicited.
-  DMESH_NAN_ROLE_MAP      Per-serial role overrides: serial=role,serial=role.
-  DMESH_NAN_PEER          Peer identity for nan-message when no positional peer is supplied.
-  DMESH_NAN_TEXT          Follow-up text for nan-message when no positional text is supplied.
-  DMESH_NAN_FOLLOWUP_SETTLE_SEC Callback evidence delay for nan-message. Default: 3.
-  DMESH_NAN_HISTORY_DURATION_MS Bounded NAN history capture duration. Default: 5000.
+  DMESH_NAN_ROLE          Only the shared both profile is supported.
   DMESH_NAN_RESTART_SETTLE_SEC NAN stop-to-restart delay. Default: 2.
   DMESH_ANDROID_EVIDENCE_DIR Evidence base directory. Default: target/android-evidence/<UTC timestamp>.
   DMESH_EMULATOR_TIMEOUT Boot timeout in seconds. Default: 240.
@@ -862,14 +785,6 @@ main() {
         nan-stop)
             detect_android_env
             stop_all_nan_sessions
-            ;;
-        nan-message)
-            detect_android_env
-            send_nan_message "${2:-}" "${3:-}"
-            ;;
-        nan-arm)
-            detect_android_env
-            arm_nan_followup "${2:-}" "${3:-}"
             ;;
         test)
             detect_android_env

@@ -27,9 +27,7 @@ dependencyResolutionManagement {
 rootProject.name = "DMesh"
 include(
      "android:lib-dmesh",
-     "android:dmesh-wifi",
      "android:app-dmesh",
-     "android:app-dmesh-transport",
      "android:app-web",
      "android:app-chat"
 )

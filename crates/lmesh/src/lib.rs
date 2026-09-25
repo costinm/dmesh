@@ -6,5 +6,6 @@
 pub use lmesh_wifi::mesh_core::api;
 pub use lmesh_wifi::mesh_core::*;
 
-/// The only permanent lmesh-specific extension: optional Linux BLE HCI.
-pub mod ble;
+/// Linux BLE is an adapter dependency; this crate only exposes it to the
+/// integration layer and does not implement the transport.
+pub use lmesh_ble_hci as ble;
