@@ -23,13 +23,14 @@ The design borrows from several existing systems:
 - **Kubernetes pods**: each app has cgroup-based resource limits and is
   watched through memory pressure (PSI) and usage.
 - **Istio**: each host has a workload identity, using OpenSSH ECDSA keys and
-  CA-signed certificates instead of X.509/mTLS.
+  CA-signed certificates in addition to X.509/mTLS. HTTP/2 is supported, and
+  the goal is to eventually be compatible with Istio HBONE.
 - **systemd**: the socket activation protocol (`LISTEN_FDS`/`LISTEN_FDNAMES`)
   and a small subset of unit-file syntax (`[Service]`, `[Socket]`, `User=`,
   `Group=`) are reused, so existing activated servers work unchanged.
-  `mesh-init` is not a systemd replacement: it can run as a systemd service,
-  and it deliberately limits what an app config can grant rather than giving
-  the config owner broad power.
+  `mesh-init` can run a subset of systemd configs and act as the init
+  (PID 1), or run as a service under systemd. It deliberately limits what an
+  app config can grant rather than giving the config owner broad power.
 
 ### Architecture
 
@@ -66,12 +67,18 @@ processes:
 
 ### APIs
 
-Each service defines its API in an `API.md` file: ordinary Markdown
-documentation with tables that give every field a stable numeric tag.
+The mesh components define their own APIs in `API.md` files: ordinary
+Markdown documentation with tables that give every field a stable numeric tag.
 `mesh-api-gen` generates Rust types, numeric IDs, JSON Schema and `tools.json`
-catalogs from it. Tagged-CBOR is the primary wire format; JSONL/JSON-RPC and a
-structured text format are converted mechanically, and MCP is added by a
-gateway (`mesh-mcp`) rather than by each worker.
+catalogs from them. Services can use the same approach, but it is optional:
+most services are expected to use JSON-RPC or other protocols, and `ssh-mesh`
+translates between protocols based on a `tools.json` catalog, however it was
+generated. MCP is added by a gateway (`mesh-mcp`) rather than by each worker.
+
+The mesh's own wire format is tagged-CBOR, a subset of CBOR equivalent to
+protobuf. JSONL/JSON-RPC and a structured text format are converted
+mechanically. Protobuf itself is planned, using the same dynamic,
+schema-driven translation with no generated stubs.
 
 ---
 
