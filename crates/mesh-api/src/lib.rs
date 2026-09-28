@@ -11,6 +11,10 @@ extern crate alloc;
 
 use alloc::string::String;
 
+/// Minimal definite-length CBOR shared by firmware and host implementations,
+/// with `minicbor`-compatible method names where signatures agree.
+pub mod cbor;
+
 /// Generated numeric wire identity for the `mesh-init` control surface
 /// (component/method and by-method field tags).
 ///

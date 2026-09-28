@@ -8,6 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value, json};
 
+pub mod java;
+
 const STANDARD_ERRORS: &[&str] = &[
     "unauthenticated",
     "permission_denied",
