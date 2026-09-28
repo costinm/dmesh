@@ -1,8 +1,77 @@
 # SSH-Mesh
 
-`ssh-mesh` is a secure, daemonless process supervisor and L4 proxy system combining Android-like application process isolation, Kubernetes-like pod resource constraints, and Istio-like mTLS/certificate workload identity.
+`ssh-mesh` is a secure, daemonless process supervisor and L4 proxy system. It
+runs local applications with per-app isolation, resource limits and a
+cryptographic workload identity, and connects them over SSH, HTTP/2 and
+WebSocket.
 
-It is designed to orchestrate secure edge networks and run on-demand, socket-activated containers, bubblewrap sandboxes, or virtual machines.
+It is designed to orchestrate secure edge networks and run on-demand,
+socket-activated containers, bubblewrap sandboxes, or virtual machines.
+
+---
+
+## What it is
+
+The design borrows from several existing systems:
+
+- **Serverless**: workloads run only while they are needed. Services are
+  started on the first connection, and stopped or frozen when idle, so there
+  are no long-running daemons holding resources.
+- **Android**: each app runs under its own UID, and a small privileged init
+  manages its lifecycle. When memory is low, lower-priority apps are frozen or
+  stopped, similar to Android's low memory killer.
+- **Kubernetes pods**: each app has cgroup-based resource limits and is
+  watched through memory pressure (PSI) and usage.
+- **Istio**: each host has a workload identity, using OpenSSH ECDSA keys and
+  CA-signed certificates instead of X.509/mTLS.
+- **systemd**: the socket activation protocol (`LISTEN_FDS`/`LISTEN_FDNAMES`)
+  and a small subset of unit-file syntax (`[Service]`, `[Socket]`, `User=`,
+  `Group=`) are reused, so existing activated servers work unchanged.
+  `mesh-init` is not a systemd replacement: it can run as a systemd service,
+  and it deliberately limits what an app config can grant rather than giving
+  the config owner broad power.
+
+### Architecture
+
+The part that needs root and the part that handles networking are separate
+processes:
+
+```
+   remote peers / browsers / ssh clients
+                 │  SSH, H2/H2C, WebSocket, mTLS
+          ┌──────▼───────┐
+          │   ssh-mesh   │  unprivileged: SSH client+server, L4 proxy,
+          │ (+ h2t, ws)  │  ControlMaster mux, REST/MCP/JSONL gateway
+          └──────┬───────┘
+                 │ UDS: JSONL / tagged-CBOR + passed FDs (stdio/PTY, listeners)
+          ┌──────▼───────┐
+          │  mesh-init   │  root (optionally PID 1), deliberately small:
+          │              │  start/stop/freeze, socket activation,
+          └──────┬───────┘  cgroups, PSI/memory observer, OOM priority
+                 │ fork → drop privileges → exec (direct, or bwrap/podman/VM)
+          ┌──────▼───────┐
+          │   workloads  │  per-app UID, cgroup, namespaces; speak stdio,
+          └──────────────┘  UDS, or the mesh API (sftp-server, mesh9p, …)
+```
+
+- `ssh-mesh` never runs as root and never executes commands itself. SSH
+  shell/exec and the HTTP exec endpoint authenticate the caller, then pass
+  the terminal or stdio descriptors to `mesh-init`, which runs the command as
+  that user.
+- `mesh-init` loads a config file per app that defines the sandbox,
+  resources and command. Callers can change only a small set of options.
+- Apps need no mesh-specific code: stdin/stdout or a UDS is enough, and the
+  mesh proxy handles HTTP/2 or SSH forwarding. The optional `mesh` library adds
+  a JSONL control socket, activation helpers and telemetry.
+
+### APIs
+
+Each service defines its API in an `API.md` file: ordinary Markdown
+documentation with tables that give every field a stable numeric tag.
+`mesh-api-gen` generates Rust types, numeric IDs, JSON Schema and `tools.json`
+catalogs from it. Tagged-CBOR is the primary wire format; JSONL/JSON-RPC and a
+structured text format are converted mechanically, and MCP is added by a
+gateway (`mesh-mcp`) rather than by each worker.
 
 ---
 
@@ -19,18 +88,33 @@ It is designed to orchestrate secure edge networks and run on-demand, socket-act
 
 The project consists of several Rust crates:
 
-- **[ssh-mesh](file:///ws/rust/ssh-mesh/crates/ssh-mesh)**: Core SSH/HTTP server/client and ControlMaster multiplexer.
-- **[mesh-init](file:///ws/rust/ssh-mesh/crates/mesh-init)**: Minimal system init/supervisor daemon and root process observer.
-- **[mesh](file:///ws/rust/ssh-mesh/crates/mesh)**: Common mesh library (Axum server, JSON protocol, UDS helpers).
-- **[ws](file:///ws/rust/ssh-mesh/crates/ws)**: WebSocket bridging and client management.
-- **[sftp](file:///ws/rust/ssh-mesh/crates/sftp)**: SFTP virtual file-system handler.
-- **[ssh-config](file:///ws/rust/ssh-mesh/crates/ssh-config)**: SSH client configuration file parser.
+- **[ssh-mesh](crates/ssh-mesh)**: Core SSH/HTTP server/client and ControlMaster multiplexer. Also builds the `h2t` and `meshkeys` binaries.
+- **[mesh-init](crates/mesh-init)**: Minimal system init/supervisor daemon and root process observer.
+- **[mesh](crates/mesh)**: Common mesh library (config, auth, JSONL and tagged-CBOR protocols, UDS helpers, activation).
+- **[mesh-api](crates/mesh-api)**: Platform-neutral shared structures and tagged-CBOR encoding, also used by firmware and Android.
+- **[mesh-api-gen](crates/mesh-api-gen)**: Build tool that generates types, IDs, schemas and `tools.json` from `API.md`.
+- **[mesh-cli](crates/mesh-cli)**: The `mesh` command-line client for local mesh services.
+- **[mesh-mcp](crates/mesh-mcp)**: Optional Model Context Protocol adapter for mesh gateways.
+- **[ws](crates/ws)**: WebSocket bridging and client management.
+- **[sftp](crates/sftp)**: SFTP virtual file-system handler (`sftp-server`).
+- **[mesh9p](crates/mesh9p)**: 9p file server, an alternative to sshfs for host and VM file sharing.
+- **[ssh-config](crates/ssh-config)**: SSH client configuration file parser.
+
+Outside the crates:
+
+- **[python](python)**: `dmesh`, a pure-Python client for local mesh services, used in tests.
+- **[nixos](nixos)**, **[flake.nix](flake.nix)**, **[manifests](manifests)**, **[Dockerfile](Dockerfile)**: Nix, NixOS, container and Cloud Run packaging.
+- **[bin](bin)**, **[scripts](scripts)**: bubblewrap and podman launchers and build helpers.
+- **[tests](tests)**: Python and NixOS integration tests.
 
 ---
 
 ## Documentation & Getting Started
 
-- **[User Guide & Tutorial](file:///ws/rust/ssh-mesh/docs/USER_GUIDE.md)**: Conceptual overview, list of use cases, and a step-by-step local mesh tutorial.
-- **[Local Multi-Host Examples](file:///ws/rust/ssh-mesh/docs/examples/README.md)**: Detailed multi-host mesh topology (Gateway, VMs, Bubblewrap) using checked-in certificates.
-- **[App VM Debugging Guide](file:///ws/rust/ssh-mesh/docs/examples/app-vm-debugging.md)**: Detailed troubleshooting commands and logs for VM-based apps.
-- **[mesh-init all-fields TOML](file:///ws/rust/ssh-mesh/crates/mesh-init/examples/all-fields.toml)**: Canonical annotated reference for every supported mesh-init service config field. Keep this file up to date when adding or changing config fields.
+- **[Local Multi-Host Examples](docs/examples/README.md)**: Detailed multi-host mesh topology (Gateway, VMs, Bubblewrap) using checked-in certificates.
+- **[App VM Debugging Guide](docs/examples/app-vm-debugging.md)**: Detailed troubleshooting commands and logs for VM-based apps.
+- **[mesh-init all-fields TOML](crates/mesh-init/examples/all-fields.toml)**: Canonical annotated reference for every supported mesh-init service config field. Keep this file up to date when adding or changing config fields.
+- **[mesh-init config](crates/mesh-init/CONFIG.md)** and **[termination model](crates/mesh-init/TERMINATION.md)**: Service configuration, activation and idle handling.
+- **[mesh-init systemd unit](crates/mesh-init/examples/mesh-init.service)**: Production installation under systemd.
+- **[Mesh library](crates/mesh/README.md)**: Protocols, framing and the echo worker examples.
+- **[NixOS](docs/nixos.md)**: NixOS module usage.
