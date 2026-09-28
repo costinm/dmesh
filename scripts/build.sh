@@ -473,7 +473,7 @@ test_cmd() {
     local name="${1:-}"
     if [ -z "$name" ]; then
         echo "Usage: scripts/build.sh test NAME" >&2
-        echo "Known tests: examples, ssh_mesh_activation, trace, cert_terminal_mesh_init" >&2
+        echo "Known tests: examples, ssh_mesh_activation, trace, cert_terminal_mesh_init, docker" >&2
         echo "Note: VM tests (test_vm_*) have moved to the initos repo." >&2
         return 2
     fi
@@ -502,6 +502,12 @@ test_cmd() {
             stage_examples "target/x86_64-unknown-linux-musl/release" "$PWD/target/dist"
             export PATH="$PWD/target/dist/opt/ssh-mesh/bin:$PWD/target/dist/opt/busybox/bin:${PATH:-}"
             python3 tests/test_cert_terminal_mesh_init.py "$@"
+            ;;
+        docker)
+            rust
+            stage_examples "target/x86_64-unknown-linux-musl/release" "$PWD/target/dist"
+            export PATH="$PWD/target/dist/opt/ssh-mesh/bin:$PWD/target/dist/opt/busybox/bin:${PATH:-}"
+            tests/test_docker.sh "$@"
             ;;
         *)
             echo "Unknown test: $name" >&2
