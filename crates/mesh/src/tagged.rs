@@ -108,15 +108,39 @@ pub struct MethodSchema {
 #[derive(Clone, Debug)]
 pub struct FieldSchema {
     pub tag: u32,
+    pub kind: Option<String>,
+    pub values: BTreeMap<String, u64>,
 }
 
 /// Catalog used for format translation. It intentionally permits unknown values.
 #[derive(Clone, Debug, Default)]
-pub struct TaggedCatalog {
+pub struct TaggedSchema {
     methods: BTreeMap<String, MethodSchema>,
 }
 
-impl TaggedCatalog {
+/// Previous name for the format-neutral tagged schema.
+pub type TaggedCatalog = TaggedSchema;
+
+impl TaggedSchema {
+    /// Reject a command outside the catalog or fields without reviewed tags.
+    /// Clients using a strictly schema-driven API can call this before a
+    /// format-specific encoder, including CBOR or a future protobuf codec.
+    pub fn validate_fields(
+        &self,
+        method: &str,
+        fields: &Map<String, Value>,
+    ) -> Result<&MethodSchema> {
+        let schema = self
+            .methods
+            .get(method)
+            .ok_or_else(|| anyhow!("unknown schema method {method}"))?;
+        for name in fields.keys() {
+            if field_schema(Some(schema), name).is_none() {
+                bail!("unknown schema field {method}.{name}");
+            }
+        }
+        Ok(schema)
+    }
     /// Read the generated numeric metadata from `tools.json`.
     ///
     /// New API.md-derived artifacts use `x-component-index`,
@@ -172,9 +196,30 @@ impl TaggedCatalog {
                                 .and_then(Value::as_u64)
                         })
                     {
-                        schema
-                            .fields
-                            .insert(field.clone(), FieldSchema { tag: tag as u32 });
+                        schema.fields.insert(
+                            field.clone(),
+                            FieldSchema {
+                                tag: tag as u32,
+                                kind: property
+                                    .get("x-mesh-cbor-type")
+                                    .or_else(|| property.get("x-dmesh-kind"))
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned),
+                                values: property
+                                    .get("x-mesh-values")
+                                    .or_else(|| property.get("x-dmesh-values"))
+                                    .and_then(Value::as_object)
+                                    .map(|values| {
+                                        values
+                                            .iter()
+                                            .filter_map(|(name, value)| {
+                                                value.as_u64().map(|value| (name.clone(), value))
+                                            })
+                                            .collect()
+                                    })
+                                    .unwrap_or_default(),
+                            },
+                        );
                     }
                 }
             }
@@ -265,11 +310,13 @@ impl TaggedCatalog {
         for (name, value) in object {
             match name.as_str() {
                 "id" => record.id = Some(value.clone()),
-                "to" => record.to = Some(value.clone()),
+                "to" if !schema.is_some_and(|schema| schema.fields.contains_key("to")) => {
+                    record.to = Some(value.clone())
+                }
                 // `data` is deliberately a CBOR byte field in the envelope.
                 // The Rust wire adapter accepts an array of octets here so
                 // binary data does not cross a base64/text conversion.
-                "data" => {
+                "data" if !schema.is_some_and(|schema| schema.fields.contains_key("data")) => {
                     let bytes = value
                         .as_array()
                         .ok_or_else(|| anyhow!("structured request data must be an octet array"))?
@@ -286,10 +333,7 @@ impl TaggedCatalog {
                     record.data = Some(bytes);
                 }
                 _ => {
-                    let key = schema
-                        .and_then(|schema| schema.fields.get(name))
-                        .map(|field| NameOrTag::Tag(field.tag))
-                        .unwrap_or_else(|| NameOrTag::parse(name));
+                    let key = field_key(schema, name);
                     record.env.insert(key, value.clone());
                 }
             }
@@ -322,27 +366,25 @@ impl TaggedCatalog {
                 let (name, value) = option
                     .split_once('=')
                     .ok_or_else(|| anyhow!("option {token} requires =value"))?;
-                if name == "to" {
+                if name == "to" && !schema.is_some_and(|schema| schema.fields.contains_key("to")) {
                     record.to = Some(text_value(value));
                     continue;
                 }
-                let key = schema
-                    .and_then(|schema| schema.fields.get(name))
-                    .map(|field| NameOrTag::Tag(field.tag))
-                    .unwrap_or_else(|| NameOrTag::parse(name));
-                record.env.insert(key, text_value(value));
+                let key = field_key(schema, name);
+                record
+                    .env
+                    .insert(key, field_text_value(schema, name, value)?);
             } else if let Some((name, value)) = token.split_once('=')
                 && !name.is_empty()
             {
-                if name == "to" {
+                if name == "to" && !schema.is_some_and(|schema| schema.fields.contains_key("to")) {
                     record.to = Some(text_value(value));
                     continue;
                 }
-                let key = schema
-                    .and_then(|schema| schema.fields.get(name))
-                    .map(|field| NameOrTag::Tag(field.tag))
-                    .unwrap_or_else(|| NameOrTag::parse(name));
-                record.env.insert(key, text_value(value));
+                let key = field_key(schema, name);
+                record
+                    .env
+                    .insert(key, field_text_value(schema, name, value)?);
             } else {
                 bail!("argument {token:?} must be name=value");
             }
@@ -389,7 +431,7 @@ impl TaggedCatalog {
             value.insert("params".to_owned(), Value::Array(record.params.clone()));
         }
         if let Some(result) = &record.result {
-            value.insert("result".to_owned(), result.clone());
+            value.insert("result".to_owned(), project_fields(result, schema));
         }
         if let Some(error) = &record.error {
             value.insert("error".to_owned(), error.clone());
@@ -407,11 +449,77 @@ impl TaggedCatalog {
     }
 }
 
+fn project_fields(value: &Value, schema: Option<&MethodSchema>) -> Value {
+    let Some(object) = value.as_object() else {
+        return value.clone();
+    };
+    let Some(schema) = schema else {
+        return value.clone();
+    };
+    let mut projected = Map::new();
+    for (key, value) in object {
+        let name = key
+            .parse::<u32>()
+            .ok()
+            .and_then(|tag| {
+                schema
+                    .fields
+                    .iter()
+                    .find(|(_, field)| field.tag == tag)
+                    .map(|(name, _)| name.clone())
+            })
+            .unwrap_or_else(|| key.clone());
+        projected.insert(name, value.clone());
+    }
+    Value::Object(projected)
+}
+
 /// Match either spelling of a catalog identity. `wire` is normally a tag for
 /// an embedded-capable API, while `name` is retained by the catalog key for
 /// host-native callers.
 fn identity_matches(actual: &NameOrTag, wire: &NameOrTag, name: &str) -> bool {
     actual == wire || matches!(actual, NameOrTag::Name(actual_name) if actual_name == name)
+}
+
+fn field_schema<'a>(schema: Option<&'a MethodSchema>, name: &str) -> Option<&'a FieldSchema> {
+    schema.and_then(|schema| {
+        schema.fields.get(name).or_else(|| {
+            name.trim_start_matches('@')
+                .parse::<u32>()
+                .ok()
+                .and_then(|tag| schema.fields.values().find(|field| field.tag == tag))
+        })
+    })
+}
+
+fn field_key(schema: Option<&MethodSchema>, name: &str) -> NameOrTag {
+    field_schema(schema, name)
+        .map(|field| NameOrTag::Tag(field.tag))
+        .unwrap_or_else(|| NameOrTag::parse(name))
+}
+
+fn field_text_value(schema: Option<&MethodSchema>, name: &str, value: &str) -> Result<Value> {
+    let Some(field) = field_schema(schema, name) else {
+        return Ok(text_value(value));
+    };
+    match field.kind.as_deref() {
+        Some("bool") => Ok(Value::Bool(value.parse()?)),
+        Some("u8" | "u16" | "u32" | "u64") => Ok(Value::from(value.parse::<u64>()?)),
+        Some("enum") => Ok(Value::from(
+            field
+                .values
+                .get(value)
+                .copied()
+                .map(Ok)
+                .unwrap_or_else(|| value.parse::<u64>())?,
+        )),
+        Some("mac") => Ok(Value::String(value.to_ascii_lowercase())),
+        Some("hex") => Ok(Value::String(format!(
+            "hex:{}",
+            value.trim_start_matches("hex:").replace(':', "")
+        ))),
+        _ => Ok(text_value(value)),
+    }
 }
 
 fn name_or_index(value: Option<&Value>, fallback: &str) -> NameOrTag {
@@ -718,6 +826,60 @@ fn text_tokens(line: &str) -> Result<Vec<&str>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_fields_accept_names_and_numeric_keys_with_declared_types() {
+        let catalog = TaggedCatalog::from_tools_json(&serde_json::json!([{
+            "name": "nan.wakeup", "x-component-index": 2, "x-method-index": 3,
+            "inputSchema": {"properties": {
+                "to": {"x-protobuf-index": 1, "x-mesh-cbor-type": "mac"},
+                "mode": {"x-protobuf-index": 2, "x-mesh-cbor-type": "enum", "x-mesh-values": {"sta": 5}}
+            }}
+        }])).unwrap();
+        let record = catalog
+            .parse_argv("nan.wakeup", &["--1=AA:BB".into(), "--mode=sta".into()])
+            .unwrap();
+        assert_eq!(
+            record.env.get(&NameOrTag::Tag(1)),
+            Some(&Value::String("aa:bb".into()))
+        );
+        assert_eq!(record.env.get(&NameOrTag::Tag(2)), Some(&Value::from(5)));
+        assert!(record.to.is_none());
+        let structured = catalog
+            .record_from_value("nan.wakeup", &serde_json::json!({"to":"AA:BB"}))
+            .unwrap();
+        assert!(
+            catalog
+                .validate_fields(
+                    "nan.wakeup",
+                    serde_json::json!({"1":"aa:bb"}).as_object().unwrap()
+                )
+                .is_ok()
+        );
+        assert!(
+            catalog
+                .validate_fields(
+                    "nan.wakeup",
+                    serde_json::json!({"99":"bad"}).as_object().unwrap()
+                )
+                .is_err()
+        );
+        assert_eq!(
+            structured.env.get(&NameOrTag::Tag(1)),
+            Some(&Value::String("AA:BB".into()))
+        );
+        let result = TaggedRecord {
+            component: NameOrTag::Tag(2),
+            method: NameOrTag::Tag(3),
+            id: Some(Value::from(9)),
+            result: Some(serde_json::json!({"1":"aa:bb", "99":true})),
+            ..Default::default()
+        };
+        let rendered = catalog.to_jsonl(&result);
+        assert_eq!(rendered["method"], "nan.wakeup");
+        assert_eq!(rendered["result"]["to"], "aa:bb");
+        assert_eq!(rendered["result"]["99"], true);
+    }
     use serde_json::json;
 
     #[test]

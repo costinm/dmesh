@@ -7,10 +7,10 @@ use std::{
     sync::{Arc, OnceLock, RwLock},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 
-use crate::tagged::TaggedCatalog;
+use crate::tagged::TaggedSchema;
 
 /// One parsed catalog together with the source used to load it.
 #[derive(Debug)]
@@ -18,7 +18,7 @@ pub struct ResolvedCatalog {
     pub component: String,
     pub path: PathBuf,
     pub tools: Arc<Value>,
-    pub catalog: Arc<TaggedCatalog>,
+    pub catalog: Arc<TaggedSchema>,
 }
 
 /// Lazy resolver shared by general clients and mesh gateway implementations.
@@ -32,6 +32,12 @@ pub struct CatalogResolver {
 }
 
 impl CatalogResolver {
+    /// Resolve a required installed catalog using the standard search path.
+    pub fn require(&self, component: &str) -> Result<Arc<ResolvedCatalog>> {
+        self.resolve(component).ok_or_else(|| {
+            anyhow!("missing {component} tools.json; set MESH_SCHEMA_DIR or install /opt/{component}/etc/schemas/tools.json")
+        })?
+    }
     /// Resolve a component using the standard client-side schema locations.
     ///
     /// `MESH_TOOLS` is an exact override. If it is set, failure to load that
@@ -74,7 +80,7 @@ impl CatalogResolver {
             .with_context(|| format!("read tools catalog {}", path.display()))?;
         let tools: Value = serde_json::from_str(&contents)
             .with_context(|| format!("parse tools catalog {}", path.display()))?;
-        let catalog = TaggedCatalog::from_tools_json(&tools).with_context(|| {
+        let catalog = TaggedSchema::from_tools_json(&tools).with_context(|| {
             format!(
                 "parse tools catalog {}: invalid tagged catalog",
                 path.display()

@@ -688,6 +688,27 @@ mod tests {
     use super::*;
     use serde_json::json;
     #[test]
+    fn tagged_record_envelope_bytes_are_stable() {
+        // Lock the canonical envelope encoding: generated Java marshalling in
+        // mesh-api-gen must produce these exact bytes for the same record.
+        let record = TaggedRecord {
+            component: crate::tagged::NameOrTag::Tag(3),
+            method: crate::tagged::NameOrTag::Tag(2),
+            id: Some(json!(7)),
+            env: [(crate::tagged::NameOrTag::Tag(1), json!("hi"))]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            encode_record(&record).unwrap(),
+            vec![
+                0xa4, 0x01, 0x03, 0x02, 0x02, 0x03, 0x07, 0x05, 0xa1, 0x01, 0x62, 0x68, 0x69
+            ]
+        );
+    }
+
+    #[test]
     fn jsonrpc_is_flattened_and_stream_framed() {
         let input =
             json!({"jsonrpc":"2.0","id":7,"method":"wifi.status","params":{"iface":"wlan0"}});

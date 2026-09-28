@@ -31,6 +31,7 @@ pub mod jsonl_proxy;
 pub mod mcp_proxy;
 pub mod mesh_rest;
 pub mod mux;
+pub mod route_ssh;
 pub mod sshc;
 pub mod sshd;
 pub mod sshmuxc;
