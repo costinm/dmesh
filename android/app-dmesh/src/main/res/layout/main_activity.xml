@@ -25,6 +25,9 @@
             android:id="@+id/con_text"
             android:text="Service starting"
             android:textStyle="bold"
+            android:typeface="monospace"
+            android:textSize="13sp"
+            android:textIsSelectable="true"
             android:padding="10dp"
             android:layout_width="match_parent"
             android:layout_height="wrap_content" />
@@ -32,6 +35,9 @@
         <TextView
             android:id="@+id/if_text"
             android:text="Interfaces"
+            android:typeface="monospace"
+            android:textSize="12sp"
+            android:textIsSelectable="true"
             android:padding="10dp"
             android:layout_width="match_parent"
             android:layout_height="wrap_content" />
@@ -39,6 +45,7 @@
         <TextView
             android:id="@+id/msg_text"
             android:text="Notifications"
+            android:textSize="12sp"
             android:padding="10dp"
             android:layout_width="match_parent"
             android:layout_height="wrap_content" />

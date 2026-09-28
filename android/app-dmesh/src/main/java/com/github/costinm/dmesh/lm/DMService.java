@@ -81,6 +81,28 @@ public class DMService extends MeshService {
 
     boolean fg = false;
 
+    /** Process-local liveness for the periodic job watchdog. */
+    private static volatile boolean running;
+
+    /** True while this process owns a live DMService instance. */
+    public static boolean isRunning() {
+        return running;
+    }
+
+    /**
+     * Start the foreground service from a background context (boot
+     * receiver, package replacement, or the persistent job). BOOT_COMPLETED
+     * and MY_PACKAGE_REPLACED are on the system's background-start allowlist.
+     */
+    public static void startBackground(Context ctx) {
+        try {
+            ctx.getApplicationContext().startForegroundService(new Intent(ctx, DMService.class));
+        } catch (Throwable t) {
+            Log.w(TAG, "Unable to start DMService from background", t);
+        }
+        LMJob.schedule(ctx.getApplicationContext(), LMJob.DEFAULT_INTERVAL_MS);
+    }
+
     public void onLowMemory() {
         Log.d(TAG, "On Low memory");
     }
@@ -102,8 +124,18 @@ public class DMService extends MeshService {
 
         @Override
         public void onReceive(Context context, Intent intent) {
-            if ("com.github.costinm.dmesh.wifi.BLE_SCAN".equals(intent.getAction())) {
+            String action = intent == null ? null : intent.getAction();
+            if ("com.github.costinm.dmesh.wifi.BLE_SCAN".equals(action)) {
                 AndroidTransportBridge.handlePendingIntent(context, intent);
+                return;
+            }
+            // Boot and package-replacement starts are allowlisted system
+            // broadcasts: bring the foreground service and the persistent
+            // watchdog job back without waiting for user interaction.
+            if (Intent.ACTION_BOOT_COMPLETED.equals(action)
+                    || Intent.ACTION_MY_PACKAGE_REPLACED.equals(action)) {
+                Log.d(TAG, "Start after " + action);
+                DMService.startBackground(context);
                 return;
             }
             CharSequence txt = getMessageText(intent);
@@ -137,6 +169,7 @@ public class DMService extends MeshService {
     @Override
     public void onCreate() {
         super.onCreate();
+        running = true;
 
         prefs = PreferenceManager.getDefaultSharedPreferences(this);
         // A foreground-service launch has a short system deadline.  Native
@@ -176,9 +209,13 @@ public class DMService extends MeshService {
         // happens: Android delivers BLE scan and GATT callbacks there.
         new Thread(this::startRustMesh, "dmesh-rust-mesh").start();
 
+        // Persistent periodic watchdog: reconciles this service while it is
+        // alive and restarts it after reboots or process death.
+        LMJob.schedule(this, LMJob.DEFAULT_INTERVAL_MS);
     }
 
     public void onDestroy() {
+        running = false;
         if (batteryMonitor != null) {
             batteryMonitor.close();
             batteryMonitor = null;
@@ -363,6 +400,44 @@ public class DMService extends MeshService {
         return "";
     }
 
+    /**
+     * Copy the bundled web UI into the Rust web root. Files here take
+     * precedence over the ssh-mesh embedded assets, so app-dmesh owns the
+     * HTTP interface surface served on 127.0.0.1:18480.
+     */
+    private void copyWebAssets(File webDir) {
+        copyWebAssets(webDir, "");
+    }
+
+    private void copyWebAssets(File webDir, String prefix) {
+        try {
+            String[] names = getAssets().list(prefix);
+            if (names == null) {
+                return;
+            }
+            for (String name : names) {
+                String path = prefix.isEmpty() ? name : prefix + "/" + name;
+                if (getAssets().list(path).length > 0) {
+                    copyWebAssets(webDir, path);
+                    continue;
+                }
+                File out = new File(webDir, path);
+                File parent = out.getParentFile();
+                if (parent != null && !parent.isDirectory() && !parent.mkdirs()) {
+                    continue;
+                }
+                try (java.io.InputStream in = getAssets().open(path);
+                     java.io.OutputStream os = new java.io.FileOutputStream(out)) {
+                    byte[] buffer = new byte[8192];
+                    int read;
+                    while ((read = in.read(buffer)) >= 0) os.write(buffer, 0, read);
+                }
+            }
+        } catch (IOException error) {
+            Log.w(TAG, "Failed to copy web assets", error);
+        }
+    }
+
     private synchronized void startRustMesh() {
         if (meshNode != null) {
             return;
@@ -377,15 +452,7 @@ public class DMService extends MeshService {
             if (!webDir.exists() && !webDir.mkdirs()) {
                 Log.w(TAG, "Failed to create Rust web dir: " + webDir);
             }
-            for (String assetName : new String[] { "ble.html", "usb.html" }) {
-                try (java.io.InputStream in = getAssets().open(assetName);
-                     java.io.OutputStream out = new java.io.FileOutputStream(new File(webDir, assetName))) {
-                    byte[] buffer = new byte[8192];
-                    int read;
-                    while ((read = in.read(buffer)) >= 0) out.write(buffer, 0, read);
-                } catch (IOException ignored) {
-                }
-            }
+            copyWebAssets(webDir);
             MeshNode node = new MeshNode(baseDir.getAbsolutePath());
             node.start(getApplicationContext(), RUST_SSH_PORT, RUST_HTTP_PORT);
             messageGateway = new MessageStreamGateway(this, () -> {
@@ -603,10 +670,15 @@ public class DMService extends MeshService {
     public int onStartCommand(Intent intent, int flags, int startId) {
         Log.d(TAG, "onStartCommand" + startId + " " + flags + " " + intent);
         if (intent == null) {
+            // Restarted after process death: keep the foreground service and
+            // make sure the persistent watchdog job is still scheduled.
+            ensureForeground();
+            LMJob.schedule(this, LMJob.DEFAULT_INTERVAL_MS);
             return START_STICKY;
         }
 
         ensureForeground();
+        LMJob.schedule(this, LMJob.DEFAULT_INTERVAL_MS);
 
         //VpnService.maybeStartVpn(prefs, this);
 

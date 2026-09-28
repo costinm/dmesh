@@ -54,6 +54,31 @@
         a:hover {
             border-color: var(--accent);
         }
+        #status-text {
+            min-height: 0;
+            margin-top: 14px;
+        }
+        #status-pre {
+            margin: 8px 0 0;
+            padding: 10px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            background: #f9fbff;
+            font: 13px/1.45 ui-monospace, Menlo, Consolas, monospace;
+            overflow: auto;
+            max-height: 420px;
+            white-space: pre;
+        }
+        #status-refresh {
+            float: right;
+            margin-top: -4px;
+            padding: 6px 14px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            background: var(--panel);
+            color: var(--accent);
+            cursor: pointer;
+        }
         strong {
             display: block;
             margin-bottom: 8px;
@@ -93,6 +118,11 @@
                 <span>Open the trace aggregation viewer.</span>
             </a>
         </div>
+        <section id="status-text" class="card">
+            <strong>Status</strong>
+            <button id="status-refresh" type="button">Refresh</button>
+            <pre id="status-pre">Loading status…</pre>
+        </section>
     </main>
     <script>
         const base = new URL('../mesh/', location.href);
@@ -115,6 +145,17 @@
                 root.replaceChildren(Object.assign(document.createElement('strong'), {textContent:'This node'}), Object.assign(document.createElement('span'), {textContent:rows.length ? rows.join(' · ') : 'No announced local address is currently available.'}));
             } catch (error) { root.replaceChildren(Object.assign(document.createElement('strong'), {textContent:'This node'}), Object.assign(document.createElement('span'), {textContent:error.message})); }
         }
+        const pre = document.getElementById('status-pre');
+        async function loadStatus() {
+            try {
+                const value = await request('services/status/call/status.text', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id:1})});
+                const text = (value?.result || value || {}).status_text;
+                pre.textContent = typeof text === 'string' && text.length ? text : 'Status is not available yet.';
+            } catch (error) { pre.textContent = `Status unavailable: ${error.message}`; }
+        }
+        document.getElementById('status-refresh').addEventListener('click', loadStatus);
+        loadStatus();
+        setInterval(loadStatus, 30000);
         loadThisNode();
     </script>
 </body>

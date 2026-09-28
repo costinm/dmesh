@@ -64,10 +64,8 @@ public final class Ble {
     private volatile boolean cocClosing;
     // The channel mid-connect(), exposed so disconnect() can unblock it.
     private volatile BluetoothSocket cocPendingChannel;
-    // Matches Rust's COC_FRAME_MAX (PACKET + 2) in crates/dmesh-android/src/bearer.rs.
-    // The Rust bearer never emits a larger frame; rejecting here keeps Java
-    // and Rust length-framing synchronized.
-    private static final int COC_FRAME_MAX = 1102;
+    // One CoC SDU carries exactly one opaque QUIC-lite packet.
+    private static final int COC_PACKET_MAX = 1100;
 
     private final ScanCallback scanCallback = new ScanCallback() {
         @Override public void onScanResult(int callbackType, ScanResult result) {
@@ -79,12 +77,12 @@ public final class Ble {
             try { address = device == null ? "" : device.getAddress(); } catch (SecurityException ignored) { }
             String mode = "unknown";
             if (record != null && record.getServiceUuids() != null) {
-                if (record.getServiceUuids().contains(DMESH_PAIRING)) mode = "virgin";
+                if (record.getServiceUuids().contains(DMESH_PAIRING)) mode = "unpaired";
                 else if (record.getServiceUuids().contains(DMESH_OPERATIONAL)) mode = "operational";
             }
             // BLE discovery and future pairing/CoC ownership remain inside
             // Do not project advertisement bytes as a mesh API:
-            // once paired, CoC presents the shared UART byte stream directly.
+            // once paired, each CoC SDU carries one opaque QUIC-lite packet.
             emit("scan_result:rssi=" + result.getRssi() + ":addr=" + address + ":mode=" + mode, data);
         }
         @Override public void onScanFailed(int errorCode) { emit("scan_failed:code=" + errorCode, new byte[0]); }
@@ -248,7 +246,7 @@ public final class Ble {
         }
     }
     public boolean writeFrame(byte[] frame, int length) {
-        if (frame == null || length < 2 || length > frame.length || length > COC_FRAME_MAX) return false;
+        if (frame == null || length < 1 || length > frame.length || length > COC_PACKET_MAX) return false;
         OutputStream out;
         synchronized (this) {
             if (!cocConnected || cocOut == null) return false;
@@ -259,7 +257,7 @@ public final class Ble {
                 out.write(frame, 0, length);
                 out.flush();
             }
-            android.util.Log.v("DMESH-BLE", "ble coc_tx_frame:bytes=" + length);
+            android.util.Log.v("DMESH-BLE", "ble coc_tx_packet:bytes=" + length);
             return true;
         } catch (IOException exception) {
             failConnection();
@@ -297,7 +295,7 @@ public final class Ble {
         while (cocConnected) {
             int read = in.read(buffer);
             if (read <= 0) { emit("coc_read_closed:bytes=" + read, new byte[0]); break; }
-            android.util.Log.v("DMESH-BLE", "ble coc_rx_chunk:bytes=" + read);
+            android.util.Log.v("DMESH-BLE", "ble coc_rx_packet:bytes=" + read);
             BearerBridge currentBridge = bridge;
             if (currentBridge != null) {
                 currentBridge.onBearerChunk("ble", buffer, read);

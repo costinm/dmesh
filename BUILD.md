@@ -130,7 +130,7 @@ tmux send-keys -t dmesh:e6.uart 'log-watch 8' Enter
 tmux capture-pane -pt dmesh:e6.uart -S -120
 ```
 
-Detach with `Ctrl-b d`; this leaves tests running. Stop a bounded lab session
+Detach with `Ctrl-b d`; this leaves tests running. Stop a time-limited lab session
 only when its evidence has been captured: `tmux kill-session -t dmesh`. Use the
 window naming convention rather than another session, so UART ownership and
 captured logs stay attributable to one device.
@@ -300,6 +300,6 @@ Main/Recovery behavioral differences as bugs.
 For the lab host's Recovery network, install
 `crates/lmesh/mesh-init/lmesh.toml` and set `LMESH_INTERFACES` to the owned AP
 interface, normally `wlan0`. lmesh owns the AP and shared raw-NAN monitor at
-startup. Use `mesh lmesh telemetry.nan_status` for a bounded host
+startup. Use `mesh lmesh telemetry.nan_status` for a short host
 check. Restart only through mesh-init when a controlled service disruption is
 needed.

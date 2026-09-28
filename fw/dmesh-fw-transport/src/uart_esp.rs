@@ -739,42 +739,6 @@ fn write_uart_current() {
     unsafe { write_queued_payload(UART_TX_CURRENT.assume_init_ref()) }
 }
 
-/// Non-blocking ingress from the UART FreeRTOS task. A full queue is an
-/// explicit lossy-path drop; it must never wait for stream credit or Wi-Fi.
-#[deprecated(
-    note = "legacy allocating/copying ingress; decode directly into a writer lent by QUIC-lite"
-)]
-pub(crate) fn enqueue_transport_packet(packet: &[u8]) -> bool {
-    if packet.is_empty() || packet.len() > UART_MAX_PACKET - 1 {
-        return false;
-    }
-    crate::shared_ingress_esp::enqueue(crate::shared_ingress_esp::IngressKind::Uart, [0; 6], packet)
-}
-
-/// Consume one complete QUIC-lite datagram without touching a UART driver.
-/// The single connection owner calls this from its normal dispatch loop.
-pub fn dequeue_transport_packet(out: &mut [u8; UART_MAX_PACKET]) -> Option<usize> {
-    let _ = out;
-    // Connection owners are called by the shared pool worker. Retaining this
-    // source-compatible stub prevents old optional lab code from
-    // accidentally reviving a second UART packet queue.
-    None
-}
-
-/// Whether the common UART L2 task has an opaque direct exception record or
-/// a QUIC-lite datagram ready for the Main dispatcher. Sleep policy uses this
-/// as a wake/work hint only; it never reads the physical UART driver.
-pub fn has_pending_ingress() -> bool {
-    false
-}
-
-/// True when one framed QUIC-lite UART packet is waiting for Main's server
-/// attachment. This lets Main defer that 32 KiB legacy server task until a
-/// real direct client has sent a request; direct CBOR records do not need it.
-pub fn has_pending_transport_packet() -> bool {
-    false
-}
-
 /// Install or clear a task-context notification callback for newly accepted
 /// UART ingress. The callback must be nonblocking and safe from the dedicated
 /// FreeRTOS UART task; it is not an interrupt callback.

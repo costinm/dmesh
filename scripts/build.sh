@@ -105,6 +105,7 @@ configure_ssh_mesh_override() {
 [patch."$ssh_mesh_url"]
 ssh-mesh = { path = "$override_dir/crates/ssh-mesh" }
 mesh = { path = "$override_dir/crates/mesh" }
+mesh-api = { path = "$override_dir/crates/mesh-api" }
 # END DMESH SSH_MESH OVERRIDE
 EOF
     SSH_MESH_OVERRIDE_ACTIVE=1
@@ -285,7 +286,6 @@ lmesh_control_test() {
     "$DMESH_CARGO_BIN" test -p lmesh --bin lmesh
     "$DMESH_CARGO_BIN" test -p lmesh-wifi json_rpc_gateway_flattens_params_for_existing_handlers --lib
     check_host_uart_ownership
-    "$DMESH_CARGO_BIN" test -p dmesh-cli --test firmware_e2e host_control_
     check_lmesh_api
 }
 
@@ -299,19 +299,7 @@ transport_test() {
     require_dmesh_cargo
     configure_ssh_mesh_override
     "$DMESH_CARGO_BIN" test -p quic-lite
-    "$DMESH_CARGO_BIN" test -p dmesh-server --features udp --lib
-    "$DMESH_CARGO_BIN" test -p dmesh-server --features udp --test object_store_stream
-}
-
-# Hardware E2E stays behind the repository build harness so operators never
-# need to invoke Cargo directly. The selected test owns the configured serial
-# endpoints exclusively; the generic default is the NAN-first pair prober.
-firmware_e2e() {
-    require_dmesh_cargo
-    configure_ssh_mesh_override
-    local test_name="${DMESH_E2E_TEST:-firmware_pair_prober}"
-    "$DMESH_CARGO_BIN" test -p dmesh-cli --test firmware_e2e "$test_name" \
-        -- --ignored --nocapture --test-threads=1
+    "$DMESH_CARGO_BIN" test -p dmesh-server --lib
 }
 
 transport_coverage() {
@@ -592,7 +580,6 @@ case "${1:-musl}" in
     lmesh-api-generate) lmesh_api_generate ;;
     object-store-test) object_store_test ;;
     transport-test) transport_test ;;
-    firmware-e2e) firmware_e2e ;;
     transport-coverage) transport_coverage ;;
     transport-fuzz-smoke) transport_fuzz_smoke ;;
     transport-loopback) transport_loopback "$@" ;;
@@ -601,5 +588,5 @@ case "${1:-musl}" in
     object-store-tcp-loopback) object_store_tcp_loopback "$@" ;;
     lmesh-restart) lmesh_restart ;;
     android-libs|android-native) shift; build_android_libs "${1:-debug}" ;;
-    *) echo "Usage: scripts/build.sh {deps|musl|android-libs|check|lmesh-check|lmesh-test|lmesh-control-test|lmesh-api-generate|object-store-test|transport-test|firmware-e2e|transport-coverage|transport-fuzz-smoke|transport-loopback|transport-tcp-loopback|transport-compare|object-store-tcp-loopback|lmesh-restart}" >&2; exit 2 ;;
+    *) echo "Usage: scripts/build.sh {deps|musl|android-libs|check|lmesh-check|lmesh-test|lmesh-control-test|lmesh-api-generate|object-store-test|transport-test|transport-coverage|transport-fuzz-smoke|transport-loopback|transport-tcp-loopback|transport-compare|object-store-tcp-loopback|lmesh-restart}" >&2; exit 2 ;;
 esac

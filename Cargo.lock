@@ -1503,8 +1503,6 @@ dependencies = [
  "dmesh-server",
  "glob",
  "libc",
- "lmesh",
- "lmesh-wifi",
  "mesh",
  "minicbor",
  "quic-lite",
@@ -1532,11 +1530,10 @@ dependencies = [
  "async-trait",
  "axum",
  "hex",
- "libc",
  "mesh",
+ "mesh-api",
  "p256",
  "quic-lite",
- "rand 0.10.3",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -2032,7 +2029,7 @@ checksum = "da0e4dd2a88388a1f4ccc7c9ce104604dab68d9f408dc34cd45823d5a9069095"
 dependencies = [
  "futures-core",
  "futures-sink",
- "spin",
+ "spin 0.9.9",
 ]
 
 [[package]]
@@ -2044,7 +2041,7 @@ dependencies = [
  "fastrand",
  "futures-core",
  "futures-sink",
- "spin",
+ "spin 0.9.9",
 ]
 
 [[package]]
@@ -3210,7 +3207,7 @@ version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 dependencies = [
- "spin",
+ "spin 0.9.9",
 ]
 
 [[package]]
@@ -3322,6 +3319,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "uart-codec",
 ]
 
 [[package]]
@@ -3330,6 +3328,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "libc",
+ "quic-lite",
  "serde_json",
 ]
 
@@ -3342,7 +3341,6 @@ dependencies = [
  "dmesh-rawnan",
  "dmesh-server",
  "libc",
- "lmesh-ble-hci",
  "lmesh-wpa",
  "mesh",
  "minicbor",
@@ -3357,7 +3355,6 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
- "uart-codec",
 ]
 
 [[package]]
@@ -3464,7 +3461,6 @@ dependencies = [
 [[package]]
 name = "mesh"
 version = "0.1.0"
-source = "git+https://github.com/costinm/ssh-mesh#b9b4b8e5aa26bf177e73e68943297dc806e987ca"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3488,7 +3484,6 @@ dependencies = [
 [[package]]
 name = "mesh-api"
 version = "0.1.0"
-source = "git+https://github.com/costinm/ssh-mesh#b9b4b8e5aa26bf177e73e68943297dc806e987ca"
 dependencies = [
  "serde",
 ]
@@ -3496,7 +3491,6 @@ dependencies = [
 [[package]]
 name = "mesh-mcp"
 version = "0.1.0"
-source = "git+https://github.com/costinm/ssh-mesh#b9b4b8e5aa26bf177e73e68943297dc806e987ca"
 dependencies = [
  "mesh",
  "serde",
@@ -4765,8 +4759,10 @@ name = "quic-lite"
 version = "0.1.0"
 dependencies = [
  "hmac 0.13.0",
- "mesh-api",
+ "libc",
  "sha2 0.11.0",
+ "smallvec",
+ "spin 0.10.1",
  "tokio",
 ]
 
@@ -5658,7 +5654,6 @@ dependencies = [
 [[package]]
 name = "sftp-server"
 version = "0.1.0"
-source = "git+https://github.com/costinm/ssh-mesh#b9b4b8e5aa26bf177e73e68943297dc806e987ca"
 dependencies = [
  "anyhow",
  "bytes",
@@ -5913,6 +5908,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "spin"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
+
+[[package]]
 name = "spki"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6158,7 +6159,6 @@ dependencies = [
 [[package]]
 name = "ssh-config"
 version = "0.57.0"
-source = "git+https://github.com/costinm/ssh-mesh#b9b4b8e5aa26bf177e73e68943297dc806e987ca"
 dependencies = [
  "futures",
  "glob",
@@ -6221,7 +6221,6 @@ dependencies = [
 [[package]]
 name = "ssh-mesh"
 version = "0.1.0"
-source = "git+https://github.com/costinm/ssh-mesh#b9b4b8e5aa26bf177e73e68943297dc806e987ca"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6927,6 +6926,8 @@ name = "uart-codec"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "quic-lite",
+ "tokio",
 ]
 
 [[package]]
@@ -8107,7 +8108,6 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 [[package]]
 name = "ws"
 version = "0.1.0"
-source = "git+https://github.com/costinm/ssh-mesh#b9b4b8e5aa26bf177e73e68943297dc806e987ca"
 dependencies = [
  "async-trait",
  "axum",

@@ -6,13 +6,36 @@ import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 
 /**
  * Small definite-length CBOR adapter for DMesh message envelopes. JNI carries
  * only these bytes; Android apps continue to use MeshStream and Bundle.
+ *
+ * Besides the Bundle adapter this class exposes a generic value API used by
+ * {@link Envelope} and generated marshalling: maps and lists encode with
+ * their natural keys, integers round-trip as Integer/Long by magnitude, and
+ * doubles use the 8-byte CBOR form.
  */
 public final class CborMessageCodec {
     private CborMessageCodec() {
+    }
+
+    /** Encode one generic CBOR value (no Bundle required). */
+    public static byte[] encodeValue(Object value) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        writeValue(out, value);
+        return out.toByteArray();
+    }
+
+    /** Decode one generic CBOR value, rejecting trailing data. */
+    public static Object decodeValue(byte[] bytes) {
+        Reader reader = new Reader(bytes);
+        Object value = reader.readGenericValue();
+        if (!reader.done()) throw new IllegalArgumentException("trailing CBOR data");
+        return value;
     }
 
     public static byte[] encode(MeshStream stream) {
@@ -51,6 +74,10 @@ public final class CborMessageCodec {
             writeText(out, (String) value);
         } else if (value instanceof Boolean) {
             out.write((Boolean) value ? 0xf5 : 0xf4);
+        } else if (value instanceof Double || value instanceof Float) {
+            writeType(out, 7, 27);
+            long bits = Double.doubleToRawLongBits(((Number) value).doubleValue());
+            for (int shift = 56; shift >= 0; shift -= 8) out.write((int) (bits >>> shift));
         } else if (value instanceof Integer || value instanceof Long) {
             long number = ((Number) value).longValue();
             if (number >= 0) writeType(out, 0, number);
@@ -65,8 +92,15 @@ public final class CborMessageCodec {
             String[] values = (String[]) value;
             writeType(out, 4, values.length);
             for (String item : values) writeText(out, item);
-        } else if (value instanceof ArrayList<?>) {
-            ArrayList<?> values = (ArrayList<?>) value;
+        } else if (value instanceof Map) {
+            Map<?, ?> map = (Map<?, ?>) value;
+            writeType(out, 5, map.size());
+            for (Map.Entry<?, ?> entry : map.entrySet()) {
+                writeValue(out, entry.getKey());
+                writeValue(out, entry.getValue());
+            }
+        } else if (value instanceof List) {
+            List<?> values = (List<?>) value;
             writeType(out, 4, values.size());
             for (Object item : values) writeValue(out, item);
         } else {
@@ -106,6 +140,47 @@ public final class CborMessageCodec {
         }
 
         boolean done() { return offset == input.length; }
+
+        /**
+         * Decode one generic CBOR value. Maps become LinkedHashMap with
+         * natural keys, arrays become ArrayList, integers stay Long so
+         * numeric field tags keep a stable key type, and doubles decode to
+         * Double. Used by {@link Envelope#decode(byte[])}.
+         */
+        Object readGenericValue() {
+            Header header = header();
+            switch (header.major) {
+                case 0: return Long.valueOf(header.value);
+                case 1: return Long.valueOf(-1L - header.value);
+                case 2: return readBytes(header.value);
+                case 3: return readTextBytes(header.value);
+                case 4: {
+                    if (header.value > 128) throw new IllegalArgumentException("CBOR array exceeds limit");
+                    ArrayList<Object> values = new ArrayList<>((int) header.value);
+                    for (int i = 0; i < header.value; i++) values.add(readGenericValue());
+                    return values;
+                }
+                case 5: {
+                    if (header.value > 128) throw new IllegalArgumentException("CBOR map exceeds limit");
+                    LinkedHashMap<Object, Object> map = new LinkedHashMap<>();
+                    for (int i = 0; i < header.value; i++) {
+                        Object key = readGenericValue();
+                        map.put(key, readGenericValue());
+                    }
+                    return map;
+                }
+                case 7:
+                    if (header.additional == 20) return Boolean.FALSE;
+                    if (header.additional == 21) return Boolean.TRUE;
+                    if (header.additional == 22) return null;
+                    if (header.additional == 26)
+                        return Float.intBitsToFloat((int) header.value);
+                    if (header.additional == 27)
+                        return Double.longBitsToDouble(header.value);
+                    // fall through
+                default: throw new IllegalArgumentException("unsupported CBOR type");
+            }
+        }
 
         Bundle readBundle() {
             Header header = header();

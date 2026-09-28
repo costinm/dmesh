@@ -8,15 +8,16 @@ Linux, Android, and optional module services.
 The API defines device ownership across USB/UART, BLE, and Wi-Fi. Initial
 provisioning uses direct USB/UART or an encrypted BLE CoC; Wi-Fi provisioning
 is deferred. Pairing a
-virgin ESP32 starts with a targeted NAN pairing wake, then provisions one
+unpaired ESP32 starts with a targeted NAN pairing wake, then provisions one
 shared secret on the device and in the
 controller's private inventory; authenticated unpair must clear that secret
 and BLE pairing data on both sides. UART alone may unlock a device without
 the current secret. The current host `companion.pair` handlers only check an
 existing private pairing result and retain a bearer. `companion.unpair` currently
 releases a local bearer; neither handler completes the device ownership
-lifecycle. Firmware source now has a virgin-only NAN wake and distinct virgin
-BLE advertising, but it has not been deployed or tested end to end. Generic
+lifecycle. Firmware source now accepts the NAN pairing wake only while unpaired
+and uses distinct pairing-mode BLE advertising, but it has not been deployed or
+tested end to end. Generic
 `settings.set` refuses pairing secrets and the control-plane root; a dedicated
 handler that verifies encrypted CoC or direct UART ingress is still needed.
 The optional device-name and root-key pairing fields are schema only until

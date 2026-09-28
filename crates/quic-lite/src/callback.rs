@@ -823,6 +823,34 @@ mod tests {
         assert_eq!(streams.retained_bytes(), 0);
     }
 
+    /// Regression: an empty FIN retained behind unread bytes was never
+    /// finished by `resume_copying`, because a consumer's 0 for a zero-length
+    /// chunk was read as "not accepted". Every later resume re-delivered the
+    /// same FIN, and a no-std drain loop spun forever.
+    #[test]
+    fn retained_empty_fin_is_delivered_once() {
+        let mut streams = CallbackStreams::<Arc<Vec<u8>>>::new(2, 16);
+        let mut sink = PartialSink {
+            data: Vec::new(),
+            limit: 0,
+            finished: Vec::new(),
+        };
+        streams
+            .receive_copying_borrowed(4, b"abc", 0, false, || Arc::new(b"abc".to_vec()), &mut sink)
+            .unwrap();
+        streams
+            .receive_copying_borrowed(4, b"", 3, true, || Arc::new(Vec::new()), &mut sink)
+            .unwrap();
+        assert!(sink.data.is_empty());
+
+        sink.limit = usize::MAX;
+        assert_eq!(streams.resume_copying(4, &mut sink).unwrap(), 3);
+        assert_eq!(sink.data, b"abc");
+        assert_eq!(sink.finished, vec![4]);
+        assert_eq!(streams.resume_copying(4, &mut sink).unwrap(), 0);
+        assert_eq!(sink.finished, vec![4], "the FIN must not be delivered again");
+    }
+
     #[test]
     fn partial_consumer_resumes_in_order_across_an_out_of_order_tail() {
         let mut streams = CallbackStreams::<Arc<Vec<u8>>>::new(2, 16);

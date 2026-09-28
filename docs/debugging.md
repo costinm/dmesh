@@ -155,7 +155,7 @@ adb shell am start-foreground-service \
 ```
 
 `dmesh-msg:1` is a binary transport. Each record is a four-byte big-endian
-length followed by one bounded (currently 2 KiB) opaque message payload. SSH
+length followed by one opaque message payload (currently limited to 2 KiB). SSH
 does not parse CBOR or shell text; it forwards record bytes. JNI also passes
 only `byte[]`. `dmeshnative` maps those bytes to/from `MeshStream` and the typed
 Bundle API before an Android service sees them.
@@ -224,6 +224,21 @@ curl -sS -X POST \
   -d '{"id":3,"auto":true}'
 ```
 
+The same table the Android status screen shows is generated on the Rust side
+and served over HTTP by the `status` service:
+
+```sh
+curl -sS -X POST \
+  'http://127.0.0.1:18480/_m/mesh/services/status/call/status.text' \
+  -H 'content-type: application/json' \
+  -d '{"id":1}'
+```
+
+The admin landing page (`/_m/adm/`) renders the same text in its Status
+section. Bearer letters are `A` Wi-Fi Aware, `B` BLE, `W` Wi-Fi UDP6,
+`N` ESP-NOW, `U` USB; `P` marks paired companions (listed first) and `z`
+marks devices that announced a pending sleep.
+
 `transport.set.wake_target` is the sleepy device's STA or AP radio MAC, not
 its BLE address. The firmware admits a targeted NAN wake only when the MAC
 matches one of its local radio interfaces.
@@ -234,7 +249,7 @@ calls. A missing record ID is one-way submission; the observation methods are
 normally called with an ID and return a correlated result.
 
 SSH exec text and JSON Lines are not command APIs. `dmesh-msg:1` accepts a
-four-byte big-endian record length followed by one bounded opaque message record;
+four-byte big-endian record length followed by one size-limited opaque message record;
 `dmeshnative` maps the record to/from the typed Android Bundle adapter.
 
 ## app-dmesh control with dmesh-cli
@@ -257,7 +272,7 @@ no replacement. Do not send secret material through the generic HTTP gateway.
 ## Radio Scan Debugging
 
 Trigger BLE and Wi-Fi through the shared HTTP services, wait a few seconds,
-then pull the bounded message history:
+then pull the retained message history:
 
 ```sh
 adb -s SERIAL forward tcp:18480 tcp:18480
@@ -313,10 +328,9 @@ stops scan/advertising and terminates an active LE connection. `ble.connect`
 initiates a central GAP connection to `addr`, then opens the requested CoC
 channel. Read the peer address from its `ble.status` `local_addr` and
 `local_addr_type` fields; `addr` accepts colon-separated or compact hex.
-`ble.coc.send` transmits one record through the active CoC channel.
-Pairing is Just Works with persisted bonding. CoC records use the same 2-byte
-big-endian length framing as UART and enter the shared Main connection path
-with bearer ID `7`.
+`ble.coc.send` transmits one SDU through the active CoC channel. Pairing is Just
+Works with persisted bonding. Each CoC SDU is one opaque QUIC-lite packet and
+enters the shared Main connection path with bearer ID `7`.
 
 ## Two Android BLE/NAN live test
 

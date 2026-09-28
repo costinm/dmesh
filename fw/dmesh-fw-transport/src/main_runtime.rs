@@ -3176,55 +3176,6 @@ pub(crate) fn receive_tagged_raw_wifi(
     Some(alloc::vec::Vec::from(&response[..used]))
 }
 
-/// Handle one unmarked UART frame after the adapter has copied it unchanged.
-/// The shared direct endpoint owns long-header parsing and response framing,
-/// so UART has the same direct allowlist as NOW and UDP6. All application
-/// operations, including telemetry and raw-Wi-Fi, use normal QUIC streams.
-#[cfg(any())]
-pub(crate) fn receive_uart_raw_ingress(
-    _item: crate::shared_ingress_esp::IngressPacket,
-    packet: &[u8],
-) {
-    // This worker is the single UART raw ingress owner, so a fixed response
-    // scratch does not add a bearer queue. The physical adapter sees only
-    // complete PPP fields; `ConnectionlessMessage` retains the envelope.
-    static mut RESPONSE: [u8; crate::TRANSPORT_MTU] = [0; crate::TRANSPORT_MTU];
-    let response_scratch = unsafe {
-        // `addr_of_mut!` avoids manufacturing a mutable reference to the
-        // static. The UART raw worker is its sole owner, as documented above.
-        &mut *core::ptr::addr_of_mut!(RESPONSE)
-    };
-    let disposition = dmesh_server::direct::ConnectionlessMessage::receive(
-        packet,
-        response_scratch,
-        |payload, response| {
-            if let Some(announce) = dmesh_server::announce::decode_announce(payload) {
-                crate::wifi_raw_udp6_esp::record_connectionless_announce(announce, [0; 6]);
-                return dmesh_server::direct::ConnectionlessDisposition::Handled;
-            }
-            let mut response_len = 0;
-            if receive_direct_request(payload, |record| {
-                if record.len() <= response.len() {
-                    response[..record.len()].copy_from_slice(record);
-                    response_len = record.len();
-                }
-            }) {
-                if response_len == 0 {
-                    dmesh_server::direct::ConnectionlessDisposition::Handled
-                } else {
-                    dmesh_server::direct::ConnectionlessDisposition::Response(response_len)
-                }
-            } else {
-                dmesh_server::direct::ConnectionlessDisposition::NotHandled
-            }
-        },
-    );
-    if let dmesh_server::direct::ConnectionlessDisposition::Response(used) = disposition {
-        let response_scratch = unsafe { &*core::ptr::addr_of!(RESPONSE) };
-        let _ = crate::uart_esp::send_connectionless_packet(&response_scratch[..used]);
-    }
-}
-
 /// Fixed boot identity and lifecycle callback owned by Main. It is created
 /// once from `fw/main`; Core has no role selector or product policy branch.
 pub(crate) struct MainRuntimeService {

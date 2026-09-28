@@ -6,62 +6,60 @@ import android.app.job.JobScheduler;
 import android.app.job.JobService;
 import android.content.ComponentName;
 import android.content.Context;
-import android.os.SystemClock;
 import android.util.Log;
 
 import static android.app.job.JobScheduler.RESULT_SUCCESS;
 
 /**
- *  LMJob runs avery 15min (min interval allowed).
- *  Will run an update cycle.
+ * Persistent periodic watchdog for the DMesh foreground service.
  *
- * If the battery permissions/fg are not enabled this is the main discovery
- * interface: dmesh-service is foreground service, but doesn't hold wake 
- * locks and device may doze.
+ * Runs every 15 minutes (the minimum periodic interval). Each run
+ * reconciles the service: if the foreground service is not running, it is
+ * started again. The job is persisted, so it survives reboots as long as it
+ * was scheduled at least once before the reboot.
  */
 public class LMJob extends JobService {
     private static final String TAG = "DMJob";
+    public static final long DEFAULT_INTERVAL_MS = 15 * 60 * 1000;
 
-    static long lastStart;
-    static boolean scheduled = false;
-
+    /**
+     * (Re-)schedule the periodic reconciliation job. Safe to call any number
+     * of times: the previous job with the same id is replaced.
+     */
     public static void schedule(Context ctx, long interval) {
-        if (scheduled) {
+        JobScheduler js = (JobScheduler) ctx.getSystemService(Context.JOB_SCHEDULER_SERVICE);
+        if (js == null) {
             return;
         }
-        JobScheduler js = (JobScheduler) ctx.getSystemService(Context.JOB_SCHEDULER_SERVICE);
-        js.cancel(1);
-        Log.d(TAG, "Schedule periodic after " + interval/1000);
-
-        if (interval > 0) {
-            JobInfo.Builder b = new JobInfo.Builder(1, new ComponentName(
-                    ctx.getPackageName(), LMJob.class.getName()))
-                    .setPersisted(true)
-                    .setPeriodic(interval);
-
-            b.setRequiresBatteryNotLow(true);
-            JobInfo  job = b.build();
-            if (RESULT_SUCCESS == js.schedule(job)) {
-                scheduled = true;
-            }
+        if (interval <= 0) {
+            interval = DEFAULT_INTERVAL_MS;
+        }
+        interval = Math.max(interval, JobInfo.getMinPeriodMillis());
+        JobInfo job = new JobInfo.Builder(1, new ComponentName(
+                ctx.getPackageName(), LMJob.class.getName()))
+                .setPersisted(true)
+                .setPeriodic(interval)
+                .build();
+        if (RESULT_SUCCESS == js.schedule(job)) {
+            Log.d(TAG, "Scheduled periodic reconciliation after " + interval / 1000 + "s");
+        } else {
+            Log.w(TAG, "Failed to schedule periodic reconciliation");
         }
     }
 
     @Override
     public boolean onStartJob(final JobParameters params) {
-        lastStart = SystemClock.elapsedRealtime();
-
-        Runnable r = new Runnable() {
-            @Override
-            public void run() {
-                // Reconciliation belongs to Rust's durable update path. This
-                // legacy job is intentionally inert until Rust exposes it.
-                Log.d(TAG, "LMJob " + params.getJobId());
-                jobFinished(params, false);
-            }
-        };
-        new Thread(r).start();
-        return true;
+        Log.d(TAG, "LMJob " + params.getJobId());
+        // Reconcile: the persistent job must bring the foreground service
+        // back after a crash, a force stop of the old process, or a boot
+        // where the start broadcast was missed.
+        if (!DMService.isRunning()) {
+            DMService.startBackground(this);
+        }
+        // Defensive re-schedule: keeps the persisted job fresh even if it
+        // was cancelled externally.
+        schedule(this, DEFAULT_INTERVAL_MS);
+        return false;
     }
 
     public void onLowMemory() {
@@ -69,7 +67,7 @@ public class LMJob extends JobService {
     }
 
     public void onTrimMemory(int level) {
-        Log.d(TAG, "On Trim memory");
+        Log.d(TAG, "On Trim memory " + level);
     }
 
     @Override

@@ -28,7 +28,7 @@ flash, reset, logs, and NAN wake examples.
 
 # `discovery` API (6)
 
-## 9. `nodes` — Return the bounded cross-bearer observed-device inventory
+## 9. `nodes` — Return the retained cross-bearer observed-device inventory
 
 **UI:** default
 
@@ -52,7 +52,7 @@ optional bearer-local correlation address and is never a device identity.
 | 9 | `active_subscribe_rx` | `u32` | Active Subscribe receipts. |
 | 10 | `followup_rx` | `u32` | Follow-up receipts. |
 | 11 | `last_kind` | `u8` | Last discovery packet kind. |
-| 12 | `last_payload_len` | `u16` | Bounded length metadata; payload is not retained here. |
+| 12 | `last_payload_len` | `u16` | Payload length metadata; payload is not retained here. |
 | 13 | `last_payload_hash` | `u32` | Non-secret payload fingerprint. |
 | 14 | `unavailable_fields` | `u32` | Explicit complement of `available_fields`. |
 | 15 | `channel` | `u8` | Optional receiver-side capture channel. |
@@ -174,10 +174,10 @@ adapter; `idle_ms` and `charging_ms` describe the current interval, while
 
 # `companion` API (209)
 
-Pairing makes a virgin ESP32 a companion of one Linux or Android controller.
+Pairing makes an unpaired ESP32 a companion of one Linux or Android controller.
 Every pairing attempt first sends `nan.pair_wakeup` through a nearby observer,
 even when the provisioning exchange will use USB, BLE, or Wi-Fi. A sleepy
-virgin device may then open a bounded pairing window. A device that already
+unpaired device may then open a time-limited pairing window. A device that already
 has `sec:key` ignores this invitation.
 `kind` selects the bearer used for this operation. Initial provisioning is
 currently limited to direct UART/USB and encrypted BLE CoC. It does
@@ -202,13 +202,13 @@ VIP6 bytes as 16 lowercase hexadecimal digits plus `.json`;
 the old catalog inventory is not pairing authority. The secret must not appear in normal
 discovery, logs, HTTP responses, or command history.
 
-BLE advertisements use a distinct DMesh pairing service while virgin. Once
+BLE advertisements use a distinct DMesh pairing service while unpaired. Once
 paired they use the operational service and may include a short owner hint,
 such as the last four bytes of the owner's VIP, to help a controller match its
 private inventory. The hint is public metadata, not authorization; signed
 identity and shared-secret proof remain required.
 
-## 1. `pair` — Provision a virgin companion
+## 1. `pair` — Provision an unpaired companion
 
 For UART, `vip6` must match a signed discovery check; physical access is the
 trust boundary, as with esp-tool, so no link encryption is required. BLE uses
@@ -246,13 +246,13 @@ mesh lmesh companion.unpair --kind=uart --id=/dev/ttyUSB0
 | 6 | `name` | `string` | Optional new device name, persisted in NVS during pairing. |
 | 7 | `root_public_key_b64` | `string` | Optional base64 compressed P-256 control-plane root public key (33 bytes). |
 
-## 2. `unpair` — Reset a companion to virgin state
+## 2. `unpair` — Reset a companion to unpaired state
 
 `kind` names the bearer carrying this operation; it does not identify the
 bearer on which pairing happened. Unpair removes its shared secret and
 BLE pairing data on the ESP32, removes its owned-device entry and BLE bond on
 Linux or Android, and releases its bearer. Afterwards the ESP32 behaves like
-a virgin device. Over Wi-Fi or BLE, unpair requires proof of the current
+an unpaired device. Over Wi-Fi or BLE, unpair requires proof of the current
 shared secret and must reject devices owned by another controller. UART alone
 may unlock a device without that proof, including one paired to someone else.
 Physical UART access already permits Linux to flash the ESP32; future eFuse
@@ -265,6 +265,27 @@ request that arrives over Wi-Fi or BLE, even if its `kind` field says `uart`.
 |---:|---|---|---|
 | 1 | `kind` | `string` | Bearer carrying the unpair request. |
 | 2 | `id` | `string` | Target identifier on that bearer. |
+
+# `provision` API (210)
+
+This device-side internal API is used after the targeted NAN pairing wake.
+It accepts direct UART/USB or an encrypted BLE CoC, and rejects Wi-Fi, NAN,
+unencrypted CoC, and relayed requests. The device commits name and root first,
+then the secret last. The caller verifies the correlated result and durably
+saves the signed identity, name, root and secret before reporting completion.
+Credential bytes are never logged.
+
+## 1. `install` — Commit an unpaired device's companion credentials
+
+**Visibility:** private
+
+### Request
+
+| Tag | Field | Type | Description |
+|---:|---|---|---|
+| 1 | `name` | `string` | Name to persist in NVS. |
+| 2 | `root_public_key` | `bytes` | Compressed P-256 control-plane root, 33 bytes. |
+| 3 | `secret` | `bytes` | Newly generated shared secret, 32 bytes. |
 
 # `log` API (208)
 
@@ -280,7 +301,7 @@ frames remain unchanged. `log-watch` remains the device pull interface.
 
 | Tag | Field | Type | Description |
 |---:|---|---|---|
-| 1 | `text` | `string` | One bounded UTF-8 log line. |
+| 1 | `text` | `string` | One size-limited UTF-8 log line. |
 | 2 | `source` | `string` | Observer-local bearer path or name. |
 | 3 | `timestamp_ms` | `u64` | Observer receipt time. |
 
@@ -339,7 +360,7 @@ dmesh-cli DEVICE telemetry.nan_status
 |---:|---|---|---|
 | 1 | `to` | `string` | Target radio MAC address. |
 
-## 12. `pair_wakeup` — Invite only a virgin device into a bounded pairing window
+## 12. `pair_wakeup` — Invite only an unpaired device into a time-limited pairing window
 
 An observer sends this targeted NAN request before pairing over any bearer.
 The device accepts it only while `sec:key` is empty; an owned device ignores
@@ -372,7 +393,7 @@ mesh lmesh wifi.mgmt.capture --iface=wlan0 --channel=6 --capture_ms=200
 
 # `lmesh` API (4)
 
-## 30. `probe` — Run a bounded QUIC probe through the selected Linux radio path
+## 30. `probe` — Run a time-limited QUIC probe through the selected Linux radio path
 
 **UI:** advanced
 
@@ -400,7 +421,7 @@ mesh lmesh wifi.mgmt.capture --iface=wlan0 --channel=6 --capture_ms=200
 | 2 | `destination` | `string` | destination parameter. |
 | 3 | `payload` | `string` | payload parameter. |
 
-## 10. `messages.history` — Read bounded local message history
+## 10. `messages.history` — Read retained local message history
 
 **UI:** advanced
 
@@ -411,53 +432,6 @@ mesh lmesh wifi.mgmt.capture --iface=wlan0 --channel=6 --capture_ms=200
 | 1 | `keys` | `string` | keys parameter. |
 | 2 | `limit` | `u64` | limit parameter. |
 
-
-# `relay` API (220)
-
-## 30. `connect` — relay.connect on the local Linux mesh daemon
-
-**UI:** advanced
-
-### Request
-
-| Tag | Field | Type | Description |
-|---:|---|---|---|
-| 1 | `relay_endpoint` | `string` | relay endpoint parameter. |
-| 2 | `next_hop_mac` | `string` | next hop mac parameter. |
-
-## 31. `open` — relay.open on the local Linux mesh daemon
-
-**UI:** advanced
-
-### Request
-
-| Tag | Field | Type | Description |
-|---:|---|---|---|
-| 1 | `relay_endpoint` | `string` | relay endpoint parameter. |
-
-## 32. `endpoint.status` — relay.endpoint.status on the local Linux mesh daemon
-
-**UI:** advanced
-
-### Request
-
-| Tag | Field | Type | Description |
-|---:|---|---|---|
-| 1 | `relay_endpoint` | `string` | relay endpoint parameter. |
-
-## 33. `close` — relay.close on the local Linux mesh daemon
-
-**UI:** advanced
-
-### Request
-
-| Tag | Field | Type | Description |
-|---:|---|---|---|
-| 1 | `relay_endpoint` | `string` | relay endpoint parameter. |
-
-## 34. `status` — relay.status on the local Linux mesh daemon
-
-**UI:** advanced
 
 # `link` API (221)
 
@@ -631,50 +605,6 @@ mesh lmesh wifi.mgmt.capture --iface=wlan0 --channel=6 --capture_ms=200
 | 4 | `max_frames` | `u64` | max frames parameter. |
 | 5 | `active` | `bool` | active parameter. |
 
-# `uart` API (206)
-
-Linux USB serial ports are listed without opening them. `discover` briefly
-opens a selected port to request its signed identity and VIP, then closes it.
-`companion.pair` retains the port as a companion bearer only after that check.
-Removal releases ownership. QUIC-lite streams use complete PPP framed datagrams;
-connectionless checks use QUIC-lite long packets. Boot text becomes `log.record`.
-
-```sh
-mesh lmesh uart.devices
-mesh lmesh uart.discover --path=/dev/serial/by-id/DEVICE
-mesh lmesh companion.pair --kind=uart --id=/dev/serial/by-id/DEVICE --vip6=fd00::1234
-mesh lmesh uart.baud --baud=921600
-mesh lmesh uart.reset
-mesh lmesh companion.unpair --kind=uart --id=/dev/serial/by-id/DEVICE
-```
-
-## 1. `status` — Show the paired UART companion, visible port count, and modem lines
-
-The paired status reports DTR and RTS output levels plus the read-only CTS
-input when the adapter supports modem-line inspection.
-
-## 2. `devices` — List USB serial ports and observed VIPs without opening them
-
-## 3. `discover` — Temporarily check one or all listed ports for signed identity
-
-### Request
-
-| Tag | Field | Type | Description |
-|---:|---|---|---|
-| 1 | `path` | `string` | Optional listed port path; omission checks all. |
-| 2 | `baud` | `u32` | Optional baud rate for the temporary check. |
-| 3 | `timeout_ms` | `u64` | Per-port check timeout. |
-
-## 4. `baud` — Set the paired UART port baud rate
-
-### Request
-
-| Tag | Field | Type | Description |
-|---:|---|---|---|
-| 1 | `baud` | `u32` | Supported baud rate. |
-
-## 5. `reset` — Pulse the paired UART reset control lines
-
 <!-- dmesh-api:end -->
 
 <!-- dmesh-api:android -->
@@ -687,7 +617,7 @@ Android BLE adapter operations. The service uses tagged CBOR; the Android framew
 
 **UI:** default
 
-## 2. `scan` — Start a bounded BLE scan
+## 2. `scan` — Start a time-limited BLE scan
 
 **UI:** default
 
@@ -729,7 +659,7 @@ companion API so the same method applies to BLE, UART, and Wi-Fi.
 
 # `radio` API (202)
 
-## 1. `history` — Read bounded local radio event history
+## 1. `history` — Read retained local radio event history
 
 **UI:** default
 
@@ -767,13 +697,21 @@ companion API so the same method applies to BLE, UART, and Wi-Fi.
 
 **UI:** default
 
+## 5. `discover` — Read the attached device's signed identity
+
+Sends a tagged discovery request over the open USB QUIC bearer. The response
+must carry a valid device signature. This is a read-only identity check and
+does not pair or claim the device.
+
+**UI:** default
+
 # `wifi` API (205)
 
 ## 1. `status` — Report local Wi-Fi controller and NAN state
 
 **UI:** default
 
-## 2. `scan` — Request a bounded platform Wi-Fi scan
+## 2. `scan` — Request a time-limited platform Wi-Fi scan
 
 **UI:** default
 
@@ -792,24 +730,24 @@ The component and method columns are the numeric CBOR tags.
 | 101 | 2 | `runtime.reset` | Reset the runtime diagnostics counters. |
 | 102 | 1 | `power.snapshot` | Read CPU frequency, power management, and sleep counters. |
 | 103 | 1 | `memory.snapshot` | Read packet pool, worker stack, and internal memory metrics. |
-| 8 | 1 | `probe` | Run a bounded QUIC-lite transfer and report throughput. |
+| 8 | 1 | `probe` | Run a time-limited QUIC-lite transfer and report throughput. |
 | 10 | 2 | `object.flash` | Transfer a verified firmware object into a selected durable slot. |
-| 1000 | 3 | `module.stop` | Request bounded module shutdown before flash work. |
+| 1000 | 3 | `module.stop` | Request module shutdown with a deadline before flash work. |
 | 11 | 1 | `boot.recovery` | Request a Main to Recovery handoff. |
 | 12 | 1 | `firmware.identity` | Read the booted firmware identity after a handoff or update. |
 | 104 | 80 | `ble.start` | Start the BLE companion radio. |
 | 104 | 81 | `ble.stop` | Stop the BLE companion radio. |
-| 104 | 82 | `ble.scan` | Start a bounded BLE scan. |
+| 104 | 82 | `ble.scan` | Start a time-limited BLE scan. |
 | 104 | 83 | `ble.status` | Read BLE adapter and link state. |
 | 104 | 84 | `ble.scan_stop` | Stop an active BLE scan. |
 | 104 | 85 | `ble.connect` | Connect to a selected BLE peer. |
-| 104 | 86 | `ble.coc.send` | Send a payload over a BLE L2CAP channel. |
+| 104 | 86 | `ble.coc.send` | Send one payload as one BLE L2CAP CoC SDU. |
 | 9 | 1 | `status` | Read compact device health and application state. |
 | 9 | 2 | `services` | List registered service handlers. |
 | 9 | 3 | `metrics` | Read general transport and service counters. |
-| 9 | 4 | `events` | Read bounded event history. |
-| 9 | 5 | `log-watch` | Read bounded structured log records. |
-| 4 | 71 | `radio.tx` | Submit one bounded raw radio frame for diagnostics. |
+| 9 | 4 | `events` | Read retained event history. |
+| 9 | 5 | `log-watch` | Read retained structured log records. |
+| 4 | 71 | `radio.tx` | Submit one size-limited raw radio frame for diagnostics. |
 | 4 | 72 | `radio.control` | Adjust volatile radio diagnostic controls. |
 | 4 | 73 | `radio.snapshot` | Read radio state and counters. |
 | 4 | 77 | `wifi.scan` | Scan or read retained Wi-Fi results. |
@@ -951,6 +889,8 @@ are described by the method purpose above.
 | 4 | `psm` | `u16` | — |
 
 ### `ble.coc.send` request fields
+
+The payload is the complete CoC SDU. It has no bearer-local length prefix.
 
 | Tag | Field | Type | Values |
 |---:|---|---|---|
@@ -1124,12 +1064,12 @@ in field `6` as `{1: ok, 2: loader_result_abs}`.
 |---:|---|---:|---|
 | 1000 | module | 1 | Refresh and return loader header/status. |
 | 1000 | module | 2 | Initialize the native module loader. |
-| 1000 | module | 3 | Request a bounded loader stop before flash work. |
+| 1000 | module | 3 | Request a loader stop with a deadline before flash work. |
 | 1001 | hello | 4 | Start module service tag 46. |
 | 1002 | lora | 4 | Configure and start/command module service tag 43. |
 | 1003 | hardware | 4 | Start module service tag 45. |
 
-For `RUN` (method 4), field `10` is passed unchanged as the bounded module
+For `RUN` (method 4), field `10` is passed unchanged as the size-limited module
 payload. The loader derives flash placement from its service tag and validates
 the DMOD header; callers never supply a flash offset.
 
@@ -1188,7 +1128,7 @@ The first item is `operation`; the remaining items depend on that operation.
 No text keys or text values are required.
 
 The array is the body of QUIC-lite stream service tag `45`. The immediate
-stream response is CBOR `[0]` when the bounded Main-owned module queue accepts
+stream response is CBOR `[0]` when the fixed-capacity Main-owned module queue accepts
 the request; execution and samples are asynchronous module events. `[0]` is
 not a completed-operation result.
 
@@ -1313,7 +1253,7 @@ errors are events, not blocking command responses.
 LoRa and FSK wire payloads are opaque to Main. Chip-specific IRQ, FIFO, BUSY,
 reset, and continuous-RX behavior remain module-owned.
 
-The QUIC-lite service tag is `43`. Main acknowledges a bounded accepted stream
+The QUIC-lite service tag is `43`. Main acknowledges an accepted stream
 request with CBOR `[0]`, then invokes the module from its serialized owner
 loop. RX/TX completion remains an asynchronous module event; bearer tasks do
 not wait for radio work.

@@ -92,20 +92,20 @@ fn copy_into_pool(
     writer.commit(bytes.len()).unwrap()
 }
 
-/// Bug: a full receive queue on the copying `NoStdRuntime::progress` path
-/// loses stream data permanently.
+/// Regression: a slow consumer on the copying `NoStdRuntime::progress` path
+/// must receive the complete stream.
 ///
-/// `mux` commits the packet to transport state (its packet number enters
-/// the ACK ranges) before the application callback runs. When the
-/// `next_stream_chunk` queue is full, the callback returns `BufferTooSmall`,
-/// `CallbackStreams` resets the stream locally, and `progress` returns an
-/// error. The packet is still ACKed, so the sender never retransmits it, and
-/// the peer is not told that the stream was reset. The transfer then stalls
-/// with a gap forever. A full queue must either leave the packet
-/// unacknowledged (so it is retransmitted) or stop granting credit, never
-/// ACK and drop.
+/// Earlier failures, all now fixed:
+/// - a full `next_stream_chunk` queue made the callback fail after the packet
+///   had been committed (ACKed), so data the peer would never resend was
+///   dropped; the callback now accepts 0 bytes and QUIC-lite retains them
+///   without granting credit;
+/// - retention was capped at 4 KiB while the advertised receive window was
+///   256 KiB, so retained bytes overflowed after the ACK; retention is now
+///   sized from the advertised `max_data` window;
+/// - a retained empty FIN was re-delivered on every resume, spinning the
+///   drain loop.
 #[test]
-#[ignore = "known bug: committed packets beyond retained receive capacity are still lost"]
 fn slow_queue_consumer_receives_complete_stream() {
     let (client_bearer, client_context, client_sent) = Capture::<Pool>::new("client");
     let mut client = NoStdRuntime::new(

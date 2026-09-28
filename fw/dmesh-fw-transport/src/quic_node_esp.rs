@@ -9,10 +9,10 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use quic_lite::{
-    BearerContext, BearerInfo, BearerName, EgressSubmission, OwnedPacket, PacketBearer,
-    PacketEgress, PacketMeta, PacketSubmitError, PeerL2Address, QuicNodeEgressError, QuicStream,
     nostd::NoStdRuntime,
     packet_pool::{PacketPool, PoolBufferLease},
+    BearerContext, BearerInfo, BearerName, EgressSubmission, OwnedPacket, PacketBearer,
+    PacketEgress, PacketMeta, PacketSubmitError, PeerL2Address, QuicNodeEgressError, QuicStream,
 };
 
 const PACKETS: usize = 8;

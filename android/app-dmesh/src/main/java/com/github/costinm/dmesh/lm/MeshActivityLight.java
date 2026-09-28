@@ -6,9 +6,12 @@ import android.app.Activity;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.graphics.Typeface;
 import android.hardware.usb.UsbDevice;
 import android.hardware.usb.UsbManager;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Log;
 import android.view.Menu;
 import android.view.MenuItem;
@@ -66,6 +69,14 @@ public class MeshActivityLight extends Activity {
     private TextView msgText;
     private Intent pendingStartupIntent;
     private boolean pendingVpnStart;
+    private final Handler refreshHandler = new Handler(Looper.getMainLooper());
+    private final Runnable refreshLoop = new Runnable() {
+        @Override public void run() {
+            refreshStatus();
+            refreshHandler.postDelayed(this, STATUS_REFRESH_MS);
+        }
+    };
+    private static final long STATUS_REFRESH_MS = 5000;
 
     static List<String> checkPermissions(Context ctx) {
         List<String> missing = new ArrayList<>();
@@ -92,8 +103,12 @@ public class MeshActivityLight extends Activity {
         conText = findViewById(R.id.con_text);
         ifText = findViewById(R.id.if_text);
         msgText = findViewById(R.id.msg_text);
+        // The Rust status table is column-aligned; it needs a fixed-width font.
+        conText.setTypeface(Typeface.MONOSPACE);
+        ifText.setTypeface(Typeface.MONOSPACE);
         ifText.setOnClickListener(v -> updateInterfaces());
-        msgText.setText("Open Web for DMesh status and controls");
+        msgText.setText("Tap for DMesh web status and controls");
+        msgText.setOnClickListener(v -> openWebAdmin());
 
         List<String> missing = checkPermissions(getApplicationContext());
         if (!missing.isEmpty()) {
@@ -106,6 +121,19 @@ public class MeshActivityLight extends Activity {
         startDMeshService();
         refreshStatus();
         handleIntent(getIntent());
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        refreshStatus();
+        refreshHandler.postDelayed(refreshLoop, STATUS_REFRESH_MS);
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        refreshHandler.removeCallbacks(refreshLoop);
     }
 
     @Override

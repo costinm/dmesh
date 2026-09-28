@@ -134,6 +134,9 @@ build_one() {
         "$DMESH_REPO/fw/mod_lora/include/dmesh_lora_abi.h" \
         "$DMESH_REPO/fw/main/native/dmesh_uart_log/CMakeLists.txt" \
         "$DMESH_REPO/fw/main/native/dmesh_uart_log/dmesh_uart_log.c" \
+        "$DMESH_REPO/fw/ble/native/dmesh_nimble/CMakeLists.txt" \
+        "$DMESH_REPO/fw/ble/native/dmesh_nimble/dmesh_nimble.c" \
+        "$DMESH_REPO/fw/ble/native/dmesh_nimble/include/dmesh_nimble.h" \
         | sha256sum | awk '{print $1}')"
     local sdk_id="cache-v3:${IDF_PATH}:$(git -C "$IDF_PATH" describe --tags --always 2>/dev/null || true):${sdk_defaults_digest}"
     if [[ ! -f "$sdk_stamp" || "$(cat "$sdk_stamp")" != "$sdk_id" ]]; then

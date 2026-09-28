@@ -37,9 +37,13 @@ public class NotificationHandler {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             createNotificationChannel();
         }
-        Intent i = new Intent();
-        i.setComponent(new ComponentName(ctx.getPackageName(), ctx.getPackageName() + ".SetupActivity"));
-        pi = PendingIntent.getActivity(ctx, 1, i, PendingIntent.FLAG_MUTABLE);
+        // Tapping the notification opens the lightweight status screen.
+        // The PendingIntent must be immutable: mutable intents that start
+        // activities are rejected on newer Android.
+        Intent i = new Intent(ctx, MeshActivityLight.class)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        pi = PendingIntent.getActivity(ctx, 2, i,
+                PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
 
         brIntent = new Intent();
         brIntent.setComponent(new ComponentName(ctx.getPackageName(), ctx.getPackageName() + ".DMService$Receiver"));
@@ -47,7 +51,8 @@ public class NotificationHandler {
         i = new Intent();
         i.setComponent(new ComponentName(ctx.getPackageName(), ctx.getPackageName() + ".DMService"))
                 .putExtra(":uri", "sync");
-        syncPI = PendingIntent.getService(ctx, 1, i, PendingIntent.FLAG_MUTABLE);
+        syncPI = PendingIntent.getService(ctx, 1, i,
+                PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
 
     }
 
