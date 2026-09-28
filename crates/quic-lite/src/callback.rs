@@ -1,8 +1,12 @@
 //! Ordered packet-backed stream delivery.
 //!
-//! The bearer owns the received datagram lease.  This module keeps ranges as
+//! The bearer owns the received packet lease.  This module keeps ranges as
 //! `(lease, range)` references and exposes either an asynchronous completion
 //! API or a synchronous copying callback over the same ordering state.
+//! Currently callbacks are ordered, so the chunk at `offset == 0` is also the
+//! new-stream notification. A future explicitly out-of-order delivery mode may
+//! require a separate lifecycle signal, but the ordered API does not pay for
+//! that extra callback.
 
 use alloc::{sync::Arc, vec::Vec};
 use core::ops::Range;
@@ -10,6 +14,7 @@ use core::ops::Range;
 /// A reference-counted or pool-backed received packet. Cloning this value must
 /// retain the packet, not copy its payload.
 pub trait PacketLease: Clone {
+    /// Borrow the complete immutable storage retained by this lease.
     fn bytes(&self) -> &[u8];
 }
 
@@ -26,35 +31,57 @@ impl PacketLease for Arc<Vec<u8>> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// One ordered stream range whose packet lease remains owned by the receiver.
+///
+/// This is public for allocation-sensitive no-std consumers that defer
+/// processing without copying packet bytes; host Tokio users receive owned
+/// stream chunks from the higher-level API instead.
 pub struct StreamChunk<P: PacketLease> {
+    /// QUIC stream identifier within the association.
     pub stream: u64,
+    /// Byte offset of the first byte in this chunk.
     pub offset: u64,
+    /// Whether this range reaches the peer's final stream size.
     pub end: bool,
+    /// Opaque token supplied back through [`CallbackStreams::done`].
     pub delivery_id: u64,
+    /// Retained packet storage containing this stream range.
     pub packet: P,
+    /// Byte range within `packet` containing application data.
     pub range: Range<usize>,
 }
 
 impl<P: PacketLease> StreamChunk<P> {
+    /// Borrow only the application bytes selected by this chunk.
     pub fn bytes(&self) -> &[u8] {
         &self.packet.bytes()[self.range.clone()]
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Completion token for a leased stream chunk.
 pub struct StreamDone {
+    /// Stream whose outstanding chunk has finished processing.
     pub stream: u64,
+    /// Exact delivery generation being completed.
     pub delivery_id: u64,
 }
 
+/// Deferred, zero-copy stream delivery callbacks for no-std integrations.
 pub trait StreamEvents<P: PacketLease> {
+    /// Deliver the next ordered retained chunk.
     fn stream_chunk(&mut self, chunk: StreamChunk<P>);
+    /// Report that ordered delivery reached FIN.
     fn stream_finished(&mut self, stream: u64);
+    /// Report that delivery terminated with an application error code.
     fn stream_reset(&mut self, stream: u64, code: u64);
 }
 
-pub trait CopyingStreamEvents {
+/// Synchronous stream consumer which may copy or process bytes immediately.
+pub(crate) trait CopyingStreamEvents {
+    /// Application callback failure type.
     type Error;
+    /// Consume bytes and return the number accepted from the front of `bytes`.
     fn stream_chunk(
         &mut self,
         stream: u64,
@@ -62,22 +89,38 @@ pub trait CopyingStreamEvents {
         end: bool,
         bytes: &[u8],
     ) -> Result<usize, Self::Error>;
+    /// Report successful ordered completion; default is no action.
     fn stream_finished(&mut self, _stream: u64) {}
+    /// Report a stream reset; default is no action.
     fn stream_reset(&mut self, _stream: u64, _code: u64) {}
 }
 
+/// Stream identity used for one connectionless direct long packet.
+///
+/// Ordinary QUIC stream IDs are at most 2^62-1, so this value cannot collide
+/// with an associated stream. Each direct packet is delivered synchronously as
+/// a fresh transient stream: one offset-zero chunk with FIN, then finished.
+pub(crate) const DIRECT_MESSAGE_STREAM_ID: u64 = u64::MAX;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Invalid ordering, completion, or storage state in callback delivery.
 pub enum CallbackError {
+    /// A new range overlaps retained data without being an exact duplicate.
     InvalidOverlap,
+    /// Conflicting FIN ranges imply different final sizes.
     InvalidFin,
+    /// Completion does not match the currently outstanding chunk.
     InvalidCompletion,
+    /// Configured stream or retained-byte capacity is exhausted.
     Capacity,
-    Reset,
 }
 
 #[derive(Debug)]
-pub enum CopyingError<E> {
+/// Distinguishes callback failure from QUIC-lite delivery-state failure.
+pub(crate) enum CopyingError<E> {
+    /// Ordered delivery state rejected the operation.
     Transport(CallbackError),
+    /// The application callback returned its own error.
     Callback(E),
 }
 
@@ -246,7 +289,7 @@ impl<P: PacketLease> OrderedStream<P> {
 }
 
 /// Bounded ordered delivery state for one connection. The transport calls
-/// `receive` after validating the complete datagram.
+/// `receive` after validating the complete packet.
 #[derive(Clone)]
 pub struct CallbackStreams<P: PacketLease> {
     streams: Vec<OrderedStream<P>>,
@@ -256,6 +299,7 @@ pub struct CallbackStreams<P: PacketLease> {
 }
 
 impl<P: PacketLease> CallbackStreams<P> {
+    /// Create ordered delivery state with explicit stream and retained-byte limits.
     pub fn new(max_streams: usize, max_retained_bytes: usize) -> Self {
         Self {
             streams: Vec::new(),
@@ -279,6 +323,7 @@ impl<P: PacketLease> CallbackStreams<P> {
         Ok(self.streams.last_mut().unwrap())
     }
 
+    /// Insert one retained packet range and emit the next ordered leased chunk.
     pub fn receive_leased<E: StreamEvents<P>>(
         &mut self,
         stream: u64,
@@ -316,7 +361,8 @@ impl<P: PacketLease> CallbackStreams<P> {
         Ok(())
     }
 
-    pub fn receive_copying<E: CopyingStreamEvents>(
+    /// Insert one packet range and synchronously drain available ordered bytes.
+    pub(crate) fn receive_copying<E: CopyingStreamEvents>(
         &mut self,
         stream: u64,
         packet: P,
@@ -370,7 +416,7 @@ impl<P: PacketLease> CallbackStreams<P> {
     /// packet beyond this callback. This keeps synchronous embedded users out
     /// of the allocator on their normal receive path while retaining the same
     /// bounded reordering behaviour as `receive_copying`.
-    pub fn receive_copying_borrowed<E, F>(
+    pub(crate) fn receive_copying_borrowed<E, F>(
         &mut self,
         stream: u64,
         bytes: &[u8],
@@ -443,7 +489,7 @@ impl<P: PacketLease> CallbackStreams<P> {
     /// ready.  A consumer that stopped part way through a borrowed packet
     /// leaves only its unread suffix here; this method redelivers that suffix
     /// without inventing a dispatcher- or handler-specific packet queue.
-    pub fn resume_copying<E: CopyingStreamEvents>(
+    pub(crate) fn resume_copying<E: CopyingStreamEvents>(
         &mut self,
         stream: u64,
         events: &mut E,
@@ -495,6 +541,7 @@ impl<P: PacketLease> CallbackStreams<P> {
         }
     }
 
+    /// Release one outstanding leased chunk and deliver subsequent ordered data.
     pub fn done<E: StreamEvents<P>>(
         &mut self,
         completion: StreamDone,
@@ -523,6 +570,7 @@ impl<P: PacketLease> CallbackStreams<P> {
         Ok(())
     }
 
+    /// Return the completion token for the chunk currently held by an application.
     pub fn outstanding(&self, stream: u64) -> Option<StreamDone> {
         self.streams
             .iter()
@@ -530,6 +578,7 @@ impl<P: PacketLease> CallbackStreams<P> {
             .and_then(|state| state.outstanding.as_ref().map(|value| value.0))
     }
 
+    /// Number of streams which have not reached FIN or reset.
     pub fn stream_count(&self) -> usize {
         self.streams
             .iter()
@@ -537,10 +586,12 @@ impl<P: PacketLease> CallbackStreams<P> {
             .count()
     }
 
+    /// Packet-backed application bytes retained for gaps or deferred completion.
     pub fn retained_bytes(&self) -> usize {
         self.retained_bytes
     }
 
+    /// Drop retained state for one stream and notify the application.
     pub fn reset<E: StreamEvents<P>>(&mut self, stream: u64, code: u64, events: &mut E) {
         if let Some(state) = self.streams.iter_mut().find(|state| state.id == stream) {
             let retained = state
@@ -828,7 +879,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut streams = CallbackStreams::<Arc<Vec<u8>>>::new(2, source.len());
         let mut sink = CopySink::default();
-        // Model a lost first datagram followed by one repaired fresh-number
+        // Model a lost first packet followed by one repaired fresh-number
         // copy. The callback layer must replay the retained tail exactly once
         // and preserve every byte; object/flash parsing is intentionally not
         // involved in this transport regression.
@@ -936,7 +987,7 @@ mod tests {
         // This models a fresh-number transport retransmission of the same
         // stream range after the receiver's bounded reassembly is full. Its
         // packet-number/header encoding may put the payload at a different
-        // offset in the replacement datagram.
+        // offset in the replacement packet.
         streams
             .receive_copying(4, Arc::new(b"htail".to_vec()), 4, 1..5, false, &mut sink)
             .unwrap();

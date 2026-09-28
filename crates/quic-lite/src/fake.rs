@@ -1,266 +1,140 @@
-//! Deterministic local datagram bearer for conformance and fault testing.
-//! It transports opaque datagrams; stream operations are built by the caller.
+//! In-memory packet bearer for public `QuicNode` tests.
+//!
+//! It uses the same attach, ingress, submission, and completion contracts as
+//! physical bearers and does not expose a second connection or stream driver.
 
+#[cfg(test)]
 use std::collections::VecDeque;
-use std::vec;
+use std::sync::{Arc, Mutex};
 use std::vec::Vec;
 
-use crate::mux::StreamMux;
-use crate::{ConnectionId, ConnectionLimits, Error, Role};
-
-/// Test-harness-only link between deterministic packet queues and the real
-/// mux/endpoint receive APIs. This is intentionally private: production
-/// adapters use the borrowed association/driver interfaces documented at the
-/// crate root, not this copying poll contract. Scripted retries below do not
-/// test production loss scheduling, physical readiness, or multipath fallback.
-trait DatagramBearer {
-    type Error;
-
-    /// Enqueue an opaque packet in the simulated link at the supplied tick.
-    fn send_datagram(&mut self, now: u64, payload: &[u8]) -> Result<(), Self::Error>;
-
-    /// Copy at most one simulated packet into scratch storage for the harness.
-    /// Production receive does not require this extra ownership-transfer copy.
-    fn receive_datagram(&mut self, now: u64, out: &mut [u8]) -> Result<Option<usize>, Self::Error>;
-}
-
-const TEST_SERVICE_ECHO: u8 = 2;
-const TEST_SERVICE_STREAM: u8 = 4;
-const TEST_SERVICE_METRICS: u8 = 6;
-const TEST_SERVICE_EVENTS: u8 = 7;
 #[cfg(test)]
-use self::{
-    TEST_SERVICE_ECHO as SERVICE_ECHO, TEST_SERVICE_EVENTS as SERVICE_EVENTS,
-    TEST_SERVICE_METRICS as SERVICE_METRICS, TEST_SERVICE_STREAM as SERVICE_STREAM,
+use crate::bearer::OwnedPacket;
+use crate::bearer::{
+    BearerContext, BearerInfo, BearerName, EgressSubmission, PacketBearer, PacketEgress,
+    PacketPool, PacketSendOutcome, PacketSubmitError, PacketWriter, PeerL2Address,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StreamOperation {
-    Echo,
-    Metrics,
-    Events,
-    Registry,
+/// Complete in-memory bearer for public `QuicNode` API tests.
+pub struct FakePacketBearer<P: PacketPool + 'static> {
+    info: BearerInfo,
+    sent: Arc<Mutex<Vec<Vec<u8>>>>,
+    attached: bool,
+    pair: Option<(Arc<Mutex<FakePair<P>>>, usize)>,
+    pool: core::marker::PhantomData<fn() -> P>,
 }
 
-impl StreamOperation {
-    fn service(self) -> u8 {
-        match self {
-            Self::Echo => TEST_SERVICE_ECHO,
-            Self::Metrics => TEST_SERVICE_METRICS,
-            Self::Events => TEST_SERVICE_EVENTS,
-            Self::Registry => TEST_SERVICE_STREAM,
+struct FakePair<P: PacketPool + 'static> {
+    contexts: [Option<BearerContext<P>>; 2],
+}
+
+impl<P: PacketPool + 'static> FakePacketBearer<P> {
+    /// Create an unattached in-memory bearer with the supplied registration name.
+    ///
+    /// This is public only for external conformance and stress tests; production
+    /// applications should register a physical bearer implementation.
+    pub fn new(name: BearerName) -> Self {
+        Self {
+            info: BearerInfo {
+                name,
+                max_packet_size: crate::DEFAULT_MAX_PACKET_SIZE,
+                prefix_required: 0,
+                suffix_required: 0,
+                requires_packet_encryption: false,
+                secure_link: true,
+                nominal_bitrate_bps: 0,
+                local_mac: None,
+            },
+            sent: Arc::new(Mutex::new(Vec::new())),
+            attached: false,
+            pair: None,
+            pool: core::marker::PhantomData,
         }
     }
 
-    fn body(self) -> &'static [u8] {
-        match self {
-            Self::Echo | Self::Metrics | Self::Registry => b"",
-            Self::Events => b"since=0",
-        }
+    /// Create two complete packet bearers connected back-to-back.
+    pub fn pair(first: BearerName, second: BearerName) -> (Self, Self) {
+        let pair = Arc::new(Mutex::new(FakePair {
+            contexts: [None, None],
+        }));
+        let mut first = Self::new(first);
+        first.pair = Some((pair.clone(), 0));
+        let mut second = Self::new(second);
+        second.pair = Some((pair, 1));
+        (first, second)
+    }
+
+    /// Captured opaque QUIC packets, for tests which only inspect submission.
+    pub fn sent_packets(&self) -> Arc<Mutex<Vec<Vec<u8>>>> {
+        self.sent.clone()
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OperationResult {
-    pub stream_id: u64,
-    pub operation: StreamOperation,
-    pub response: Vec<u8>,
-}
-
-/// Keep simulated link failures distinct from core transport failures.
-#[derive(Debug)]
-enum OperationHarnessError<C, S> {
-    ClientBearer(C),
-    ServerBearer(S),
-    Transport(Error),
-}
-
-/// Exercise real mux/endpoint stream processing over deterministic fake links.
-/// The scripted retry loop is not the production connection/egress driver.
-pub fn run_stream_operations(
-    operations: &[StreamOperation],
-    faults: FaultConfig,
-) -> Result<Vec<OperationResult>, Error> {
-    let mut c2s = FakeDatagramLink::new(faults);
-    let mut s2c = FakeDatagramLink::new(faults);
-    run_stream_operations_with_bearers(operations, &mut c2s, &mut s2c, faults.latency_ticks.max(1))
-}
-
-/// Internal seam for instrumented fake links used by the tests below.
-fn run_stream_operations_with_bearers<C2S, S2C>(
-    operations: &[StreamOperation],
-    c2s: &mut C2S,
-    s2c: &mut S2C,
-    tick: u64,
-) -> Result<Vec<OperationResult>, Error>
+impl<P> PacketEgress<P::Buffer> for FakePacketBearer<P>
 where
-    C2S: DatagramBearer<Error = Error>,
-    S2C: DatagramBearer<Error = Error>,
+    P: PacketPool + 'static,
 {
-    run_stream_operations_with_external_bearers(
-        operations,
-        c2s,
-        s2c,
-        tick,
-        ConnectionId::new(0x501).ok_or(Error::Invalid)?,
-        ConnectionId::new(0x502).ok_or(Error::Invalid)?,
-    )
-    .map_err(|error| match error {
-        OperationHarnessError::ClientBearer(error) | OperationHarnessError::ServerBearer(error) => {
-            error
+    fn submit(
+        &mut self,
+        _peer_l2_address: PeerL2Address,
+        submission: EgressSubmission<P::Buffer>,
+    ) -> Result<(), PacketSubmitError<P::Buffer>> {
+        debug_assert!(self.attached);
+        self.sent
+            .lock()
+            .unwrap()
+            .push(submission.packet().bytes().to_vec());
+        if let Some((pair, side)) = &self.pair {
+            let target = pair.lock().unwrap().contexts[1 - *side].clone();
+            if let Some(target) = target
+                && let Some(mut writer) = target
+                    .pool()
+                    .acquire_writer(crate::PACKET_PREFIX_RESERVE, 0)
+            {
+                let bytes = submission.packet().bytes();
+                if let Some(output) = writer.payload_mut().get_mut(..bytes.len()) {
+                    output.copy_from_slice(bytes);
+                    if let Some(packet) = writer.commit(bytes.len()) {
+                        target.enqueue_packet(
+                            crate::PacketMeta {
+                                bearer: target.bearer(),
+                                peer_l2_address: PeerL2Address::new(1).unwrap(),
+                                received_at_us: 0,
+                            },
+                            packet,
+                        );
+                    }
+                }
+            }
         }
-        OperationHarnessError::Transport(error) => error,
-    })
+        submission.complete(PacketSendOutcome::Sent, 0);
+        Ok(())
+    }
 }
 
-/// Vary directional CIDs to check isolation in the simulated stream harness.
+impl<P> PacketBearer<P> for FakePacketBearer<P>
+where
+    P: PacketPool + 'static,
+{
+    type AttachError = core::convert::Infallible;
+
+    fn info(&self) -> BearerInfo {
+        self.info
+    }
+
+    fn attach(&mut self, context: BearerContext<P>) -> Result<(), Self::AttachError> {
+        if let Some((pair, side)) = &self.pair {
+            pair.lock().unwrap().contexts[*side] = Some(context);
+        }
+        self.attached = true;
+        Ok(())
+    }
+}
+
+/// Byte-level fault policy used only by transport-state unit tests.
 #[cfg(test)]
-fn run_stream_operations_with_bearers_and_cids<C2S, S2C>(
-    operations: &[StreamOperation],
-    c2s: &mut C2S,
-    s2c: &mut S2C,
-    tick: u64,
-    client_cid: ConnectionId,
-    server_cid: ConnectionId,
-) -> Result<Vec<OperationResult>, Error>
-where
-    C2S: DatagramBearer<Error = Error>,
-    S2C: DatagramBearer<Error = Error>,
-{
-    run_stream_operations_with_external_bearers(operations, c2s, s2c, tick, client_cid, server_cid)
-        .map_err(|error| match error {
-            OperationHarnessError::ClientBearer(error)
-            | OperationHarnessError::ServerBearer(error) => error,
-            OperationHarnessError::Transport(error) => error,
-        })
-}
-
-/// Internal runner preserving fake-link error types for error-propagation tests.
-fn run_stream_operations_with_external_bearers<C2S, S2C>(
-    operations: &[StreamOperation],
-    c2s: &mut C2S,
-    s2c: &mut S2C,
-    tick: u64,
-    client_cid: ConnectionId,
-    server_cid: ConnectionId,
-) -> Result<Vec<OperationResult>, OperationHarnessError<C2S::Error, S2C::Error>>
-where
-    C2S: DatagramBearer,
-    S2C: DatagramBearer,
-{
-    let mut client = StreamMux::<8, 8>::new(
-        Role::Client,
-        ConnectionLimits::default(),
-        1200,
-        32,
-        8,
-        16 * 1024,
-    );
-    let mut server = StreamMux::<8, 8>::new(
-        Role::Server,
-        ConnectionLimits::default(),
-        1200,
-        32,
-        8,
-        16 * 1024,
-    );
-    client
-        .install_connection_ids(client_cid, server_cid)
-        .map_err(OperationHarnessError::Transport)?;
-    server
-        .install_connection_ids(server_cid, client_cid)
-        .map_err(OperationHarnessError::Transport)?;
-    let mut results = Vec::new();
-    let mut now = 0;
-    let tick = tick.max(1);
-    for (index, operation) in operations.iter().copied().enumerate() {
-        let stream_id = 4 + index as u64 * 4;
-        client
-            .endpoint
-            .open_send_stream(stream_id, crate::INITIAL_MAX_STREAM_DATA)
-            .map_err(OperationHarnessError::Transport)?;
-        let mut request = Vec::from([operation.service()]);
-        request.extend_from_slice(operation.body());
-        let mut packet = vec![0u8; 1400];
-        let (used, _) = client
-            .endpoint
-            .encode_stream_packet(server_cid, stream_id, 0, true, &request, &mut packet)
-            .map_err(OperationHarnessError::Transport)?;
-        c2s.send_datagram(now, &packet[..used])
-            .map_err(OperationHarnessError::ClientBearer)?;
-        let mut incoming = vec![0u8; 1400];
-        let mut response = None;
-        for attempt in 0..16 {
-            if let Some(length) = c2s
-                .receive_datagram(now, &mut incoming)
-                .map_err(OperationHarnessError::ClientBearer)?
-            {
-                if let Some(candidate) = server
-                    .receive_datagram(&incoming[..length])
-                    .map_err(OperationHarnessError::Transport)?
-                {
-                    if candidate.stream_id == stream_id {
-                        response = Some(candidate);
-                        break;
-                    }
-                }
-            }
-            if attempt == 15 {
-                break;
-            }
-            now = now.saturating_add(tick);
-            c2s.send_datagram(now, &packet[..used])
-                .map_err(OperationHarnessError::ClientBearer)?;
-        }
-        let response = response.ok_or(OperationHarnessError::Transport(Error::Invalid))?;
-        let mut response_packet = vec![0u8; 1400];
-        let (response_len, _) = server
-            .encode_response(
-                1 + index as u64 * 4,
-                &response.data,
-                true,
-                &mut response_packet,
-            )
-            .map_err(OperationHarnessError::Transport)?;
-        s2c.send_datagram(now, &response_packet[..response_len])
-            .map_err(OperationHarnessError::ServerBearer)?;
-        let mut outgoing = vec![0u8; 1400];
-        let mut result = None;
-        for attempt in 0..16 {
-            if let Some(length) = s2c
-                .receive_datagram(now, &mut outgoing)
-                .map_err(OperationHarnessError::ServerBearer)?
-            {
-                if let crate::TransportPacket::Stream { frame, .. } = client
-                    .endpoint
-                    .receive_datagram(&outgoing[..length])
-                    .map_err(OperationHarnessError::Transport)?
-                {
-                    if frame.id == 1 + index as u64 * 4 {
-                        result = Some(frame.data.to_vec());
-                        break;
-                    }
-                }
-            }
-            if attempt == 15 {
-                break;
-            }
-            now = now.saturating_add(tick);
-            s2c.send_datagram(now, &response_packet[..response_len])
-                .map_err(OperationHarnessError::ServerBearer)?;
-        }
-        let response_bytes = result.ok_or(OperationHarnessError::Transport(Error::Invalid))?;
-        results.push(OperationResult {
-            stream_id,
-            operation,
-            response: response_bytes,
-        });
-    }
-    Ok(results)
-}
-
 #[derive(Clone, Copy, Debug)]
-pub struct FaultConfig {
+pub(crate) struct FaultConfig {
     pub latency_ticks: u64,
     pub drop_every: Option<u64>,
     pub duplicate: bool,
@@ -268,6 +142,7 @@ pub struct FaultConfig {
     pub mtu: usize,
 }
 
+#[cfg(test)]
 impl Default for FaultConfig {
     fn default() -> Self {
         Self {
@@ -280,395 +155,79 @@ impl Default for FaultConfig {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug)]
-struct QueuedDatagram {
+struct FaultPacket {
     ready_at: u64,
     ordinal: u64,
     bytes: Vec<u8>,
 }
 
+/// Private byte queue for testing transport loss and timers. This is not a
+/// bearer and cannot attach to or drive a `QuicNode`.
+#[cfg(test)]
 #[derive(Debug)]
-pub struct FakeDatagramLink {
+pub(crate) struct FaultQueue {
     config: FaultConfig,
-    queue: VecDeque<QueuedDatagram>,
+    queue: VecDeque<FaultPacket>,
     sent: u64,
-    dropped: u64,
 }
 
-impl FakeDatagramLink {
-    pub fn new(config: FaultConfig) -> Self {
+#[cfg(test)]
+impl FaultQueue {
+    pub(crate) fn new(config: FaultConfig) -> Self {
         Self {
             config,
             queue: VecDeque::new(),
             sent: 0,
-            dropped: 0,
         }
     }
 
-    pub fn sent(&self) -> u64 {
-        self.sent
-    }
-    pub fn dropped(&self) -> u64 {
-        self.dropped
-    }
-    pub fn queued(&self) -> usize {
-        self.queue.len()
-    }
-
-    pub fn send(&mut self, now: u64, payload: &[u8]) {
+    pub(crate) fn submit_at(&mut self, now: u64, payload: &[u8]) -> Result<(), crate::Error> {
         self.sent = self.sent.saturating_add(1);
-        let ordinal = self.sent;
         if self
             .config
             .drop_every
-            .is_some_and(|n| n != 0 && ordinal % n == 0)
+            .is_some_and(|n| n != 0 && self.sent % n == 0)
         {
-            self.dropped = self.dropped.saturating_add(1);
-            return;
+            return Ok(());
         }
         let mut bytes = payload.to_vec();
         bytes.truncate(self.config.mtu);
-        let ready_at = now.saturating_add(self.config.latency_ticks);
-        self.queue.push_back(QueuedDatagram {
-            ready_at,
-            ordinal,
-            bytes: bytes.clone(),
-        });
+        let packet = FaultPacket {
+            ready_at: now.saturating_add(self.config.latency_ticks),
+            ordinal: self.sent,
+            bytes,
+        };
+        self.queue.push_back(packet);
         if self.config.duplicate {
-            self.queue.push_back(QueuedDatagram {
-                ready_at,
-                ordinal,
-                bytes,
+            let packet = self.queue.back().expect("packet was just queued");
+            self.queue.push_back(FaultPacket {
+                ready_at: packet.ready_at,
+                ordinal: packet.ordinal,
+                bytes: packet.bytes.clone(),
             });
         }
+        Ok(())
     }
 
-    pub fn poll(&mut self, now: u64) -> Vec<Vec<u8>> {
+    pub(crate) fn poll_owned(&mut self, now: u64) -> Vec<OwnedPacket<Vec<u8>>> {
         let mut ready = Vec::new();
         let mut pending = VecDeque::new();
-        while let Some(datagram) = self.queue.pop_front() {
-            if datagram.ready_at <= now {
-                ready.push(datagram);
+        while let Some(packet) = self.queue.pop_front() {
+            if packet.ready_at <= now {
+                ready.push(packet);
             } else {
-                pending.push_back(datagram);
+                pending.push_back(packet);
             }
         }
         self.queue = pending;
         if self.config.reorder {
-            ready.sort_by_key(|entry| core::cmp::Reverse(entry.ordinal));
+            ready.sort_by_key(|packet| core::cmp::Reverse(packet.ordinal));
         }
-        ready.into_iter().map(|entry| entry.bytes).collect()
-    }
-
-    fn poll_one(&mut self, now: u64) -> Option<Vec<u8>> {
-        let mut selected = None;
-        for (index, datagram) in self.queue.iter().enumerate() {
-            if datagram.ready_at > now {
-                continue;
-            }
-            if selected.is_none()
-                || self.config.reorder
-                    && datagram.ordinal
-                        > self
-                            .queue
-                            .get(selected.unwrap())
-                            .map(|value| value.ordinal)
-                            .unwrap_or(0)
-            {
-                selected = Some(index);
-            }
-            if !self.config.reorder {
-                break;
-            }
-        }
-        selected.and_then(|index| self.queue.remove(index).map(|datagram| datagram.bytes))
-    }
-}
-
-impl DatagramBearer for FakeDatagramLink {
-    type Error = crate::Error;
-
-    fn send_datagram(&mut self, now: u64, payload: &[u8]) -> Result<(), Self::Error> {
-        self.send(now, payload);
-        Ok(())
-    }
-
-    fn receive_datagram(&mut self, now: u64, out: &mut [u8]) -> Result<Option<usize>, Self::Error> {
-        let Some(payload) = self.poll_one(now) else {
-            return Ok(None);
-        };
-        if payload.len() > out.len() {
-            return Err(crate::Error::BufferTooSmall);
-        }
-        out[..payload.len()].copy_from_slice(&payload);
-        Ok(Some(payload.len()))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::vec;
-
-    #[test]
-    fn operation_runner_drives_shared_stream_handlers() {
-        let results = run_stream_operations(
-            &[
-                StreamOperation::Echo,
-                StreamOperation::Metrics,
-                StreamOperation::Events,
-                StreamOperation::Registry,
-            ],
-            FaultConfig {
-                latency_ticks: 2,
-                mtu: 1200,
-                ..FaultConfig::default()
-            },
-        )
-        .unwrap_or_else(|error| panic!("operation failed: {error:?}"));
-        assert_eq!(results.len(), 4);
-        assert_eq!(results[0].response, vec![SERVICE_ECHO]);
-        assert_eq!(results[1].response, vec![SERVICE_METRICS]);
-        assert_eq!(
-            results[2].response,
-            vec![SERVICE_EVENTS, b's', b'i', b'n', b'c', b'e', b'=', b'0']
-        );
-        assert_eq!(results[3].response, vec![SERVICE_STREAM]);
-    }
-
-    #[test]
-    fn operation_runner_retries_stream_operations_under_faults() {
-        let results = run_stream_operations(
-            &[StreamOperation::Metrics, StreamOperation::Events],
-            FaultConfig {
-                latency_ticks: 3,
-                drop_every: Some(2),
-                duplicate: true,
-                reorder: true,
-                mtu: 1200,
-            },
-        )
-        .unwrap();
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].response, vec![SERVICE_METRICS]);
-        assert_eq!(
-            results[1].response,
-            vec![SERVICE_EVENTS, b's', b'i', b'n', b'c', b'e', b'=', b'0']
-        );
-    }
-
-    #[test]
-    fn operation_runner_accepts_replacement_bearers() {
-        struct CountingBearer {
-            inner: FakeDatagramLink,
-            sends: usize,
-            receives: usize,
-        }
-
-        impl DatagramBearer for CountingBearer {
-            type Error = Error;
-
-            fn send_datagram(&mut self, now: u64, payload: &[u8]) -> Result<(), Self::Error> {
-                self.sends += 1;
-                self.inner.send_datagram(now, payload)
-            }
-
-            fn receive_datagram(
-                &mut self,
-                now: u64,
-                out: &mut [u8],
-            ) -> Result<Option<usize>, Self::Error> {
-                self.receives += 1;
-                self.inner.receive_datagram(now, out)
-            }
-        }
-
-        let mut c2s = CountingBearer {
-            inner: FakeDatagramLink::new(FaultConfig {
-                latency_ticks: 1,
-                ..FaultConfig::default()
-            }),
-            sends: 0,
-            receives: 0,
-        };
-        let mut s2c = CountingBearer {
-            inner: FakeDatagramLink::new(FaultConfig {
-                latency_ticks: 1,
-                ..FaultConfig::default()
-            }),
-            sends: 0,
-            receives: 0,
-        };
-        let result = run_stream_operations_with_bearers(
-            &[StreamOperation::Metrics, StreamOperation::Events],
-            &mut c2s,
-            &mut s2c,
-            1,
-        )
-        .unwrap();
-        assert_eq!(result.len(), 2);
-        assert!(c2s.sends > 0 && c2s.receives > 0);
-        assert!(s2c.sends > 0 && s2c.receives > 0);
-    }
-
-    #[test]
-    fn operation_runner_accepts_native_errors_from_external_bearers() {
-        #[derive(Debug)]
-        struct ForeignError;
-
-        struct ForeignBearer {
-            inner: FakeDatagramLink,
-        }
-
-        impl DatagramBearer for ForeignBearer {
-            type Error = ForeignError;
-
-            fn send_datagram(&mut self, now: u64, payload: &[u8]) -> Result<(), Self::Error> {
-                self.inner
-                    .send_datagram(now, payload)
-                    .map_err(|_| ForeignError)
-            }
-
-            fn receive_datagram(
-                &mut self,
-                now: u64,
-                out: &mut [u8],
-            ) -> Result<Option<usize>, Self::Error> {
-                self.inner
-                    .receive_datagram(now, out)
-                    .map_err(|_| ForeignError)
-            }
-        }
-
-        let mut c2s = ForeignBearer {
-            inner: FakeDatagramLink::new(FaultConfig {
-                latency_ticks: 1,
-                ..FaultConfig::default()
-            }),
-        };
-        let mut s2c = ForeignBearer {
-            inner: FakeDatagramLink::new(FaultConfig {
-                latency_ticks: 1,
-                ..FaultConfig::default()
-            }),
-        };
-        let result = run_stream_operations_with_external_bearers(
-            &[StreamOperation::Metrics, StreamOperation::Events],
-            &mut c2s,
-            &mut s2c,
-            1,
-            ConnectionId::new(0x811).unwrap(),
-            ConnectionId::new(0x822).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].response, vec![SERVICE_METRICS]);
-        assert_eq!(
-            result[1].response,
-            vec![SERVICE_EVENTS, b's', b'i', b'n', b'c', b'e', b'=', b'0']
-        );
-    }
-
-    #[test]
-    fn operation_runner_isolates_two_connections_with_multiple_streams() {
-        let operations = [
-            StreamOperation::Echo,
-            StreamOperation::Metrics,
-            StreamOperation::Events,
-            StreamOperation::Registry,
-        ];
-        let faults = FaultConfig {
-            latency_ticks: 4,
-            drop_every: Some(3),
-            duplicate: true,
-            reorder: true,
-            mtu: 1200,
-        };
-        let mut first_c2s = FakeDatagramLink::new(faults);
-        let mut first_s2c = FakeDatagramLink::new(faults);
-        let first = run_stream_operations_with_bearers_and_cids(
-            &operations,
-            &mut first_c2s,
-            &mut first_s2c,
-            1,
-            ConnectionId::new(0x601).unwrap(),
-            ConnectionId::new(0x602).unwrap(),
-        )
-        .unwrap();
-        let mut second_c2s = FakeDatagramLink::new(faults);
-        let mut second_s2c = FakeDatagramLink::new(faults);
-        let second = run_stream_operations_with_bearers_and_cids(
-            &operations,
-            &mut second_c2s,
-            &mut second_s2c,
-            1,
-            ConnectionId::new(0x701).unwrap(),
-            ConnectionId::new(0x702).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(first.len(), operations.len());
-        assert_eq!(second.len(), operations.len());
-        assert!(
-            first
-                .iter()
-                .any(|result| result.operation == StreamOperation::Metrics
-                    && result.response == vec![SERVICE_METRICS])
-        );
-        assert!(
-            second
-                .iter()
-                .any(|result| result.operation == StreamOperation::Metrics
-                    && result.response == vec![SERVICE_METRICS])
-        );
-    }
-
-    #[test]
-    fn injects_latency_loss_duplication_reordering_and_mtu() {
-        let mut link = FakeDatagramLink::new(FaultConfig {
-            latency_ticks: 5,
-            drop_every: Some(3),
-            duplicate: true,
-            reorder: true,
-            mtu: 3,
-        });
-        link.send(0, b"one");
-        link.send(0, b"two");
-        link.send(0, b"three");
-        assert!(link.poll(4).is_empty());
-        let packets = link.poll(5);
-        assert_eq!(
-            packets,
-            vec![
-                b"two".to_vec(),
-                b"two".to_vec(),
-                b"one".to_vec(),
-                b"one".to_vec()
-            ]
-        );
-        assert_eq!(link.dropped(), 1);
-    }
-
-    #[test]
-    fn bearer_contract_preserves_datagram_boundaries() {
-        let mut link = FakeDatagramLink::new(FaultConfig {
-            latency_ticks: 2,
-            duplicate: true,
-            ..FaultConfig::default()
-        });
-        DatagramBearer::send_datagram(&mut link, 0, b"first").unwrap();
-        let mut out = [0u8; 16];
-        assert!(
-            DatagramBearer::receive_datagram(&mut link, 1, &mut out)
-                .unwrap()
-                .is_none()
-        );
-        let used = DatagramBearer::receive_datagram(&mut link, 2, &mut out)
-            .unwrap()
-            .unwrap();
-        assert_eq!(&out[..used], b"first");
-        let duplicate = DatagramBearer::receive_datagram(&mut link, 2, &mut out)
-            .unwrap()
-            .unwrap();
-        assert_eq!(&out[..duplicate], b"first");
+        ready
+            .into_iter()
+            .map(|packet| OwnedPacket::from_buffer(packet.bytes))
+            .collect()
     }
 }

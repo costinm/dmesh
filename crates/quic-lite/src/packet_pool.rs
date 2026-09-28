@@ -6,22 +6,18 @@
 
 use core::{
     cell::UnsafeCell,
+    ops::Range,
     sync::atomic::{AtomicU8, AtomicU32, Ordering},
 };
 
 /// Opaque ownership token for one packet slot.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PacketSlot(u8);
+pub(crate) struct PacketSlot(u8);
 
 impl PacketSlot {
-    pub const fn index(self) -> usize {
+    pub(crate) const fn index(self) -> usize {
         self.0 as usize
-    }
-    /// Queue-only sentinel used by an adapter work item that carries no
-    /// packet-slot ownership. It must never reach packet access or release.
-    pub const fn sentinel() -> Self {
-        Self(u8::MAX)
     }
 }
 
@@ -42,10 +38,42 @@ pub struct PoolLease<'a, const SLOTS: usize, const MTU: usize> {
     len: usize,
 }
 
-/// Exclusive construction access to one shared packet slot.
+/// Pool lease view for [`crate::OwnedPacket`]. `AsRef` exposes the complete
+/// slot while `packet_range` identifies the initialized packet bytes.
+pub struct PoolBufferLease<'a, const SLOTS: usize, const MTU: usize> {
+    lease: PoolLease<'a, SLOTS, MTU>,
+}
+
+impl<const SLOTS: usize, const MTU: usize> core::fmt::Debug for PoolBufferLease<'_, SLOTS, MTU> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("PoolBufferLease")
+            .field("slot", &self.lease.slot)
+            .field("range", &self.packet_range())
+            .finish()
+    }
+}
+
+impl<const SLOTS: usize, const MTU: usize> PoolBufferLease<'_, SLOTS, MTU> {
+    pub(crate) fn packet_range(&self) -> Range<usize> {
+        self.lease.start..self.lease.start + self.lease.len
+    }
+}
+
+impl<const SLOTS: usize, const MTU: usize> AsRef<[u8]> for PoolBufferLease<'_, SLOTS, MTU> {
+    fn as_ref(&self) -> &[u8] {
+        self.lease
+            .pool
+            .packet(self.lease.slot, MTU)
+            .expect("valid pool buffer lease")
+    }
+}
+
+/// Exclusive construction access to one slot in a `QuicNode` packet pool.
 ///
 /// A producer reserves bearer headroom, serializes directly into
-/// [`payload_mut`](Self::payload_mut), then commits a normal [`PoolLease`].
+/// the [`crate::PacketWriter`] trait's writable region, then commits a normal
+/// [`PoolLease`].
 /// Unlike `PoolLease`, this value cannot be cloned, so mutable access cannot
 /// race a relayed or retained read lease. Dropping it without committing
 /// returns the slot to the device-wide pool.
@@ -59,19 +87,19 @@ pub struct PacketWriter<'a, const SLOTS: usize, const MTU: usize> {
 impl<'a, const SLOTS: usize, const MTU: usize> PacketWriter<'a, SLOTS, MTU> {
     /// Writable application/transport payload after the caller-reserved
     /// bearer headroom.
-    pub fn payload_mut(&mut self) -> &mut [u8] {
+    pub(crate) fn payload_mut(&mut self) -> &mut [u8] {
         unsafe { &mut (&mut (*self.pool.packets.get())[self.slot.index()])[self.start..] }
     }
 
     /// Full packet storage, including the reserved prefix. A bearer uses this
     /// after the producer has serialized its payload to fill headers in place.
-    pub fn frame_mut(&mut self) -> &mut [u8] {
+    pub(crate) fn frame_mut(&mut self) -> &mut [u8] {
         unsafe { &mut (*self.pool.packets.get())[self.slot.index()] }
     }
 
     /// Commit `len` payload bytes and turn exclusive construction access into
     /// a clonable shared lease. The producer must have initialized those bytes.
-    pub fn commit(mut self, len: usize) -> Option<PoolLease<'a, SLOTS, MTU>> {
+    pub(crate) fn commit(mut self, len: usize) -> Option<PoolLease<'a, SLOTS, MTU>> {
         if len > MTU.saturating_sub(self.start) {
             return None;
         }
@@ -84,9 +112,14 @@ impl<'a, const SLOTS: usize, const MTU: usize> PacketWriter<'a, SLOTS, MTU> {
         })
     }
 
+    /// Commit packet bytes while preserving access to the complete pool slot.
+    pub(crate) fn commit_buffer(self, len: usize) -> Option<PoolBufferLease<'a, SLOTS, MTU>> {
+        self.commit(len).map(|lease| PoolBufferLease { lease })
+    }
+
     /// Commit a complete bearer frame after its reserved prefix was filled in
     /// place. The resulting lease begins at byte zero.
-    pub fn commit_frame(mut self, payload_len: usize) -> Option<PoolLease<'a, SLOTS, MTU>> {
+    pub(crate) fn commit_frame(mut self, payload_len: usize) -> Option<PoolLease<'a, SLOTS, MTU>> {
         let len = self.start.checked_add(payload_len)?;
         if len > MTU {
             return None;
@@ -98,6 +131,22 @@ impl<'a, const SLOTS: usize, const MTU: usize> PacketWriter<'a, SLOTS, MTU> {
             start: 0,
             len,
         })
+    }
+}
+
+impl<const SLOTS: usize, const MTU: usize> crate::PacketWriter
+    for PacketWriter<'static, SLOTS, MTU>
+{
+    type Buffer = PoolBufferLease<'static, SLOTS, MTU>;
+
+    fn payload_mut(&mut self) -> &mut [u8] {
+        PacketWriter::payload_mut(self)
+    }
+
+    fn commit(self, len: usize) -> Option<crate::OwnedPacket<Self::Buffer>> {
+        let buffer = self.commit_buffer(len)?;
+        let range = buffer.packet_range();
+        crate::OwnedPacket::new(buffer, range).ok()
     }
 }
 
@@ -136,6 +185,7 @@ impl<const SLOTS: usize, const MTU: usize> Drop for PoolLease<'_, SLOTS, MTU> {
 }
 
 impl<const SLOTS: usize, const MTU: usize> PoolLease<'_, SLOTS, MTU> {
+    /// Borrow the initialized packet bytes selected by this lease.
     pub fn bytes(&self) -> &[u8] {
         self.payload()
     }
@@ -144,16 +194,17 @@ impl<const SLOTS: usize, const MTU: usize> PoolLease<'_, SLOTS, MTU> {
         &self.pool.packet(self.slot, MTU).expect("valid pool lease")
             [self.start..self.start + self.len]
     }
+    /// Length of the initialized packet range.
     pub const fn len(&self) -> usize {
         self.len
     }
-    pub const fn slot(&self) -> PacketSlot {
+    pub(crate) const fn slot(&self) -> PacketSlot {
         self.slot
     }
 
     /// Add a bearer header in already-reserved headroom. The payload bytes are
     /// not moved, which is essential when they are end-to-end ciphertext.
-    pub fn prepend(&mut self, header: &[u8]) -> bool {
+    pub(crate) fn prepend(&mut self, header: &[u8]) -> bool {
         if header.len() > self.start {
             return false;
         }
@@ -167,7 +218,7 @@ impl<const SLOTS: usize, const MTU: usize> PoolLease<'_, SLOTS, MTU> {
     }
 
     /// Remove a bearer header by changing metadata only.
-    pub fn strip_prefix(&mut self, bytes: usize) -> bool {
+    pub(crate) fn strip_prefix(&mut self, bytes: usize) -> bool {
         if bytes > self.len {
             return false;
         }
@@ -188,6 +239,10 @@ impl<const SLOTS: usize, const MTU: usize> AsRef<[u8]> for PoolLease<'_, SLOTS, 
 unsafe impl<const SLOTS: usize, const MTU: usize> Sync for PacketPool<SLOTS, MTU> {}
 
 impl<const SLOTS: usize, const MTU: usize> PacketPool<SLOTS, MTU> {
+    /// Construct a fixed-capacity pool with every slot initially free.
+    ///
+    /// The pool is public so a no-std application can place its node-owned
+    /// packet storage explicitly; bearers only borrow it through the node.
     pub const fn new() -> Self {
         assert!(SLOTS <= 32);
         Self {
@@ -197,7 +252,7 @@ impl<const SLOTS: usize, const MTU: usize> PacketPool<SLOTS, MTU> {
         }
     }
 
-    pub fn acquire(&self) -> Option<PacketSlot> {
+    pub(crate) fn acquire(&self) -> Option<PacketSlot> {
         self.acquire_reserving(0)
     }
 
@@ -206,7 +261,7 @@ impl<const SLOTS: usize, const MTU: usize> PacketPool<SLOTS, MTU> {
     /// RX and TX share this pool. A receiver can reserve reply capacity without
     /// maintaining a separate ingress or egress pool. The availability check
     /// and acquisition are one atomic operation.
-    pub fn acquire_reserving(&self, reserved: usize) -> Option<PacketSlot> {
+    pub(crate) fn acquire_reserving(&self, reserved: usize) -> Option<PacketSlot> {
         let mut current = self.free.load(Ordering::Acquire);
         loop {
             if current.count_ones() as usize <= reserved {
@@ -229,11 +284,12 @@ impl<const SLOTS: usize, const MTU: usize> PacketPool<SLOTS, MTU> {
         }
     }
 
+    /// Number of slots immediately available for ingress or egress.
     pub fn available(&self) -> usize {
         self.free.load(Ordering::Acquire).count_ones() as usize
     }
 
-    /// Acquire a shared packet and initialize its bytes in one bounded copy.
+    /// Acquire a node-owned packet slot and initialize its bytes in one copy.
     /// The returned lease may be retained by connection ordering or handed to
     /// a bearer without allocating a second packet.
     pub fn acquire_with(&self, data: &[u8]) -> Option<PoolLease<'_, SLOTS, MTU>> {
@@ -241,7 +297,7 @@ impl<const SLOTS: usize, const MTU: usize> PacketPool<SLOTS, MTU> {
     }
 
     /// Acquire a slot with prefix space reserved for the selected bearer.
-    pub fn acquire_with_headroom(
+    pub(crate) fn acquire_with_headroom(
         &self,
         headroom: usize,
         data: &[u8],
@@ -265,23 +321,32 @@ impl<const SLOTS: usize, const MTU: usize> PacketPool<SLOTS, MTU> {
     /// Reserve a shared slot for a producer that can serialize directly into
     /// the packet. This avoids copying CBOR, stream bytes, or proxy payloads
     /// into a bearer-owned scratch frame just to add a prefix later.
-    pub fn acquire_writer(&self, headroom: usize) -> Option<PacketWriter<'_, SLOTS, MTU>> {
+    pub(crate) fn acquire_writer(&self, headroom: usize) -> Option<PacketWriter<'_, SLOTS, MTU>> {
+        self.acquire_writer_reserving(headroom, 0)
+    }
+
+    /// Reserve a writer while atomically leaving `reserved` slots free.
+    pub(crate) fn acquire_writer_reserving(
+        &self,
+        headroom: usize,
+        reserved: usize,
+    ) -> Option<PacketWriter<'_, SLOTS, MTU>> {
         if headroom > MTU {
             return None;
         }
         Some(PacketWriter {
             pool: self,
-            slot: self.acquire()?,
+            slot: self.acquire_reserving(reserved)?,
             start: headroom,
             active: true,
         })
     }
 
-    pub fn write(&self, slot: PacketSlot, data: &[u8]) -> bool {
+    pub(crate) fn write(&self, slot: PacketSlot, data: &[u8]) -> bool {
         self.write_at(slot, 0, data)
     }
 
-    pub fn write_at(&self, slot: PacketSlot, offset: usize, data: &[u8]) -> bool {
+    pub(crate) fn write_at(&self, slot: PacketSlot, offset: usize, data: &[u8]) -> bool {
         if slot.index() >= SLOTS || offset.saturating_add(data.len()) > MTU {
             return false;
         }
@@ -292,7 +357,7 @@ impl<const SLOTS: usize, const MTU: usize> PacketPool<SLOTS, MTU> {
         true
     }
 
-    pub fn packet(&self, slot: PacketSlot, len: usize) -> Option<&[u8]> {
+    pub(crate) fn packet(&self, slot: PacketSlot, len: usize) -> Option<&[u8]> {
         if slot.index() >= SLOTS || len > MTU {
             return None;
         }
@@ -302,17 +367,34 @@ impl<const SLOTS: usize, const MTU: usize> PacketPool<SLOTS, MTU> {
     /// Transfer a lease between bearer/connection/path queues. This does not
     /// change memory usage or copy bytes; the next owner must eventually call
     /// `release` exactly once.
-    pub const fn transfer(&self, slot: PacketSlot) -> PacketSlot {
+    pub(crate) const fn transfer(&self, slot: PacketSlot) -> PacketSlot {
         slot
     }
 
-    pub fn release(&self, slot: PacketSlot) -> bool {
+    pub(crate) fn release(&self, slot: PacketSlot) -> bool {
         if slot.index() >= SLOTS {
             return false;
         }
         let bit = 1u32 << slot.0;
         let previous = self.free.fetch_or(bit, Ordering::AcqRel);
         previous & bit == 0
+    }
+}
+
+impl<const SLOTS: usize, const MTU: usize> crate::PacketPool for PacketPool<SLOTS, MTU> {
+    type Buffer = PoolBufferLease<'static, SLOTS, MTU>;
+    type Writer = PacketWriter<'static, SLOTS, MTU>;
+
+    fn acquire_writer(&'static self, headroom: usize, reserved: usize) -> Option<Self::Writer> {
+        self.acquire_writer_reserving(headroom, reserved)
+    }
+
+    fn capacity(&self) -> usize {
+        SLOTS
+    }
+
+    fn available(&self) -> usize {
+        PacketPool::available(self)
     }
 }
 
@@ -392,6 +474,24 @@ mod tests {
         assert_eq!(pool.available(), 0);
         drop(writer);
         assert_eq!(pool.available(), 1);
+    }
+
+    #[test]
+    fn common_pool_interface_serializes_directly_into_owned_packet() {
+        use crate::PacketPool as _;
+
+        static POOL: PacketPool<2, 16> = PacketPool::new();
+        let packet = POOL
+            .build_packet(4, 1, |output| -> Result<usize, ()> {
+                output[..3].copy_from_slice(&[7, 8, 9]);
+                Ok(3)
+            })
+            .unwrap();
+        assert_eq!(packet.bytes(), &[7, 8, 9]);
+        assert_eq!(packet.prefix_capacity(), 4);
+        assert_eq!(POOL.available(), 1);
+        drop(packet);
+        assert_eq!(POOL.available(), 2);
     }
 
     #[test]

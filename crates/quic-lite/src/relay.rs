@@ -6,6 +6,8 @@
 //! endpoint processing or next-hop egress; it must not maintain a competing
 //! relay lookup table.
 
+#[cfg(test)]
+use crate::connection::{ServerPacket, classify_server_packet};
 use crate::{
     ConnectionId, Error, ShortHeaderPrefix, decode_direct_packet, decode_routing_prefix,
     rewrite_bootstrap_destination, rewrite_dcid,
@@ -17,14 +19,14 @@ use crate::{
 /// explicit protocol state, not a numeric sentinel. Only the initial
 /// OPEN is allowed to use it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ForwardDestination {
+pub(crate) enum ForwardDestination {
     Connection(ConnectionId),
     Bootstrap,
 }
 
 /// Opaque forwarding action selected by a non-zero local DCID.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ForwardRule<NextHop> {
+pub(crate) struct ForwardRule<NextHop> {
     /// Platform-owned adjacent-peer or egress handle.
     pub next_hop: NextHop,
     /// Destination written before submitting the packet to `next_hop`.
@@ -32,13 +34,13 @@ pub struct ForwardRule<NextHop> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum DcidTarget<Endpoint, NextHop> {
+pub(crate) enum DcidTarget<Endpoint, NextHop> {
     Endpoint(Endpoint),
     Forward(ForwardRule<NextHop>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DcidRegistryError {
+pub(crate) enum DcidRegistryError {
     InvalidConnectionId,
     Occupied,
     Full,
@@ -53,12 +55,18 @@ pub(crate) enum DcidIngress<'a, Endpoint, NextHop> {
     Forward(ShortHeaderPrefix, &'a ForwardRule<NextHop>),
 }
 
-/// Outcome of classifying one complete bearer datagram.  Forwarding has
+pub(crate) enum RouterTarget<'a, Endpoint, NextHop> {
+    Endpoint(&'a Endpoint),
+    Forward(&'a ForwardRule<NextHop>),
+    Missing,
+}
+
+/// Outcome of classifying one complete bearer packet.  Forwarding has
 /// already copied the rewritten packet into caller-owned storage.  Direct and
 /// endpoint outcomes retain borrowed input because neither path needs an
 /// intermediate packet copy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DcidDatagram<'a, Endpoint, NextHop> {
+pub(crate) enum DcidPacket<'a, Endpoint, NextHop> {
     Direct {
         payload: &'a [u8],
     },
@@ -81,37 +89,255 @@ pub enum DcidDatagram<'a, Endpoint, NextHop> {
 /// Failure while performing the single DCID classification required at a
 /// bearer boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DcidDatagramError {
+pub(crate) enum DcidPacketError {
     Header(Error),
     Registry(DcidRegistryError),
     Rewrite(Error),
 }
 
-/// Classify one complete QUIC-lite-shaped datagram before any endpoint or
+/// Bearer-neutral result of routing one complete packet on a shared listener.
+///
+/// This is the narrow runtime boundary used by UDP, UART, BLE, and radio
+/// bearers. It contains no peer L2 address: the caller keeps the ingress
+/// `PacketMeta` and uses it only after the selected QUIC owner accepts the
+/// packet.
+pub(crate) enum PacketRoute<'a, Endpoint, NextHop> {
+    Direct(crate::DirectMessageRequest<'a>),
+    Initial(crate::BootstrapOpen),
+    Endpoint {
+        destination: ConnectionId,
+        endpoint: &'a Endpoint,
+    },
+    /// An opaque packet matched association-owned state, normally a peer's
+    /// stateless-reset token. It intentionally has no parseable destination.
+    OpaqueEndpoint {
+        endpoint: &'a Endpoint,
+    },
+    Forward {
+        received_dcid: ConnectionId,
+        rule: &'a ForwardRule<NextHop>,
+        used: usize,
+    },
+    /// Send `output[..used]` back through the bearer address on which the
+    /// unknown short-header packet arrived.
+    StatelessReset {
+        used: usize,
+    },
+    Unknown {
+        destination: ConnectionId,
+    },
+}
+
+/// One DCID namespace for endpoint associations and relay forwarding rules.
+///
+/// The registry remains an implementation detail of the node owner. Bearers
+/// submit complete bytes and never inspect a long/short header or use their
+/// physical peer L2 address to select an association.
+pub(crate) struct PacketRouter<Endpoint, NextHop, const ENTRIES: usize> {
+    registry: DcidRegistry<Endpoint, NextHop, ENTRIES>,
+    _reset_key: Option<crate::StatelessResetKey>,
+}
+
+impl<Endpoint, NextHop, const ENTRIES: usize> PacketRouter<Endpoint, NextHop, ENTRIES> {
+    pub(crate) fn new(reset_key: Option<crate::StatelessResetKey>) -> Self {
+        Self {
+            registry: DcidRegistry::new(),
+            _reset_key: reset_key,
+        }
+    }
+
+    pub(crate) fn register_endpoint(
+        &mut self,
+        dcid: ConnectionId,
+        endpoint: Endpoint,
+    ) -> Result<(), DcidRegistryError> {
+        self.registry.insert_endpoint(dcid, endpoint)
+    }
+
+    pub(crate) fn register_forward(
+        &mut self,
+        dcid: ConnectionId,
+        rule: ForwardRule<NextHop>,
+    ) -> Result<(), DcidRegistryError> {
+        self.registry.install_forward(dcid, rule)
+    }
+
+    pub(crate) fn contains(&self, dcid: ConnectionId) -> bool {
+        self.registry.contains(dcid)
+    }
+
+    pub(crate) fn remove_endpoint(&mut self, dcid: ConnectionId, expected: &Endpoint) -> bool
+    where
+        Endpoint: PartialEq,
+    {
+        let Some(entry) = self.registry.entries.iter_mut().find(|entry| {
+            entry.as_ref().is_some_and(|(key, target)| {
+                *key == dcid
+                    && matches!(target, DcidTarget::Endpoint(endpoint) if endpoint == expected)
+            })
+        }) else {
+            return false;
+        };
+        entry.take();
+        true
+    }
+
+    pub(crate) fn remove_forward(&mut self, dcid: ConnectionId) -> bool {
+        let Some(entry) = self.registry.entries.iter_mut().find(|entry| {
+            entry.as_ref().is_some_and(|(key, target)| {
+                *key == dcid && matches!(target, DcidTarget::Forward(_))
+            })
+        }) else {
+            return false;
+        };
+        entry.take();
+        true
+    }
+
+    pub(crate) fn target(
+        &self,
+        input: &[u8],
+    ) -> Result<RouterTarget<'_, Endpoint, NextHop>, Error> {
+        let prefix = decode_routing_prefix(input)?;
+        match self.registry.ingress(prefix) {
+            Ok(DcidIngress::Endpoint(_, endpoint)) => Ok(RouterTarget::Endpoint(endpoint)),
+            Ok(DcidIngress::Forward(_, rule)) => Ok(RouterTarget::Forward(rule)),
+            Err(DcidRegistryError::Missing) => Ok(RouterTarget::Missing),
+            Err(_) => unreachable!("registry lookup reports only a missing key"),
+        }
+    }
+
+    pub(crate) fn opaque_endpoint(
+        &self,
+        accepts: impl FnMut(&Endpoint) -> bool,
+    ) -> Option<&Endpoint> {
+        self.registry.endpoint_matching(accepts)
+    }
+
+    pub(crate) fn encode_stateless_reset(
+        &self,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<Option<usize>, Error> {
+        match self._reset_key {
+            Some(key) => key.encode_for_unknown_packet(input, output),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) fn reset_token_for(
+        &self,
+        connection_id: ConnectionId,
+    ) -> Option<crate::StatelessResetToken> {
+        self._reset_key.map(|key| key.token_for(connection_id))
+    }
+
+    /// Route one packet. Malformed input is rejected after normal parsing;
+    /// callers with outgoing client associations use
+    /// [`Self::route_with_opaque`] so their private reset tokens are checked.
+    #[cfg(test)]
+    fn route<'a>(
+        &'a self,
+        input: &'a [u8],
+        output: &mut [u8],
+    ) -> Result<PacketRoute<'a, Endpoint, NextHop>, Error> {
+        self.route_with_opaque(input, output, |_, _| false)
+    }
+
+    /// Route one packet and offer otherwise-unparseable bytes to endpoint
+    /// state. The callback must check only association-owned opaque state; it
+    /// must not parse another routing header or compare a bearer address.
+    #[cfg(test)]
+    fn route_with_opaque<'a>(
+        &'a self,
+        input: &'a [u8],
+        output: &mut [u8],
+        mut accepts_opaque: impl FnMut(&Endpoint, &[u8]) -> bool,
+    ) -> Result<PacketRoute<'a, Endpoint, NextHop>, Error> {
+        let classified = match classify_server_packet(input) {
+            Ok(classified) => classified,
+            Err(error) => {
+                if let Some(endpoint) = self
+                    .registry
+                    .endpoint_matching(|endpoint| accepts_opaque(endpoint, input))
+                {
+                    return Ok(PacketRoute::OpaqueEndpoint { endpoint });
+                }
+                return Err(error);
+            }
+        };
+        match classified {
+            ServerPacket::Direct => {
+                let request = crate::DirectMessageEndpoint::new().receive_request(input)?;
+                Ok(PacketRoute::Direct(request))
+            }
+            ServerPacket::Initial(open) => Ok(PacketRoute::Initial(open)),
+            classified @ (ServerPacket::BootstrapAck { destination }
+            | ServerPacket::Established { destination }) => {
+                let may_reset = matches!(classified, ServerPacket::Established { .. });
+                let prefix = decode_routing_prefix(input)?;
+                match self.registry.ingress(prefix) {
+                    Ok(DcidIngress::Endpoint(_, endpoint)) => Ok(PacketRoute::Endpoint {
+                        destination,
+                        endpoint,
+                    }),
+                    Ok(DcidIngress::Forward(_, rule)) => {
+                        let used = match rule.destination {
+                            ForwardDestination::Connection(dcid) => {
+                                rewrite_dcid(input, dcid, output)
+                            }
+                            ForwardDestination::Bootstrap => {
+                                rewrite_bootstrap_destination(input, output)
+                            }
+                        }?;
+                        Ok(PacketRoute::Forward {
+                            received_dcid: destination,
+                            rule,
+                            used,
+                        })
+                    }
+                    Err(DcidRegistryError::Missing) => {
+                        if may_reset && let Some(reset_key) = self._reset_key {
+                            if let Some(used) =
+                                reset_key.encode_for_unknown_packet(input, output)?
+                            {
+                                return Ok(PacketRoute::StatelessReset { used });
+                            }
+                        }
+                        Ok(PacketRoute::Unknown { destination })
+                    }
+                    Err(_) => unreachable!("registry lookup reports only a missing key"),
+                }
+            }
+        }
+    }
+}
+
+/// Classify one complete QUIC-lite-shaped packet before any endpoint or
 /// application dispatcher runs. A forwarding target rewrites only the DCID
 /// into `output`; flags, packet number, and body are preserved byte-for-byte.
 ///
 /// `output` is deliberately caller-owned because ESP Main must use its shared
 /// packet pool and host/Android own their socket buffers. This function owns no
 /// queues, clock, transport metadata, or next-hop policy.
-pub fn dispatch_datagram<'a, Endpoint, NextHop, const ENTRIES: usize>(
+pub(crate) fn dispatch_packet<'a, Endpoint, NextHop, const ENTRIES: usize>(
     registry: &'a DcidRegistry<Endpoint, NextHop, ENTRIES>,
     input: &'a [u8],
     output: &mut [u8],
-) -> Result<DcidDatagram<'a, Endpoint, NextHop>, DcidDatagramError> {
+) -> Result<DcidPacket<'a, Endpoint, NextHop>, DcidPacketError> {
     // Direct traffic is its own custom-version long-header form.  Classify it
     // before DCID routing so neither this registry nor a bearer treats an
     // empty Initial destination as a synthetic numeric CID.
     if crate::DirectMessageEndpoint::is_packet(input) {
-        let (_, payload) = decode_direct_packet(input).map_err(DcidDatagramError::Header)?;
-        return Ok(DcidDatagram::Direct { payload });
+        let (_, payload) = decode_direct_packet(input).map_err(DcidPacketError::Header)?;
+        return Ok(DcidPacket::Direct { payload });
     }
-    let prefix = decode_routing_prefix(input).map_err(DcidDatagramError::Header)?;
+    let prefix = decode_routing_prefix(input).map_err(DcidPacketError::Header)?;
     match registry
         .ingress(prefix)
-        .map_err(DcidDatagramError::Registry)?
+        .map_err(DcidPacketError::Registry)?
     {
-        DcidIngress::Endpoint(prefix, endpoint) => Ok(DcidDatagram::Endpoint {
+        DcidIngress::Endpoint(prefix, endpoint) => Ok(DcidPacket::Endpoint {
             received_dcid: prefix.dcid,
             endpoint,
         }),
@@ -120,8 +346,8 @@ pub fn dispatch_datagram<'a, Endpoint, NextHop, const ENTRIES: usize>(
                 ForwardDestination::Connection(dcid) => rewrite_dcid(input, dcid, output),
                 ForwardDestination::Bootstrap => rewrite_bootstrap_destination(input, output),
             }
-            .map_err(DcidDatagramError::Rewrite)?;
-            Ok(DcidDatagram::Forward {
+            .map_err(DcidPacketError::Rewrite)?;
+            Ok(DcidPacket::Forward {
                 received_dcid: prefix.dcid,
                 rule,
                 used,
@@ -132,7 +358,7 @@ pub fn dispatch_datagram<'a, Endpoint, NextHop, const ENTRIES: usize>(
 
 /// Fixed-capacity registry for all non-zero local DCIDs.
 #[derive(Clone)]
-pub struct DcidRegistry<Endpoint, NextHop, const ENTRIES: usize> {
+pub(crate) struct DcidRegistry<Endpoint, NextHop, const ENTRIES: usize> {
     entries: [Option<(ConnectionId, DcidTarget<Endpoint, NextHop>)>; ENTRIES],
 }
 
@@ -143,24 +369,24 @@ impl<Endpoint, NextHop, const ENTRIES: usize> Default for DcidRegistry<Endpoint,
 }
 
 impl<Endpoint, NextHop, const ENTRIES: usize> DcidRegistry<Endpoint, NextHop, ENTRIES> {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             entries: core::array::from_fn(|_| None),
         }
     }
 
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.entries.iter().filter(|entry| entry.is_some()).count()
     }
 
     /// Whether a non-zero local DCID is already owned by any endpoint or
     /// forwarding target. Reconciliation uses this to reject a replacement
     /// before removing the currently active rule.
-    pub fn contains(&self, dcid: ConnectionId) -> bool {
+    pub(crate) fn contains(&self, dcid: ConnectionId) -> bool {
         self.entries.iter().flatten().any(|(key, _)| *key == dcid)
     }
 
-    pub fn insert_endpoint(
+    pub(crate) fn insert_endpoint(
         &mut self,
         dcid: ConnectionId,
         endpoint: Endpoint,
@@ -168,7 +394,7 @@ impl<Endpoint, NextHop, const ENTRIES: usize> DcidRegistry<Endpoint, NextHop, EN
         self.insert(dcid, DcidTarget::Endpoint(endpoint))
     }
 
-    pub fn install_forward(
+    pub(crate) fn install_forward(
         &mut self,
         dcid: ConnectionId,
         rule: ForwardRule<NextHop>,
@@ -179,7 +405,7 @@ impl<Endpoint, NextHop, const ENTRIES: usize> DcidRegistry<Endpoint, NextHop, EN
     /// Install a forward rule once, or accept an exact duplicate as an
     /// idempotent control retry. Returns whether this call inserted a new
     /// entry. A different target for the same local DCID remains a conflict.
-    pub fn install_forward_idempotent(
+    pub(crate) fn install_forward_idempotent(
         &mut self,
         dcid: ConnectionId,
         rule: ForwardRule<NextHop>,
@@ -207,7 +433,7 @@ impl<Endpoint, NextHop, const ENTRIES: usize> DcidRegistry<Endpoint, NextHop, EN
 
     /// Replace only an existing forwarding target.  Endpoint ownership cannot
     /// be silently overwritten by relay setup.
-    pub fn update_forward(
+    pub(crate) fn update_forward(
         &mut self,
         dcid: ConnectionId,
         rule: ForwardRule<NextHop>,
@@ -229,7 +455,7 @@ impl<Endpoint, NextHop, const ENTRIES: usize> DcidRegistry<Endpoint, NextHop, EN
         Ok(())
     }
 
-    pub fn remove(&mut self, dcid: ConnectionId) -> Option<DcidTarget<Endpoint, NextHop>> {
+    pub(crate) fn remove(&mut self, dcid: ConnectionId) -> Option<DcidTarget<Endpoint, NextHop>> {
         let entry = self
             .entries
             .iter_mut()
@@ -251,6 +477,16 @@ impl<Endpoint, NextHop, const ENTRIES: usize> DcidRegistry<Endpoint, NextHop, EN
             DcidTarget::Endpoint(endpoint) => DcidIngress::Endpoint(prefix, endpoint),
             DcidTarget::Forward(rule) => DcidIngress::Forward(prefix, rule),
         })
+    }
+
+    fn endpoint_matching(&self, mut predicate: impl FnMut(&Endpoint) -> bool) -> Option<&Endpoint> {
+        self.entries
+            .iter()
+            .filter_map(Option::as_ref)
+            .find_map(|(_, target)| match target {
+                DcidTarget::Endpoint(endpoint) if predicate(endpoint) => Some(endpoint),
+                _ => None,
+            })
     }
 
     fn insert(
@@ -350,8 +586,8 @@ mod tests {
         let direct_len = encode_direct_packet(3, &[0xa0], &mut direct).unwrap();
         let mut output = [0; 32];
         assert!(matches!(
-            dispatch_datagram(&registry, &direct[..direct_len], &mut output),
-            Ok(DcidDatagram::Direct { payload }) if payload == [0xa0]
+            dispatch_packet(&registry, &direct[..direct_len], &mut output),
+            Ok(DcidPacket::Direct { payload }) if payload == [0xa0]
         ));
 
         let mut endpoint_packet = [0; 16];
@@ -364,8 +600,8 @@ mod tests {
         .encode(&mut endpoint_packet)
         .unwrap();
         assert!(matches!(
-            dispatch_datagram(&registry, &endpoint_packet[..endpoint_len], &mut output),
-            Ok(DcidDatagram::Endpoint { received_dcid, endpoint: 7 })
+            dispatch_packet(&registry, &endpoint_packet[..endpoint_len], &mut output),
+            Ok(DcidPacket::Endpoint { received_dcid, endpoint: 7 })
                 if received_dcid == endpoint
         ));
 
@@ -379,8 +615,8 @@ mod tests {
         .encode(&mut relay_packet)
         .unwrap();
         let used =
-            match dispatch_datagram(&registry, &relay_packet[..relay_len], &mut output).unwrap() {
-                DcidDatagram::Forward { rule, used, .. } => {
+            match dispatch_packet(&registry, &relay_packet[..relay_len], &mut output).unwrap() {
+                DcidPacket::Forward { rule, used, .. } => {
                     assert_eq!(rule.next_hop, 9);
                     used
                 }
@@ -417,8 +653,8 @@ mod tests {
         )
         .unwrap();
         let mut output = [0; 64];
-        let DcidDatagram::Forward { used, .. } =
-            dispatch_datagram(&registry, &packet[..packet_len], &mut output).unwrap()
+        let DcidPacket::Forward { used, .. } =
+            dispatch_packet(&registry, &packet[..packet_len], &mut output).unwrap()
         else {
             panic!("bootstrap packet must be forwarded")
         };
@@ -444,8 +680,371 @@ mod tests {
         .unwrap();
         let mut output = [0; 64];
         assert!(matches!(
-            dispatch_datagram(&registry, &packet[..packet_len], &mut output),
-            Err(DcidDatagramError::Registry(DcidRegistryError::Missing))
+            dispatch_packet(&registry, &packet[..packet_len], &mut output),
+            Err(DcidPacketError::Registry(DcidRegistryError::Missing))
         ));
+    }
+
+    #[test]
+    fn packet_router_owns_shared_listener_classification_and_dcid_dispatch() {
+        let server_cid = ConnectionId::new(0x41).unwrap();
+        let client_cid = ConnectionId::new(0x42).unwrap();
+        let relay_cid = ConnectionId::relay_local(2, 1).unwrap();
+        let mut router = PacketRouter::<u8, u16, 3>::new(None);
+        router.register_endpoint(server_cid, 1).unwrap();
+        router.register_endpoint(client_cid, 2).unwrap();
+        router
+            .register_forward(
+                relay_cid,
+                ForwardRule {
+                    next_hop: 9,
+                    destination: ForwardDestination::Connection(server_cid),
+                },
+            )
+            .unwrap();
+        let mut packet = [0u8; 128];
+        let mut output = [0u8; 128];
+
+        let direct_len = encode_direct_packet(3, b"direct", &mut packet).unwrap();
+        assert!(matches!(
+            router.route(&packet[..direct_len], &mut output),
+            Ok(PacketRoute::Direct(request)) if request.payload() == b"direct"
+        ));
+
+        let source = ConnectionId::new(0x43).unwrap();
+        let initial_len = crate::encode_bootstrap_open_packet(source, 0, &mut packet).unwrap();
+        assert!(matches!(
+            router.route(&packet[..initial_len], &mut output),
+            Ok(PacketRoute::Initial(open)) if open.client_receive_cid == source
+        ));
+
+        let ack_len =
+            crate::encode_bootstrap_open_ack_packet(client_cid, server_cid, 0, &mut packet)
+                .unwrap();
+        assert!(matches!(
+            router.route(&packet[..ack_len], &mut output),
+            Ok(PacketRoute::Endpoint { destination, endpoint: 2 })
+                if destination == client_cid
+        ));
+
+        let established_len = ShortHeader {
+            flags: FLAG_FIXED,
+            dcid: server_cid,
+            packet_number: 1,
+            packet_number_len: 1,
+        }
+        .encode(&mut packet)
+        .unwrap();
+        assert!(matches!(
+            router.route(&packet[..established_len], &mut output),
+            Ok(PacketRoute::Endpoint { destination, endpoint: 1 })
+                if destination == server_cid
+        ));
+
+        let relay_len = ShortHeader {
+            flags: FLAG_FIXED,
+            dcid: relay_cid,
+            packet_number: 2,
+            packet_number_len: 1,
+        }
+        .encode(&mut packet)
+        .unwrap();
+        let used = match router.route(&packet[..relay_len], &mut output).unwrap() {
+            PacketRoute::Forward {
+                received_dcid,
+                rule,
+                used,
+            } => {
+                assert_eq!(received_dcid, relay_cid);
+                assert_eq!(rule.next_hop, 9);
+                used
+            }
+            _ => panic!("relay CID must select its forwarding rule"),
+        };
+        assert_eq!(
+            ShortHeader::decode(&output[..used]).unwrap().0.dcid,
+            server_cid
+        );
+    }
+
+    #[test]
+    fn packet_router_generates_reset_only_for_unknown_short_dcid() {
+        let reset_key = crate::StatelessResetKey::from_device_secret(&[0x71; 32]).unwrap();
+        let router = PacketRouter::<u8, u16, 1>::new(Some(reset_key));
+        let unknown = ConnectionId::new(0x55).unwrap();
+        let mut packet = [0x44u8; 48];
+        let header_len = ShortHeader {
+            flags: FLAG_FIXED,
+            dcid: unknown,
+            packet_number: 1,
+            packet_number_len: 1,
+        }
+        .encode(&mut packet)
+        .unwrap();
+        packet[header_len..].fill(0x44);
+        let mut output = [0u8; 64];
+        let used = match router.route(&packet, &mut output).unwrap() {
+            PacketRoute::StatelessReset { used } => used,
+            _ => panic!("unknown established CID must produce a reset"),
+        };
+        assert_eq!(used, packet.len());
+        assert!(reset_key.token_for(unknown).matches_packet(&output[..used]));
+
+        let client = ConnectionId::new(0x56).unwrap();
+        let server = ConnectionId::new(0x57).unwrap();
+        let ack_len =
+            crate::encode_bootstrap_open_ack_packet(client, server, 0, &mut packet).unwrap();
+        assert!(matches!(
+            router.route(&packet[..ack_len], &mut output),
+            Ok(PacketRoute::Unknown { destination }) if destination == client
+        ));
+    }
+
+    #[test]
+    fn packet_router_offers_opaque_reset_to_association_state_without_an_address() {
+        #[derive(Clone, Copy)]
+        struct ClientState {
+            token: crate::StatelessResetToken,
+        }
+
+        let peer_key = crate::StatelessResetKey::from_device_secret(&[0x81; 32]).unwrap();
+        let client_cid = ConnectionId::new(0x61).unwrap();
+        let old_server_cid = ConnectionId::new(0x62).unwrap();
+        let mut router = PacketRouter::<ClientState, (), 1>::new(None);
+        router
+            .register_endpoint(
+                client_cid,
+                ClientState {
+                    token: peer_key.token_for(old_server_cid),
+                },
+            )
+            .unwrap();
+
+        let mut stale = [0x22u8; 48];
+        let header_len = ShortHeader {
+            flags: FLAG_FIXED,
+            dcid: old_server_cid,
+            packet_number: 9,
+            packet_number_len: 1,
+        }
+        .encode(&mut stale)
+        .unwrap();
+        stale[header_len..].fill(0x22);
+        let mut reset = [0u8; 48];
+        let reset_len = peer_key
+            .encode_for_unknown_packet(&stale, &mut reset)
+            .unwrap()
+            .unwrap();
+        let mut scratch = [0u8; 64];
+        assert!(matches!(
+            router.route_with_opaque(&reset[..reset_len], &mut scratch, |client, packet| {
+                client.token.matches_packet(packet)
+            }),
+            Ok(PacketRoute::OpaqueEndpoint { endpoint })
+                if endpoint.token.matches_packet(&reset[..reset_len])
+        ));
+    }
+
+    #[test]
+    fn packet_router_keeps_multiple_clients_servers_and_relays_in_one_namespace() {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum Endpoint {
+            Client(u8),
+            Server(u8),
+        }
+
+        let clients = [0x101, 0x102].map(|value| ConnectionId::new(value).unwrap());
+        let servers = [0x201, 0x202].map(|value| ConnectionId::new(value).unwrap());
+        let relays = [
+            ConnectionId::relay_local(2, 1).unwrap(),
+            ConnectionId::relay_local(2, 2).unwrap(),
+        ];
+        let mut router = PacketRouter::<Endpoint, u8, 6>::new(None);
+        for (index, cid) in clients.into_iter().enumerate() {
+            router
+                .register_endpoint(cid, Endpoint::Client(index as u8))
+                .unwrap();
+        }
+        for (index, cid) in servers.into_iter().enumerate() {
+            router
+                .register_endpoint(cid, Endpoint::Server(index as u8))
+                .unwrap();
+        }
+        for (index, cid) in relays.into_iter().enumerate() {
+            router
+                .register_forward(
+                    cid,
+                    ForwardRule {
+                        next_hop: index as u8,
+                        destination: ForwardDestination::Connection(servers[index]),
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            router.register_forward(
+                clients[0],
+                ForwardRule {
+                    next_hop: 9,
+                    destination: ForwardDestination::Bootstrap,
+                },
+            ),
+            Err(DcidRegistryError::Occupied)
+        );
+
+        let mut packet = [0u8; 96];
+        let mut output = [0u8; 96];
+        for (index, client_cid) in clients.into_iter().enumerate() {
+            let used = crate::encode_bootstrap_open_ack_packet(
+                client_cid,
+                servers[index],
+                index as u32,
+                &mut packet,
+            )
+            .unwrap();
+            assert!(matches!(
+                router.route(&packet[..used], &mut output),
+                Ok(PacketRoute::Endpoint {
+                    destination,
+                    endpoint: Endpoint::Client(found),
+                }) if destination == client_cid && *found == index as u8
+            ));
+        }
+        for (index, server_cid) in servers.into_iter().enumerate() {
+            let used = ShortHeader {
+                flags: FLAG_FIXED,
+                dcid: server_cid,
+                packet_number: index as u32 + 1,
+                packet_number_len: 1,
+            }
+            .encode(&mut packet)
+            .unwrap();
+            assert!(matches!(
+                router.route(&packet[..used], &mut output),
+                Ok(PacketRoute::Endpoint {
+                    destination,
+                    endpoint: Endpoint::Server(found),
+                }) if destination == server_cid && *found == index as u8
+            ));
+        }
+        for (index, relay_cid) in relays.into_iter().enumerate() {
+            let used = ShortHeader {
+                flags: FLAG_FIXED,
+                dcid: relay_cid,
+                packet_number: index as u32 + 3,
+                packet_number_len: 1,
+            }
+            .encode(&mut packet)
+            .unwrap();
+            let rewritten = match router.route(&packet[..used], &mut output).unwrap() {
+                PacketRoute::Forward { rule, used, .. } => {
+                    assert_eq!(rule.next_hop, index as u8);
+                    used
+                }
+                _ => panic!("relay did not share the root namespace"),
+            };
+            assert_eq!(
+                ShortHeader::decode(&output[..rewritten]).unwrap().0.dcid,
+                servers[index]
+            );
+        }
+
+        assert!(router.remove_endpoint(servers[0], &Endpoint::Server(0)));
+        assert!(!router.remove_endpoint(servers[0], &Endpoint::Server(0)));
+        let used = ShortHeader {
+            flags: FLAG_FIXED,
+            dcid: servers[0],
+            packet_number: 8,
+            packet_number_len: 1,
+        }
+        .encode(&mut packet)
+        .unwrap();
+        assert!(matches!(
+            router.route(&packet[..used], &mut output),
+            Ok(PacketRoute::Unknown { destination }) if destination == servers[0]
+        ));
+        let used = ShortHeader {
+            flags: FLAG_FIXED,
+            dcid: servers[1],
+            packet_number: 9,
+            packet_number_len: 1,
+        }
+        .encode(&mut packet)
+        .unwrap();
+        assert!(matches!(
+            router.route(&packet[..used], &mut output),
+            Ok(PacketRoute::Endpoint {
+                endpoint: Endpoint::Server(1),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn opaque_reset_selects_the_matching_client_among_multiple_endpoints() {
+        #[derive(Clone, Copy)]
+        struct Endpoint {
+            id: u8,
+            token: Option<crate::StatelessResetToken>,
+        }
+
+        let peer_key = crate::StatelessResetKey::from_device_secret(&[0x91; 32]).unwrap();
+        let peer_cids = [0x301, 0x302].map(|value| ConnectionId::new(value).unwrap());
+        let local_cids = [0x401, 0x402, 0x403].map(|value| ConnectionId::new(value).unwrap());
+        let mut router = PacketRouter::<Endpoint, (), 3>::new(None);
+        router
+            .register_endpoint(
+                local_cids[0],
+                Endpoint {
+                    id: 0,
+                    token: Some(peer_key.token_for(peer_cids[0])),
+                },
+            )
+            .unwrap();
+        router
+            .register_endpoint(
+                local_cids[1],
+                Endpoint {
+                    id: 1,
+                    token: Some(peer_key.token_for(peer_cids[1])),
+                },
+            )
+            .unwrap();
+        router
+            .register_endpoint(local_cids[2], Endpoint { id: 2, token: None })
+            .unwrap();
+
+        let mut stale = [0x33u8; 48];
+        let header_len = ShortHeader {
+            flags: FLAG_FIXED,
+            dcid: peer_cids[1],
+            packet_number: 4,
+            packet_number_len: 1,
+        }
+        .encode(&mut stale)
+        .unwrap();
+        stale[header_len..].fill(0x33);
+        let mut reset = [0u8; 48];
+        let reset_len = peer_key
+            .encode_for_unknown_packet(&stale, &mut reset)
+            .unwrap()
+            .unwrap();
+        let mut scratch = [0u8; 64];
+        assert!(matches!(
+            router.route_with_opaque(&reset[..reset_len], &mut scratch, |endpoint, packet| {
+                endpoint.token.is_some_and(|token| token.matches_packet(packet))
+            }),
+            Ok(PacketRoute::OpaqueEndpoint { endpoint }) if endpoint.id == 1
+        ));
+        reset[reset_len - 1] ^= 1;
+        assert!(
+            router
+                .route_with_opaque(&reset[..reset_len], &mut scratch, |endpoint, packet| {
+                    endpoint
+                        .token
+                        .is_some_and(|token| token.matches_packet(packet))
+                })
+                .is_err()
+        );
     }
 }
