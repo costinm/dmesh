@@ -288,11 +288,30 @@ impl<P: PacketLease> OrderedStream<P> {
     }
 }
 
+/// Retained-byte ceiling for ordered delivery on one association.
+///
+/// A consumer may accept only a prefix of a chunk (or nothing), and the
+/// remainder is retained without granting receive credit. Connection flow
+/// control bounds unconsumed bytes by the advertised `max_data` window, so a
+/// ceiling at least that large means an admitted packet can always be
+/// retained. A smaller ceiling would let a packet be acknowledged and then
+/// fail retention, losing data the peer will never resend. This is a ceiling,
+/// not a preallocation.
+pub(crate) fn retention_for_receive_window(
+    limits: crate::ConnectionLimits,
+    minimum: usize,
+) -> usize {
+    usize::try_from(limits.max_data)
+        .unwrap_or(usize::MAX)
+        .max(minimum)
+}
+
 /// Bounded ordered delivery state for one connection. The transport calls
 /// `receive` after validating the complete packet.
 #[derive(Clone)]
 pub struct CallbackStreams<P: PacketLease> {
     streams: Vec<OrderedStream<P>>,
+    retired: Vec<u64>,
     max_streams: usize,
     max_retained_bytes: usize,
     retained_bytes: usize,
@@ -303,6 +322,7 @@ impl<P: PacketLease> CallbackStreams<P> {
     pub fn new(max_streams: usize, max_retained_bytes: usize) -> Self {
         Self {
             streams: Vec::new(),
+            retired: Vec::new(),
             max_streams,
             max_retained_bytes,
             retained_bytes: 0,
@@ -310,6 +330,7 @@ impl<P: PacketLease> CallbackStreams<P> {
     }
 
     fn stream_mut(&mut self, id: u64) -> Result<&mut OrderedStream<P>, CallbackError> {
+        self.streams.retain(|stream| !stream.finished);
         if let Some(index) = self.streams.iter().position(|stream| stream.id == id) {
             return Ok(&mut self.streams[index]);
         }
@@ -323,6 +344,12 @@ impl<P: PacketLease> CallbackStreams<P> {
         Ok(self.streams.last_mut().unwrap())
     }
 
+    fn retire(&mut self, id: u64) {
+        if id != DIRECT_MESSAGE_STREAM_ID && !self.retired.contains(&id) {
+            self.retired.push(id);
+        }
+    }
+
     /// Insert one retained packet range and emit the next ordered leased chunk.
     pub fn receive_leased<E: StreamEvents<P>>(
         &mut self,
@@ -333,6 +360,9 @@ impl<P: PacketLease> CallbackStreams<P> {
         fin: bool,
         events: &mut E,
     ) -> Result<(), CallbackError> {
+        if self.retired.contains(&stream) {
+            return Ok(());
+        }
         let bytes = range.len();
         // A retransmission can arrive after the retained window is full. Do
         // not reject it before OrderedStream has identified it as an exact
@@ -371,12 +401,12 @@ impl<P: PacketLease> CallbackStreams<P> {
         fin: bool,
         events: &mut E,
     ) -> Result<(), CopyingError<E::Error>> {
-        // A synchronous consumer does not retain the packet which closes the
-        // current gap. Permit that one immediately consumable range in
-        // addition to the reorder budget; otherwise a full tail buffer rejects
-        // the missing prefix forever and can never drain. Asynchronous leased
-        // delivery keeps the strict bound because its outstanding packet must
-        // remain owned until an explicit completion.
+        if self.retired.contains(&stream) {
+            return Ok(());
+        }
+        let bytes = range.len();
+        // A range at the consumer cursor drains synchronously and therefore
+        // does not compete with retained out-of-order storage.
         let directly_consumable = self
             .streams
             .iter()
@@ -384,30 +414,25 @@ impl<P: PacketLease> CallbackStreams<P> {
             .map_or(offset == 0, |state| {
                 !state.finished && state.outstanding.is_none() && offset == state.consumed
             });
-        let temporary_allowance = directly_consumable.then_some(range.len()).unwrap_or(0);
-        self.max_retained_bytes = self.max_retained_bytes.saturating_add(temporary_allowance);
-        let mut sink = CopyAdapter {
-            events,
-            error: None,
-        };
-        let received = self.receive_leased(stream, packet, offset, range, fin, &mut sink);
-        self.max_retained_bytes = self.max_retained_bytes.saturating_sub(temporary_allowance);
-        received.map_err(CopyingError::Transport)?;
-        if let Some(error) = sink.error.take() {
-            sink.events.stream_reset(stream, 1);
-            return Err(CopyingError::Callback(error));
-        }
-        loop {
-            let Some(done) = self.outstanding(stream) else {
-                break;
-            };
-            self.done(done, &mut sink)
+        let checkpoint = self.clone();
+        let added = {
+            let state = self.stream_mut(stream).map_err(CopyingError::Transport)?;
+            let before = state.retained.len();
+            state
+                .insert(packet, offset, range, fin)
                 .map_err(CopyingError::Transport)?;
-            if let Some(error) = sink.error.take() {
-                sink.events.stream_reset(stream, 1);
-                return Err(CopyingError::Callback(error));
+            state.retained.len() != before
+        };
+        if added {
+            if !directly_consumable
+                && self.retained_bytes.saturating_add(bytes) > self.max_retained_bytes
+            {
+                *self = checkpoint;
+                return Err(CopyingError::Transport(CallbackError::Capacity));
             }
+            self.retained_bytes = self.retained_bytes.saturating_add(bytes);
         }
+        self.resume_copying(stream, events)?;
         Ok(())
     }
 
@@ -429,6 +454,9 @@ impl<P: PacketLease> CallbackStreams<P> {
         E: CopyingStreamEvents,
         F: FnOnce() -> P,
     {
+        if self.retired.contains(&stream) {
+            return Ok(());
+        }
         let len = bytes.len() as u64;
         let end = offset
             .checked_add(len)
@@ -472,6 +500,9 @@ impl<P: PacketLease> CallbackStreams<P> {
             if fin {
                 state.finished = true;
                 events.stream_finished(stream);
+                let _ = state;
+                self.streams.retain(|state| state.id != stream);
+                self.retire(stream);
                 return Ok(());
             }
             // A borrowed prefix may close a gap in already retained ranges.
@@ -520,7 +551,11 @@ impl<P: PacketLease> CallbackStreams<P> {
                     return Err(CopyingError::Callback(error));
                 }
             };
-            if consumed == 0 {
+            // A zero-length FIN chunk carries no bytes to hold back, so it
+            // cannot be refused: returning 0 accepts it, exactly as on the
+            // borrowed ingress path. Treating it as "not accepted" would
+            // re-deliver the same FIN on every resume.
+            if consumed == 0 && !bytes.is_empty() {
                 return Ok(total);
             }
             total = total.saturating_add(consumed);
@@ -536,6 +571,8 @@ impl<P: PacketLease> CallbackStreams<P> {
             if item.end {
                 state.finished = true;
                 events.stream_finished(stream);
+                self.streams.remove(index);
+                self.retire(stream);
                 return Ok(total);
             }
         }
@@ -561,6 +598,9 @@ impl<P: PacketLease> CallbackStreams<P> {
         self.retained_bytes = self.retained_bytes.saturating_sub(outstanding_len);
         if finished {
             events.stream_finished(completion.stream);
+            self.streams.remove(index);
+            self.retire(completion.stream);
+            return Ok(());
         }
         if self.streams[index].outstanding.is_none() {
             if let Some(chunk) = self.streams[index].next_chunk() {
@@ -593,7 +633,8 @@ impl<P: PacketLease> CallbackStreams<P> {
 
     /// Drop retained state for one stream and notify the application.
     pub fn reset<E: StreamEvents<P>>(&mut self, stream: u64, code: u64, events: &mut E) {
-        if let Some(state) = self.streams.iter_mut().find(|state| state.id == stream) {
+        if let Some(index) = self.streams.iter().position(|state| state.id == stream) {
+            let state = &mut self.streams[index];
             let retained = state
                 .retained
                 .iter()
@@ -609,30 +650,8 @@ impl<P: PacketLease> CallbackStreams<P> {
             state.outstanding = None;
             state.finished = true;
             events.stream_reset(stream, code);
+            self.streams.remove(index);
         }
-    }
-}
-
-struct CopyAdapter<'a, E: CopyingStreamEvents> {
-    events: &'a mut E,
-    error: Option<E::Error>,
-}
-
-impl<'a, P: PacketLease, E: CopyingStreamEvents> StreamEvents<P> for CopyAdapter<'a, E> {
-    fn stream_chunk(&mut self, chunk: StreamChunk<P>) {
-        if self.error.is_none() {
-            self.error = self
-                .events
-                .stream_chunk(chunk.stream, chunk.offset, chunk.end, chunk.bytes())
-                .map(|_| ())
-                .err();
-        }
-    }
-    fn stream_finished(&mut self, stream: u64) {
-        self.events.stream_finished(stream);
-    }
-    fn stream_reset(&mut self, stream: u64, code: u64) {
-        self.events.stream_reset(stream, code);
     }
 }
 

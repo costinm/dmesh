@@ -735,6 +735,7 @@ where
                 }
                 index
             };
+            let fin = chunk.fin;
             match self.routes[index]
                 .incoming
                 .try_send(ReceivedStreamChunkData {
@@ -742,7 +743,11 @@ where
                     fin: chunk.fin,
                     bytes: chunk.bytes,
                 }) {
-                Ok(()) => {}
+                Ok(()) => {
+                    if fin {
+                        self.routes.remove(index);
+                    }
+                }
                 Err(mpsc::error::TrySendError::Full(data)) => {
                     self.node
                         .stream_chunks

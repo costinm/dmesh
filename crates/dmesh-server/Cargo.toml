@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 sha2 = { version = "0.11", default-features = false }
+mesh-api = { git = "https://github.com/costinm/ssh-mesh", package = "mesh-api", default-features = false }
 p256 = { version = "=0.14.0-rc.7", features = ["ecdsa"], optional = true }
 anyhow = { version = "1", optional = true }
 hex = { version = "0.4", optional = true }
@@ -17,10 +18,9 @@ axum = { version = "0.7", optional = true }
 ssh-mesh = { git = "https://github.com/costinm/ssh-mesh", package = "ssh-mesh", optional = true }
 mesh = { git = "https://github.com/costinm/ssh-mesh", package = "mesh", optional = true }
 async-trait = { version = "0.1", optional = true }
-rand = { version = "0.10", optional = true }
 
 [features]
-default = ["std", "udp"]
+default = ["std"]
 std = [
     "dep:anyhow",
     "dep:hex",
@@ -30,9 +30,9 @@ std = [
     "dep:tracing",
     "dep:tracing-subscriber",
     "dep:p256",
+    "quic-lite/tokio",
 ]
-udp = ["std", "dep:libc", "dep:rand", "quic-lite/std"]
-mesh-session = ["udp", "dep:mesh"]
+mesh-session = ["std", "dep:mesh"]
 http = ["mesh-session", "dep:axum", "dep:ssh-mesh", "dep:async-trait"]
 
 [dev-dependencies]
@@ -41,19 +41,6 @@ tempfile = "3"
 [lib]
 name = "dmesh_server"
 
-[[example]]
-name = "recovery-probe-server"
-required-features = ["udp"]
-test = true
-
-[[test]]
-name = "running_lmesh_wifi"
-required-features = ["udp"]
-
 [dependencies.quic-lite]
 path = "../quic-lite"
 default-features = false
-
-[dependencies.libc]
-version = "0.2"
-optional = true

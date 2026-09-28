@@ -11,7 +11,25 @@ use crate::{
     cbor::{Decoder, Encoder},
     tagged::{Name, Record, decode},
 };
-pub use quic_lite::{connection::ConnectionManager, connection::ConnectionPolicy};
+/// Application policy applied when creating the next QUIC association.
+///
+/// This is a service request, not a transport handle: it deliberately carries
+/// no connection ID, bearer, packet buffer, or node implementation detail.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ConnectionPolicy {
+    pub ack_frequency: Option<u8>,
+    pub ack_delay_ms: Option<u8>,
+    pub tx_burst_packets: Option<u8>,
+    pub path_policy: Option<u8>,
+    pub timeout_ms: Option<u32>,
+}
+
+/// Platform application of a decoded connection policy request.
+pub trait ConnectionManager {
+    type Error;
+
+    fn configure_connection(&mut self, policy: ConnectionPolicy) -> Result<(), Self::Error>;
+}
 
 /// Component for QUIC-lite connection/stream/RPC/forwarding primitives.
 /// Component 2 is assigned to the normal QUIC `probe` stream service; keep
@@ -24,6 +42,7 @@ const FIELD_ACK_DELAY_MS: u64 = 3;
 const FIELD_TX_BURST_PACKETS: u64 = 4;
 const FIELD_PATH_POLICY: u64 = 11;
 const FIELD_TIMEOUT_MS: u64 = 12;
+const MAX_ACK_FREQUENCY: u64 = 8;
 
 /// Connection policy operation carried by a normal QUIC stream. Stream open,
 /// RPC, and forwarding belong to their transport-independent managers; this
@@ -86,8 +105,7 @@ fn decode_policy(encoded: &[u8]) -> Option<ConnectionPolicy> {
     for _ in 0..count {
         match d.uint()? {
             FIELD_ACK_FREQUENCY => {
-                policy.ack_frequency =
-                    Some(d.uint()?.clamp(1, quic_lite::ACK_RANGE_CAPACITY as u64) as u8)
+                policy.ack_frequency = Some(d.uint()?.clamp(1, MAX_ACK_FREQUENCY) as u8)
             }
             FIELD_ACK_DELAY_MS => policy.ack_delay_ms = Some(d.uint()?.clamp(1, 25) as u8),
             FIELD_TX_BURST_PACKETS => policy.tx_burst_packets = Some(d.uint()?.min(32) as u8),

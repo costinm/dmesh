@@ -28,7 +28,7 @@ dmesh-cli http://127.0.0.1:18480 transport.set --mode=6
 
 ~~~sh
 . ./env.sh
-export DMESH_DEVICE_CATALOG=/path/to/device-catalog.toml # Optional private inventory.
+export DMESH_DEVICE_CATALOG=/path/to/device-catalog.toml # Deprecated test override only.
 dmesh-cli DEVICE status
 dmesh-cli udp://[fe80::1234%wlan0]:3337 status
 dmesh-cli SERIAL status
@@ -38,7 +38,10 @@ An IPv6 link-local address needs its interface scope, such as %wlan0. A
 catalog name with a scoped Wi-Fi address tries it first and checks the signed
 identity. If that fails, the CLI uses discovery and NAN activation. A catalog
 VIP6 selects an identity; it is not a directly routable UDP address. See the
-[example device catalog](examples/device-catalog.toml).
+[example device catalog](examples/device-catalog.toml). Static host inventory
+is deprecated; normal device selection is moving to discovery plus paired-device
+leases. Hardware tests must restore and release acquired peers so later runs can
+select them reproducibly.
 
 ## Find and inspect devices
 
@@ -144,6 +147,7 @@ dmesh-cli DEVICE settings.list                     # List setting keys.
 dmesh-cli DEVICE settings.get --key=name             # Read one key.
 dmesh-cli DEVICE settings.set --key=name --value=demo  # Set one key.
 dmesh-cli DEVICE settings.set --1=name --2=demo        # Same request using numeric tags.
+dmesh-cli DEVICE settings.set --key=quic.pool --value=32 # Larger per-device packet ceiling.
 dmesh-cli DEVICE relay.list                        # Inspect known relay entries.
 dmesh-cli DEVICE connection.configure --ack_frequency=2 --ack_delay_ms=10
 ~~~

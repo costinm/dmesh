@@ -42,13 +42,12 @@ pub mod power;
 pub mod probe;
 mod probe_service;
 mod probe_stream;
+pub mod provision;
 /// Bearer-neutral raw-command decoding and handler dispatch. Firmware and
 /// hosts supply handlers; neither UART nor Wi-Fi participates in this layer.
 pub mod raw_dispatch;
 /// CBOR-decoded, socket-free raw 802.11 hardware request schema.
 pub mod raw_wifi;
-/// Tagged-CBOR setup records for one-way DCID forwarding.
-pub mod relay;
 /// Canonical numeric tagged-CBOR identities shared by CLI, HTTP, Linux, and
 /// Android Rust adapters.
 pub mod service_catalog;
@@ -60,21 +59,21 @@ pub mod services;
 pub mod settings;
 /// Host-testable STA discovery and association policy.
 pub mod sta_selection;
-/// Bearer-neutral server connection bootstrap/mux state. This is no-std and
-/// has host tests; ESP and host adapters own their peer and socket/task glue.
-pub mod stream_server;
+/// Application dispatch over accepted QUIC-lite byte streams.
+///
+/// This is the replacement boundary for the legacy packet-oriented server:
+/// quic-lite owns nodes, associations, packet routing, and bearers, while
+/// dmesh-server handlers accept ordinary asynchronous streams.
+#[cfg(feature = "std")]
+pub mod stream_service;
 /// Bounded borrowed tagged-CBOR envelope shared with host mesh control.
 pub mod tagged;
 /// Portable local discovery status and transport-owned metric views.
 pub mod telemetry;
-/// Shared QUIC connection/server/client glue above bearer frame I/O.
-pub mod transport;
 /// Common ingress provenance and policy-driven egress selection shared by
 /// QUIC-lite, direct messages, radio adapters, and future relay paths.
 pub mod transport_path;
 pub mod transport_state;
-/// UART framing shared by host and firmware bearer adapters.
-pub mod uart;
 /// Cross-platform selection of NAN observers for waking a sleepy peer.
 pub mod wake;
 
@@ -95,12 +94,6 @@ pub mod transport_service;
 pub mod usb_service;
 #[cfg(feature = "http")]
 pub mod wifi_service;
-
-/// Host UDP adapter and standalone test server. This is intentionally kept
-/// out of `quic-lite`: it owns sockets, Tokio scheduling, object-server
-/// wiring, and test-only service handlers.
-#[cfg(feature = "udp")]
-pub mod udp;
 
 #[cfg(feature = "std")]
 mod host {
@@ -384,16 +377,6 @@ mod host {
             }
             let manifest = self.manifests.get(&source)?;
             Ok((manifest_bytes(&manifest, request)?, std::fs::read(source)?))
-        }
-
-        #[deprecated(note = "use response_object; record framing is not used on the wire")]
-        pub fn response_records(&self, request: GetRequest<'_>) -> Result<Vec<(u8, Vec<u8>)>> {
-            let (manifest, body) = self.response_object(request)?;
-            Ok(vec![
-                (RECORD_MANIFEST, manifest),
-                (RECORD_BLOB, body),
-                (RECORD_DONE, Vec::new()),
-            ])
         }
     }
 

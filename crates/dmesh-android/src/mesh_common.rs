@@ -19,45 +19,19 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::runtime::Runtime;
 
-#[cfg(target_os = "android")]
-struct AndroidDiscoveryApplication;
-
-#[cfg(target_os = "android")]
-impl dmesh_server::udp::TaggedApplicationHandler for AndroidDiscoveryApplication {
-    fn handle_tagged<'a>(
-        &'a self,
-        _context: dmesh_server::udp::TaggedStreamContext,
-        request: Vec<u8>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + 'a>> {
-        Box::pin(async move {
-            if let Some(response) = crate::mesh_jni::android_discovery_active_response(&request) {
-                return Some(response);
-            }
-            if let Some(response) = crate::mesh_jni::android_nan_wakeup_response(&request) {
-                return Some(response);
-            }
-            if let Some(response) = crate::mesh_jni::android_battery_response(&request) {
-                return Some(response);
-            }
-            if let Some(response) = crate::mesh_jni::android_telemetry_response(&request) {
-                return Some(response);
-            }
-            crate::mesh_jni::android_discovery_nodes_response(&request)
-        })
-    }
-}
-
 /// Opaque handle for a running mesh node instance.
 ///
 /// Owns the tokio runtime, the `MeshNode`, the SSH client manager,
-/// and join handles for the SSH, HTTP, and shared UDP service tasks.
+/// and join handles for the SSH, HTTP, and discovery tasks. The Android UDP
+/// socket is retained until the shared QUIC node registers it as a bearer.
 pub struct MeshHandle {
     pub node: Arc<MeshNode>,
     pub client_manager: Arc<SshClientManager>,
     pub runtime: Runtime,
     pub ssh_server_handle: Option<tokio::task::JoinHandle<()>>,
     pub http_server_handle: Option<tokio::task::JoinHandle<()>>,
-    pub udp_server_handle: Option<tokio::task::JoinHandle<()>>,
+    #[cfg(target_os = "android")]
+    pub android_udp_socket: std::sync::Mutex<Option<std::net::UdpSocket>>,
     pub announce_server_handle: Option<tokio::task::JoinHandle<()>>,
     /// Platform network transitions request an immediate announce without
     /// changing the fifteen-minute periodic cadence.
@@ -186,48 +160,20 @@ pub fn start_mesh(
     // Keep this Android-only: host MeshNode users must not unexpectedly claim
     // the stable Wi-Fi UDP port merely by constructing a node.
     #[cfg(target_os = "android")]
-    let udp_server_handle = {
+    let android_udp_socket = {
         // Java opens this descriptor on Android's selected Network.  Adopt it
         // here so the single Rust QUIC-lite listener retains that route mark;
         // a second bind would silently lose it.
-        let socket = runtime.block_on(async move {
-            match android_udp_fd {
-                Some(fd) => {
-                    let socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
-                    socket.set_nonblocking(true)?;
-                    tokio::net::UdpSocket::from_std(socket).map(Arc::new)
-                }
-                None => tokio::net::UdpSocket::bind((
-                    Ipv6Addr::UNSPECIFIED,
-                    dmesh_server::udp::STABLE_WIFI_UDP_PORT,
-                ))
-                .await
-                .map(Arc::new),
-            }
-        })?;
-        let udp_config = dmesh_server::udp::UdpConfig {
-            bind: SocketAddr::from((
+        let socket = match android_udp_fd {
+            Some(fd) => unsafe { std::net::UdpSocket::from_raw_fd(fd) },
+            None => std::net::UdpSocket::bind((
                 Ipv6Addr::UNSPECIFIED,
-                dmesh_server::udp::STABLE_WIFI_UDP_PORT,
-            )),
-            socket: Some(socket),
-            artifact_root: base_path.clone(),
-            tagged_handler: Some(Arc::new(
-                dmesh_server::udp::CanonicalTaggedStreamHandler::new(Arc::new(
-                    AndroidDiscoveryApplication,
-                )),
-            )),
-            ..dmesh_server::udp::UdpConfig::default()
+                dmesh_server::firmware_profile::DEFAULT_EVENT_PORT,
+            ))?,
         };
-        Some(runtime.spawn(async move {
-            if let Err(error) = dmesh_server::udp::run(udp_config).await {
-                log::error!("Android UDP service failed: {error}");
-            }
-        }))
+        socket.set_nonblocking(true)?;
+        std::sync::Mutex::new(Some(socket))
     };
-    #[cfg(not(target_os = "android"))]
-    let udp_server_handle = None;
-
     #[cfg(target_os = "android")]
     let (announce_server_handle, announce_trigger) = {
         let public_key = node
@@ -254,7 +200,8 @@ pub fn start_mesh(
         runtime,
         ssh_server_handle: Some(ssh_server_handle),
         http_server_handle,
-        udp_server_handle,
+        #[cfg(target_os = "android")]
+        android_udp_socket,
         announce_server_handle,
         announce_trigger,
         mesh_services,
@@ -276,9 +223,6 @@ pub fn stop_mesh(handle: MeshHandle) {
         h.abort();
     }
     if let Some(h) = handle.http_server_handle {
-        h.abort();
-    }
-    if let Some(h) = handle.udp_server_handle {
         h.abort();
     }
     if let Some(h) = handle.announce_server_handle {
@@ -350,8 +294,7 @@ async fn android_announce_loop(
             received = socket.recv_from(&mut receive) => match received {
                 Ok((len, sender)) => {
                     let packet = &receive[..len];
-                    if let Some(request) = dmesh_server::direct::ConnectionlessMessage::decode(packet)
-                        && let Some(request_id) = dmesh_server::announce::discovery_request_id(request)
+                    if let Some(request_id) = dmesh_server::announce::discovery_request_id(packet)
                     {
                         let announce = crate::mesh_jni::android_discovery_announce(
                             &public_key,
@@ -359,7 +302,6 @@ async fn android_announce_loop(
                         );
                         let mut response = [0u8; 256];
                         let mut record = [0u8; 320];
-                        let mut envelope = [0u8; 384];
                         if let Some(response_len) = dmesh_server::announce::encode_discovery_response(
                             announce, request_id, &mut response,
                         )
@@ -368,11 +310,8 @@ async fn android_announce_loop(
                                 crate::mesh_jni::android_discovery_facts(),
                                 &mut record,
                             )
-                            && let Some(envelope_len) = dmesh_server::direct::ConnectionlessMessage::encode(
-                                &record[..record_len], &mut envelope,
-                            )
                         {
-                            match socket.send_to(&envelope[..envelope_len], sender).await {
+                            match socket.send_to(&record[..record_len], sender).await {
                                 Ok(_) => log::info!("Android replied to directed UDP discovery from {sender}"),
                                 Err(error) => log::warn!("Android directed UDP discovery reply failed: {error}"),
                             }

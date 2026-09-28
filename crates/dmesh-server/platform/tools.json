@@ -1,6 +1,6 @@
 [
   {
-    "description": "Return the bounded cross-bearer observed-device inventory",
+    "description": "Return the retained cross-bearer observed-device inventory",
     "inputSchema": {
       "properties": {},
       "required": [],
@@ -528,7 +528,7 @@
     ]
   },
   {
-    "description": "Provision a virgin companion",
+    "description": "Provision an unpaired companion",
     "inputSchema": {
       "properties": {
         "baud": {
@@ -591,7 +591,7 @@
     ]
   },
   {
-    "description": "Reset a companion to virgin state",
+    "description": "Reset a companion to unpaired state",
     "inputSchema": {
       "properties": {
         "id": {
@@ -657,7 +657,7 @@
     "x-ui-visibility": "default"
   },
   {
-    "description": "Start a bounded BLE scan",
+    "description": "Start a time-limited BLE scan",
     "inputSchema": {
       "properties": {},
       "required": [],
@@ -775,7 +775,7 @@
     "x-ui-visibility": "default"
   },
   {
-    "description": "Read bounded local radio event history",
+    "description": "Read retained local radio event history",
     "inputSchema": {
       "properties": {
         "keys": {
@@ -947,6 +947,34 @@
     "x-ui-visibility": "default"
   },
   {
+    "description": "Read the attached device's signed identity",
+    "inputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "name": "usb.discover",
+    "outputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 204,
+    "x-method-index": 5,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ],
+    "x-ui-visibility": "default"
+  },
+  {
     "description": "Report local Wi-Fi controller and NAN state",
     "inputSchema": {
       "properties": {},
@@ -975,7 +1003,7 @@
     "x-ui-visibility": "default"
   },
   {
-    "description": "Request a bounded platform Wi-Fi scan",
+    "description": "Request a time-limited platform Wi-Fi scan",
     "inputSchema": {
       "properties": {},
       "required": [],

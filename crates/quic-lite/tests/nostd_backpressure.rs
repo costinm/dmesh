@@ -1,0 +1,222 @@
+//! Regression coverage for no-std receive backpressure.
+
+use std::sync::{Arc, Mutex};
+
+use quic_lite::{
+    BearerContext, BearerInfo, BearerName, ConnectionLimits, EgressSubmission, PacketBearer,
+    PacketEgress, PacketMeta, PacketPool as PacketPoolTrait, PacketSendOutcome, PacketSubmitError,
+    PacketWriter, PeerL2Address, QuicNode, nostd::NoStdRuntime, packet_pool::PacketPool,
+};
+
+type Pool = PacketPool<8, { quic_lite::DEFAULT_PACKET_POOL_SLOT_SIZE }>;
+static CLIENT_POOL: Pool = Pool::new();
+static SERVER_POOL: Pool = Pool::new();
+
+struct Capture<P: PacketPoolTrait + 'static> {
+    name: BearerName,
+    context: Arc<Mutex<Option<BearerContext<P>>>>,
+    sent: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+impl<P: PacketPoolTrait + 'static> Capture<P> {
+    fn new(
+        name: &str,
+    ) -> (
+        Self,
+        Arc<Mutex<Option<BearerContext<P>>>>,
+        Arc<Mutex<Vec<Vec<u8>>>>,
+    ) {
+        let context = Arc::new(Mutex::new(None));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                name: BearerName::new(name).unwrap(),
+                context: context.clone(),
+                sent: sent.clone(),
+            },
+            context,
+            sent,
+        )
+    }
+}
+
+impl<P> PacketEgress<P::Buffer> for Capture<P>
+where
+    P: PacketPoolTrait + 'static,
+{
+    fn submit(
+        &mut self,
+        _peer: PeerL2Address,
+        submission: EgressSubmission<P::Buffer>,
+    ) -> Result<(), PacketSubmitError<P::Buffer>> {
+        let (packet, completion) = submission.into_parts();
+        self.sent.lock().unwrap().push(packet.bytes().to_vec());
+        completion.complete(packet, PacketSendOutcome::Sent, 0);
+        Ok(())
+    }
+}
+
+impl<P> PacketBearer<P> for Capture<P>
+where
+    P: PacketPoolTrait + 'static,
+{
+    type AttachError = core::convert::Infallible;
+
+    fn info(&self) -> BearerInfo {
+        BearerInfo {
+            name: self.name,
+            max_packet_size: quic_lite::DEFAULT_MAX_PACKET_SIZE,
+            prefix_required: quic_lite::PACKET_PREFIX_RESERVE,
+            suffix_required: quic_lite::PACKET_SUFFIX_RESERVE,
+            requires_packet_encryption: false,
+            secure_link: true,
+            nominal_bitrate_bps: 115_200,
+            local_mac: None,
+        }
+    }
+
+    fn attach(&mut self, context: BearerContext<P>) -> Result<(), Self::AttachError> {
+        *self.context.lock().unwrap() = Some(context);
+        Ok(())
+    }
+}
+
+fn copy_into_pool(
+    pool: &'static Pool,
+    bytes: &[u8],
+) -> quic_lite::OwnedPacket<<Pool as PacketPoolTrait>::Buffer> {
+    let mut writer = pool
+        .acquire_writer(quic_lite::PACKET_PREFIX_RESERVE, 0)
+        .unwrap();
+    writer.payload_mut()[..bytes.len()].copy_from_slice(bytes);
+    writer.commit(bytes.len()).unwrap()
+}
+
+/// Bug: a full receive queue on the copying `NoStdRuntime::progress` path
+/// loses stream data permanently.
+///
+/// `mux` commits the packet to transport state (its packet number enters
+/// the ACK ranges) before the application callback runs. When the
+/// `next_stream_chunk` queue is full, the callback returns `BufferTooSmall`,
+/// `CallbackStreams` resets the stream locally, and `progress` returns an
+/// error. The packet is still ACKed, so the sender never retransmits it, and
+/// the peer is not told that the stream was reset. The transfer then stalls
+/// with a gap forever. A full queue must either leave the packet
+/// unacknowledged (so it is retransmitted) or stop granting credit, never
+/// ACK and drop.
+#[test]
+#[ignore = "known bug: committed packets beyond retained receive capacity are still lost"]
+fn slow_queue_consumer_receives_complete_stream() {
+    let (client_bearer, client_context, client_sent) = Capture::<Pool>::new("client");
+    let mut client = NoStdRuntime::new(
+        QuicNode::<(), 1, 2, Pool>::new(None, &CLIENT_POOL),
+        ConnectionLimits::default(),
+    );
+    let client_bearer_id = client.add_bearer(client_bearer).unwrap();
+    let client_address = PacketMeta {
+        bearer: client_bearer_id,
+        peer_l2_address: PeerL2Address::new(1).unwrap(),
+        received_at_us: 1,
+    };
+    let (server_bearer, server_context, server_sent) = Capture::<Pool>::new("server");
+    let mut server = NoStdRuntime::new(
+        QuicNode::<(), 1, 2, Pool>::new(None, &SERVER_POOL),
+        ConnectionLimits::default(),
+    );
+    let server_bearer_id = server.add_bearer(server_bearer).unwrap();
+    let server_address = PacketMeta {
+        bearer: server_bearer_id,
+        peer_l2_address: PeerL2Address::new(2).unwrap(),
+        received_at_us: 2,
+    };
+
+    let association = client.associate(client_address, 1).unwrap();
+    let initial = client_sent.lock().unwrap().pop().unwrap();
+    server_context
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .enqueue_packet(server_address, copy_into_pool(&SERVER_POOL, &initial));
+    server.progress().unwrap();
+    let open_ack = server_sent.lock().unwrap().pop().unwrap();
+    client_context
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .enqueue_packet(client_address, copy_into_pool(&CLIENT_POOL, &open_ack));
+    client.progress().unwrap();
+    assert!(client.association_is_established(association));
+
+    let mut stream = client.open_stream(association).unwrap();
+    let data: Vec<u8> = (0..30_000u32).map(|index| index as u8).collect();
+    let mut sent = 0;
+    let mut finished = false;
+    let mut received = Vec::new();
+    let mut now = 10u64;
+    for round in 0..2_000 {
+        now += 5_000;
+        while sent < data.len() {
+            let end = (sent + 1_000).min(data.len());
+            match client.write_stream(&mut stream, &data[sent..end]) {
+                Ok(accepted) => sent += accepted,
+                Err(_) => break,
+            }
+        }
+        if sent == data.len() && !finished {
+            finished = client.finish_stream(&mut stream).is_ok();
+        }
+        for packet in core::mem::take(&mut *client_sent.lock().unwrap()) {
+            server_context
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .enqueue_packet(
+                    PacketMeta {
+                        received_at_us: now,
+                        ..server_address
+                    },
+                    copy_into_pool(&SERVER_POOL, &packet),
+                );
+            // Errors are the symptom under test; keep driving the node.
+            let _ = server.progress();
+        }
+        // The application drains its queue only every fourth round.
+        if round % 4 == 0 {
+            while let Some(chunk) = server.next_stream_chunk() {
+                received.extend_from_slice(&chunk.bytes);
+            }
+        }
+        let _ = server.advance_time(now);
+        for packet in core::mem::take(&mut *server_sent.lock().unwrap()) {
+            client_context
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .enqueue_packet(
+                    PacketMeta {
+                        received_at_us: now,
+                        ..client_address
+                    },
+                    copy_into_pool(&CLIENT_POOL, &packet),
+                );
+            let _ = client.progress();
+        }
+        let _ = client.advance_time(now);
+        if received.len() == data.len() {
+            break;
+        }
+    }
+    while let Some(chunk) = server.next_stream_chunk() {
+        received.extend_from_slice(&chunk.bytes);
+    }
+    assert_eq!(
+        received.len(),
+        data.len(),
+        "stream stalled after a queue-full drop"
+    );
+    assert_eq!(received, data);
+}

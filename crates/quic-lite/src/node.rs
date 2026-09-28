@@ -917,6 +917,13 @@ impl<
         };
         self.router.register_endpoint(receive_cid, id)?;
         self.generations[slot] = generation;
+        let client_retention = match &state {
+            Association::Client(client) => crate::callback::retention_for_receive_window(
+                client.connection().local_limits(),
+                crate::DEFAULT_REORDER_CAPACITY_BYTES,
+            ),
+            Association::Server(_) => crate::DEFAULT_REORDER_CAPACITY_BYTES,
+        };
         let entry = Some(AssociationSlot {
             generation,
             receive_cid,
@@ -928,7 +935,7 @@ impl<
             last_activity_us: self.clock_us,
             client_delivery: crate::callback::CallbackStreams::new(
                 crate::DEFAULT_STREAM_STATE_LIMIT,
-                crate::DEFAULT_REORDER_CAPACITY_BYTES,
+                client_retention,
             ),
         });
         if slot == self.associations.len() {
@@ -1277,10 +1284,7 @@ where
         if let Some(token) = self.router.reset_token_for(receive_cid) {
             client.connection_mut().set_local_reset_token(token);
         }
-        client.select_packet_path(address);
-        let packet = Self::build_packet(self.pool, |output| {
-            client.start(output).map(|(_, used)| used)
-        })?;
+        let packet = Self::build_packet(self.pool, |output| client.start(output))?;
         let association = self.add_client(receive_cid, client)?;
         self.remember_address(association, address);
         self.slot_mut(association)
@@ -1625,9 +1629,7 @@ where
         }
         let packet = match &mut slot.state {
             Association::Client(client) => Self::build_packet(pool, |output| {
-                client
-                    .encode_stream_payload_at(stream_id, offset, bytes, fin, output)
-                    .map(|(_, used)| used)
+                client.encode_stream_payload_at(stream_id, offset, bytes, fin, output)
             })?,
             Association::Server(server) => Self::build_packet(pool, |output| {
                 server.encode_stream_payload_at(stream_id, offset, bytes, fin, output)
@@ -1657,9 +1659,7 @@ where
             .ok_or(QuicNodeError::MissingAssociation)?;
         let packet = match &mut slot.state {
             Association::Client(client) => Self::build_optional_packet(pool, |output| {
-                client
-                    .poll_transmit(output)
-                    .map(|packet| packet.map(|(_, used)| used))
+                client.connection_mut().poll_transmit(output)
             })?,
             Association::Server(server) => {
                 Self::build_optional_packet(pool, |output| server.poll_transmit(output))?
@@ -1704,9 +1704,7 @@ where
                 .ok_or(QuicNodeError::MissingAssociation)?;
             match &mut slot.state {
                 Association::Client(client) => Self::build_optional_packet(pool, |output| {
-                    client
-                        .poll_transmit(output)
-                        .map(|packet| packet.map(|(_, used)| used))
+                    client.connection_mut().poll_transmit(output)
                 })?,
                 Association::Server(server) => {
                     Self::build_optional_packet(pool, |output| server.poll_transmit(output))?
@@ -1728,10 +1726,10 @@ where
                 .ok_or(QuicNodeError::MissingAssociation)?;
             match &mut slot.state {
                 Association::Client(client) => Self::build_packet(pool, |output| {
-                    client.close(code)?;
+                    client.connection_mut().close(code)?;
                     client
+                        .connection_mut()
                         .poll_close(output)?
-                        .map(|(_, used)| used)
                         .ok_or(Error::Invalid)
                 })?,
                 Association::Server(server) => Self::build_packet(pool, |output| {
@@ -1831,9 +1829,7 @@ where
                 Association::Server(_) => unreachable!("only clients bootstrap"),
             };
             let packet = Self::build_packet(self.pool, |output| {
-                client
-                    .encode_open_attempt(bootstrap.next_attempt, output)
-                    .map(|(_, used)| used)
+                client.encode_open_attempt(bootstrap.next_attempt, output)
             })?;
             slot.bootstrap = Some(ClientBootstrap {
                 next_attempt: bootstrap.next_attempt.saturating_add(1),
@@ -2195,7 +2191,7 @@ where
                             .receive_packet(meta, bytes, |_| Ok(()))
                             .map_err(QuicNodePacketRejection::Packet)?;
                     } else if let Some(payload) = client
-                        .receive_serial_response_payload_packet(meta, bytes, false)
+                        .receive_stream_payload_packet(meta, bytes)
                         .map_err(QuicNodePacketRejection::Packet)?
                     {
                         let mut sink = OrderedNodeSink {
@@ -2273,6 +2269,67 @@ where
         }
         self.remember_address(id, meta);
         Ok(ingress)
+    }
+
+    /// Resume ordered bytes retained after an application accepted only a
+    /// prefix. This is runtime plumbing: it uses the same stream callback and
+    /// receive-credit accounting as packet ingress without owning a transport.
+    pub(crate) fn resume_stream_delivery<StreamEvent>(
+        &mut self,
+        association: QuicAssociation,
+        stream_id: u64,
+        on_stream: &mut StreamEvent,
+    ) -> Result<usize, QuicNodePacketRejection>
+    where
+        StreamEvent:
+            FnMut(ApplicationStreamSource, u64, u64, bool, &[u8]) -> Result<usize, crate::Error>,
+    {
+        let slot = self
+            .slot_mut(association)
+            .ok_or(QuicNodePacketRejection::Packet(Error::WrongConnectionId))?;
+        match &mut slot.state {
+            Association::Client(client) => {
+                let mut sink = OrderedNodeSink {
+                    association,
+                    handler: on_stream,
+                    consumed: 0,
+                };
+                slot.client_delivery
+                    .resume_copying(stream_id, &mut sink)
+                    .map_err(|error| match error {
+                        crate::callback::CopyingError::Transport(_) => {
+                            QuicNodePacketRejection::Packet(Error::Invalid)
+                        }
+                        crate::callback::CopyingError::Callback(error) => {
+                            QuicNodePacketRejection::Application(error)
+                        }
+                    })?;
+                if sink.consumed != 0 {
+                    client
+                        .stream_consumed(stream_id, sink.consumed, false)
+                        .map_err(QuicNodePacketRejection::Packet)?;
+                }
+                Ok(sink.consumed)
+            }
+            Association::Server(server) => server
+                .resume_stream_events(stream_id, |stream, offset, fin, bytes| {
+                    on_stream(
+                        ApplicationStreamSource::Association(association),
+                        stream,
+                        offset,
+                        fin,
+                        bytes,
+                    )
+                })
+                .map_err(|error| match error {
+                    crate::mux::StreamDeliveryError::Packet(error) => {
+                        QuicNodePacketRejection::Packet(error)
+                    }
+                    crate::mux::StreamDeliveryError::Application(error) => {
+                        QuicNodePacketRejection::Application(error)
+                    }
+                }),
+        }
     }
 
     /// Earliest Initial retry, ACK, loss, or PTO deadline across the node.

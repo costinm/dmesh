@@ -4,10 +4,12 @@
 //! so the mesh integration layer does not implement a platform bearer.
 
 mod coc;
+mod coc_bearer;
 mod service;
 mod wire;
 
-pub use coc::{COC_FRAME_MAX, CocChannel, DEFAULT_COC_PSM};
+pub use coc::{COC_PACKET_MAX, CocChannel, DEFAULT_COC_PSM};
+pub use coc_bearer::CocBearer;
 pub use service::BleService;
 pub use wire::{Advertisement, DMESH_BLE_SERVICE_UUID16};
 

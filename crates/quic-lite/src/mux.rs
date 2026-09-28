@@ -233,6 +233,42 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
         Ok(())
     }
 
+    /// Resume bytes retained because an application consumer previously
+    /// accepted only a prefix. Receive credit advances only by the number of
+    /// bytes accepted by this callback.
+    pub(crate) fn resume_stream_events<F>(
+        &mut self,
+        stream_id: u64,
+        mut on_stream: F,
+    ) -> Result<usize, StreamDeliveryError>
+    where
+        F: FnMut(u64, u64, bool, &[u8]) -> Result<usize, Error>,
+    {
+        let mut sink = ApplicationStreamSink {
+            handler: &mut on_stream,
+            bytes: 0,
+            finished: false,
+        };
+        self.ordered
+            .resume_copying(stream_id, &mut sink)
+            .map_err(|error| match error {
+                CopyingError::Transport(_) => StreamDeliveryError::Packet(Error::Invalid),
+                CopyingError::Callback(error) => StreamDeliveryError::Application(error),
+            })?;
+        if sink.bytes != 0 {
+            self.endpoint
+                .stream_consumed(stream_id, sink.bytes)
+                .map_err(StreamDeliveryError::Packet)?;
+        }
+        if sink.finished {
+            if self.completed.len() >= self.max_pending_streams {
+                self.completed.remove(0);
+            }
+            self.completed.push(stream_id);
+        }
+        Ok(sink.bytes)
+    }
+
     /// Encode one contiguous response-stream fragment.  Application handlers
     /// remain oblivious to bearer MTU: the QUIC terminal chooses fragments and
     /// retains their shared stream offset for UDP, UART, NOW, and NAN alike.

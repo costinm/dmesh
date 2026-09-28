@@ -205,25 +205,6 @@
       "x-dmesh-device": true
     },
     {
-      "name": "relay.list",
-      "description": "Call the relay.list QUIC stream handler",
-      "inputSchema": {
-        "type": "object",
-        "properties": {}
-      },
-      "outputSchema": {
-        "type": "object"
-      },
-      "x-component-index": 5,
-      "x-method-index": 3,
-      "x-ui-visibility": "advanced",
-      "x-check-all": {},
-      "x-check-all-platforms": [
-        "esp32"
-      ],
-      "x-dmesh-device": true
-    },
-    {
       "name": "discovery.nodes",
       "description": "Call the discovery.nodes QUIC stream handler",
       "inputSchema": {
@@ -2005,7 +1986,7 @@
       "x-dmesh-device": true
     },
     {
-      "description": "Invite only a virgin device into a bounded pairing window",
+      "description": "Invite only an unpaired device into a time-limited pairing window",
       "inputSchema": {
         "properties": {
           "to": {
@@ -2039,7 +2020,7 @@
       "x-dmesh-device": true
     },
     {
-      "description": "Provision a virgin companion",
+      "description": "Provision an unpaired companion",
       "inputSchema": {
         "properties": {
           "baud": {
@@ -2102,7 +2083,7 @@
       ]
     },
     {
-      "description": "Reset a companion to virgin state",
+      "description": "Reset a companion to unpaired state",
       "inputSchema": {
         "properties": {
           "id": {
@@ -2140,7 +2121,7 @@
       ]
     },
     {
-      "description": "Run a bounded QUIC probe through the selected Linux radio path",
+      "description": "Run a time-limited QUIC probe through the selected Linux radio path",
       "inputSchema": {
         "properties": {
           "bytes": {
@@ -2248,7 +2229,7 @@
       "x-ui-visibility": "advanced"
     },
     {
-      "description": "Read bounded local message history",
+      "description": "Read retained local message history",
       "inputSchema": {
         "properties": {
           "keys": {
@@ -2273,175 +2254,6 @@
       },
       "x-component-index": 4,
       "x-method-index": 10,
-      "x-standard-errors": [
-        "unauthenticated",
-        "permission_denied",
-        "timeout",
-        "remote_exception",
-        "invalid_argument",
-        "not_found",
-        "conflict",
-        "unavailable",
-        "internal"
-      ],
-      "x-ui-visibility": "advanced"
-    },
-    {
-      "description": "relay.connect on the local Linux mesh daemon",
-      "inputSchema": {
-        "properties": {
-          "next_hop_mac": {
-            "type": "string",
-            "x-protobuf-index": 2,
-            "x-protobuf-type": "string"
-          },
-          "relay_endpoint": {
-            "type": "string",
-            "x-protobuf-index": 1,
-            "x-protobuf-type": "string"
-          }
-        },
-        "required": [],
-        "type": "object"
-      },
-      "name": "relay.connect",
-      "outputSchema": {
-        "properties": {},
-        "required": [],
-        "type": "object"
-      },
-      "x-component-index": 220,
-      "x-method-index": 30,
-      "x-standard-errors": [
-        "unauthenticated",
-        "permission_denied",
-        "timeout",
-        "remote_exception",
-        "invalid_argument",
-        "not_found",
-        "conflict",
-        "unavailable",
-        "internal"
-      ],
-      "x-ui-visibility": "advanced"
-    },
-    {
-      "description": "relay.open on the local Linux mesh daemon",
-      "inputSchema": {
-        "properties": {
-          "relay_endpoint": {
-            "type": "string",
-            "x-protobuf-index": 1,
-            "x-protobuf-type": "string"
-          }
-        },
-        "required": [],
-        "type": "object"
-      },
-      "name": "relay.open",
-      "outputSchema": {
-        "properties": {},
-        "required": [],
-        "type": "object"
-      },
-      "x-component-index": 220,
-      "x-method-index": 31,
-      "x-standard-errors": [
-        "unauthenticated",
-        "permission_denied",
-        "timeout",
-        "remote_exception",
-        "invalid_argument",
-        "not_found",
-        "conflict",
-        "unavailable",
-        "internal"
-      ],
-      "x-ui-visibility": "advanced"
-    },
-    {
-      "description": "relay.endpoint.status on the local Linux mesh daemon",
-      "inputSchema": {
-        "properties": {
-          "relay_endpoint": {
-            "type": "string",
-            "x-protobuf-index": 1,
-            "x-protobuf-type": "string"
-          }
-        },
-        "required": [],
-        "type": "object"
-      },
-      "name": "relay.endpoint.status",
-      "outputSchema": {
-        "properties": {},
-        "required": [],
-        "type": "object"
-      },
-      "x-component-index": 220,
-      "x-method-index": 32,
-      "x-standard-errors": [
-        "unauthenticated",
-        "permission_denied",
-        "timeout",
-        "remote_exception",
-        "invalid_argument",
-        "not_found",
-        "conflict",
-        "unavailable",
-        "internal"
-      ],
-      "x-ui-visibility": "advanced"
-    },
-    {
-      "description": "relay.close on the local Linux mesh daemon",
-      "inputSchema": {
-        "properties": {
-          "relay_endpoint": {
-            "type": "string",
-            "x-protobuf-index": 1,
-            "x-protobuf-type": "string"
-          }
-        },
-        "required": [],
-        "type": "object"
-      },
-      "name": "relay.close",
-      "outputSchema": {
-        "properties": {},
-        "required": [],
-        "type": "object"
-      },
-      "x-component-index": 220,
-      "x-method-index": 33,
-      "x-standard-errors": [
-        "unauthenticated",
-        "permission_denied",
-        "timeout",
-        "remote_exception",
-        "invalid_argument",
-        "not_found",
-        "conflict",
-        "unavailable",
-        "internal"
-      ],
-      "x-ui-visibility": "advanced"
-    },
-    {
-      "description": "relay.status on the local Linux mesh daemon",
-      "inputSchema": {
-        "properties": {},
-        "required": [],
-        "type": "object"
-      },
-      "name": "relay.status",
-      "outputSchema": {
-        "properties": {},
-        "required": [],
-        "type": "object"
-      },
-      "x-component-index": 220,
-      "x-method-index": 34,
       "x-standard-errors": [
         "unauthenticated",
         "permission_denied",
@@ -3066,163 +2878,6 @@
       },
       "x-component-index": 5,
       "x-method-index": 13,
-      "x-standard-errors": [
-        "unauthenticated",
-        "permission_denied",
-        "timeout",
-        "remote_exception",
-        "invalid_argument",
-        "not_found",
-        "conflict",
-        "unavailable",
-        "internal"
-      ]
-    },
-    {
-      "description": "Show the paired UART companion, visible port count, and modem lines",
-      "inputSchema": {
-        "properties": {},
-        "required": [],
-        "type": "object"
-      },
-      "name": "uart.status",
-      "outputSchema": {
-        "properties": {},
-        "required": [],
-        "type": "object"
-      },
-      "x-component-index": 206,
-      "x-method-index": 1,
-      "x-standard-errors": [
-        "unauthenticated",
-        "permission_denied",
-        "timeout",
-        "remote_exception",
-        "invalid_argument",
-        "not_found",
-        "conflict",
-        "unavailable",
-        "internal"
-      ]
-    },
-    {
-      "description": "List USB serial ports and observed VIPs without opening them",
-      "inputSchema": {
-        "properties": {},
-        "required": [],
-        "type": "object"
-      },
-      "name": "uart.devices",
-      "outputSchema": {
-        "properties": {},
-        "required": [],
-        "type": "object"
-      },
-      "x-component-index": 206,
-      "x-method-index": 2,
-      "x-standard-errors": [
-        "unauthenticated",
-        "permission_denied",
-        "timeout",
-        "remote_exception",
-        "invalid_argument",
-        "not_found",
-        "conflict",
-        "unavailable",
-        "internal"
-      ]
-    },
-    {
-      "description": "Temporarily check one or all listed ports for signed identity",
-      "inputSchema": {
-        "properties": {
-          "baud": {
-            "type": "integer",
-            "x-protobuf-index": 2,
-            "x-protobuf-type": "u32"
-          },
-          "path": {
-            "type": "string",
-            "x-protobuf-index": 1,
-            "x-protobuf-type": "string"
-          },
-          "timeout_ms": {
-            "type": "integer",
-            "x-protobuf-index": 3,
-            "x-protobuf-type": "u64"
-          }
-        },
-        "required": [],
-        "type": "object"
-      },
-      "name": "uart.discover",
-      "outputSchema": {
-        "properties": {},
-        "required": [],
-        "type": "object"
-      },
-      "x-component-index": 206,
-      "x-method-index": 3,
-      "x-standard-errors": [
-        "unauthenticated",
-        "permission_denied",
-        "timeout",
-        "remote_exception",
-        "invalid_argument",
-        "not_found",
-        "conflict",
-        "unavailable",
-        "internal"
-      ]
-    },
-    {
-      "description": "Set the paired UART port baud rate",
-      "inputSchema": {
-        "properties": {
-          "baud": {
-            "type": "integer",
-            "x-protobuf-index": 1,
-            "x-protobuf-type": "u32"
-          }
-        },
-        "required": [],
-        "type": "object"
-      },
-      "name": "uart.baud",
-      "outputSchema": {
-        "properties": {},
-        "required": [],
-        "type": "object"
-      },
-      "x-component-index": 206,
-      "x-method-index": 4,
-      "x-standard-errors": [
-        "unauthenticated",
-        "permission_denied",
-        "timeout",
-        "remote_exception",
-        "invalid_argument",
-        "not_found",
-        "conflict",
-        "unavailable",
-        "internal"
-      ]
-    },
-    {
-      "description": "Pulse the paired UART reset control lines",
-      "inputSchema": {
-        "properties": {},
-        "required": [],
-        "type": "object"
-      },
-      "name": "uart.reset",
-      "outputSchema": {
-        "properties": {},
-        "required": [],
-        "type": "object"
-      },
-      "x-component-index": 206,
-      "x-method-index": 5,
       "x-standard-errors": [
         "unauthenticated",
         "permission_denied",

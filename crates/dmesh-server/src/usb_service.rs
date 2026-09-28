@@ -15,6 +15,7 @@ pub trait UsbBackend: Send + Sync {
     async fn devices(&self) -> anyhow::Result<Value>;
     async fn open(&self, params: Value) -> anyhow::Result<Value>;
     async fn close(&self) -> anyhow::Result<Value>;
+    async fn discover(&self) -> anyhow::Result<Value>;
 }
 
 pub fn tools_json() -> Value {
@@ -105,6 +106,7 @@ impl UsbService {
                 self.backend.open(params).await
             }
             "usb.close" => self.backend.close().await,
+            "usb.discover" => self.backend.discover().await,
             other => bail!("unsupported usb service method {other}"),
         }
     }
@@ -130,6 +132,9 @@ mod tests {
         }
         async fn close(&self) -> anyhow::Result<Value> {
             Ok(json!({"operation": "close"}))
+        }
+        async fn discover(&self) -> anyhow::Result<Value> {
+            Ok(json!({"operation": "discover"}))
         }
     }
 

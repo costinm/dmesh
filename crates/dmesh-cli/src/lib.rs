@@ -9,7 +9,7 @@ pub mod client;
 mod device;
 mod flash;
 mod http;
-pub mod prober;
+mod node_client;
 mod schema;
 pub mod uart;
 

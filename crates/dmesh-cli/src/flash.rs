@@ -5,6 +5,7 @@
 //! host platform's discovery, NAN wake, Recovery handoff, object stream, and
 //! post-reboot health gates.
 
+use crate::client::fresh_request_id;
 use crate::{
     client::{
         catalog_udp6_peer, catalog_vip6_inventory, direct_discovery_announce,
@@ -15,7 +16,7 @@ use crate::{
     device::resolve_catalog_target,
     schema::encode_stream_command_with_id,
 };
-use dmesh_server::{announce, udp::fresh_request_id};
+use dmesh_server::announce;
 use std::{
     env,
     net::{Ipv6Addr, SocketAddr},
@@ -49,8 +50,12 @@ pub(crate) fn flash_upload_object(
 }
 
 pub(crate) fn flash_upload_success(response: &[u8]) -> Result<(), String> {
+    if response == b"ok" {
+        println!("SUCCESS object.flash complete");
+        return Ok(());
+    }
     let record = dmesh_server::tagged::decode(response)
-        .ok_or("object.flash completed without a tagged terminal response")?;
+        .ok_or("object.flash completed without an `ok` result")?;
     let result = record
         .result
         .ok_or("object.flash terminal response was not successful")?;

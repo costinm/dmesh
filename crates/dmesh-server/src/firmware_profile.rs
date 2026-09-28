@@ -4,13 +4,12 @@
 //! and has no ESP-IDF, FreeRTOS, NVS, socket, or bearer dependency. Firmware
 //! supplies persistence and applies the resulting profile to its radio.
 
+use crate::connection::ConnectionPolicy;
 use crate::{
     cbor::Encoder,
-    connection,
     control::{self, TransportConfig, TransportKind},
     tagged,
 };
-use quic_lite::connection::ConnectionPolicy;
 
 /// Stable `lmesh-wifi` event destination until an event handler selects a
 /// different endpoint. This is not the raw UDP6 bearer port (3339), and it
@@ -312,15 +311,6 @@ pub fn encode_profile_control_response(
             out,
         );
     }
-    if let Some(request) = connection::decode_record(record) {
-        return tagged::encode_numeric_response(
-            connection::CONNECTION_COMPONENT,
-            connection_method(request),
-            id,
-            &[0xa0],
-            out,
-        );
-    }
     None
 }
 
@@ -333,17 +323,10 @@ fn control_method(request: control::Request<'_>) -> u64 {
     }
 }
 
-fn connection_method(request: connection::Request) -> u64 {
-    match request {
-        connection::Request::Configure(_) => connection::CONNECTION_CONFIGURE,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::control::TransportConfig;
-    use quic_lite::connection::ConnectionPolicy;
 
     #[test]
     fn event_port_defaults_to_stable_lmesh_wifi() {
@@ -421,14 +404,6 @@ mod tests {
         assert!(profile.espnow_capture);
         assert_eq!(profile.raw_tx_rate, 24);
         assert_eq!(profile.ack_frequency, 8);
-        apply_connection_policy(
-            ConnectionPolicy {
-                tx_burst_packets: Some(1),
-                ..ConnectionPolicy::default()
-            },
-            &mut profile,
-        );
-        assert_eq!(profile.tx_burst_packets, 1);
     }
 
     #[test]

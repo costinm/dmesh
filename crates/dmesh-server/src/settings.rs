@@ -297,26 +297,6 @@ mod tests {
 
     #[cfg(feature = "std")]
     #[test]
-    fn private_device_secret_exposes_only_its_reset_key_branch() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("device-secret.bin");
-        assert!(
-            stateless_reset_key_from_private_file(&path)
-                .unwrap()
-                .is_none()
-        );
-        std::fs::write(&path, [0x55; 32]).unwrap();
-        let key = stateless_reset_key_from_private_file(&path)
-            .unwrap()
-            .unwrap();
-        let cid = quic_lite::ConnectionId::new(9).unwrap();
-        assert_eq!(key.token_for(cid), key.token_for(cid));
-        std::fs::write(&path, [0x55; 15]).unwrap();
-        assert!(stateless_reset_key_from_private_file(&path).is_err());
-    }
-
-    #[cfg(feature = "std")]
-    #[test]
     fn private_device_secret_write_is_not_a_common_setting() {
         let directory = tempfile::tempdir().unwrap();
         let secret_path = directory.path().join("device-secret.bin");

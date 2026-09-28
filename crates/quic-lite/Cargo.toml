@@ -18,7 +18,7 @@ libc = { version = "0.2", optional = true }
 tokio = { version = "1", default-features = false, features = ["io-util", "macros", "net", "rt", "sync", "time"], optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", default-features = false, features = ["io-util", "macros", "net", "rt", "sync"] }
+tokio = { version = "1", default-features = false, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 
 [lib]
 name = "quic_lite"

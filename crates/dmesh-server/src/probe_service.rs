@@ -8,6 +8,12 @@ use crate::{
     tagged::{Name, Record},
 };
 
+pub use quic_lite::probe::{
+    MAX_BYTES as PROBE_MAX_BYTES, MAX_NORMAL_STREAMS as PROBE_MAX_NORMAL_STREAMS,
+    ProbePlan as ProbeServicePlan, ProbeRequest as ProbeServiceRequest,
+    ProbeResult as ProbeServiceResult,
+};
+
 pub const PROBE_COMPONENT: u64 = 8;
 pub const PROBE_RUN: u64 = 1;
 /// Bounded storage for one complete canonical `probe.run` request.
@@ -21,47 +27,6 @@ const FIELD_HIGH_PRIORITY_BYTES: u64 = 9;
 const FIELD_PARALLEL_STREAMS: u64 = 10;
 const FIELD_INITIAL_CONSUME_DELAY_MS: u64 = 11;
 const FIELD_CONSUME_DELAY_MS: u64 = 12;
-
-/// Maximum number of normal diagnostic streams in one handler invocation.
-/// Keep this aligned with the bounded QUIC-lite service profile rather than
-/// letting a host-only adapter accept a shape firmware cannot represent.
-pub const PROBE_MAX_NORMAL_STREAMS: usize = 4;
-/// The service-level byte bound is deliberately independent of a bearer MTU.
-/// A caller supplies the latter when constructing an [`ProbeServicePlan`].
-pub const PROBE_MAX_BYTES: u64 = 64 * 1024 * 1024;
-
-/// Decoded PROBE request. QUIC-lite owns packet scheduling and flow control.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ProbeServiceRequest {
-    pub bytes: u64,
-    pub packet_size: u16,
-    pub ack_frequency: Option<u8>,
-    pub ack_delay_ms: Option<u8>,
-    pub low_priority_bytes: Option<u32>,
-    pub high_priority_bytes: Option<u32>,
-    pub parallel_streams: Option<u8>,
-    /// Hold all receive credit for this long after the first stream chunk.
-    /// This models an erase or other one-time storage barrier.
-    pub initial_consume_delay_ms: Option<u32>,
-    /// Delay returning credit for each subsequently consumed chunk.
-    pub consume_delay_ms: Option<u32>,
-}
-
-impl ProbeServiceRequest {
-    pub const fn new(bytes: u64, packet_size: u16) -> Self {
-        Self {
-            bytes,
-            packet_size,
-            ack_frequency: None,
-            ack_delay_ms: None,
-            low_priority_bytes: None,
-            high_priority_bytes: None,
-            parallel_streams: None,
-            initial_consume_delay_ms: None,
-            consume_delay_ms: None,
-        }
-    }
-}
 
 /// Encode the canonical correlated `probe.run` request.
 pub fn encode_probe_run_request(
@@ -175,78 +140,6 @@ pub fn decode_probe_run_record(record: Record<'_>) -> Option<(u64, ProbeServiceR
     Some((record.id?, request))
 }
 
-/// Fully normalized, bearer-neutral PROBE handler work plan.
-///
-/// This is the single place where the stream service turns its compact wire
-/// request into bounded normal/high/low producers and an ACK policy.  ESP
-/// adapters and the host UDP listener must consume this plan instead of
-/// independently clamping byte counts or choosing a different stream shape.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ProbeServicePlan {
-    pub packet_size: usize,
-    pub normal_streams: usize,
-    pub normal_bytes: [usize; PROBE_MAX_NORMAL_STREAMS],
-    pub high_priority_bytes: usize,
-    pub low_priority_bytes: usize,
-    /// Human-facing ACK ratio, not the `frequency - 1` wire encoding.
-    pub ack_frequency: u8,
-    pub ack_delay_ms: u8,
-    pub initial_consume_delay_ms: u32,
-    pub consume_delay_ms: u32,
-}
-
-impl ProbeServicePlan {
-    /// Normalize a decoded service request for a specific complete-datagram
-    /// payload budget. `max_packet_size` is supplied by the bearer adapter,
-    /// but every other decision is shared by host and firmware.
-    pub fn from_request(request: ProbeServiceRequest, max_packet_size: usize) -> Self {
-        let normal_streams =
-            usize::from(request.parallel_streams.unwrap_or(1)).clamp(1, PROBE_MAX_NORMAL_STREAMS);
-        let requested = request.bytes.clamp(1, PROBE_MAX_BYTES) as usize;
-        let each = requested / normal_streams;
-        let remainder = requested % normal_streams;
-        let mut normal_bytes = [0; PROBE_MAX_NORMAL_STREAMS];
-        for (index, bytes) in normal_bytes.iter_mut().take(normal_streams).enumerate() {
-            *bytes = each + usize::from(index < remainder);
-        }
-        Self {
-            // Four bytes of deterministic PROBE sequence occupy each stream
-            // payload. A smaller value cannot produce a valid frame.
-            packet_size: usize::from(request.packet_size).clamp(8, max_packet_size.max(8)),
-            normal_streams,
-            normal_bytes,
-            high_priority_bytes: request
-                .high_priority_bytes
-                .map(usize::try_from)
-                .and_then(Result::ok)
-                .unwrap_or(0)
-                .min(PROBE_MAX_BYTES as usize),
-            low_priority_bytes: request
-                .low_priority_bytes
-                .map(usize::try_from)
-                .and_then(Result::ok)
-                .unwrap_or(0)
-                .min(PROBE_MAX_BYTES as usize),
-            ack_frequency: request
-                .ack_frequency
-                .unwrap_or(2)
-                .clamp(1, quic_lite::ACK_RANGE_CAPACITY as u8),
-            ack_delay_ms: request.ack_delay_ms.unwrap_or(5).clamp(1, 25),
-            initial_consume_delay_ms: request.initial_consume_delay_ms.unwrap_or(0),
-            consume_delay_ms: request.consume_delay_ms.unwrap_or(0),
-        }
-    }
-
-    pub fn total_bytes(&self) -> u64 {
-        self.normal_bytes[..self.normal_streams]
-            .iter()
-            .copied()
-            .sum::<usize>()
-            .saturating_add(self.high_priority_bytes)
-            .saturating_add(self.low_priority_bytes) as u64
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -294,7 +187,7 @@ mod tests {
         assert_eq!(plan.normal_bytes, [3, 3, 2, 2]);
         assert_eq!(plan.high_priority_bytes, 3);
         assert_eq!(plan.low_priority_bytes, 7);
-        assert_eq!(plan.ack_frequency, quic_lite::ACK_RANGE_CAPACITY as u8);
+        assert_eq!(plan.ack_frequency, 8);
         assert_eq!(plan.ack_delay_ms, 1);
         assert_eq!(plan.total_bytes(), 20);
     }

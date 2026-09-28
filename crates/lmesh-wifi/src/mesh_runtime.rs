@@ -11,6 +11,10 @@ use anyhow::{Context, Result};
 use tokio::time::{Duration, sleep};
 use tracing::{debug, error, warn};
 
+pub type HostPacketPool =
+    quic_lite::packet_pool::PacketPool<32, { quic_lite::DEFAULT_PACKET_POOL_SLOT_SIZE }>;
+pub type HostQuicNode = quic_lite::QuicNode<(), 32, 32, HostPacketPool>;
+
 /// Keep host multicast presence aligned with NAN/NOW/ESP refreshes. Operators
 /// may still override this through `LMESH_ANNOUNCE_INTERVAL_SECS`.
 const DEFAULT_ANNOUNCE_INTERVAL_SECS: u64 = 5 * 60;
@@ -36,7 +40,7 @@ pub struct RuntimeDefaults {
 pub const LMESH_DEFAULTS: RuntimeDefaults = RuntimeDefaults {
     control_socket: "/run/mesh/lmesh/mesh.sock.cbor",
     http_port: 18981,
-    udp_port: dmesh_server::udp::STABLE_WIFI_UDP_PORT,
+    udp_port: 3337,
 };
 
 /// Generated public catalog. Only reviewed entries carry numeric tags, so the
@@ -61,10 +65,14 @@ fn public_tools_json() -> serde_json::Value {
 }
 
 /// Run the shared Linux mesh control plane.
-pub async fn run_mesh_service(defaults: RuntimeDefaults) -> Result<()> {
+pub async fn run_mesh_service(
+    defaults: RuntimeDefaults,
+    node: HostQuicNode,
+    espnow_ingress: Arc<dyn crate::espnow_bearer::EspNowIngress>,
+) -> Result<()> {
     let (trace_buffer, _trace_guard) = mesh::local_trace::init("lmesh");
     mesh::local_trace::serve("lmesh", trace_buffer.clone());
-    if let Err(error) = run_server(defaults).await {
+    if let Err(error) = run_server(defaults, node, espnow_ingress).await {
         // mesh-init intentionally discards child stderr in the production
         // service unit. Persist the startup failure in the service log so a
         // stale control socket is diagnosable without changing radio state or
@@ -75,7 +83,18 @@ pub async fn run_mesh_service(defaults: RuntimeDefaults) -> Result<()> {
     Ok(())
 }
 
-async fn run_server(defaults: RuntimeDefaults) -> Result<()> {
+async fn run_server(
+    defaults: RuntimeDefaults,
+    node: HostQuicNode,
+    espnow_ingress: Arc<dyn crate::espnow_bearer::EspNowIngress>,
+) -> Result<()> {
+    let (node, driver) =
+        quic_lite::tokio::TokioNodeDriver::new(node, quic_lite::ConnectionLimits::default());
+    tokio::task::spawn_local(async move {
+        if let Err(error) = driver.run().await {
+            warn!(?error, "lmesh_quic_driver_stopped");
+        }
+    });
     let mut discovery = LocalDiscovery::new(None).await?;
     // The shared LAN label is local configuration only. The wire announce
     // carries the resulting IPv6 address and this service's distinct UDP
@@ -86,22 +105,7 @@ async fn run_server(defaults: RuntimeDefaults) -> Result<()> {
     discovery.start().await?;
     let discovery = Arc::new(discovery);
     let service = Arc::new(LmeshService::new(discovery.clone()));
-    // Hotplug is an advisory inventory edge. It never opens a newly added
-    // UART; only an explicit uart.discover or companion.pair command may do that.
-    let uart = service.uart_controller();
-    std::thread::spawn(move || {
-        let watcher = uart_codec::host::PortWatcher::new().ok();
-        loop {
-            if let Some(watcher) = &watcher {
-                let _ = watcher.wait(std::time::Duration::from_secs(60));
-            } else {
-                std::thread::sleep(std::time::Duration::from_secs(60));
-            }
-            if let Err(error) = uart.reconcile_presence() {
-                warn!(%error, "uart_presence_reconcile_failed");
-            }
-        }
-    });
+    service.set_espnow_ingress(espnow_ingress);
     // Netlink is only an advisory hint. A base-device event waits for the USB
     // driver to settle, then runs the same presence-edge check as the periodic
     // fallback. AP, monitor, carrier, and P2P events are ignored.
@@ -147,24 +151,24 @@ async fn run_server(defaults: RuntimeDefaults) -> Result<()> {
             }
         }
     });
-    let udp_started = service.start_udp_tagged_handler(
-        defaults.udp_port,
-        Arc::new(dmesh_server::udp::CanonicalTaggedStreamHandler::new(
-            Arc::new(LmeshCborHandler {
+    let udp_handler = Arc::new(dmesh_server::stream_service::RecordStreamHandler::new(
+        LmeshRecordHandler {
+            handler: LmeshCborHandler {
                 service: service.clone(),
-            }),
-        )),
-    );
-    if udp_started.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
-        if let Some(socket) = service.udp_listener_socket() {
-            discovery.set_shared_udp_socket(socket);
-        } else {
-            warn!("normal UDP listener started without an outbound socket handle");
+            },
+        },
+        64 * 1024,
+    ));
+    tokio::task::spawn_local(async move {
+        loop {
+            if let Err(error) =
+                dmesh_server::stream_service::accept_one(&node, udp_handler.as_ref()).await
+            {
+                warn!(%error, "lmesh_quic_stream_failed");
+            }
         }
-        debug!(?udp_started, "lmesh_development_quic_started");
-    } else {
-        warn!(?udp_started, "lmesh_development_quic_start_failed");
-    }
+    });
+    debug!(port = defaults.udp_port, "lmesh_quic_node_started");
     // The validated multicast observation updates this daemon's radio inventory.
     let announce_service = service.clone();
     discovery
@@ -383,27 +387,35 @@ struct LmeshCborHandler {
     service: Arc<LmeshService>,
 }
 
-impl dmesh_server::udp::TaggedApplicationHandler for LmeshCborHandler {
-    fn handle_tagged<'a>(
+struct LmeshRecordHandler {
+    handler: LmeshCborHandler,
+}
+
+impl dmesh_server::stream_service::RecordHandler for LmeshRecordHandler {
+    fn handle<'a>(
         &'a self,
-        _context: dmesh_server::udp::TaggedStreamContext,
         request: Vec<u8>,
-    ) -> Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = std::io::Result<Vec<u8>>> + 'a>> {
         Box::pin(async move {
-            let record = mesh::cbor::decode_record(&request).ok()?;
-            // Component 9 belongs to the connection owner.  In particular,
-            // its event history is per QUIC association, so projecting it
-            // through lmesh's process-local JSON request enum would both
-            // lose that context and shadow the shared diagnostic terminal.
-            // Declining here lets `dmesh_server::udp` call the common
-            // connection-aware handler after this application adapter.
+            let record = mesh::cbor::decode_record(&request).map_err(std::io::Error::other)?;
             if is_connection_diagnostic(&record) {
-                return None;
+                return dmesh_server::services::dispatch_tagged_stream(&request).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "diagnostic handler rejected request",
+                    )
+                });
             }
-            let response = mesh::wire::TaggedRecordHandler::handle_record(self, record)
+            let response = mesh::wire::TaggedRecordHandler::handle_record(&self.handler, record)
                 .await
-                .ok()??;
-            mesh::cbor::encode_record(&response).ok()
+                .map_err(std::io::Error::other)?
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "lmesh handler declined request",
+                    )
+                })?;
+            mesh::cbor::encode_record(&response).map_err(std::io::Error::other)
         })
     }
 }
@@ -764,7 +776,6 @@ mod tests {
             "power.snapshot",
             "probe",
             "radio.snapshot",
-            "relay.list",
             "runtime.snapshot",
             "services",
             "settings.get",

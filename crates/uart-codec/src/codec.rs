@@ -30,6 +30,13 @@ pub const DEFAULT_RECORD_MAX: usize = 4_000;
 /// driver accepts bytes; it never needs a second, worst-case escaped frame.
 pub struct Encoder<'a> {
     payload: &'a [u8],
+    cursor: EncoderCursor,
+}
+
+/// Copyable progress for streaming a borrowed payload into a byte-stream
+/// writer. Drivers retain this beside the owned packet lease across writes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EncoderCursor {
     prefix: Option<u8>,
     offset: usize,
     state: EncodeState,
@@ -55,9 +62,7 @@ impl<'a> Encoder<'a> {
         }
         Ok(Self {
             payload,
-            prefix: None,
-            offset: 0,
-            state: EncodeState::OpeningFlag,
+            cursor: EncoderCursor::new(None),
         })
     }
 
@@ -69,9 +74,7 @@ impl<'a> Encoder<'a> {
         }
         Ok(Self {
             payload,
-            prefix: Some(prefix),
-            offset: 0,
-            state: EncodeState::OpeningFlag,
+            cursor: EncoderCursor::new(Some(prefix)),
         })
     }
 
@@ -79,6 +82,32 @@ impl<'a> Encoder<'a> {
     /// Calling this with short buffers is equivalent to writing the complete
     /// PPP frame at once.
     pub fn write(&mut self, out: &mut [u8]) -> usize {
+        self.cursor.write(self.payload, out)
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.cursor.is_finished()
+    }
+}
+
+impl EncoderCursor {
+    pub const fn raw() -> Self {
+        Self::new(None)
+    }
+
+    pub const fn prefixed(prefix: u8) -> Self {
+        Self::new(Some(prefix))
+    }
+
+    const fn new(prefix: Option<u8>) -> Self {
+        Self {
+            prefix,
+            offset: 0,
+            state: EncodeState::OpeningFlag,
+        }
+    }
+
+    pub fn write(&mut self, payload: &[u8], out: &mut [u8]) -> usize {
         let mut used = 0;
         while used < out.len() && self.state != EncodeState::Done {
             out[used] = match self.state {
@@ -90,11 +119,11 @@ impl<'a> Encoder<'a> {
                     let byte = if let Some(prefix) = self.prefix.take() {
                         prefix
                     } else {
-                        if self.offset == self.payload.len() {
+                        if self.offset == payload.len() {
                             self.state = EncodeState::ClosingFlag;
                             continue;
                         }
-                        let byte = self.payload[self.offset];
+                        let byte = payload[self.offset];
                         self.offset += 1;
                         byte
                     };

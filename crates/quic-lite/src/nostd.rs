@@ -383,7 +383,9 @@ where
     ///
     /// Returning `n` accepts exactly the first `n` bytes. QUIC-lite retains an
     /// unread suffix under its ordered-delivery limit and does not grant
-    /// receive credit for it. In-order chunks therefore require no per-chunk
+    /// receive credit for it. A zero-length chunk (a bare FIN) cannot be
+    /// refused: returning 0 for it accepts the end of the stream. In-order
+    /// chunks therefore require no per-chunk
     /// allocation. Connectionless direct messages continue through
     /// [`Self::next_stream_chunk`] because their reply handle is constructed
     /// only after packet classification completes.
@@ -460,8 +462,10 @@ where
                                 bytes,
                             );
                         }
-                        if streams.len() == streams.capacity() {
-                            return Err(crate::Error::BufferTooSmall);
+                        // A zero-length FIN cannot be refused (it has no bytes
+                        // to retain), so it is queued even at capacity.
+                        if !bytes.is_empty() && streams.len() == streams.capacity() {
+                            return Ok(0);
                         }
                         streams.push_back(ReceivedStreamChunk {
                             stream: crate::QuicStream::incoming(association, stream),
@@ -547,7 +551,45 @@ where
 
     /// Take the next ordered application stream chunk.
     pub fn next_stream_chunk(&mut self) -> Option<ReceivedStreamChunk> {
-        self.streams.pop_front()
+        let chunk = self.streams.pop_front()?;
+        if let Some(association) = chunk.stream.association() {
+            let streams = &mut self.streams;
+            let resumed = self.node.resume_stream_delivery(
+                association,
+                chunk.stream.id(),
+                &mut |source, stream, offset, fin, bytes| {
+                    let ApplicationStreamSource::Association(association) = source else {
+                        return Ok(bytes.len());
+                    };
+                    // A zero-length FIN cannot be refused (it has no bytes to
+                    // retain), so it is queued even at capacity.
+                    if !bytes.is_empty() && streams.len() == streams.capacity() {
+                        return Ok(0);
+                    }
+                    streams.push_back(ReceivedStreamChunk {
+                        stream: crate::QuicStream::incoming(association, stream),
+                        offset,
+                        fin,
+                        bytes: bytes.to_vec(),
+                    });
+                    Ok(bytes.len())
+                },
+            );
+            debug_assert!(
+                resumed.is_ok(),
+                "retained stream resume failed: {resumed:?}"
+            );
+            if resumed.is_ok_and(|bytes| bytes != 0) {
+                if let Ok(Some(packet)) = self.node.poll_association_control(association) {
+                    let _ = self.node.submit_egress(
+                        packet.bearer,
+                        packet.peer_l2_address,
+                        packet.packet,
+                    );
+                }
+            }
+        }
+        Some(chunk)
     }
 
     /// Take the next terminal association lifecycle event.

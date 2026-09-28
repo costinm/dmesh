@@ -1,15 +1,74 @@
-//! Shared host inventory resolved from the common E2E/device catalog.
-//!
-//! This module contains names and stable bearer addresses only. It does not
-//! create a transport connection, open a serial adapter, or read credentials.
-//! `dmesh-cli`, the flasher, and E2E can therefore make identical target
-//! choices without recreating a per-tool forwarding inventory.
+//! Caller-provided device catalog and stable bearer-address resolution.
 
-use crate::prober::{DEFAULT_DEVICE_CATALOG, E2eConfig, E2eDeviceConfig};
+use serde::Deserialize;
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
 };
+
+pub const DEFAULT_DEVICE_CATALOG: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/examples/device-catalog.toml");
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct DeviceCatalog {
+    pub(crate) devices: Vec<CatalogDevice>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct CatalogDevice {
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) serial: Option<String>,
+    #[serde(default)]
+    pub(crate) serial_glob: Option<String>,
+    #[serde(default)]
+    pub(crate) uart_baud: Option<u32>,
+    #[serde(default)]
+    pub(crate) mac: Option<String>,
+    #[serde(default)]
+    pub(crate) ipv4: Option<String>,
+    #[serde(default)]
+    pub(crate) vip6: Option<String>,
+    #[serde(default)]
+    pub(crate) ipv6_link_local: Option<String>,
+    #[serde(default)]
+    pub(crate) udp6_iface: Option<String>,
+    #[serde(default = "default_udp_port")]
+    pub(crate) udp_port: u16,
+    #[serde(default)]
+    pub(crate) auth_secret_ref: Option<String>,
+}
+
+impl DeviceCatalog {
+    pub(crate) fn from_path(path: &Path) -> Result<Self, String> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| format!("read {}: {error}", path.display()))?;
+        let catalog = toml::from_str::<Self>(&text)
+            .map_err(|error| format!("parse {}: {error}", path.display()))?;
+        let mut names = std::collections::BTreeSet::new();
+        for device in &catalog.devices {
+            if !names.insert(device.name.as_str()) {
+                return Err(format!(
+                    "duplicate device {:?} in {}",
+                    device.name,
+                    path.display()
+                ));
+            }
+        }
+        Ok(catalog)
+    }
+
+    pub(crate) fn require_device(&self, name: &str) -> Result<&CatalogDevice, String> {
+        self.devices
+            .iter()
+            .find(|device| device.name == name)
+            .ok_or_else(|| format!("configured device {name} is missing"))
+    }
+}
+
+fn default_udp_port() -> u16 {
+    3337
+}
 
 /// Optional override for the one shared inventory location.
 pub const DEVICE_CATALOG_ENV: &str = "DMESH_DEVICE_CATALOG";
@@ -91,7 +150,7 @@ pub fn load_device(name: &str) -> Result<DeviceProfile, String> {
         return Err(format!("invalid device name {name:?}"));
     }
     let path = device_catalog_path();
-    let catalog = E2eConfig::from_path(&path)?;
+    let catalog = DeviceCatalog::from_path(&path)?;
     let device = catalog.require_device(name)?;
     profile_from_device(device)
 }
@@ -112,7 +171,7 @@ pub fn resolve_catalog_target(target: &str) -> Result<Option<DeviceProfile>, Str
         }
     }
     let path = device_catalog_path();
-    let catalog = E2eConfig::from_path(&path)?;
+    let catalog = DeviceCatalog::from_path(&path)?;
     if let Some(vip6) = vip6 {
         let device = catalog
             .devices
@@ -140,7 +199,7 @@ pub fn resolve_catalog_target(target: &str) -> Result<Option<DeviceProfile>, Str
         .transpose()
 }
 
-fn profile_from_device(device: &E2eDeviceConfig) -> Result<DeviceProfile, String> {
+fn profile_from_device(device: &CatalogDevice) -> Result<DeviceProfile, String> {
     let name = &device.name;
     let static_ipv4 = device
         .ipv4
@@ -221,11 +280,11 @@ pub fn resolve_udp_peer(target: &str) -> Result<Option<SocketAddr>, String> {
 
 #[cfg(test)]
 mod tests {
+    use super::DEFAULT_DEVICE_CATALOG;
     use super::{
         DEFAULT_UDP_PORT, DeviceProfile, device_catalog_path, load_device, resolve_catalog_target,
         resolve_udp_peer,
     };
-    use crate::prober::DEFAULT_DEVICE_CATALOG;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     #[test]

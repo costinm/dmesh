@@ -20,6 +20,28 @@ pub struct StaSelection<'a> {
     pub server_link_local: [u8; 16],
 }
 
+/// Derive the IPv6 link-local address used by a Wi-Fi peer from its MAC.
+pub const fn link_local_from_mac(mac: [u8; 6]) -> [u8; 16] {
+    [
+        0xfe,
+        0x80,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        mac[0] ^ 0x02,
+        mac[1],
+        mac[2],
+        0xff,
+        0xfe,
+        mac[3],
+        mac[4],
+        mac[5],
+    ]
+}
+
 /// True for the DMesh `DIRECT-...-dmesh` AP naming family.
 pub const fn is_dmesh_direct_ssid(ssid: &[u8]) -> bool {
     const PREFIX: &[u8] = b"DIRECT-";
@@ -57,7 +79,7 @@ pub fn select_sta_candidate<'a>(
             return Some(StaSelection {
                 candidate: *candidate,
                 preferred: true,
-                server_link_local: quic_lite::raw_udp6::link_local_from_mac(candidate.bssid),
+                server_link_local: link_local_from_mac(candidate.bssid),
             });
         }
         if !is_dmesh_direct_ssid(candidate.ssid) {
@@ -70,7 +92,7 @@ pub fn select_sta_candidate<'a>(
     strongest.map(|candidate| StaSelection {
         candidate,
         preferred: false,
-        server_link_local: quic_lite::raw_udp6::link_local_from_mac(candidate.bssid),
+        server_link_local: link_local_from_mac(candidate.bssid),
     })
 }
 

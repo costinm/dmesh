@@ -8,7 +8,12 @@ publish = false
 name = "uart_codec"
 
 [features]
-host = ["dep:libc"]
+host = ["dep:libc", "dep:tokio", "quic-lite/tokio"]
 
 [dependencies]
 libc = { version = "0.2", optional = true }
+quic-lite = { path = "../quic-lite" }
+tokio = { version = "1", default-features = false, features = ["net", "sync"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["macros", "net", "rt"] }

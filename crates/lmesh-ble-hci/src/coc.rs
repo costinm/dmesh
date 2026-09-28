@@ -12,8 +12,8 @@ const BDADDR_LE_PUBLIC: u8 = 0x01;
 const BDADDR_LE_RANDOM: u8 = 0x02;
 
 pub const DEFAULT_COC_PSM: u16 = 0x0080;
-/// Two-byte big-endian length plus the normal 1100-byte QUIC-lite packet.
-pub const COC_FRAME_MAX: usize = 1102;
+/// Maximum opaque QUIC-lite packet carried by one CoC SDU.
+pub const COC_PACKET_MAX: usize = 1100;
 
 #[repr(C)]
 struct SockaddrL2 {
@@ -25,7 +25,7 @@ struct SockaddrL2 {
 }
 
 /// Connected kernel L2CAP CoC socket. Pairing and bond policy remain owned by
-/// BlueZ/the kernel; this type owns only the reliable byte-stream channel.
+/// BlueZ/the kernel; this type owns only the reliable record-oriented channel.
 pub struct CocChannel {
     fd: RawFd,
     pub address: String,
@@ -34,32 +34,43 @@ pub struct CocChannel {
 }
 
 impl CocChannel {
-    /// One complete QUIC-lite packet in the shared two-byte CoC framing.
-    pub fn send_frame(&self, packet: &[u8]) -> Result<()> {
-        if packet.is_empty() || packet.len() + 2 > COC_FRAME_MAX {
-            bail!("BLE CoC packet exceeds the bounded frame");
-        }
-        let mut framed = Vec::with_capacity(packet.len() + 2);
-        framed.extend_from_slice(&(packet.len() as u16).to_be_bytes());
-        framed.extend_from_slice(packet);
-        self.write_all(&framed)
+    /// Legacy manual packet submission. New integrations register this
+    /// record-oriented bearer with QuicNode.
+    #[deprecated(note = "register the BLE CoC packet bearer with QuicNode")]
+    pub fn send_packet(&self, packet: &[u8]) -> Result<()> {
+        self.write_packet(packet)
     }
 
-    pub fn receive_frame(&self, timeout: Duration) -> Result<Option<Vec<u8>>> {
-        let mut poll = libc::pollfd { fd: self.fd, events: libc::POLLIN, revents: 0 };
-        let ready = unsafe { libc::poll(&mut poll, 1, timeout.as_millis().min(i32::MAX as u128) as i32) };
-        if ready < 0 { return Err(std::io::Error::last_os_error()).context("poll BLE CoC"); }
-        if ready == 0 { return Ok(None); }
+    /// Legacy manual packet receive. New integrations register this
+    /// record-oriented bearer with QuicNode.
+    #[deprecated(note = "register the BLE CoC packet bearer with QuicNode")]
+    pub fn receive_packet(&self, timeout: Duration) -> Result<Option<Vec<u8>>> {
+        let mut poll = libc::pollfd {
+            fd: self.fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe {
+            libc::poll(
+                &mut poll,
+                1,
+                timeout.as_millis().min(i32::MAX as u128) as i32,
+            )
+        };
+        if ready < 0 {
+            return Err(std::io::Error::last_os_error()).context("poll BLE CoC");
+        }
+        if ready == 0 {
+            return Ok(None);
+        }
         if poll.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
             bail!("BLE CoC disconnected");
         }
-        let mut bytes = [0u8; COC_FRAME_MAX];
-        let used = self.read(&mut bytes)?;
-        if used < 3 { bail!("short BLE CoC frame"); }
-        let length = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
-        if length == 0 || length + 2 != used { bail!("invalid BLE CoC frame length"); }
-        Ok(Some(bytes[2..used].to_vec()))
+        let mut bytes = [0u8; COC_PACKET_MAX];
+        let used = self.read_packet(&mut bytes)?;
+        Ok(Some(bytes[..used].to_vec()))
     }
+
     pub fn connect(address: &str, psm: u16) -> Result<Self> {
         if !(0x0080..=0x00ff).contains(&psm) {
             bail!("BLE CoC PSM must be in the dynamic range 0x0080..=0x00ff");
@@ -75,8 +86,17 @@ impl CocChannel {
                 Ok(fd) => {
                     let mut security = [0u8; 2];
                     let mut length = security.len() as libc::socklen_t;
-                    if unsafe { libc::getsockopt(fd, SOL_BLUETOOTH, BT_SECURITY, security.as_mut_ptr().cast(), &mut length) } < 0
-                        || length < 1 || security[0] < BT_SECURITY_MEDIUM[0]
+                    if unsafe {
+                        libc::getsockopt(
+                            fd,
+                            SOL_BLUETOOTH,
+                            BT_SECURITY,
+                            security.as_mut_ptr().cast(),
+                            &mut length,
+                        )
+                    } < 0
+                        || length < 1
+                        || security[0] < BT_SECURITY_MEDIUM[0]
                     {
                         unsafe { libc::close(fd) };
                         bail!("BLE CoC did not negotiate an encrypted link");
@@ -95,35 +115,51 @@ impl CocChannel {
             .with_context(|| format!("connect BLE CoC {address} psm=0x{psm:04x}"))
     }
 
-    pub fn read(&self, output: &mut [u8]) -> Result<usize> {
-        let read = unsafe { libc::recv(self.fd, output.as_mut_ptr().cast(), output.len(), 0) };
+    pub fn read_packet(&self, output: &mut [u8]) -> Result<usize> {
+        let read = unsafe {
+            libc::recv(
+                self.fd,
+                output.as_mut_ptr().cast(),
+                output.len(),
+                libc::MSG_TRUNC,
+            )
+        };
         if read < 0 {
             return Err(std::io::Error::last_os_error()).context("read BLE CoC");
         }
-        Ok(read as usize)
+        let read = read as usize;
+        if read == 0 {
+            bail!("BLE CoC disconnected");
+        }
+        if read > output.len() {
+            bail!(
+                "BLE CoC packet of {read} bytes exceeds receive capacity {}",
+                output.len()
+            );
+        }
+        Ok(read)
     }
 
-    pub fn write_all(&self, bytes: &[u8]) -> Result<()> {
-        if bytes.is_empty() || bytes.len() > COC_FRAME_MAX {
-            bail!("BLE CoC frame must contain 1..={COC_FRAME_MAX} bytes");
+    pub fn write_packet(&self, packet: &[u8]) -> Result<()> {
+        if packet.is_empty() || packet.len() > COC_PACKET_MAX {
+            bail!("BLE CoC packet must contain 1..={COC_PACKET_MAX} bytes");
         }
-        let mut written = 0;
-        while written < bytes.len() {
-            let sent = unsafe {
-                libc::send(
-                    self.fd,
-                    bytes[written..].as_ptr().cast(),
-                    bytes.len() - written,
-                    libc::MSG_NOSIGNAL,
-                )
-            };
-            if sent < 0 {
-                return Err(std::io::Error::last_os_error()).context("write BLE CoC");
-            }
-            if sent == 0 {
-                bail!("BLE CoC closed during write");
-            }
-            written += sent as usize;
+        let sent = unsafe {
+            libc::send(
+                self.fd,
+                packet.as_ptr().cast(),
+                packet.len(),
+                libc::MSG_NOSIGNAL,
+            )
+        };
+        if sent < 0 {
+            return Err(std::io::Error::last_os_error()).context("write BLE CoC packet");
+        }
+        if sent as usize != packet.len() {
+            bail!(
+                "partial BLE CoC packet write: {sent}/{} bytes",
+                packet.len()
+            );
         }
         Ok(())
     }
@@ -154,7 +190,16 @@ fn connect_one(address: [u8; 6], psm: u16, address_type: u8) -> Result<RawFd> {
     }
     // Ask BlueZ/the kernel for an encrypted link. Its configured agent owns
     // consent and bond persistence; a bare CoC connection is not pairing.
-    if unsafe { libc::setsockopt(fd, SOL_BLUETOOTH, BT_SECURITY, BT_SECURITY_MEDIUM.as_ptr().cast(), BT_SECURITY_MEDIUM.len() as _) } < 0 {
+    if unsafe {
+        libc::setsockopt(
+            fd,
+            SOL_BLUETOOTH,
+            BT_SECURITY,
+            BT_SECURITY_MEDIUM.as_ptr().cast(),
+            BT_SECURITY_MEDIUM.len() as _,
+        )
+    } < 0
+    {
         let error = std::io::Error::last_os_error();
         unsafe { libc::close(fd) };
         return Err(error).context("require BLE link security");

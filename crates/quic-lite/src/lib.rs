@@ -40,9 +40,8 @@ pub use bearer::{
     PeerL2Address,
 };
 pub use node::{
-    AssociationEvent, QuicAssociation, QuicNode, QuicNodeEgressError, QuicNodeError, QuicStream,
-    ReceivedStreamChunk, DEFAULT_PACKET_POOL_SLOT_SIZE, PACKET_PREFIX_RESERVE,
-    PACKET_SUFFIX_RESERVE,
+    AssociationEvent, DEFAULT_PACKET_POOL_SLOT_SIZE, PACKET_PREFIX_RESERVE, PACKET_SUFFIX_RESERVE,
+    QuicAssociation, QuicNode, QuicNodeEgressError, QuicNodeError, QuicStream, ReceivedStreamChunk,
 };
 
 #[cfg(any(feature = "std", test))]
@@ -2666,6 +2665,9 @@ pub(crate) struct ConnectionState<const N: usize> {
     pub limits: ConnectionLimits,
     pub received_data: u64,
     streams: Vec<StreamState>,
+    /// Inclusive stream-ID ranges already retired. IDs in one range have the
+    /// same low two direction/type bits and advance in steps of four.
+    retired_streams: Vec<(u64, u64)>,
 }
 
 impl<const N: usize> ConnectionState<N> {
@@ -2676,6 +2678,7 @@ impl<const N: usize> ConnectionState<N> {
             limits,
             received_data: 0,
             streams: Vec::new(),
+            retired_streams: Vec::new(),
         }
     }
 
@@ -2754,6 +2757,39 @@ impl<const N: usize> ConnectionState<N> {
         self.streams[slot].accept(offset, len, fin)?;
         self.received_data = self.received_data.saturating_add(delta);
         Ok(&mut self.streams[slot])
+    }
+
+    fn is_retired(&self, id: u64) -> bool {
+        self.retired_streams
+            .iter()
+            .any(|(first, last)| id >= *first && id <= *last && (id - first) % 4 == 0)
+    }
+
+    fn retire_stream(&mut self, id: u64) -> bool {
+        let Some(index) = self.find(id) else {
+            return false;
+        };
+        self.streams.remove(index);
+        let class = id & 3;
+        let mut first = id;
+        let mut last = id;
+        let mut at = 0;
+        while at < self.retired_streams.len() {
+            let (range_first, range_last) = self.retired_streams[at];
+            if range_first & 3 == class
+                && range_last.saturating_add(4) >= first
+                && last.saturating_add(4) >= range_first
+            {
+                first = first.min(range_first);
+                last = last.max(range_last);
+                self.retired_streams.remove(at);
+            } else {
+                at += 1;
+            }
+        }
+        self.retired_streams.push((first, last));
+        self.retired_streams.sort_unstable_by_key(|range| range.0);
+        true
     }
 
     pub(crate) fn consume(&mut self, id: u64, n: u64) -> Result<(), Error> {
@@ -3837,9 +3873,26 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
                 duplicate: false,
             });
         };
+        for stream in &mut streams[..stream_count] {
+            if stream.is_some_and(|stream| self.receive.is_retired(stream.id)) {
+                // A retransmission may use a fresh packet number after the
+                // original ACK was lost. Preserve ACK/control processing for
+                // this packet, but never recreate or redeliver the stream.
+                *stream = None;
+            }
+        }
         for stream in streams[..stream_count].iter().flatten() {
             self.receive
                 .accept(stream.id, stream.offset, stream.data.len(), stream.fin)?;
+        }
+        // A FIN may arrive after every byte was already consumed (for example
+        // the separate empty FIN written by `finish_stream`). Delivery does
+        // not report zero consumed bytes, so this is the only event on which
+        // such a stream becomes complete and can release its slot.
+        for stream in streams[..stream_count].iter().flatten() {
+            if stream.fin {
+                self.try_retire_stream(stream.id);
+            }
         }
         // Selective ACK gaps are loss signals. Do not wait for the normal
         // coalescing threshold when a packet creates or fills a gap.
@@ -4208,13 +4261,16 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
         }
         let peer_initiated = self.receive.is_peer_initiated(stream_id);
         self.send.remove_stream(stream_id);
-        self.receive.remove_stream(stream_id);
+        self.receive.retire_stream(stream_id);
         self.pending_stream_ids
             .retain(|pending| *pending != stream_id);
         if peer_initiated && stream_id & 2 == 0 {
             self.receive.limits.max_streams_bidi =
                 self.receive.limits.max_streams_bidi.saturating_add(1);
             self.max_streams_bidi_pending = true;
+            // An earlier credit packet may still be in flight. Its ACK must
+            // not clear this newer MAX_STREAMS value before it is sent.
+            self.credit_dirty |= self.credit_packet_number.is_some();
             self.credit_pending = true;
             self.control_pending = true;
         }
@@ -4358,6 +4414,10 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
                     }
                 }
                 Frame::MaxData(max) => self.send.extend_connection(max),
+                // Credit for a retired stream can arrive late (reordered or
+                // retried control packet). It is obsolete, not an error:
+                // rejecting it would also discard the ACK in this packet.
+                Frame::MaxStreamData { id, .. } if self.receive.is_retired(id) => {}
                 Frame::MaxStreamData { id, max } => self.send.extend_stream(id, max)?,
                 Frame::MaxStreamsBidi(max) => {
                     self.peer_max_streams_bidi = self.peer_max_streams_bidi.max(max)
@@ -4459,6 +4519,10 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
             }
             match frame {
                 Frame::MaxData(max) => self.send.extend_connection(max),
+                // Credit for a retired stream can arrive late (reordered or
+                // retried control packet). It is obsolete, not an error:
+                // rejecting it would also discard the ACK in this packet.
+                Frame::MaxStreamData { id, .. } if self.receive.is_retired(id) => {}
                 Frame::MaxStreamData { id, max } => self.send.extend_stream(id, max)?,
                 Frame::MaxStreamsBidi(max) => {
                     self.peer_max_streams_bidi = self.peer_max_streams_bidi.max(max)
@@ -5841,9 +5905,11 @@ mod tests {
         let mut malformed = [0u8; 64];
         let header_len = header.encode(&mut malformed).unwrap();
         malformed[header_len] = FRAME_STREAM_BASE as u8 | 0x04 | 0x02 | 1;
-        assert!(endpoint
-            .receive_packet(&malformed[..header_len + 1])
-            .is_err());
+        assert!(
+            endpoint
+                .receive_packet(&malformed[..header_len + 1])
+                .is_err()
+        );
         assert_eq!(endpoint.peer_connection_id(), None);
 
         let frame_len = Frame::Ping.encode(&mut malformed[header_len..]).unwrap();
@@ -6252,11 +6318,13 @@ mod tests {
         sender.set_time(85);
         sender.receive_packet(&ack[..used]).unwrap();
 
-        assert!(sender
-            .sent_packets
-            .iter()
-            .flatten()
-            .any(|packet| packet.packet_number == first && !packet.lost));
+        assert!(
+            sender
+                .sent_packets
+                .iter()
+                .flatten()
+                .any(|packet| packet.packet_number == first && !packet.lost)
+        );
     }
 
     #[test]
@@ -6594,10 +6662,12 @@ mod tests {
             repairs += 1;
         }
         assert_eq!(repairs, 3);
-        assert!(sender
-            .retransmit_pto_probe(0, 250, &mut packet)
-            .unwrap()
-            .is_none());
+        assert!(
+            sender
+                .retransmit_pto_probe(0, 250, &mut packet)
+                .unwrap()
+                .is_none()
+        );
         let stats = sender.stats();
         assert_eq!(stats.loss_retransmitted_packets, 3);
         assert_eq!(stats.pto_retransmitted_packets, 0);
@@ -6621,41 +6691,57 @@ mod tests {
 
         // All four packets are overdue together. This must still emit just
         // one PTO probe, rather than a tight-loop burst of four retries.
-        assert!(sender
-            .retransmit_pto_probe(250, 250, &mut packet)
-            .unwrap()
-            .is_some());
-        assert!(sender
-            .retransmit_pto_probe(250, 250, &mut packet)
-            .unwrap()
-            .is_none());
-        assert!(sender
-            .retransmit_pto_probe(499, 250, &mut packet)
-            .unwrap()
-            .is_none());
+        assert!(
+            sender
+                .retransmit_pto_probe(250, 250, &mut packet)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            sender
+                .retransmit_pto_probe(250, 250, &mut packet)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            sender
+                .retransmit_pto_probe(499, 250, &mut packet)
+                .unwrap()
+                .is_none()
+        );
         // PTO backoff doubles the next wait.
-        assert!(sender
-            .retransmit_pto_probe(750, 250, &mut packet)
-            .unwrap()
-            .is_some());
-        assert!(sender
-            .retransmit_pto_probe(1_750, 250, &mut packet)
-            .unwrap()
-            .is_some());
-        assert!(sender
-            .retransmit_pto_probe(3_750, 250, &mut packet)
-            .unwrap()
-            .is_some());
+        assert!(
+            sender
+                .retransmit_pto_probe(750, 250, &mut packet)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            sender
+                .retransmit_pto_probe(1_750, 250, &mut packet)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            sender
+                .retransmit_pto_probe(3_750, 250, &mut packet)
+                .unwrap()
+                .is_some()
+        );
         // The common cap remains eight base PTOs; a fifth loss does not grow
         // the next retry to sixteen PTOs and strand a bounded operation.
-        assert!(sender
-            .retransmit_pto_probe(5_749, 250, &mut packet)
-            .unwrap()
-            .is_none());
-        assert!(sender
-            .retransmit_pto_probe(5_750, 250, &mut packet)
-            .unwrap()
-            .is_some());
+        assert!(
+            sender
+                .retransmit_pto_probe(5_749, 250, &mut packet)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            sender
+                .retransmit_pto_probe(5_750, 250, &mut packet)
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(sender.stats().pto_retransmitted_packets, 5);
     }
 
@@ -6914,10 +7000,12 @@ mod tests {
             .encode_stream_packet(peer, 4, 0, true, b"clock", &mut packet)
             .unwrap();
         sender.set_time(109_999);
-        assert!(sender
-            .retransmit_due(109_999, 10_000, &mut packet)
-            .unwrap()
-            .is_none());
+        assert!(
+            sender
+                .retransmit_due(109_999, 10_000, &mut packet)
+                .unwrap()
+                .is_none()
+        );
         let (_, retransmitted) = sender
             .retransmit_due(110_000, 10_000, &mut packet)
             .unwrap()
@@ -6949,10 +7037,12 @@ mod tests {
             .find(|sent| sent.packet_number == packet_number)
             .unwrap()
             .lost = true;
-        assert!(sender
-            .retransmit_stream_packet(packet_number, &mut packet)
-            .unwrap()
-            .is_some());
+        assert!(
+            sender
+                .retransmit_stream_packet(packet_number, &mut packet)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -8026,14 +8116,16 @@ mod tests {
         assert!(key.token_for(stale).matches_packet(&reset[..used]));
         assert!(!key.token_for(other).matches_packet(&reset[..used]));
         assert_ne!(&reset[..used - STATELESS_RESET_TOKEN_LEN], &[0; 32]);
-        assert!(key
-            .encode_for_unknown_cid(&[0xc0; 48], stale, &mut reset)
-            .unwrap()
-            .is_none());
-        assert!(key
-            .encode_for_unknown_cid(&triggering[..20], stale, &mut reset)
-            .unwrap()
-            .is_none());
+        assert!(
+            key.encode_for_unknown_cid(&[0xc0; 48], stale, &mut reset)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            key.encode_for_unknown_cid(&triggering[..20], stale, &mut reset)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -8124,6 +8216,282 @@ mod tests {
         assert_eq!(
             rewrite_dcid(&direct[..direct_len], inbound, &mut packet),
             Err(Error::Invalid)
+        );
+    }
+}
+
+#[cfg(test)]
+mod stream_retirement_regressions {
+    use super::*;
+
+    /// Bug: a retired peer-initiated stream is re-opened by a late
+    /// retransmission of its own data.
+    ///
+    /// `try_retire_stream` removes the stream from `ConnectionState` once the
+    /// local send half is acknowledged and the receive half is consumed. It
+    /// does not remember that the ID was used. If the ACK for the peer's
+    /// request packet is lost, the peer's PTO retransmission (a fresh packet
+    /// number, so not a duplicate) reaches `ConnectionState::accept`, which
+    /// finds no stream, sees the ordinal below `max_streams_bidi`, and inserts
+    /// a new `StreamState`. The application then receives offset 0 + FIN of
+    /// the same request a second time. Retired peer stream IDs must be
+    /// acknowledged and discarded, not reopened.
+    #[test]
+    fn late_retransmission_does_not_reopen_retired_peer_stream() {
+        let client_cid = ConnectionId::new(0x11).unwrap();
+        let server_cid = ConnectionId::new(0x22).unwrap();
+        let mut client =
+            EndpointState::<4, 16>::new(Role::Client, ConnectionLimits::default(), 1200);
+        let mut server =
+            EndpointState::<4, 16>::new(Role::Server, ConnectionLimits::default(), 1200);
+        client
+            .install_connection_ids(client_cid, server_cid)
+            .unwrap();
+        server
+            .install_connection_ids(server_cid, client_cid)
+            .unwrap();
+
+        client.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
+        let mut request = [0u8; 256];
+        let (request_len, request_pn) = client
+            .encode_stream_packet(server_cid, 4, 0, true, b"request", &mut request)
+            .unwrap();
+        let first = server
+            .receive_packet_batch(&request[..request_len])
+            .unwrap();
+        assert_eq!(first.streams().count(), 1);
+        server.stream_consumed(4, 7).unwrap();
+        // The server's ACK for the request is lost on the air.
+        let mut lost_ack = [0u8; 256];
+        let _ = server.poll_transmit(&mut lost_ack).unwrap();
+
+        server.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
+        let mut response = [0u8; 256];
+        let (response_len, _) = server
+            .encode_stream_packet(client_cid, 4, 0, true, b"response", &mut response)
+            .unwrap();
+        client
+            .receive_packet_batch(&response[..response_len])
+            .unwrap();
+        client.stream_consumed(4, 8).unwrap();
+        let mut client_ack = [0u8; 256];
+        let used = client.poll_transmit(&mut client_ack).unwrap().unwrap();
+        server.receive_packet_batch(&client_ack[..used]).unwrap();
+        assert_eq!(
+            server.receive.stream_max_data(4),
+            None,
+            "precondition: the server retired stream 4"
+        );
+
+        // The client never saw an ACK for its request and retransmits it.
+        let mut retransmission = [0u8; 256];
+        let (retransmission_len, _) = client
+            .retransmit_stream_packet(request_pn, &mut retransmission)
+            .unwrap()
+            .unwrap();
+        let late = server
+            .receive_packet_batch(&retransmission[..retransmission_len])
+            .unwrap();
+        assert_eq!(
+            late.streams().count(),
+            0,
+            "a retired stream's data must not be delivered again"
+        );
+    }
+
+    /// A reordered or retried control packet can carry MAX_STREAM_DATA for a
+    /// stream the receiver has already retired. That credit is obsolete; the
+    /// packet must still be accepted so the ACK it carries is not discarded.
+    #[test]
+    fn late_max_stream_data_for_retired_stream_keeps_packet() {
+        let client_cid = ConnectionId::new(0x11).unwrap();
+        let server_cid = ConnectionId::new(0x22).unwrap();
+        let mut client =
+            EndpointState::<4, 16>::new(Role::Client, ConnectionLimits::default(), 1200);
+        let mut server =
+            EndpointState::<4, 16>::new(Role::Server, ConnectionLimits::default(), 1200);
+        client
+            .install_connection_ids(client_cid, server_cid)
+            .unwrap();
+        server
+            .install_connection_ids(server_cid, client_cid)
+            .unwrap();
+        client.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
+        let mut request = [0u8; 256];
+        let (request_len, _) = client
+            .encode_stream_packet(server_cid, 4, 0, true, b"request", &mut request)
+            .unwrap();
+        server
+            .receive_packet_batch(&request[..request_len])
+            .unwrap();
+        server.stream_consumed(4, 7).unwrap();
+        server.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
+        let mut response = [0u8; 256];
+        let (response_len, _) = server
+            .encode_stream_packet(client_cid, 4, 0, true, b"response", &mut response)
+            .unwrap();
+        client
+            .receive_packet_batch(&response[..response_len])
+            .unwrap();
+        client.stream_consumed(4, 8).unwrap();
+        let mut client_ack = [0u8; 256];
+        let used = client.poll_transmit(&mut client_ack).unwrap().unwrap();
+        server.receive_packet_batch(&client_ack[..used]).unwrap();
+        assert!(
+            server.receive.is_retired(4),
+            "precondition: stream 4 retired"
+        );
+
+        let mut late = [0u8; 256];
+        let mut used = ShortHeader {
+            flags: FLAG_FIXED,
+            dcid: server_cid,
+            packet_number: 60,
+            packet_number_len: 4,
+        }
+        .encode(&mut late)
+        .unwrap();
+        let mut ranges = AckRangeSet::new();
+        ranges.insert_range(AckRange { start: 0, end: 1 });
+        used += Frame::AckRanges {
+            largest: 1,
+            delay: 0,
+            ranges,
+        }
+        .encode(&mut late[used..])
+        .unwrap();
+        used += Frame::MaxStreamData {
+            id: 4,
+            max: 1_000_000,
+        }
+        .encode(&mut late[used..])
+        .unwrap();
+        assert!(server.receive_packet_batch(&late[..used]).is_ok());
+    }
+
+    fn endpoint_pair() -> (
+        EndpointState<4, 16>,
+        EndpointState<4, 16>,
+        ConnectionId,
+        ConnectionId,
+    ) {
+        let client_cid = ConnectionId::new(0x11).unwrap();
+        let server_cid = ConnectionId::new(0x22).unwrap();
+        let mut client =
+            EndpointState::<4, 16>::new(Role::Client, ConnectionLimits::default(), 1200);
+        let mut server =
+            EndpointState::<4, 16>::new(Role::Server, ConnectionLimits::default(), 1200);
+        client
+            .install_connection_ids(client_cid, server_cid)
+            .unwrap();
+        server
+            .install_connection_ids(server_cid, client_cid)
+            .unwrap();
+        (client, server, client_cid, server_cid)
+    }
+
+    fn packet_frames(packet: &[u8]) -> std::vec::Vec<Frame<'_>> {
+        let (_, mut offset) = ShortHeader::decode(packet).unwrap();
+        let mut frames = std::vec::Vec::new();
+        while offset < packet.len() {
+            let (frame, used) = decode_frame(&packet[offset..]).unwrap();
+            frames.push(frame);
+            offset += used;
+        }
+        frames
+    }
+
+    /// Bug (fixed): a stream whose final event is an empty FIN never released
+    /// its slot. `finish_stream` writes the FIN as a separate zero-length
+    /// STREAM frame, and delivery does not report zero consumed bytes, so
+    /// `try_retire_stream` ran only on consumption or on our FIN's ACK. When
+    /// the peer's empty FIN arrived last, the stream stayed allocated; after
+    /// enough exchanges `open_stream` failed with `StreamLimit` forever.
+    #[test]
+    fn empty_fin_after_consumption_retires_stream() {
+        let (mut client, mut server, client_cid, server_cid) = endpoint_pair();
+        client.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
+        let mut packet = [0u8; 256];
+        let (used, _) = client
+            .encode_stream_packet(server_cid, 4, 0, false, b"abc", &mut packet)
+            .unwrap();
+        server.receive_packet_batch(&packet[..used]).unwrap();
+        server.stream_consumed(4, 3).unwrap();
+
+        server.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
+        let (used, _) = server
+            .encode_stream_packet(client_cid, 4, 0, true, b"ok", &mut packet)
+            .unwrap();
+        client.receive_packet_batch(&packet[..used]).unwrap();
+        client.stream_consumed(4, 2).unwrap();
+        let mut ack = [0u8; 256];
+        let ack_len = client.poll_transmit(&mut ack).unwrap().unwrap();
+        server.receive_packet_batch(&ack[..ack_len]).unwrap();
+        assert!(
+            !server.receive.is_retired(4),
+            "request FIN not received yet"
+        );
+
+        let (used, _) = client
+            .encode_stream_packet(server_cid, 4, 3, true, b"", &mut packet)
+            .unwrap();
+        server.receive_packet_batch(&packet[..used]).unwrap();
+        assert!(
+            server.receive.is_retired(4),
+            "an empty FIN completing a consumed stream must release it"
+        );
+    }
+
+    /// Bug (fixed): a MAX_STREAMS increase raised while an earlier credit
+    /// packet was in flight could be lost. `try_retire_stream` set
+    /// `credit_pending` but not `credit_dirty`; if the ACK for the older
+    /// credit packet arrived before the next `poll_transmit`, it cleared
+    /// `credit_pending` and `max_streams_bidi_pending`, and the new limit was
+    /// never sent.
+    #[test]
+    fn max_streams_raised_while_credit_in_flight_is_sent() {
+        let (mut client, mut server, client_cid, server_cid) = endpoint_pair();
+        client.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
+        let mut packet = [0u8; 256];
+        let (used, _) = client
+            .encode_stream_packet(server_cid, 4, 0, false, b"abc", &mut packet)
+            .unwrap();
+        server.receive_packet_batch(&packet[..used]).unwrap();
+        server.stream_consumed(4, 3).unwrap();
+        // Credit packet X is sent but delayed on the air.
+        let mut credit = [0u8; 256];
+        let credit_len = server.poll_transmit(&mut credit).unwrap().unwrap();
+
+        server.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
+        let (used, _) = server
+            .encode_stream_packet(client_cid, 4, 0, true, b"ok", &mut packet)
+            .unwrap();
+        client.receive_packet_batch(&packet[..used]).unwrap();
+        client.stream_consumed(4, 2).unwrap();
+        let mut ack = [0u8; 256];
+        let ack_len = client.poll_transmit(&mut ack).unwrap().unwrap();
+        server.receive_packet_batch(&ack[..ack_len]).unwrap();
+
+        // The request's FIN retires stream 4 and raises MAX_STREAMS while X
+        // is still unacknowledged. No poll_transmit happens before X's ACK.
+        let (used, _) = client
+            .encode_stream_packet(server_cid, 4, 3, true, b"", &mut packet)
+            .unwrap();
+        server.receive_packet_batch(&packet[..used]).unwrap();
+        assert!(server.receive.is_retired(4));
+
+        client.receive_packet_batch(&credit[..credit_len]).unwrap();
+        // Let the client's delayed-ACK timer expire.
+        client.set_time(1_000_000);
+        let ack_len = client.poll_transmit(&mut ack).unwrap().unwrap();
+        server.receive_packet_batch(&ack[..ack_len]).unwrap();
+
+        let used = server.poll_transmit(&mut packet).unwrap().unwrap();
+        assert!(
+            packet_frames(&packet[..used])
+                .iter()
+                .any(|frame| matches!(frame, Frame::MaxStreamsBidi(_))),
+            "the raised MAX_STREAMS limit must still be published"
         );
     }
 }

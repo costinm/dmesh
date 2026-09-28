@@ -18,16 +18,26 @@ use sha2::{Digest, Sha256};
 /// Verify a host-observed signed identity before promoting it to ownership.
 #[cfg(feature = "std")]
 pub fn verify_identity(announce: Announce) -> bool {
-    use p256::ecdsa::{Signature, VerifyingKey};
     use p256::ecdsa::signature::Verifier;
+    use p256::ecdsa::{Signature, VerifyingKey};
 
-    if !announce.has_identity() { return true; }
+    if !announce.has_identity() {
+        return true;
+    }
     let digest = Sha256::digest(announce.public_key());
-    if announce.device_id() != &digest[..announce.device_id().len()] { return false; }
-    let Ok(signature) = Signature::from_slice(announce.signature()) else { return false; };
-    let Ok(key) = VerifyingKey::from_sec1_bytes(announce.public_key()) else { return false; };
+    if announce.device_id() != &digest[..announce.device_id().len()] {
+        return false;
+    }
+    let Ok(signature) = Signature::from_slice(announce.signature()) else {
+        return false;
+    };
+    let Ok(key) = VerifyingKey::from_sec1_bytes(announce.public_key()) else {
+        return false;
+    };
     let mut signed = [0u8; 384];
-    let Some(used) = signing_bytes(announce, &mut signed) else { return false; };
+    let Some(used) = signing_bytes(announce, &mut signed) else {
+        return false;
+    };
     key.verify(&signed[..used], &signature).is_ok()
 }
 
@@ -878,12 +888,17 @@ pub fn encode_nan_wakeup_request(target: [u8; 6], id: u64, out: &mut [u8]) -> Op
     encode_nan_target_request(ANNOUNCE_NAN_WAKEUP, target, id, out)
 }
 
-/// Queue a target-checked NAN invitation that only a virgin ESP32 may admit.
+/// Queue a target-checked NAN invitation that only an unpaired ESP32 may admit.
 pub fn encode_nan_pair_wakeup_request(target: [u8; 6], id: u64, out: &mut [u8]) -> Option<usize> {
     encode_nan_target_request(ANNOUNCE_NAN_PAIR_WAKEUP, target, id, out)
 }
 
-fn encode_nan_target_request(method: u64, target: [u8; 6], id: u64, out: &mut [u8]) -> Option<usize> {
+fn encode_nan_target_request(
+    method: u64,
+    target: [u8; 6],
+    id: u64,
+    out: &mut [u8],
+) -> Option<usize> {
     let mut e = Encoder::new(out);
     e.map(4)?;
     e.uint(1)?;

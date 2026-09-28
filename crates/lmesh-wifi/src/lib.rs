@@ -14,17 +14,16 @@ use std::{
     },
 };
 
+pub mod espnow_bearer;
 mod infra_credentials;
 mod radio;
 /// Host-side JSON/compatibility conversion for raw NAN and legacy BLE commands.
 /// The byte/state core remains in `dmesh-rawnan`.
 pub mod radio_protocol;
-pub mod ble_companion;
 pub mod recovery;
-pub mod uart_service;
 
 // The shared Linux mesh discovery/routing core. `lmesh` re-exports this
-// module and contributes only its BLE launcher integration.
+// module and contributes executable-owned bearer initialization.
 extern crate self as lmesh_wifi;
 pub mod mesh_core;
 pub mod mesh_runtime;

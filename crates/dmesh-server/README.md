@@ -296,25 +296,30 @@ next-hop description is resolved locally.
 
 `signed_object` identifies an immutable image with
 `{0:name?,1:cpu,2:target}`. The host-side `ObjectServer` resolves that identity
-to one object body. On the wire the object-data stream is exactly one complete
-canonical CBOR manifest followed immediately by `image_size` raw binary bytes
-and QUIC FIN. There is no per-block CBOR or private manifest/blob/done framing.
+to one object body. On the wire the host opens one bidirectional flash stream
+and sends a four-byte big-endian manifest length, exactly that many bytes of
+canonical CBOR manifest, then `image_size` raw binary bytes and QUIC FIN. There
+is no second data stream, per-block CBOR, or private manifest/blob/done framing.
+The device returns the terminal result on that stream, or resets it when the
+manifest or body is rejected.
 
-`flash` is the device-handler contract, not an ESP transport feature. Its body extends
-the same object identity with optional `address` and `transport` plus
-`dry_run`: `{0:name?,1:cpu,2:target,3:address?,4:transport,5:dry_run}`.
-The host sends that body and the device feeds ordinary ordered stream bytes to
-`SignedObjectReceiver`. The CBOR decoder reports the exact manifest boundary;
-the receiver validates the signed manifest before admitting body data, derives
-block indexes and lengths from it, verifies the body incrementally, and calls
-an injected sink. Firmware injects the erase/write partition sink; host tests
-inject `FileImageSink`. Invalid manifest, length, proof, digest, or sink state
-is an application rejection and terminates the stream/operation.
+`flash` is the device streaming-handler contract, not an ESP transport
+feature. The signed manifest carries the CPU and image target; local device
+policy maps an admitted target to its writable partition or address. The
+device feeds ordinary ordered stream bytes to `SignedObjectReceiver`. The
+length prefix fixes the manifest boundary; the receiver validates the signed
+manifest before admitting body data, derives block indexes and lengths from it,
+verifies the body incrementally, and calls an injected sink. Firmware injects
+the CPU/target admission and erase/write partition sink; host tests inject
+`FileImageSink`. Invalid manifest, length, proof, digest, platform match, or
+sink state rejects the stream before unsafe writes continue.
 
-The host owns object selection and opens one QUIC-lite association containing
-the `flash` command stream and the ordered object-data stream. The device sends
-the correlated command response only after the sink is complete and durable;
-the request handler does not wait or block a bearer task.
+The host may first use identity or status streams on the same association to
+select an artifact. The flash stream remains self-contained, and the device
+validates the signed manifest CPU and target against local platform policy
+before erasing or accepting body bytes. The device sends the correlated result
+only after the sink is complete and durable; the handler does not block a
+bearer task.
 
 Only one association may own a mutable object sink at a time. The shared
 `ExclusiveTransfer` state admits and constructs that operation atomically from

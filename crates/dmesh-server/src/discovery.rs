@@ -12,6 +12,159 @@ use alloc::collections::BTreeMap;
 #[cfg(feature = "std")]
 use alloc::vec::Vec;
 
+/// One correlated response from a host IPv6 multicast discovery sweep.
+///
+/// Discovery is its own application protocol. `peer` is the UDP source tuple
+/// observed by the socket and is not a QUIC path or association address.
+#[cfg(feature = "std")]
+#[derive(Clone, Debug)]
+pub struct MulticastDiscoveryPeer {
+    pub peer: std::net::SocketAddr,
+    pub announce: crate::announce::Announce,
+    pub facts: Option<crate::announce::DiscoveryFacts>,
+}
+
+/// Send one tagged discovery request on every local IPv6 multicast scope and
+/// collect its correlated tagged responses.
+///
+/// This function deliberately owns both CBOR interpretation and multicast
+/// socket I/O. Discovery datagrams are not QUIC packets and never enter a
+/// QUIC node or bearer.
+#[cfg(feature = "std")]
+pub fn discover_multicast_ipv6() -> Result<Vec<MulticastDiscoveryPeer>, String> {
+    use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6, UdpSocket};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    const DISCOVERY_PORT: u16 = 5227;
+    let request_id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(1, |duration| duration.as_micros() as u64)
+        .max(1);
+    let mut request = [0u8; 96];
+    let request_len = crate::announce::encode_discovery_request(request_id, &mut request)
+        .ok_or_else(|| "encode UDP6 multicast discovery request".to_owned())?;
+    let socket = UdpSocket::bind(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0))
+        .map_err(|error| format!("bind UDP6 multicast discovery socket: {error}"))?;
+    socket
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .map_err(|error| format!("configure UDP6 multicast discovery socket: {error}"))?;
+    let group = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x5227);
+    let mut submitted = 0usize;
+    let interfaces = std::fs::read_dir("/sys/class/net")
+        .map_err(|error| format!("enumerate network interfaces: {error}"))?;
+    for entry in interfaces {
+        let entry = entry.map_err(|error| format!("read network interface: {error}"))?;
+        if entry.file_name() == "lo" {
+            continue;
+        }
+        let Some(index) = std::fs::read_to_string(entry.path().join("ifindex"))
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let destination = SocketAddrV6::new(group, DISCOVERY_PORT, 0, index);
+        if socket.send_to(&request[..request_len], destination).is_ok() {
+            submitted += 1;
+        }
+    }
+    if submitted == 0 {
+        return Err("UDP6 multicast discovery was not submitted on any interface".to_owned());
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut peers = Vec::new();
+    let mut input = [0u8; 1500];
+    while Instant::now() < deadline {
+        let Ok((used, source)) = socket.recv_from(&mut input) else {
+            continue;
+        };
+        let Some(record) = crate::tagged::decode(&input[..used]) else {
+            continue;
+        };
+        if record.id != Some(request_id) {
+            continue;
+        }
+        let facts = crate::announce::discovery_facts(record);
+        let Some(announce) = crate::announce::decode_record(record) else {
+            continue;
+        };
+        let peer = match source {
+            SocketAddr::V6(source) if announce.udp_port != 0 => {
+                let address = announce
+                    .udp_link_local_v6()
+                    .or_else(|| announce.sta_link_local_v6())
+                    .map(Ipv6Addr::from)
+                    .unwrap_or(*source.ip());
+                SocketAddr::V6(SocketAddrV6::new(
+                    address,
+                    announce.udp_port,
+                    source.flowinfo(),
+                    source.scope_id(),
+                ))
+            }
+            source => source,
+        };
+        if peers
+            .iter()
+            .any(|known: &MulticastDiscoveryPeer| known.peer == peer)
+        {
+            continue;
+        }
+        peers.push(MulticastDiscoveryPeer {
+            peer,
+            announce,
+            facts,
+        });
+    }
+    Ok(peers)
+}
+
+/// Exchange one raw discovery record with an already known UDP endpoint.
+/// The endpoint commonly uses the service port (`3339` on ESP), but the
+/// payload remains discovery protocol data and never enters QUIC.
+#[cfg(feature = "std")]
+pub fn discover_udp(
+    peer: std::net::SocketAddr,
+    request_id: u64,
+    response_timeout: std::time::Duration,
+) -> Result<crate::announce::Announce, String> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+
+    let bind = match peer {
+        SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+    };
+    let socket = UdpSocket::bind(bind)
+        .map_err(|error| format!("bind directed discovery socket: {error}"))?;
+    socket
+        .set_read_timeout(Some(response_timeout))
+        .map_err(|error| format!("configure directed discovery socket: {error}"))?;
+    let mut request = [0u8; 96];
+    let used = crate::announce::encode_discovery_request(request_id, &mut request)
+        .ok_or_else(|| "encode directed discovery request".to_owned())?;
+    socket
+        .send_to(&request[..used], peer)
+        .map_err(|error| format!("send directed discovery request: {error}"))?;
+    let mut response = [0u8; 1500];
+    let (used, source) = socket
+        .recv_from(&mut response)
+        .map_err(|error| format!("receive directed discovery response: {error}"))?;
+    if source.ip() != peer.ip() {
+        return Err(format!(
+            "directed discovery response came from unexpected peer {source}"
+        ));
+    }
+    let record = crate::tagged::decode(&response[..used])
+        .ok_or_else(|| "directed discovery response is not tagged CBOR".to_owned())?;
+    if record.id != Some(request_id) {
+        return Err("directed discovery response has the wrong request ID".to_owned());
+    }
+    crate::announce::decode_record(record)
+        .filter(|announce| announce.kind == crate::announce::ANNOUNCE_DISCOVERY)
+        .ok_or_else(|| "directed discovery response is not announce.discovery".to_owned())
+}
+
 pub const OBSERVATION_PEER: u32 = 1 << 0;
 pub const OBSERVATION_BSSID: u32 = 1 << 1;
 pub const OBSERVATION_CHANNEL: u32 = 1 << 2;
@@ -147,8 +300,9 @@ impl PairedDevices {
         {
             use std::os::unix::fs::PermissionsExt;
             match std::fs::metadata(&path) {
-                Ok(metadata) if metadata.permissions().mode() & 0o077 != 0 =>
-                    return Err("paired device file must be mode 0600".into()),
+                Ok(metadata) if metadata.permissions().mode() & 0o077 != 0 => {
+                    return Err("paired device file must be mode 0600".into());
+                }
                 Ok(_) => (),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                 Err(error) => return Err(format!("stat paired device: {error}")),
@@ -161,8 +315,12 @@ impl PairedDevices {
         };
         let device: OwnedDevice = serde_json::from_slice(&bytes)
             .map_err(|error| format!("parse paired device: {error}"))?;
-        if device.vip6.as_deref().and_then(|value| value.parse::<std::net::Ipv6Addr>().ok())
-            != vip6.parse::<std::net::Ipv6Addr>().ok() {
+        if device
+            .vip6
+            .as_deref()
+            .and_then(|value| value.parse::<std::net::Ipv6Addr>().ok())
+            != vip6.parse::<std::net::Ipv6Addr>().ok()
+        {
             return Err("paired device VIP6 does not match filename".into());
         }
         Ok(Some(device))
@@ -170,35 +328,50 @@ impl PairedDevices {
 
     pub fn save(directory: &std::path::Path, device: &OwnedDevice) -> Result<(), String> {
         use std::io::Write;
-        #[cfg(unix)] use std::os::unix::fs::OpenOptionsExt;
-        if device.secret.len() < 16 || device.public_key.len() != 33
+        #[cfg(unix)]
+        use std::os::unix::fs::OpenOptionsExt;
+        if device.secret.len() < 16
+            || device.public_key.len() != 33
             || !matches!(device.public_key[0], 2 | 3)
             || device.root_public_key.len() != 33
             || !matches!(device.root_public_key[0], 2 | 3)
             || device.vip6.is_none()
-            || device.name.as_deref().is_none_or(|name| name.is_empty()
-                || name.len() > crate::announce::MAX_DEVICE_NAME) {
+            || device
+                .name
+                .as_deref()
+                .is_none_or(|name| name.is_empty() || name.len() > crate::announce::MAX_DEVICE_NAME)
+        {
             return Err("pairing result needs name, secret, signed public key, control-plane root, and VIP6".into());
         }
-        std::fs::create_dir_all(directory).map_err(|error| format!("create pairing directory: {error}"))?;
-        #[cfg(unix)] {
+        std::fs::create_dir_all(directory)
+            .map_err(|error| format!("create pairing directory: {error}"))?;
+        #[cfg(unix)]
+        {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
                 .map_err(|error| format!("protect pairing directory: {error}"))?;
         }
         let path = Self::path(directory, device.vip6.as_deref().unwrap())?;
-        if path.exists() { return Err("device already has a pairing result".into()); }
+        if path.exists() {
+            return Err("device already has a pairing result".into());
+        }
         let temporary = path.with_extension("json.tmp");
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
-        #[cfg(unix)] options.mode(0o600);
-        let mut file = options.open(&temporary).map_err(|error| format!("create pairing result: {error}"))?;
-        let bytes = serde_json::to_vec_pretty(device).map_err(|error| format!("encode pairing result: {error}"))?;
-        file.write_all(&bytes).and_then(|_| file.sync_all())
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options
+            .open(&temporary)
+            .map_err(|error| format!("create pairing result: {error}"))?;
+        let bytes = serde_json::to_vec_pretty(device)
+            .map_err(|error| format!("encode pairing result: {error}"))?;
+        file.write_all(&bytes)
+            .and_then(|_| file.sync_all())
             .map_err(|error| format!("write pairing result: {error}"))?;
         std::fs::hard_link(&temporary, &path)
             .map_err(|error| format!("commit pairing result: {error}"))?;
-        std::fs::remove_file(&temporary).map_err(|error| format!("remove pairing temporary file: {error}"))
+        std::fs::remove_file(&temporary)
+            .map_err(|error| format!("remove pairing temporary file: {error}"))
     }
 
     pub fn remove(directory: &std::path::Path, vip6: &str) -> Result<(), String> {
@@ -322,8 +495,8 @@ impl DiscoveryObservation {
 #[cfg(test)]
 mod tests {
     use super::{
-        DiscoveryObservation, DiscoveryPacketKind, PairedDevices, OBSERVATION_ALL_FIELDS,
-        OwnedDevice,
+        DiscoveryObservation, DiscoveryPacketKind, OBSERVATION_ALL_FIELDS, OwnedDevice,
+        PairedDevices,
     };
     use alloc::collections::BTreeMap;
 
@@ -331,22 +504,41 @@ mod tests {
     fn pairing_result_is_private_per_device_and_cannot_replace_an_owner() {
         let directory = tempfile::tempdir().unwrap();
         let device = OwnedDevice {
-            device_id: "device/one".into(), name: Some("sensor".into()), mac: Some([1, 2, 3, 4, 5, 6]),
-            public_key: vec![2; 33], root_public_key: vec![3; 33], vip6: Some("fc00::1".into()),
-            endpoints: BTreeMap::new(), secret: vec![7; 32],
+            device_id: "device/one".into(),
+            name: Some("sensor".into()),
+            mac: Some([1, 2, 3, 4, 5, 6]),
+            public_key: vec![2; 33],
+            root_public_key: vec![3; 33],
+            vip6: Some("fc00::1".into()),
+            endpoints: BTreeMap::new(),
+            secret: vec![7; 32],
         };
         PairedDevices::save(directory.path(), &device).unwrap();
-        assert_eq!(PairedDevices::load(directory.path(), "fc00::1").unwrap().unwrap().secret, device.secret);
+        assert_eq!(
+            PairedDevices::load(directory.path(), "fc00::1")
+                .unwrap()
+                .unwrap()
+                .secret,
+            device.secret
+        );
         assert!(PairedDevices::save(directory.path(), &device).is_err());
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
-        #[cfg(unix)] {
+        #[cfg(unix)]
+        {
             use std::os::unix::fs::PermissionsExt;
             let file = PairedDevices::path(directory.path(), "fc00::1").unwrap();
             assert_eq!(file.file_name().unwrap(), "0000000000000001.json");
-            assert_eq!(std::fs::metadata(file).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
         PairedDevices::remove(directory.path(), "fc00::1").unwrap();
-        assert!(PairedDevices::load(directory.path(), "fc00::1").unwrap().is_none());
+        assert!(
+            PairedDevices::load(directory.path(), "fc00::1")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -388,5 +580,4 @@ mod tests {
         assert_eq!(observation.last_rssi_dbm, Some(-42));
         assert_eq!(observation.unavailable_fields(), 0);
     }
-
 }

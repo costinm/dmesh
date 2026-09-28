@@ -115,7 +115,11 @@ pub(crate) fn record_ble_scan_result(event: &str, payload: &[u8]) {
         .strip_prefix("addr=")
         .filter(|value| !value.is_empty())
         .unwrap_or_default();
-    let mode = if matches!(mode_field, "virgin" | "operational") { mode_field } else { "unknown" };
+    let mode = if matches!(mode_field, "unpaired" | "operational") {
+        mode_field
+    } else {
+        "unknown"
+    };
     if address.is_empty() || !address.chars().all(|c| c.is_ascii_hexdigit() || c == ':') {
         return;
     }
@@ -626,34 +630,70 @@ static ANDROID_WIFI_COMPANION: OnceLock<Mutex<Option<String>>> = OnceLock::new()
 #[cfg(target_os = "android")]
 fn accepted_android_companion(value: Value) -> anyhow::Result<Value> {
     match value.get("status").and_then(Value::as_str) {
-        Some("rejected" | "unsupported" | "invalid") => anyhow::bail!("Android companion operation rejected: {value}"),
+        Some("rejected" | "unsupported" | "invalid") => {
+            anyhow::bail!("Android companion operation rejected: {value}")
+        }
         _ => Ok(value),
     }
 }
 
 #[cfg(target_os = "android")]
-fn android_require_owned_companion(id: &str, expected_vip6: Option<&str>) -> anyhow::Result<(String, String)> {
-    let devices = discovered_devices().lock().map_err(|_| anyhow::anyhow!("discovery inventory poisoned"))?;
-    let (device_id, device) = devices.iter().find(|(device_id, device)| {
-        device.info.get("signed").and_then(Value::as_bool) == Some(true)
-            && (*device_id == id || device.peer.eq_ignore_ascii_case(id)
-                || device.transports.values().any(|address| address.eq_ignore_ascii_case(id))
-                || device.info.get("vip6").and_then(Value::as_str) == Some(id))
-            && expected_vip6.is_none_or(|expected| device.info.get("vip6").and_then(Value::as_str) == Some(expected))
-    }).context("companion has no matching signed discovery identity")?;
-    let vip6 = device.info.get("vip6").and_then(Value::as_str)
-        .context("signed companion has no VIP6")?.to_owned();
-    let public_key = device.info.get("public_key").and_then(Value::as_str)
-        .context("signed companion has no public key")?.to_owned();
+fn android_require_owned_companion(
+    id: &str,
+    expected_vip6: Option<&str>,
+) -> anyhow::Result<(String, String)> {
+    let devices = discovered_devices()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("discovery inventory poisoned"))?;
+    let (device_id, device) = devices
+        .iter()
+        .find(|(device_id, device)| {
+            device.info.get("signed").and_then(Value::as_bool) == Some(true)
+                && (*device_id == id
+                    || device.peer.eq_ignore_ascii_case(id)
+                    || device
+                        .transports
+                        .values()
+                        .any(|address| address.eq_ignore_ascii_case(id))
+                    || device.info.get("vip6").and_then(Value::as_str) == Some(id))
+                && expected_vip6.is_none_or(|expected| {
+                    device.info.get("vip6").and_then(Value::as_str) == Some(expected)
+                })
+        })
+        .context("companion has no matching signed discovery identity")?;
+    let vip6 = device
+        .info
+        .get("vip6")
+        .and_then(Value::as_str)
+        .context("signed companion has no VIP6")?
+        .to_owned();
+    let public_key = device
+        .info
+        .get("public_key")
+        .and_then(Value::as_str)
+        .context("signed companion has no public key")?
+        .to_owned();
     let device_id = device_id.clone();
     drop(devices);
-    let path = ANDROID_OWNED_DEVICES_PATH.get().context("Android owned-device inventory path unavailable")?;
+    let path = ANDROID_OWNED_DEVICES_PATH
+        .get()
+        .context("Android owned-device inventory path unavailable")?;
     let owned = dmesh_server::discovery::PairedDevices::load(path, &vip6)
-        .map_err(anyhow::Error::msg)?.context("companion has no private pairing result")?;
-    if owned.device_id != device_id { anyhow::bail!("paired device ID differs from signed discovery"); }
-    if owned.secret.len() < 16 { anyhow::bail!("owned companion has no provisioned control secret"); }
+        .map_err(anyhow::Error::msg)?
+        .context("companion has no private pairing result")?;
+    if owned.device_id != device_id {
+        anyhow::bail!("paired device ID differs from signed discovery");
+    }
+    if owned.secret.len() < 16 {
+        anyhow::bail!("owned companion has no provisioned control secret");
+    }
     if !owned.public_key.is_empty()
-        && owned.public_key.iter().map(|byte| format!("{byte:02x}")).collect::<String>() != public_key
+        && owned
+            .public_key
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+            != public_key
     {
         anyhow::bail!("owned companion public key differs from signed discovery");
     }
@@ -666,14 +706,28 @@ fn android_require_owned_companion(id: &str, expected_vip6: Option<&str>) -> any
 #[cfg(target_os = "android")]
 #[async_trait]
 impl dmesh_server::companion_service::CompanionBackend for AndroidCompanionBackend {
-    async fn pair(&self, kind: String, id: String, _vip6: Option<String>, _baud: Option<u32>, psm: Option<u16>) -> anyhow::Result<Value> {
+    async fn pair(
+        &self,
+        kind: String,
+        id: String,
+        _vip6: Option<String>,
+        _baud: Option<u32>,
+        psm: Option<u16>,
+    ) -> anyhow::Result<Value> {
         // TODO(pairing): BLE currently acknowledges starting a native bond;
         // Wi-Fi only checks an existing secret. Neither provisions and
-        // durably commits a new secret to a virgin device and inventory.
+        // durably commits a new secret to an unpaired device and inventory.
         match kind.as_str() {
-            "ble" => accepted_android_companion(android_ble_command("companion.pair", &json!({"kind": kind, "id": id, "psm": psm.unwrap_or(128)}))
-                .context("Android BLE callback is unavailable")?),
-            "wifi" => anyhow::bail!("Wi-Fi companion provisioning is not implemented; use BLE or direct UART"),
+            "ble" => accepted_android_companion(
+                android_ble_command(
+                    "companion.pair",
+                    &json!({"kind": kind, "id": id, "psm": psm.unwrap_or(128)}),
+                )
+                .context("Android BLE callback is unavailable")?,
+            ),
+            "wifi" => anyhow::bail!(
+                "Wi-Fi companion provisioning is not implemented; use BLE or direct UART"
+            ),
             _ => anyhow::bail!("unsupported Android companion kind: {kind}"),
         }
     }
@@ -684,13 +738,19 @@ impl dmesh_server::companion_service::CompanionBackend for AndroidCompanionBacke
         match kind.as_str() {
             "ble" => {
                 android_require_owned_companion(&id, None)?;
-                accepted_android_companion(android_ble_command("companion.unpair", &json!({"kind": kind, "id": id}))
-                    .context("Android BLE callback is unavailable")?)
+                accepted_android_companion(
+                    android_ble_command("companion.unpair", &json!({"kind": kind, "id": id}))
+                        .context("Android BLE callback is unavailable")?,
+                )
             }
             "wifi" => {
-                let mut paired = ANDROID_WIFI_COMPANION.get_or_init(|| Mutex::new(None))
-                    .lock().map_err(|_| anyhow::anyhow!("Wi-Fi companion state poisoned"))?;
-                if paired.as_deref() != Some(id.as_str()) { anyhow::bail!("Wi-Fi companion is not locally paired"); }
+                let mut paired = ANDROID_WIFI_COMPANION
+                    .get_or_init(|| Mutex::new(None))
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Wi-Fi companion state poisoned"))?;
+                if paired.as_deref() != Some(id.as_str()) {
+                    anyhow::bail!("Wi-Fi companion is not locally paired");
+                }
                 *paired = None;
                 Ok(json!({"paired": false, "kind": "wifi", "released": id}))
             }
@@ -700,8 +760,12 @@ impl dmesh_server::companion_service::CompanionBackend for AndroidCompanionBacke
 }
 
 #[cfg(target_os = "android")]
-pub(crate) fn register_companion_service(services: &ssh_mesh::mesh_rest::MeshServiceRegistry) -> bool {
-    match dmesh_server::companion_service::CompanionService::mesh_service(Arc::new(AndroidCompanionBackend)) {
+pub(crate) fn register_companion_service(
+    services: &ssh_mesh::mesh_rest::MeshServiceRegistry,
+) -> bool {
+    match dmesh_server::companion_service::CompanionService::mesh_service(Arc::new(
+        AndroidCompanionBackend,
+    )) {
         Ok(service) => {
             services.register(dmesh_server::companion_service::SERVICE_NAME, service);
             true
@@ -756,6 +820,38 @@ impl dmesh_server::usb_service::UsbBackend for AndroidUsbBackend {
     }
     async fn close(&self) -> anyhow::Result<Value> {
         android_usb_command("usb.close", &json!({})).context("Android USB callback is unavailable")
+    }
+    async fn discover(&self) -> anyhow::Result<Value> {
+        let runtime = crate::bearer::current().context("USB bearer is not running")?;
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_micros() as u64;
+        let mut request = [0u8; 96];
+        let len = dmesh_server::announce::encode_discovery_request(id, &mut request)
+            .context("encode USB discovery request")?;
+        let response = runtime
+            .request("usb", &request[..len])
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let record = dmesh_server::tagged::decode(&response)
+            .context("USB discovery response is not tagged CBOR")?;
+        anyhow::ensure!(record.id == Some(id), "USB discovery reply ID differs");
+        let announce = dmesh_server::announce::decode_announce(&response)
+            .context("USB peer did not return a discovery announcement")?;
+        anyhow::ensure!(
+            announce.has_identity() && dmesh_server::announce::verify_identity(announce),
+            "USB discovery identity signature is invalid"
+        );
+        let vip6 = dmesh_server::announce::virtual_ip6(announce.public_key())
+            .map(Ipv6Addr::from)
+            .context("USB identity has no VIP6")?;
+        Ok(json!({
+            "signed": true,
+            "vip6": vip6,
+            "name": announce.device_name(),
+            "device_id": announce.device_id().iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+            "public_key": announce.public_key().iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+        }))
     }
 }
 
@@ -1159,8 +1255,7 @@ fn companion_names() -> BTreeMap<String, String> {
         let Ok(bytes) = std::fs::read(entry.path()) else {
             continue;
         };
-        let Ok(device) =
-            serde_json::from_slice::<dmesh_server::discovery::OwnedDevice>(&bytes)
+        let Ok(device) = serde_json::from_slice::<dmesh_server::discovery::OwnedDevice>(&bytes)
         else {
             continue;
         };
@@ -1201,8 +1296,14 @@ impl StatusRow {
     }
 
     fn render(&self, out: &mut String) {
-        let rssi = self.rssi.map(|value| format!("{value}")).unwrap_or_default();
-        let age = self.age_ms.map(compact_age).unwrap_or_else(|| "?".to_owned());
+        let rssi = self
+            .rssi
+            .map(|value| format!("{value}"))
+            .unwrap_or_default();
+        let age = self
+            .age_ms
+            .map(compact_age)
+            .unwrap_or_else(|| "?".to_owned());
         let name: String = self.name.chars().take(16).collect();
         out.push_str(&format!(
             "\n{:<2}{:<8} {:<16} {:<5} {:>4} {:>5}",
@@ -1223,18 +1324,16 @@ pub(crate) fn status_text() -> String {
             devices.clone()
         },
     );
-    let networks = local_networks().lock().map_or_else(
-        |_| BTreeMap::new(),
-        |table| table.networks.clone(),
-    );
+    let networks = local_networks()
+        .lock()
+        .map_or_else(|_| BTreeMap::new(), |table| table.networks.clone());
     let battery = power_state()
         .lock()
         .map(|power| power.battery.clone())
         .unwrap_or_default();
-    let ble_results = ble_scan_results_store().lock().map_or_else(
-        |_| BTreeMap::new(),
-        |results| results.clone(),
-    );
+    let ble_results = ble_scan_results_store()
+        .lock()
+        .map_or_else(|_| BTreeMap::new(), |results| results.clone());
     let companions = companion_names();
 
     let mut rows: Vec<StatusRow> = Vec::new();
@@ -1377,12 +1476,14 @@ pub(crate) fn status_text() -> String {
                 .get("rssi")
                 .and_then(Value::as_i64)
                 .and_then(|value| i16::try_from(value).ok()),
-            age_ms: Some(now_ms.saturating_sub(
-                result
-                    .get("last_seen_ms")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(now_ms),
-            )),
+            age_ms: Some(
+                now_ms.saturating_sub(
+                    result
+                        .get("last_seen_ms")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(now_ms),
+                ),
+            ),
             companion: false,
         });
     }
@@ -1498,9 +1599,7 @@ impl mesh::wire::TaggedRecordHandler for StatusTextService {
 }
 
 #[cfg(target_os = "android")]
-pub(crate) fn register_status_service(
-    services: &ssh_mesh::mesh_rest::MeshServiceRegistry,
-) -> bool {
+pub(crate) fn register_status_service(services: &ssh_mesh::mesh_rest::MeshServiceRegistry) -> bool {
     match StatusTextService::mesh_service() {
         Ok(service) => {
             services.register("status", service);
@@ -1555,7 +1654,7 @@ pub(crate) fn android_discovery_announce(
         }) {
             announce.set_sta_link_local_v6(address.octets());
             announce.set_udp_link_local_v6(address.octets());
-            announce.set_udp_port(dmesh_server::udp::STABLE_WIFI_UDP_PORT);
+            announce.set_udp_port(dmesh_server::firmware_profile::DEFAULT_EVENT_PORT);
         }
     }
     announce
@@ -1758,13 +1857,15 @@ pub(crate) fn observe_announce(
     };
     prune_discovered_devices(&mut devices, now_ms);
     let id = bytes_to_hex(announce.device_id());
-    let device = devices.entry(id.clone()).or_insert_with(|| DiscoveredDevice {
-        last_seen_ms: now_ms,
-        peer: String::new(),
-        info: Value::Null,
-        transports: BTreeMap::new(),
-        observations: BTreeMap::new(),
-    });
+    let device = devices
+        .entry(id.clone())
+        .or_insert_with(|| DiscoveredDevice {
+            last_seen_ms: now_ms,
+            peer: String::new(),
+            info: Value::Null,
+            transports: BTreeMap::new(),
+            observations: BTreeMap::new(),
+        });
     let bearer = if source.starts_with("nan") {
         "nan"
     } else {
@@ -2115,7 +2216,7 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                 // must use the same normal QUIC UDP listener as multicast and
                 // directed discovery, not an Android-only port convention.
                 announce.set_udp_link_local_v6(address.octets());
-                announce.set_udp_port(dmesh_server::udp::STABLE_WIFI_UDP_PORT);
+                announce.set_udp_port(dmesh_server::firmware_profile::DEFAULT_EVENT_PORT);
             }
             let mut out = [0; 96];
             let used = dmesh_server::announce::encode(announce, &mut out)
@@ -3201,7 +3302,7 @@ impl crate::bearer::BearerEgress for JavaBearerEgress {
         let length = if crate::bearer::is_uart_bearer(bearer) {
             crate::bearer::encode_uart_packet(bearer, packet, &mut scratch[..]).unwrap_or(0)
         } else {
-            crate::bearer::coc_frame(packet, &mut scratch[..]).unwrap_or(0)
+            crate::bearer::coc_packet(packet, &mut scratch[..]).unwrap_or(0)
         };
         if length == 0 {
             return;
@@ -3278,9 +3379,18 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeSetCal
         frame,
         scratch: Mutex::new([0u8; crate::bearer::BEARER_FRAME_MAX]),
     });
-    crate::bearer::set_current(Some(crate::bearer::BearerRuntime::spawn(
+    #[cfg(target_os = "android")]
+    let udp_socket = handle
+        .android_udp_socket
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
+    #[cfg(not(target_os = "android"))]
+    let udp_socket = None;
+    crate::bearer::set_current(Some(crate::bearer::BearerRuntime::spawn_with_udp(
         handle.runtime.handle().clone(),
         bearer_egress,
+        udp_socket,
     )));
 
     let client_listener = Arc::new(JniSshClientListener {
@@ -4055,7 +4165,7 @@ mod tests {
         observe_announce(companion, "aa:bb:cc:dd:ee:01".to_owned(), "nan_sd", b"p");
         let now_ms = chrono::Utc::now().timestamp_millis();
         if let Ok(mut devices) = discovered_devices().lock() {
-            if let Some(device) = devices.get_mut(&bytes_to_hex(announce_device_id(&id))) {
+            if let Some(device) = devices.get_mut(&bytes_to_hex(&id[..8])) {
                 observe_packet(
                     device,
                     "nan",
@@ -4082,8 +4192,12 @@ mod tests {
 
         // Provisional BLE rendezvous row with no matching identity.
         record_ble_scan_result(
-            "scan_result:rssi=-70:addr=01:02:03:04:05:06:mode=operational",
+            "scan_result:rssi=-70:addr=01:02:03:04:05:06:mode=unpaired",
             &[0x20, 0x00, 1, 2, 3, 4],
+        );
+        assert_eq!(
+            ble_scan_results_store().lock().unwrap()["01:02:03:04:05:06"]["mode"],
+            "unpaired"
         );
 
         let text = status_text();
@@ -4137,6 +4251,8 @@ mod tests {
 
     #[test]
     fn power_telemetry_is_validated_and_retained_in_rust() {
+        // Power state is process-global; tests that reset it must serialize.
+        let _guard = RADIO_STATE_TEST_LOCK.lock().unwrap();
         *power_state().lock().unwrap() = dmesh_server::power::PowerState::default();
         radio_message(
             "radio.power.status",
@@ -4157,6 +4273,8 @@ mod tests {
     fn private_battery_cbor_update_reaches_shared_telemetry() {
         use dmesh_server::cbor::Encoder;
 
+        // Power state is process-global; tests that reset it must serialize.
+        let _guard = RADIO_STATE_TEST_LOCK.lock().unwrap();
         *power_state().lock().unwrap() = dmesh_server::power::PowerState::default();
         let mut record = [0u8; 128];
         let mut encoder = Encoder::new(&mut record);
@@ -4446,7 +4564,10 @@ mod tests {
             announce.udp_link_local_v6(),
             Some("fe80::1234".parse::<Ipv6Addr>().unwrap().octets())
         );
-        assert_eq!(announce.udp_port, dmesh_server::udp::STABLE_WIFI_UDP_PORT);
+        assert_eq!(
+            announce.udp_port,
+            dmesh_server::firmware_profile::DEFAULT_EVENT_PORT
+        );
     }
 
     #[test]
