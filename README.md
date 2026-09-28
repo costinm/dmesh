@@ -18,19 +18,22 @@ The design borrows from several existing systems:
   started on the first connection, and stopped or frozen when idle, so there
   are no long-running daemons holding resources.
 - **Android**: each app runs under its own UID, and a small privileged init
-  manages its lifecycle. When memory is low, lower-priority apps are frozen or
-  stopped, similar to Android's low memory killer.
-- **Kubernetes pods**: each app has cgroup-based resource limits and is
-  watched through memory pressure (PSI) and usage.
+  manages its lifecycle. As with Android's low memory killer, memory pressure
+  (PSI) and usage are watched, and when memory is low lower-priority apps are
+  frozen or stopped.
+- **Kubernetes pods**: apps are started declaratively from a config that
+  includes cgroup-based resource limits (systemd services work similarly).
 - **Istio**: each host has a workload identity, using OpenSSH ECDSA keys and
   CA-signed certificates in addition to X.509/mTLS. HTTP/2 is supported, and
   the goal is to eventually be compatible with Istio HBONE.
-- **systemd**: the socket activation protocol (`LISTEN_FDS`/`LISTEN_FDNAMES`)
-  and a small subset of unit-file syntax (`[Service]`, `[Socket]`, `User=`,
-  `Group=`) are reused, so existing activated servers work unchanged.
-  `mesh-init` can run a subset of systemd configs and act as the init
-  (PID 1), or run as a service under systemd. It deliberately limits what an
-  app config can grant rather than giving the config owner broad power.
+- **systemd**: `mesh-init` implements a subset of systemd functionality and
+  can act as the init (PID 1), or run as a service under systemd. The socket
+  activation protocol (`LISTEN_FDS`/`LISTEN_FDNAMES`) is the same, so existing
+  activated servers work unchanged. App configs are TOML files that reuse
+  systemd section and key names (`[Service]`, `[Socket]`, `ExecStart`,
+  `User=`, `Group=`); there is no converter from systemd unit files yet.
+  `mesh-init` deliberately limits what an app config can grant rather than
+  giving the config owner broad power.
 
 ### Architecture
 
@@ -79,6 +82,9 @@ The mesh's own wire format is tagged-CBOR, a subset of CBOR equivalent to
 protobuf. JSONL/JSON-RPC and a structured text format are converted
 mechanically. Protobuf itself is planned, using the same dynamic,
 schema-driven translation with no generated stubs.
+
+The intent is that clients and services using any supportable encoding can
+communicate with each other, with the mesh gateways translating between them.
 
 ---
 
