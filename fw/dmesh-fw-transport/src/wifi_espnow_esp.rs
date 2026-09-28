@@ -23,13 +23,13 @@ pub struct EspNowPeer {
 }
 
 pub type EspNowHandler =
-    fn(EspNowPeer, &[u8], &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE]) -> Option<usize>;
+    fn(EspNowPeer, &[u8], &mut [u8; quic_lite::DEFAULT_MAX_PACKET_SIZE]) -> Option<usize>;
 /// Connection-owned egress poller. It is the same packet-at-a-time contract
 /// used by raw UDP6: the action adapter has no egress queue of its own.
 pub type EspNowPollHandler =
-    fn(EspNowPeer, &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE]) -> Option<usize>;
+    fn(EspNowPeer, &mut [u8; quic_lite::DEFAULT_MAX_PACKET_SIZE]) -> Option<usize>;
 
-const FRAME_CAPACITY: usize = quic_lite::DEFAULT_MAX_DATAGRAM_SIZE + 96;
+const FRAME_CAPACITY: usize = quic_lite::DEFAULT_MAX_PACKET_SIZE + 96;
 /// STA, AP, and the action bearer are deliberately co-channel (6) in this
 /// design. A 400-ms off-channel dwell serialized each NOW packet and capped
 /// even a successful transfer at a few kbit/s.  The C6 private receive path
@@ -130,9 +130,9 @@ struct ActionTxRequest {
 /// callbacks and packet turns never allocate.
 #[repr(C)]
 struct ActionBuffers {
-    response: [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
+    response: [u8; quic_lite::DEFAULT_MAX_PACKET_SIZE],
     tx_frame: [u8; FRAME_CAPACITY],
-    rx_payload: [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
+    rx_payload: [u8; quic_lite::DEFAULT_MAX_PACKET_SIZE],
     action_tx_request: ActionTxRequest,
 }
 
@@ -572,6 +572,16 @@ fn admit_now_payload(source: [u8; 6], payload: &[u8]) {
     }
     if recently_seen_action(source, payload) {
         RX_DUPLICATE_ACTIONS.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    if let Some(sync) = dmesh_rawnan::parse_now_sync_body(payload) {
+        crate::main_runtime::receive_nan_service_info(source, sync.service_info);
+        return;
+    }
+    if dmesh_server::tagged::decode(payload).is_some() {
+        let _ = crate::main_runtime::receive_direct_request(payload, |response| {
+            let _ = transmit(EspNowPeer { mac: source }, response);
+        });
         return;
     }
     if !crate::wifi_esp::enqueue_now_payload(source, payload) {

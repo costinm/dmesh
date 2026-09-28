@@ -6,8 +6,6 @@
 //! hardware-only module; no QUIC, bearer, or application handler participates
 //! in these operations.
 
-use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
-
 const RTC_CUSTOM_OFFSET: usize = 12;
 const RTC_HEALTH_EVENT_OFFSET: usize = RTC_CUSTOM_OFFSET + 4;
 const RTC_HANDOFF_OFFSET: usize = RTC_CUSTOM_OFFSET + 5;
@@ -18,10 +16,6 @@ const RTC_RETAIN_SIZE: usize = 48;
 pub const HANDOFF_NORMAL: u8 = 0;
 pub const HANDOFF_RECOVERY: u8 = 1;
 pub const HANDOFF_MAIN: u8 = 2;
-
-static RECOVERY_BOOT_STATE: AtomicU8 = AtomicU8::new(0);
-static RECOVERY_BOOT_CID_LOW: AtomicU32 = AtomicU32::new(0);
-static RECOVERY_BOOT_CID_HIGH: AtomicU32 = AtomicU32::new(0);
 
 #[cfg(target_arch = "riscv32")]
 // C6 application code cannot write RTC DRAM low. Keep this high-end block
@@ -105,49 +99,7 @@ pub fn mark_main_healthy() {
 
 /// Record a Recovery request without racing its QUIC response.
 pub fn request_recovery_boot() -> bool {
-    RECOVERY_BOOT_STATE.store(1, Ordering::Release);
-    true
-}
-
-/// Bind the handler request to the association whose terminal response was
-/// actually encoded after packet admission selected the current CID.
-pub(crate) fn bind_recovery_response(cid: quic_lite::ConnectionId) {
-    if RECOVERY_BOOT_STATE.load(Ordering::Acquire) != 1 {
-        return;
-    }
-    let value = cid.value();
-    RECOVERY_BOOT_CID_LOW.store(value as u32, Ordering::Relaxed);
-    RECOVERY_BOOT_CID_HIGH.store((value >> 32) as u32, Ordering::Relaxed);
-    RECOVERY_BOOT_STATE.store(2, Ordering::Release);
-}
-
-/// Arm Stage2 and schedule restart only after QUIC-lite reports that the peer
-/// acknowledged the terminal stream response. ACK details remain private to
-/// the transport; this is only the generic application delivery edge.
-pub(crate) fn response_delivered(cid: quic_lite::ConnectionId) {
-    if RECOVERY_BOOT_STATE.load(Ordering::Acquire) != 2 {
-        return;
-    }
-    let expected = u64::from(RECOVERY_BOOT_CID_LOW.load(Ordering::Relaxed))
-        | (u64::from(RECOVERY_BOOT_CID_HIGH.load(Ordering::Relaxed)) << 32);
-    if cid.value() != expected
-        || RECOVERY_BOOT_STATE
-            .compare_exchange(2, 0, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-    {
-        return;
-    }
-    // Arm retained state before waking the shared worker. `schedule_work` may
-    // dispatch immediately on another core, so scheduling first left a race
-    // where `restart_work` could reach `esp_restart` while Stage2 still saw
-    // `HANDOFF_NORMAL`. The response has already been terminally delivered;
-    // from this point every reset must select Recovery, including an
-    // asynchronous watchdog reset while the delayed worker restart is pending.
-    arm_recovery();
-    if !crate::task_esp::schedule_restart_ms(250) {
-        // Keep the armed one-shot selection rather than clearing it: a later
-        // reset still reaches the requested repair image. The response was
-        // delivered and must never be reported as a successful no-op.
-        RECOVERY_BOOT_STATE.store(2, Ordering::Release);
-    }
+    // Re-enable only after the new stream API exposes terminal delivery. A
+    // request must never arm Recovery merely because its response was queued.
+    false
 }

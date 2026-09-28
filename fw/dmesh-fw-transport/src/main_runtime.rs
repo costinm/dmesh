@@ -26,7 +26,7 @@ extern "C" {
 
 const NVS_READONLY: i32 = 0;
 const NVS_READWRITE: i32 = 1;
-const SETTINGS_KEYS: [&[u8]; 7] = [
+const SETTINGS_KEYS: [&[u8]; 8] = [
     b"mode",
     b"name",
     b"domain",
@@ -34,6 +34,7 @@ const SETTINGS_KEYS: [&[u8]; 7] = [
     b"sta_server_ll",
     b"sta_server_port",
     b"ble.auto",
+    b"quic.pool",
 ];
 // Private settings are write-only. `id_p256` is created internally and stored
 // as a binary NVS blob; it is never a settings transport value.
@@ -47,7 +48,9 @@ static PAIRING_WINDOW_UNTIL_MS: core::sync::atomic::AtomicU32 =
 
 fn pairing_window_open() -> bool {
     let deadline = PAIRING_WINDOW_UNTIL_MS.load(Ordering::Acquire);
-    if deadline == 0 { return false; }
+    if deadline == 0 {
+        return false;
+    }
     let now = (unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) as u64 / 1_000) as u32;
     deadline.wrapping_sub(now) <= PAIRING_WINDOW_MS
 }
@@ -86,10 +89,10 @@ pub(crate) fn secret_setting_exists(key: &[u8]) -> bool {
     result && length > 1
 }
 
-/// Presence only: a virgin-only NAN pairing invitation must never read the
+/// Presence only: a NAN pairing invitation for an unpaired device must never read the
 /// shared secret or infer ownership from a public VIP prefix.
 pub fn shared_secret_exists() -> bool {
-    // An NVS failure must never make an owned device look virgin. This
+    // An NVS failure must never make an owned device look unpaired. This
     // predicate also selects the BLE advertisement and NAN pairing wake.
     if unsafe { nvs_flash_init() } != 0 {
         return true;
@@ -100,7 +103,12 @@ pub fn shared_secret_exists() -> bool {
     }
     let mut length = 0usize;
     let status = unsafe {
-        nvs_get_blob(handle, SHARED_SECRET_NVS_KEY.as_ptr().cast(), core::ptr::null_mut(), &mut length)
+        nvs_get_blob(
+            handle,
+            SHARED_SECRET_NVS_KEY.as_ptr().cast(),
+            core::ptr::null_mut(),
+            &mut length,
+        )
     };
     unsafe { nvs_close(handle) };
     status != esp_idf_sys::ESP_ERR_NVS_NOT_FOUND as i32
@@ -207,6 +215,7 @@ pub(crate) fn write_setting(key: &[u8], value: &[u8]) -> bool {
         b"sta_server_ll" => value.starts_with(b"fe80:") && !value.contains(&b'%'),
         b"sta_server_port" => parse_port(value).is_some(),
         b"ble.auto" => matches!(value, b"true" | b"false"),
+        b"quic.pool" => parse_packet_pool_slots(value).is_some(),
         _ => false,
     };
     if !valid {
@@ -226,10 +235,42 @@ pub(crate) fn write_setting(key: &[u8], value: &[u8]) -> bool {
             && nvs_commit(handle) == 0
     };
     unsafe { nvs_close(handle) };
+    if result && key == b"quic.pool" {
+        crate::shared_ingress_esp::set_packet_capacity_limit(
+            parse_packet_pool_slots(value)
+                .unwrap_or(crate::shared_ingress_esp::ESP_CALLBACK_PACKET_SLOTS),
+        );
+    }
     // Announcements are signed once at startup. Persisted identity metadata
     // therefore becomes visible after the reboot which applies the setting;
     // never make a live settings write re-enter the expensive signer.
     result
+}
+
+fn parse_packet_pool_slots(value: &[u8]) -> Option<usize> {
+    let mut slots = 0usize;
+    for byte in value {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        slots = slots
+            .checked_mul(10)?
+            .checked_add(usize::from(*byte - b'0'))?;
+    }
+    (crate::shared_ingress_esp::ESP_CALLBACK_PACKET_SLOTS
+        ..=crate::shared_ingress_esp::ESP_MAX_PACKET_SLOTS)
+        .contains(&slots)
+        .then_some(slots)
+}
+
+/// Load the persistent per-device packet-pool ceiling. Missing or malformed
+/// values retain the conservative classic-ESP default.
+pub(crate) fn apply_packet_pool_capacity_from_nvs() {
+    let mut value = [0u8; 8];
+    let slots = read_setting(b"quic.pool", &mut value)
+        .and_then(|used| parse_packet_pool_slots(&value[..used]))
+        .unwrap_or(crate::shared_ingress_esp::ESP_CALLBACK_PACKET_SLOTS);
+    crate::shared_ingress_esp::set_packet_capacity_limit(slots);
 }
 
 /// Store reviewed binary control-plane material. Pairing secrets need a
@@ -257,6 +298,43 @@ pub(crate) fn write_binary_setting(key: &[u8], value: &[u8]) -> bool {
             && nvs_commit(handle) == 0
     };
     unsafe { nvs_close(handle) };
+    result
+}
+
+/// Commit credentials from the bearer-verified Main provisioning handler.
+/// The shared secret is the last NVS write: until it commits the device stays
+/// unpaired and a failed attempt can be repeated after another NAN invitation.
+pub fn install_pairing(name: &str, root_public_key: &[u8], secret: &[u8]) -> bool {
+    if !pairing_window_open()
+        || shared_secret_exists()
+        || secret.len() != 32
+        || root_public_key.len() != 33
+        || !matches!(root_public_key[0], 2 | 3)
+        || !write_setting(b"name", name.as_bytes())
+        || !write_binary_setting(b"cp", root_public_key)
+    {
+        return false;
+    }
+    if unsafe { nvs_flash_init() } != 0 {
+        return false;
+    }
+    let mut handle = 0_u32;
+    if unsafe { nvs_open(b"sec\0".as_ptr().cast(), NVS_READWRITE, &mut handle) } != 0 {
+        return false;
+    }
+    let result = unsafe {
+        nvs_set_blob(
+            handle,
+            SHARED_SECRET_NVS_KEY.as_ptr().cast(),
+            secret.as_ptr().cast(),
+            secret.len(),
+        ) == 0
+            && nvs_commit(handle) == 0
+    };
+    unsafe { nvs_close(handle) };
+    if result {
+        PAIRING_WINDOW_UNTIL_MS.store(0, Ordering::Release);
+    }
     result
 }
 
@@ -824,6 +902,9 @@ pub(crate) fn maybe_enter_sleep(
 /// or packet poll. Wi-Fi callbacks record bounded state and return, while this
 /// owner task performs the selected follow-up driver operation that may block.
 pub(crate) fn service_radio_deadline(services: u8) {
+    if services & DEADLINE_QUIC_INGRESS != 0 {
+        crate::quic_node_esp::progress();
+    }
     if services & DEADLINE_NAN_CAPTURE != 0 {
         crate::wifi_nan_dw_capture_esp::service_deadline();
     }
@@ -1524,7 +1605,7 @@ fn build_announce_record_with_capabilities(
     // active STA netif. AP endpoints are found by multicast rather than being
     // repeated in the announce.
     if crate::wifi_esp::sta_associated() {
-        let address = quic_lite::raw_udp6::link_local_from_mac(mac);
+        let address = crate::raw_udp6::link_local_from_mac(mac);
         announce.set_sta_link_local_v6(address);
         // Raw UDP6 is a normal QUIC bearer on Main, not merely an observation
         // source. Advertise the same path facts which the receive adapter
@@ -1657,8 +1738,7 @@ fn apply_sleep_boundary(
     // the conservative predicted phase. Honor only the bounded capture lease
     // published by that owner; without a selected beacon the original
     // deadline remains the safe maximum.
-    if let Some(capture_until_ms) =
-        crate::wifi_nan_dw_capture_esp::sleepy_resume_capture_until_ms()
+    if let Some(capture_until_ms) = crate::wifi_nan_dw_capture_esp::sleepy_resume_capture_until_ms()
     {
         state.sleepy_awake_until_ms = state.sleepy_awake_until_ms.min(capture_until_ms);
     }
@@ -1785,6 +1865,9 @@ pub(crate) enum MainRuntimeEvent {
 
 const DEADLINE_NAN_CAPTURE: u8 = 1 << 0;
 const DEADLINE_ROC: u8 = 1 << 1;
+/// A bearer enqueued a QUIC packet. Parsing and handler dispatch run on Main's
+/// owner task rather than on a UART or Wi-Fi adapter stack.
+const DEADLINE_QUIC_INGRESS: u8 = 1 << 2;
 /// A server-side connection PTO. Main only queues the typed event; the
 /// shared packet worker owns the service ledger and performs the egress turn.
 const DEADLINE_CONNECTION: u8 = 1 << 5;
@@ -1958,6 +2041,12 @@ pub(crate) fn request_deadline_recheck() {
     enqueue_adapter_completion(DEADLINE_RECHECK);
 }
 
+/// Wake Main after a bearer committed packet ownership to QUIC-lite's common
+/// ingress queue. The packet itself remains in the shared pool.
+pub(crate) fn request_quic_ingress() {
+    enqueue_adapter_completion(DEADLINE_QUIC_INGRESS);
+}
+
 /// Wake the Main owner after the shared connection worker changed NOW
 /// retransmission state. Called once per accepted NOW datagram, not from a
 /// Wi-Fi callback and never as a periodic tick. The next owner turn merely
@@ -2092,7 +2181,9 @@ fn wait_for_event(last_generation: u32, sleep_deadline_ms: Option<u64>) -> MainR
             // guard above.  Do not feed a duplicate request into the
             // reducer, where it is correctly classified as stale but would
             // obscure the real NAN/sleep diagnostics.
-            MainRuntimeEvent::ProfileChanged { .. } => MainRuntimeEvent::Deadline { services: pending },
+            MainRuntimeEvent::ProfileChanged { .. } => {
+                MainRuntimeEvent::Deadline { services: pending }
+            }
         };
     }
     if let Some((services, _)) = deadline {
@@ -2375,7 +2466,11 @@ pub(crate) fn receive_tagged_discovery(
             dmesh_server::announce::ANNOUNCE_COMPONENT,
             dmesh_server::announce::ANNOUNCE_NAN_PAIR_WAKEUP,
             id,
-            if queued { &[0xa1, 1, 0xf5] } else { &[0xa1, 1, 0xf4] },
+            if queued {
+                &[0xa1, 1, 0xf5]
+            } else {
+                &[0xa1, 1, 0xf4]
+            },
             &mut response,
         )?;
         return Some(alloc::vec::Vec::from(&response[..used]));
@@ -2554,9 +2649,7 @@ pub(crate) fn receive_nan_service_info(peer: [u8; 6], packet: &[u8]) {
         crate::commands::send_stats(&[
             (
                 b"nan transport.set rejected peer_le",
-                u64::from_le_bytes([
-                    peer[0], peer[1], peer[2], peer[3], peer[4], peer[5], 0, 0,
-                ]),
+                u64::from_le_bytes([peer[0], peer[1], peer[2], peer[3], peer[4], peer[5], 0, 0]),
             ),
             (b"nan transport.set rejected bytes", packet.len() as u64),
         ]);
@@ -2594,17 +2687,32 @@ where
     true
 }
 
-/// Dispatch the complete shared direct-request allowlist without knowledge of
-/// its bearer. Presence records are consumed by discovery observation; the
-/// only request forms here are directed discovery and `transport.set`.
+/// Dispatch one discovery request or mutable direct-control record without
+/// knowledge of its bearer. Discovery is an application datagram shared by
+/// UDP multicast, BLE, NAN, and NOW; it does not enter the QUIC direct plane.
 pub(crate) fn receive_direct_request<F>(packet: &[u8], send_response: F) -> bool
 where
     F: FnOnce(&[u8]),
 {
+    if dmesh_server::announce::discovery_request_id(packet).is_some() {
+        let Some(record) = dmesh_server::tagged::decode(packet) else {
+            return false;
+        };
+        let Some(response) = receive_tagged_discovery(record) else {
+            return false;
+        };
+        send_response(&response);
+        return true;
+    }
     match dmesh_server::direct::classify(packet) {
         Some(dmesh_server::direct::DirectMessageKind::PairWakeup) => {
-            let Some(record) = dmesh_server::tagged::decode(packet) else { return false; };
-            let Some(target) = dmesh_server::announce::decode_nan_pair_wakeup_request(record) else { return false; };
+            let Some(record) = dmesh_server::tagged::decode(packet) else {
+                return false;
+            };
+            let Some(target) = dmesh_server::announce::decode_nan_pair_wakeup_request(record)
+            else {
+                return false;
+            };
             let station = crate::wifi_esp::interface_mac(crate::wifi_esp::RadioInterface::Sta);
             let ap = crate::wifi_esp::interface_mac(crate::wifi_esp::RadioInterface::Ap);
             if (station != Some(target) && ap != Some(target)) || shared_secret_exists() {
@@ -2621,10 +2729,22 @@ where
                 },
             };
             let mut encoded = [0u8; 96];
-            let Some(used) = dmesh_server::control::encode_request(request, Some(record.id.unwrap_or(0)), &mut encoded) else { return false; };
-            let Some(control_record) = dmesh_server::tagged::decode(&encoded[..used]) else { return false; };
-            let Some(control_response) = receive_direct_tagged_control(control_record) else { return false; };
-            if dmesh_server::tagged::decode(&control_response).is_none_or(|reply| reply.error.is_some()) {
+            let Some(used) = dmesh_server::control::encode_request(
+                request,
+                Some(record.id.unwrap_or(0)),
+                &mut encoded,
+            ) else {
+                return false;
+            };
+            let Some(control_record) = dmesh_server::tagged::decode(&encoded[..used]) else {
+                return false;
+            };
+            let Some(control_response) = receive_direct_tagged_control(control_record) else {
+                return false;
+            };
+            if dmesh_server::tagged::decode(&control_response)
+                .is_none_or(|reply| reply.error.is_some())
+            {
                 return false;
             }
             let now = (unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) as u64 / 1_000) as u32;
@@ -2639,17 +2759,6 @@ where
             ) {
                 send_response(&response[..used]);
             }
-            true
-        }
-        Some(dmesh_server::direct::DirectMessageKind::DiscoveryRequest) => {
-            let Some(record) = dmesh_server::tagged::decode(packet) else {
-                return false;
-            };
-            let Some(response) = receive_tagged_discovery(record) else {
-                return false;
-            };
-            crate::state::direct_record_accepted();
-            send_response(&response);
             true
         }
         Some(dmesh_server::direct::DirectMessageKind::TransportSet) => {
@@ -3071,6 +3180,7 @@ pub(crate) fn receive_tagged_raw_wifi(
 /// The shared direct endpoint owns long-header parsing and response framing,
 /// so UART has the same direct allowlist as NOW and UDP6. All application
 /// operations, including telemetry and raw-Wi-Fi, use normal QUIC streams.
+#[cfg(any())]
 pub(crate) fn receive_uart_raw_ingress(
     _item: crate::shared_ingress_esp::IngressPacket,
     packet: &[u8],
@@ -3388,6 +3498,10 @@ pub(crate) fn run_main_service(service: MainRuntimeService) {
     unsafe { esp_idf_sys::esp_rom_printf(b"DMESH main: event-queue\n\0".as_ptr().cast()) };
     // The initial profile uses the default 115200 selector. USB-JTAG targets
     // ignore this value; classic UART targets configure the mapped baud here.
+    // Packet memory is a device capability, not host inventory. Classic ESP32
+    // keeps the conservative default; C6 and other devices may persist a
+    // reviewed `quic.pool` ceiling in NVS.
+    crate::main_runtime::apply_packet_pool_capacity_from_nvs();
     if !unsafe { crate::uart_esp::install_l2_driver(1) } {
         unsafe {
             esp_idf_sys::esp_rom_printf(b"DMESH main: uart-install failed\n\0".as_ptr().cast())
@@ -3456,17 +3570,13 @@ pub(crate) fn run_main_service(service: MainRuntimeService) {
         // needed to enable UART, which is an unreachable bootstrap state.
         crate::core_runtime::apply_uart_profile(true);
     }
-    if !unsafe {
-        crate::uart_esp::start_shared_l2(
-            crate::core_runtime::receive_uart_ingress,
-            crate::main_runtime::receive_uart_raw_ingress,
-        )
-    } {
+    if !unsafe { crate::uart_esp::start_shared_l2() } {
         unsafe {
             esp_idf_sys::esp_rom_printf(b"DMESH main: uart-start failed\n\0".as_ptr().cast())
         };
         return;
     }
+    crate::uart_esp::set_ingress_notify(Some(crate::main_runtime::request_quic_ingress));
     // The writer reports only a capacity edge; the shared ingress worker
     // remains the one owner of QUIC-lite state and decides whether another
     // UART packet is ready. This preserves the one-record classic-ESP32
@@ -3479,6 +3589,10 @@ pub(crate) fn run_main_service(service: MainRuntimeService) {
     let _ = dmesh_server::services::register_tagged_component(
         dmesh_server::services::FIRMWARE_COMPONENT,
         crate::firmware_identity::receive_tagged_identity,
+    );
+    let _ = dmesh_server::services::register_tagged_component(
+        dmesh_server::verified_object::OBJECT_COMPONENT,
+        crate::flash::receive_tagged_flash,
     );
     let _ = dmesh_server::services::register_tagged_component(
         dmesh_server::control::CONTROL_COMPONENT,
@@ -3511,12 +3625,6 @@ pub(crate) fn run_main_service(service: MainRuntimeService) {
     let _ = dmesh_server::services::register_tagged_component(
         crate::main_runtime::MEMORY_COMPONENT,
         crate::main_runtime::receive_tagged_memory_snapshot,
-    );
-    // Relay desired state is administered only on an authenticated QUIC
-    // stream. Connection setup remains an Initial long-header operation, not relay control.
-    let _ = dmesh_server::services::register_tagged_component(
-        dmesh_server::relay::RELAY_COMPONENT,
-        crate::relay_main::receive_tagged_relay,
     );
     crate::wifi_nan_dw_capture_esp::set_service_info_handler(Some(
         crate::main_runtime::receive_nan_service_info,

@@ -2052,7 +2052,7 @@ pub fn promiscuous_enabled() -> Result<bool, esp_idf_sys::esp_err_t> {
 /// channel move.  The task observes association loss, then scans and selects
 /// an eligible DMesh beacon; it never turns a transient missing AP into a
 /// blind `esp_wifi_connect` loop.  The selected BSSID is also the advertised
-/// server MAC: `quic_lite::raw_udp6::link_local_from_mac` derives its IPv6 LL
+/// server MAC: `crate::raw_udp6::link_local_from_mac` derives its IPv6 LL
 /// endpoint without a separate raw-UDP address setting.
 /// Start Recovery's legacy STA observation/reconnect worker.
 ///

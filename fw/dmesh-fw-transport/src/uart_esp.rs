@@ -2,28 +2,32 @@
 // queues and the nonblocking FreeRTOS L2 task shared by Recovery and Main.
 // PPP marker semantics and classification are shared server/bearer policy.
 
+// TODO: copy uart_codec codec into this file - making escaping/framing integral and done closer to the driver.
+// TODO: evaluate using interrupts for send and receive
+// TODO: remove owned buffers - use the Quic pool buffer for everything. On receive - get a pool after the packet delim.
+
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
-use dmesh_server::{
-    firmware_profile::{UART_DEFAULT, UART_OFF},
-    uart::{classify_uart_payload, UartIngress, UART_TRANSPORT_MARKER},
+use dmesh_server::firmware_profile::{UART_DEFAULT, UART_OFF};
+use quic_lite::{
+    EgressSubmission, PacketEgress, PacketSendOutcome, PacketSubmitError, PeerL2Address,
 };
-use uart_codec::codec::{Decoder as UartDecoder, Encoder as UartEncoder};
+use uart_codec::encode_packet;
+use uart_codec::pool::{PooledDecoder, PooledFrame};
 
 /// UART is an L2 bearer and therefore uses the transport MTU rather than a
 /// separate 512-byte diagnostic limit. PPP escaping is framing overhead, not
 /// an additional fragmentation layer.
 pub const UART_MAX_PACKET: usize = crate::TRANSPORT_MTU + 1;
+
 // The image's physical UART rate is intentionally a build-time choice:
 // switching it at runtime would strand a direct UART client before it could
 // receive an acknowledgement. C6 selects USB-JTAG only when a host is
 // physically attached at boot; otherwise it uses the board's UART0 bridge.
 include!(concat!(env!("OUT_DIR"), "/physical_uart_baud.rs"));
-// UART egress is a bounded flight of complete MTU records. Classic ESP32
-// chooses its depth at startup from internal-heap headroom; C6/S3 retain their
-// established fixed upper bounds. The common capacity-edge wake below prevents
-// a short queue from becoming a protocol dead end.
+
+// UART egress sends complete MTU records..
 #[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
 const UART_EGRESS_MAX_CAPACITY: usize = 4;
 #[cfg(target_arch = "riscv32")]
@@ -34,6 +38,7 @@ const UART_EGRESS_MAX_CAPACITY: usize = 8;
 pub(crate) const UART_L2_STACK_BYTES: u32 = 8 * 1024;
 #[cfg(any(target_arch = "riscv32", target_feature = "esp32s3ops"))]
 pub(crate) const UART_L2_STACK_BYTES: u32 = 8 * 1024;
+
 // USB-JTAG is a packetized USB transport on C6, not a 115200 UART. One PPP
 // frame can grow to roughly twice the transport MTU through escaping. Reserve
 // two frames per direction, matching the C6's device-wide UART flight cap.
@@ -43,10 +48,14 @@ const USB_JTAG_BUFFER_SIZE: u32 = (2 * (2 * UART_MAX_PACKET + 2)) as u32;
 // its sole consumer on classic/S3; polling `uart_read_bytes` beside the event
 // queue loses RX wakeups on some classic bridge/driver combinations.
 static UART_RX_EVENT_QUEUE: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
+
 #[cfg(target_arch = "riscv32")]
 static C6_USB_JTAG_SELECTED: AtomicBool = AtomicBool::new(false);
+
 static UART_RX_EVENT_COUNT: AtomicU32 = AtomicU32::new(0);
 static UART_RX_BYTE_COUNT: AtomicU32 = AtomicU32::new(0);
+static UART_RX_BYTES_REPORTED: AtomicBool = AtomicBool::new(false);
+static UART_RX_PACKET_REPORTED: AtomicBool = AtomicBool::new(false);
 /// Optional firmware-owner wake hook. The L2 task has no dependency on Main,
 /// Recovery, commands, or a particular executor; an owner can install this
 /// one-shot notification so its dispatcher need not wait for a housekeeping
@@ -62,13 +71,23 @@ static UART_EGRESS_QUEUED: AtomicUsize = AtomicUsize::new(0);
 /// Actual queue depth selected at startup. Keeping it atomic allows the
 /// shared worker to use the same capacity feedback without a UART lock.
 static UART_EGRESS_CAPACITY: AtomicUsize = AtomicUsize::new(0);
+
 // Solely owned by the UART writer task.  This is deliberately a short driver
 // write chunk, not a packet or an escaped-frame buffer.
 static mut UART_TX_SCRATCH: [u8; 64] = [0; 64];
-// The sole writer task receives its one raw MTU record here. Keeping it out
-// of the FreeRTOS stack prevents a packet-sized stack reservation; it is not
-// an additional queue and therefore remains bounded by `UART_EGRESS_CAPACITY`.
+
+// The sole writer task receives legacy raw/text records here. Keeping the
+// scratch record out of the FreeRTOS stack prevents a packet-sized stack
+// reservation. Pool-backed QUIC packets never pass through this record.
 static mut UART_TX_CURRENT: core::mem::MaybeUninit<QueuedUartPayload> =
+    core::mem::MaybeUninit::uninit();
+
+type UartPoolSubmission = EgressSubmission<crate::shared_ingress_esp::SharedPacketLease>;
+
+// The bearer accepts only one pool lease at a time. The FreeRTOS queue carries
+// a wake record, never the packet or its ownership-bearing Rust value.
+static UART_POOL_SUBMISSION_STATE: AtomicUsize = AtomicUsize::new(0);
+static mut UART_POOL_SUBMISSION: core::mem::MaybeUninit<UartPoolSubmission> =
     core::mem::MaybeUninit::uninit();
 static UART_APB_LOCK: AtomicPtr<esp_idf_sys::esp_pm_lock> = AtomicPtr::new(core::ptr::null_mut());
 static UART_APB_LOCK_HELD: AtomicBool = AtomicBool::new(false);
@@ -106,27 +125,8 @@ pub const fn uart_is_off(selector: u8) -> bool {
     selector == UART_OFF
 }
 
-/// Physical UART L2 receive observability. These counters deliberately stop
-/// below PPP/QUIC parsing so a host status query can distinguish a missing
-/// RX event from a malformed transport datagram.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct UartL2Stats {
-    pub physical_baud: i32,
-    pub rx_events: u32,
-    pub rx_bytes: u32,
-}
-
-pub fn uart_l2_stats() -> UartL2Stats {
-    UartL2Stats {
-        physical_baud: PHYSICAL_UART_BAUD,
-        rx_events: UART_RX_EVENT_COUNT.load(Ordering::Relaxed),
-        rx_bytes: UART_RX_BYTE_COUNT.load(Ordering::Relaxed),
-    }
-}
-
 /// Whether this boot selected the packetized native USB-JTAG endpoint rather
-/// than a power-gated physical UART. On C6 this is a runtime hardware fact;
-/// CPU architecture alone cannot describe boards fitted with UART bridges.
+/// than a power-gated physical UART.
 pub fn packetized_debug_selected() -> bool {
     #[cfg(target_arch = "riscv32")]
     {
@@ -216,13 +216,8 @@ pub unsafe fn start_l2_task() -> bool {
 /// `install_l2_driver`. Both marked QUIC-lite datagrams and unmarked opaque
 /// direct packets are admitted to the common pool; only dispatcher callbacks
 /// differ. The UART adapter does not decode either packet form.
-pub unsafe fn start_shared_l2(
-    transport: crate::shared_ingress_esp::IngressHandler,
-    raw: crate::shared_ingress_esp::IngressHandler,
-) -> bool {
-    crate::shared_ingress_esp::start(crate::shared_ingress_esp::IngressKind::Uart, transport)
-        && crate::shared_ingress_esp::start(crate::shared_ingress_esp::IngressKind::UartRaw, raw)
-        && start_l2_task()
+pub unsafe fn start_shared_l2() -> bool {
+    start_l2_task()
 }
 
 #[cfg(target_feature = "esp32s3ops")]
@@ -512,14 +507,15 @@ fn time_after_or_equal(now: u32, deadline: u32) -> bool {
     now.wrapping_sub(deadline) < i32::MAX as u32
 }
 
-/// One raw record waiting for the dedicated serial task.  It is deliberately
-/// *not* an escaped PPP frame: the writer borrows this payload and emits
-/// delimiter/escapes while USB accepts bytes.  Thus PPP costs no 2x-MTU
-/// buffer, even when every payload byte needs escaping.
+/// One raw record waiting for the dedicated serial task. It is deliberately
+/// *not* an escaped PPP frame: for transport output `bytes` contains only the
+/// opaque QUIC packet, and uart-codec adds the marker plus PPP escaping while
+/// USB accepts bytes. Thus PPP costs no 2x-MTU buffer, even when every payload
+/// byte needs escaping.
 #[repr(C)]
 struct QueuedUartPayload {
-    /// `UART_EGRESS_PPP` is raw PPP payload; `UART_EGRESS_TEXT` is raw ASCII
-    /// diagnostic text (the writer appends CRLF). Both have one writer.
+    /// `UART_EGRESS_PPP` is an opaque QUIC packet; `UART_EGRESS_TEXT` is raw
+    /// ASCII diagnostic text (the writer appends CRLF). Both have one writer.
     kind: u8,
     len: u16,
     bytes: [u8; UART_MAX_PACKET],
@@ -553,6 +549,53 @@ static UART_TX_TASK_HANDLE: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_m
 
 const UART_EGRESS_PPP: u8 = 1;
 const UART_EGRESS_TEXT: u8 = 2;
+/// ESP UART adapter for the common bearer API. It retains exactly one pool
+/// lease while the dedicated physical writer performs PPP framing and returns
+/// that lease only after the final framed byte has been accepted.
+pub struct EspUartBearer;
+
+impl PacketEgress<crate::shared_ingress_esp::SharedPacketLease> for EspUartBearer {
+    fn submit(
+        &mut self,
+        _peer_l2_address: PeerL2Address,
+        submission: UartPoolSubmission,
+    ) -> Result<(), PacketSubmitError<crate::shared_ingress_esp::SharedPacketLease>> {
+        if !physical_bearer_active()
+            || UART_POOL_SUBMISSION_STATE
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return Err(PacketSubmitError::WouldBlock(submission));
+        }
+        unsafe {
+            core::ptr::addr_of_mut!(UART_POOL_SUBMISSION)
+                .write(core::mem::MaybeUninit::new(submission))
+        };
+        // State 1 reserves the slot while it is initialized. Publish state 2
+        // only after the ownership-bearing value is complete, so the writer
+        // can never observe an uninitialized submission.
+        UART_POOL_SUBMISSION_STATE.store(2, Ordering::Release);
+        #[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
+        notify_classic_tx_task();
+        Ok(())
+    }
+}
+
+#[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
+fn notify_classic_tx_task() {
+    let task = UART_TX_TASK_HANDLE.load(Ordering::Acquire);
+    if !task.is_null() {
+        unsafe {
+            let _ = esp_idf_sys::xTaskGenericNotify(
+                task.cast(),
+                0,
+                1,
+                esp_idf_sys::eNotifyAction_eSetBits,
+                core::ptr::null_mut(),
+            );
+        }
+    }
+}
 
 pub unsafe fn init_transport_ingress_queue() -> bool {
     // Kept as an idempotent compatibility entry point for Recovery/Main
@@ -652,6 +695,9 @@ fn enqueue_uart_payload(kind: u8, payload: &[u8]) -> bool {
     };
     if !accepted {
         UART_EGRESS_QUEUED.fetch_sub(1, Ordering::AcqRel);
+    } else {
+        #[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
+        notify_classic_tx_task();
     }
     accepted
 }
@@ -695,6 +741,9 @@ fn write_uart_current() {
 
 /// Non-blocking ingress from the UART FreeRTOS task. A full queue is an
 /// explicit lossy-path drop; it must never wait for stream credit or Wi-Fi.
+#[deprecated(
+    note = "legacy allocating/copying ingress; decode directly into a writer lent by QUIC-lite"
+)]
 pub(crate) fn enqueue_transport_packet(packet: &[u8]) -> bool {
     if packet.is_empty() || packet.len() > UART_MAX_PACKET - 1 {
         return false;
@@ -778,32 +827,9 @@ pub fn send_transport_packet(packet: &[u8]) -> bool {
     if packet.is_empty() || packet.len() >= UART_MAX_PACKET {
         return false;
     }
-    // The marker is stored once with the raw payload. The physical owner
-    // turns it into PPP as bytes are accepted by USB/UART.
-    let queue = UART_EGRESS_QUEUE.load(Ordering::Acquire);
-    if queue.is_null() {
-        return false;
-    }
-    let mut queued = QueuedUartPayload {
-        kind: UART_EGRESS_PPP,
-        len: (packet.len() + 1) as u16,
-        bytes: [0; UART_MAX_PACKET],
-    };
-    queued.bytes[0] = UART_TRANSPORT_MARKER;
-    queued.bytes[1..packet.len() + 1].copy_from_slice(packet);
-    UART_EGRESS_QUEUED.fetch_add(1, Ordering::AcqRel);
-    let accepted = unsafe {
-        esp_idf_sys::xQueueGenericSend(
-            queue.cast(),
-            (&queued as *const QueuedUartPayload).cast(),
-            0,
-            0,
-        ) == 1
-    };
-    if !accepted {
-        UART_EGRESS_QUEUED.fetch_sub(1, Ordering::AcqRel);
-    }
-    accepted
+    // Compatibility path for connectionless output. Normal QUIC egress uses
+    // `EspUartBearer` and transfers its pool lease without this copy.
+    enqueue_uart_payload(UART_EGRESS_PPP, packet)
 }
 
 /// Write one private QUIC-lite direct payload through the physical PPP bearer.
@@ -821,7 +847,7 @@ pub fn send_direct_record(record: &[u8]) -> bool {
     let Some(used) = crate::core_runtime::encode_connectionless_message(record, &mut packet) else {
         return false;
     };
-    enqueue_uart_payload(UART_EGRESS_PPP, &packet[..used])
+    send_transport_packet(&packet[..used])
 }
 
 /// Write one already-encoded connectionless packet through PPP. This is the
@@ -834,7 +860,7 @@ pub fn send_connectionless_packet(packet: &[u8]) -> bool {
     if packet.is_empty() || packet.len() > UART_MAX_PACKET {
         return false;
     }
-    enqueue_uart_payload(UART_EGRESS_PPP, packet)
+    send_transport_packet(packet)
 }
 
 /// Queue one raw ASCII diagnostic line for the sole physical UART writer.
@@ -893,7 +919,7 @@ fn write_queued_payload(queued: &QueuedUartPayload) {
     }
     match queued.kind {
         UART_EGRESS_PPP => {
-            let Ok(mut encoder) = UartEncoder::new(&queued.bytes[..len], UART_MAX_PACKET) else {
+            let Ok(mut encoder) = encode_packet(&queued.bytes[..len]) else {
                 return;
             };
             while !encoder.is_finished() {
@@ -907,6 +933,43 @@ fn write_queued_payload(queued: &QueuedUartPayload) {
         }
         _ => {}
     }
+}
+
+fn write_pool_submission_if_ready() -> bool {
+    if UART_POOL_SUBMISSION_STATE
+        .compare_exchange(2, 3, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return false;
+    }
+    let submission = unsafe {
+        core::ptr::addr_of!(UART_POOL_SUBMISSION)
+            .read()
+            .assume_init()
+    };
+    let result = write_transport_bytes(submission.packet().bytes());
+    UART_POOL_SUBMISSION_STATE.store(0, Ordering::Release);
+    submission.complete(
+        if result {
+            PacketSendOutcome::Sent
+        } else {
+            PacketSendOutcome::Failed
+        },
+        0,
+    );
+    notify_egress_ready();
+    true
+}
+
+fn write_transport_bytes(packet: &[u8]) -> bool {
+    let Ok(mut encoder) = encode_packet(packet) else {
+        return false;
+    };
+    while !encoder.is_finished() {
+        let produced = unsafe { encoder.write(&mut UART_TX_SCRATCH) };
+        write_all(unsafe { &UART_TX_SCRATCH[..produced] });
+    }
+    true
 }
 
 fn write_all(bytes: &[u8]) {
@@ -962,22 +1025,6 @@ fn read_usb(bytes: &mut [u8], ticks_to_wait: u32) -> i32 {
     }
 }
 
-#[cfg(target_arch = "riscv32")]
-pub fn install_console() {
-    unsafe {
-        if !c6_usb_host_connected() {
-            return;
-        }
-        let mut config = esp_idf_sys::usb_serial_jtag_driver_config_t {
-            tx_buffer_size: USB_JTAG_BUFFER_SIZE,
-            rx_buffer_size: USB_JTAG_BUFFER_SIZE,
-        };
-        let _ = esp_idf_sys::usb_serial_jtag_driver_install(&mut config);
-    }
-}
-#[cfg(not(target_arch = "riscv32"))]
-pub fn install_console() {}
-
 pub unsafe extern "C" fn task_entry(_argument: *mut c_void) {
     command_task();
 }
@@ -993,7 +1040,7 @@ unsafe extern "C" fn classic_tx_task_entry(_argument: *mut c_void) {
 }
 
 /// Start the dedicated physical UART L2 task after the platform has installed
-/// its UART or USB-JTAG driver and all three bounded queues are ready. The
+/// its UART or USB-JTAG driver and all three queues are ready. The
 /// task is the only reader and writer of that driver; callers interact only
 /// through opaque direct-record or QUIC-lite packet queues.
 pub unsafe fn start_task(stack_bytes: u32, priority: u32, core: i32) -> bool {
@@ -1090,7 +1137,7 @@ pub unsafe fn start_task(stack_bytes: u32, priority: u32, core: i32) -> bool {
 /// poll its ring after an empty event or share the queue with transmit.
 #[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
 fn classic_rx_task(event_queue: *mut esp_idf_sys::QueueDefinition) {
-    let mut decoder = UartDecoder::with_max(UART_MAX_PACKET);
+    let mut decoder = PooledDecoder::new(crate::quic_node_esp::uart_pool());
     let mut bytes = [0u8; 256];
     loop {
         let mut event = esp_idf_sys::uart_event_t::default();
@@ -1116,32 +1163,51 @@ fn classic_rx_task(event_queue: *mut esp_idf_sys::QueueDefinition) {
                     let _ = esp_idf_sys::uart_flush_input(esp_idf_sys::uart_port_t_UART_NUM_0);
                     let _ = esp_idf_sys::xQueueGenericReset(event_queue.cast(), 0);
                 }
-                decoder = UartDecoder::with_max(UART_MAX_PACKET);
+                decoder = PooledDecoder::new(crate::quic_node_esp::uart_pool());
             }
             _ => {}
         }
     }
 }
 
-/// The matching classic ESP32 writer.  Producers enqueue complete PPP or text
-/// records, so this task may wait without delaying transport stream progress.
+/// The matching classic ESP32 writer. Pool-backed QUIC submissions wake it
+/// directly; legacy text/direct records remain in their compatibility queue.
 #[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
 fn classic_tx_task() {
     loop {
-        if !dequeue_uart_current(esp_idf_sys::TickType_t::MAX) {
-            continue;
+        let _ = write_pool_submission_if_ready();
+        while dequeue_uart_current(0) {
+            notify_egress_ready();
+            write_uart_current();
         }
-        notify_egress_ready();
-        write_uart_current();
+        unsafe {
+            let _ = esp_idf_sys::xTaskGenericNotifyWait(
+                0,
+                0,
+                u32::MAX,
+                core::ptr::null_mut(),
+                esp_idf_sys::TickType_t::MAX,
+            );
+        }
     }
 }
 
 /// Dedicated nonblocking UART L2 task. It owns only PPP decode and bounded
 /// ingress queues; all direct-record and QUIC-lite dispatch happens above it.
 fn command_task() {
-    let mut decoder = UartDecoder::with_max(UART_MAX_PACKET);
+    let mut decoder = PooledDecoder::new(crate::quic_node_esp::uart_pool());
     let mut bytes = [0u8; 256];
+    // This record is emitted only after the physical driver, codec pool,
+    // no-std QUIC runtime, registered bearer, egress queue, and sole UART task
+    // are all live. A reset-time host watch can therefore distinguish a
+    // functioning UART transport from earlier ROM/ESP-IDF console text.
+    let _ = send_debug_text(b"DMESH uart: writer ready");
+    crate::commands::send_response(b"DMESH uart: quic ready");
     loop {
+        // C6/S3 own a cooperative UART task, so a published pool lease is its
+        // own wake condition. Do not copy a packet-sized dummy record through
+        // the legacy queue merely to signal this task.
+        let wrote_pool_submission = write_pool_submission_if_ready();
         let has_pending = dequeue_uart_current(0);
         if has_pending {
             notify_egress_ready();
@@ -1198,7 +1264,7 @@ fn command_task() {
                                 );
                                 let _ = esp_idf_sys::xQueueGenericReset(event_queue.cast(), 0);
                             }
-                            decoder = UartDecoder::with_max(UART_MAX_PACKET);
+                            decoder = PooledDecoder::new(crate::quic_node_esp::uart_pool());
                         }
                         _ => {}
                     }
@@ -1216,56 +1282,62 @@ fn command_task() {
         // RTOS-tick wait. Yield after an empty poll so the UART task remains
         // cooperative while a partial write is retried.
         unsafe {
-            esp_idf_sys::vTaskDelay(if has_pending { 0 } else { 1 });
+            esp_idf_sys::vTaskDelay(if has_pending || wrote_pool_submission {
+                0
+            } else {
+                1
+            });
         }
     }
 }
 
-fn drain_uart_driver(decoder: &mut UartDecoder, bytes: &mut [u8; 256]) {
+fn drain_uart_driver(
+    decoder: &mut PooledDecoder<crate::quic_node_esp::FirmwarePool>,
+    bytes: &mut [u8; 256],
+) {
     loop {
         let count = read_usb(bytes, 0);
         if count <= 0 {
             break;
         }
         UART_RX_BYTE_COUNT.fetch_add(count as u32, Ordering::Relaxed);
+        if !UART_RX_BYTES_REPORTED.swap(true, Ordering::AcqRel) {
+            let _ = send_debug_text(b"DMESH uart: first physical rx bytes");
+        }
         consume_uart_bytes(decoder, &bytes[..count as usize]);
     }
 }
 
-fn consume_uart_bytes(decoder: &mut UartDecoder, bytes: &[u8]) {
-    if !physical_bearer_active() {
-        // Keep the ESP-IDF driver owner alive so an enabled profile can
-        // resume without reinstalling UART0, but discard bytes before PPP
-        // decode and shared-pool admission while UART is explicitly off.
+fn consume_uart_bytes(
+    decoder: &mut PooledDecoder<crate::quic_node_esp::FirmwarePool>,
+    bytes: &[u8],
+) {
+    if !physical_receive_enabled() {
+        // Keep the ESP-IDF driver owner installed, but discard bytes while
+        // UART is explicitly disabled by policy. An expired interactive
+        // window is not disabled: receiving bytes reopens that window so a
+        // host can attach to an otherwise idle UART port.
         return;
     }
-    let Ok(records) = decoder.push(bytes) else {
-        return;
-    };
-    for record in records {
-        // The marker selects normal QUIC frames. An unmarked frame is passed
-        // unchanged to the shared direct endpoint, which alone recognizes a
-        // valid long-header direct record; UART never parses CBOR here.
-        match classify_uart_payload(&record) {
-            Ok(UartIngress::Unmarked(record)) => {
-                if crate::shared_ingress_esp::enqueue(
-                    crate::shared_ingress_esp::IngressKind::UartRaw,
-                    [0; 6],
-                    record,
-                ) {
-                    activate_window();
-                    notify_ingress();
+    activate_window();
+    decoder.push(
+        bytes,
+        quic_lite::PACKET_PREFIX_RESERVE,
+        |frame| match frame {
+            PooledFrame::Packet(packet) => {
+                activate_window();
+                if !UART_RX_PACKET_REPORTED.swap(true, Ordering::AcqRel) {
+                    let _ = send_debug_text(b"DMESH uart: first pooled packet rx");
                 }
+                crate::quic_node_esp::receive_uart(packet);
+                notify_ingress();
             }
-            Ok(UartIngress::Transport(packet)) => {
-                if enqueue_transport_packet(packet) {
-                    activate_window();
-                    notify_ingress();
-                }
+            PooledFrame::PoolUnavailable => {
+                let _ = send_debug_text(b"DMESH uart: packet pool unavailable");
             }
-            Err(_) => {}
-        }
-    }
+            PooledFrame::Log(_) => {}
+        },
+    );
 }
 
 fn physical_bearer_active() -> bool {
@@ -1274,4 +1346,12 @@ fn physical_bearer_active() -> bool {
         return true;
     }
     is_active()
+}
+
+fn physical_receive_enabled() -> bool {
+    #[cfg(target_arch = "riscv32")]
+    if C6_USB_JTAG_SELECTED.load(Ordering::Acquire) {
+        return true;
+    }
+    UART_DEBUG_ENABLED.load(Ordering::Acquire)
 }

@@ -12,7 +12,7 @@ use dmesh_server::{
     services,
     tagged::{self, Name, Record},
 };
-use quic_lite::LocalAddress;
+use quic_lite::PeerL2Address;
 
 pub const BLE_COMPONENT: u64 = 104;
 
@@ -38,7 +38,12 @@ impl TransportStateObserver for BleTransportObserver {
         let live = snapshot.advertising || snapshot.connected || snapshot.coc_connected;
         match requested.ble {
             1 => {
-                if !live && !dmesh_ble::start_dmesh_service(dmesh_fw_transport::main_runtime::shared_secret_exists()).is_ok() {
+                if !live
+                    && !dmesh_ble::start_dmesh_service(
+                        dmesh_fw_transport::main_runtime::shared_secret_exists(),
+                    )
+                    .is_ok()
+                {
                     return;
                 }
                 BLE_PROFILE_ACTIVE.store(true, core::sync::atomic::Ordering::Release);
@@ -70,10 +75,6 @@ const DEFAULT_SCAN_MS: u32 = 10_000;
 const MAX_SCAN_MS: u32 = 30_000;
 
 static mut BLE_COC_RESPONSE: [u8; TRANSPORT_MTU] = [0; TRANSPORT_MTU];
-static mut BLE_COC_FRAME: [u8; TRANSPORT_MTU + 2] = [0; TRANSPORT_MTU + 2];
-static mut BLE_COC_RX: [u8; TRANSPORT_MTU + 2] = [0; TRANSPORT_MTU + 2];
-static mut BLE_COC_RX_LEN: usize = 0;
-static mut BLE_COC_RX_RECORD: Option<usize> = None;
 static BLE_INGRESS_ENQUEUED: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 static BLE_INGRESS_ACCEPTED: core::sync::atomic::AtomicUsize =
@@ -108,80 +109,22 @@ pub fn install() {
     core_runtime::install_ble_coc_egress_pump(Some(pump_ble_coc_egress));
 }
 
-fn ble_coc_path() -> LocalAddress {
+fn ble_coc_path() -> PeerL2Address {
     core_runtime::connection_path_id(dmesh_server::transport_path::TransportId::BLE.0, [0; 6])
 }
 
-fn reset_ble_coc_rx() {
-    unsafe {
-        *core::ptr::addr_of_mut!(BLE_COC_RX_LEN) = 0;
-        *core::ptr::addr_of_mut!(BLE_COC_RX_RECORD) = None;
-    }
-}
+fn on_ble_coc_state(_connected: bool) {}
 
-fn on_ble_coc_state(_connected: bool) {
-    reset_ble_coc_rx();
-}
-
-fn receive_ble_coc_bytes(chunk: &[u8]) {
+fn receive_ble_coc_bytes(packet: &[u8]) {
     if !dmesh_ble::coc_connected() {
-        reset_ble_coc_rx();
         return;
     }
-    let mut consumed = 0;
-    while consumed < chunk.len() {
-        let record = unsafe { *core::ptr::addr_of!(BLE_COC_RX_RECORD) };
-        let record = match record {
-            Some(record) if record > 0 && record <= TRANSPORT_MTU => record,
-            Some(_) => {
-                reset_ble_coc_rx();
-                return;
-            }
-            None => {
-                let len = unsafe { *core::ptr::addr_of!(BLE_COC_RX_LEN) };
-                if len < 2 {
-                    let take = (2 - len).min(chunk.len() - consumed);
-                    unsafe {
-                        let buffer = &mut *core::ptr::addr_of_mut!(BLE_COC_RX);
-                        buffer[len..len + take].copy_from_slice(&chunk[consumed..consumed + take]);
-                        *core::ptr::addr_of_mut!(BLE_COC_RX_LEN) = len + take;
-                    }
-                    consumed += take;
-                    continue;
-                }
-                let value = unsafe {
-                    let buffer = &*core::ptr::addr_of!(BLE_COC_RX);
-                    u16::from_be_bytes([buffer[0], buffer[1]]) as usize
-                };
-                if value == 0 || value > TRANSPORT_MTU {
-                    reset_ble_coc_rx();
-                    return;
-                }
-                unsafe {
-                    *core::ptr::addr_of_mut!(BLE_COC_RX_RECORD) = Some(value);
-                    *core::ptr::addr_of_mut!(BLE_COC_RX_LEN) = 0;
-                }
-                continue;
-            }
-        };
-        let len = unsafe { *core::ptr::addr_of!(BLE_COC_RX_LEN) };
-        let take = record.saturating_sub(len).min(chunk.len() - consumed);
-        unsafe {
-            let buffer = &mut *core::ptr::addr_of_mut!(BLE_COC_RX);
-            buffer[len..len + take].copy_from_slice(&chunk[consumed..consumed + take]);
-            *core::ptr::addr_of_mut!(BLE_COC_RX_LEN) = len + take;
-        }
-        consumed += take;
-        if len + take == record {
-            let payload = unsafe { &*core::ptr::addr_of!(BLE_COC_RX) };
-            BLE_INGRESS_ENQUEUED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            let _ = shared_ingress_esp::enqueue(IngressKind::BleCoc, [0; 6], &payload[..record]);
-            unsafe {
-                *core::ptr::addr_of_mut!(BLE_COC_RX_LEN) = 0;
-                *core::ptr::addr_of_mut!(BLE_COC_RX_RECORD) = None;
-            }
-        }
+    if packet.is_empty() || packet.len() > TRANSPORT_MTU {
+        BLE_INGRESS_REJECTED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        return;
     }
+    BLE_INGRESS_ENQUEUED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let _ = shared_ingress_esp::enqueue(IngressKind::BleCoc, [0; 6], packet);
 }
 
 fn receive_ble_coc_ingress(_item: IngressPacket, packet: &[u8]) {
@@ -199,7 +142,7 @@ fn receive_ble_coc_ingress(_item: IngressPacket, packet: &[u8]) {
 }
 
 fn pump_ble_coc_egress(
-    path: LocalAddress,
+    path: PeerL2Address,
     response: &mut [u8; TRANSPORT_MTU],
     immediate: Option<usize>,
 ) {
@@ -217,19 +160,13 @@ fn pump_ble_coc_egress(
     if used == 0 {
         return;
     }
-    unsafe {
-        let frame = &mut *core::ptr::addr_of_mut!(BLE_COC_FRAME);
-        frame[0] = (used >> 8) as u8;
-        frame[1] = used as u8;
-        frame[2..2 + used].copy_from_slice(&response[..used]);
-        BLE_EGRESS_ATTEMPTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        match dmesh_ble::send_coc_bytes(&frame[..2 + used]) {
-            Ok(()) => {
-                BLE_EGRESS_SENT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            }
-            Err(_) => {
-                BLE_EGRESS_SEND_ERRORS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            }
+    BLE_EGRESS_ATTEMPTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    match dmesh_ble::send_coc_bytes(&response[..used]) {
+        Ok(()) => {
+            BLE_EGRESS_SENT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        Err(_) => {
+            BLE_EGRESS_SEND_ERRORS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -532,7 +469,15 @@ fn handle_ble(record: Record<'_>) -> Option<Vec<u8>> {
     };
     let _id = record.id?;
     match method {
-        BLE_START => bool_result(record, dmesh_ble::start_dmesh_service(dmesh_fw_transport::main_runtime::shared_secret_exists()).is_ok()),
+        BLE_START => {
+            bool_result(
+                record,
+                dmesh_ble::start_dmesh_service(
+                    dmesh_fw_transport::main_runtime::shared_secret_exists(),
+                )
+                .is_ok(),
+            )
+        }
         BLE_STOP => bool_result(record, dmesh_ble::stop_dmesh_service().is_ok()),
         BLE_SCAN => {
             let duration = scan_duration(record.fields);
@@ -555,13 +500,7 @@ fn handle_ble(record: Record<'_>) -> Option<Vec<u8>> {
                 Some(value) => value,
                 None => return error_result(record, b"empty data"),
             };
-            let ok = unsafe {
-                let frame = &mut *core::ptr::addr_of_mut!(BLE_COC_FRAME);
-                frame[0] = (len >> 8) as u8;
-                frame[1] = len as u8;
-                frame[2..2 + len].copy_from_slice(&data[..len]);
-                dmesh_ble::send_coc_bytes(&frame[..2 + len]).is_ok()
-            };
+            let ok = dmesh_ble::send_coc_bytes(&data[..len]).is_ok();
             bool_result(record, ok)
         }
         _ => error_result(record, b"unsupported method"),

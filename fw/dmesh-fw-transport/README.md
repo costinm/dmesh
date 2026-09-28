@@ -20,7 +20,7 @@ aware cluster - the Wifi (STA, NOW, AP) transport activation opens an active win
 ### Shared packet bound
 
 UART, raw UDP6, and the current NOW/vendor-action bearer use one common
-transport datagram maximum: **1100 bytes** (`quic_lite::DEFAULT_MAX_DATAGRAM_SIZE`).
+transport datagram maximum: **1100 bytes** (`quic_lite::DEFAULT_MAX_PACKET_SIZE`).
 
 All firmware buffers and complete-datagram clients derive from that bound.
 Current control/probe callers must request at most 1100 bytes; there is no
@@ -214,30 +214,14 @@ resetting the association, NOW callback, or NAN capture state.
 | `path_policy` | `0` | QUIC-lite/action path-selection policy; it does not select a Wi-Fi radio mode. |
 | `timeout_ms` | `300000` | Decoded start setting, but it does not replace Main's fixed 3-second sleepy-session deadline or its 200-ms stream grace today. |
 
-### Directed-association timing gate
+### Directed-association timing
 
-The public ESP-IDF STA API accepts SSID, BSSID, and channel, but does not
-publish a direct-auth/no-scan operation. The driver may use its internal
-no-scan branch only after it already holds a matching BSSID/channel candidate;
-firmware must not call that private implementation. The supported
-`transport.start` path therefore remains the one under test.
-
-`firmware_e6_bssid_directed_sta_association` obtains the active AP identity
-from its supervised owner, starts e6 from the default unassociated NAN+NOW
-state, and measures only `esp_wifi_connect()` through the STA CONNECTED event.
-It defaults to a 500-ms bound and restores NAN+NOW before a failing assertion.
-Run it against the 500-TU lab AP without changing host radio state:
-
-```sh
-DMESH_E2E_E6=/dev/ttyACM0 \
-DMESH_E2E_AP_SERVICE=lmesh DMESH_E2E_AP_IFACE=wlan1 \
-cargo test -p dmesh-cli --test firmware_e2e \
-  firmware_e6_bssid_directed_sta_association -- --ignored --nocapture
-```
-
-`DMESH_E2E_BSSID_CONNECT_MAX_MS` can relax the diagnostic threshold while
-investigating a driver/AP regression; it must not be used to claim that a
-500-TU AP has a beacon-independent association path.
+The former board-specific UART/raw-packet timing test was retired with the
+legacy transport client. Reintroduce this measurement only through the public
+node API and the descriptor-selected hardware matrix after devices run the new
+firmware. The public ESP-IDF STA API accepts SSID, BSSID, and channel, but does
+not publish a direct-auth/no-scan operation, so a future test must continue to
+measure the supported association path rather than call private driver code.
 
 ### Target production policy (not implemented)
 

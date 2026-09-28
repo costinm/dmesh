@@ -1,6 +1,7 @@
 extern crate alloc;
 
 mod ble;
+mod pairing;
 
 fn receive_boot_control(record: dmesh_server::tagged::Record<'_>) -> Option<alloc::vec::Vec<u8>> {
     use dmesh_server::{services, tagged::Name};
@@ -88,6 +89,7 @@ pub extern "C" fn app_main() {
         receive_boot_control,
     ));
     ble::register();
+    pairing::register();
     unsafe { esp_idf_sys::esp_rom_printf(b"DMESH main: health-start\n\0".as_ptr().cast()) };
     #[cfg(feature = "modules")]
     dmesh_fw_modules::register_tagged_handlers();

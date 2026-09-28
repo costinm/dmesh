@@ -309,6 +309,17 @@ int32_t dmesh_nimble_coc_tx_pending(void) {
     return s_coc_tx_pending ? ESP_ERR_INVALID_STATE : ESP_OK;
 }
 
+bool dmesh_nimble_coc_encrypted(void) {
+#if MYNEWT_VAL(BLE_L2CAP_COC_MAX_NUM) >= 1
+    struct ble_gap_conn_desc desc;
+    return s_connected && s_coc_chan != NULL
+        && ble_gap_conn_find(s_conn_handle, &desc) == 0
+        && desc.sec_state.encrypted;
+#else
+    return false;
+#endif
+}
+
 static int dmesh_coc_event(struct ble_l2cap_event *event, void *arg) {
     (void)arg;
     switch (event->type) {

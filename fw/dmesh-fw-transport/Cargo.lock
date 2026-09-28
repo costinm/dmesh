@@ -341,6 +341,7 @@ dependencies = [
 name = "dmesh-server"
 version = "0.1.0"
 dependencies = [
+ "mesh-api",
  "quic-lite",
  "sha2",
 ]
@@ -673,7 +674,6 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "mesh-api"
 version = "0.1.0"
-source = "git+https://github.com/costinm/ssh-mesh#b9b4b8e5aa26bf177e73e68943297dc806e987ca"
 
 [[package]]
 name = "minimal-lexical"
@@ -757,8 +757,9 @@ name = "quic-lite"
 version = "0.1.0"
 dependencies = [
  "hmac",
- "mesh-api",
  "sha2",
+ "smallvec",
+ "spin",
 ]
 
 [[package]]
@@ -949,6 +950,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
+name = "smallvec"
+version = "1.16.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9395f0f0eee849a9b707b2f06bb92a6a422090e2123bb2ef8e87a0e61892a8e"
+
+[[package]]
+name = "spin"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1051,6 +1064,9 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 [[package]]
 name = "uart-codec"
 version = "0.1.0"
+dependencies = [
+ "quic-lite",
+]
 
 [[package]]
 name = "unicode-ident"

@@ -7,13 +7,12 @@
 
 use core::ffi::{c_char, c_int, c_uchar, c_uint, c_ushort};
 use core::sync::atomic::{
-    AtomicBool, AtomicI32, AtomicU16, AtomicU32, AtomicU8, AtomicUsize, Ordering,
+    AtomicBool, AtomicI32, AtomicU8, AtomicU16, AtomicU32, AtomicUsize, Ordering,
 };
 
 pub const COC_PSM: u16 = 0x0080;
-/// Normal Main QUIC packets are 1100 bytes today.  The native CoC component
-/// reserves 1152 bytes, leaving room for byte-stream framing without retaining
-/// the old 256-byte test ceiling.
+/// Normal Main QUIC packets are 1100 bytes today. Each CoC SDU carries exactly
+/// one packet; the native allocation retains a small amount of spare capacity.
 pub const COC_PACKET_CAPACITY: usize = 1152;
 
 static READY: AtomicBool = AtomicBool::new(false);
@@ -48,6 +47,7 @@ extern "C" {
     ) -> c_int;
     fn dmesh_nimble_coc_send(data: *const c_uchar, len: c_ushort) -> c_int;
     fn dmesh_nimble_coc_tx_pending() -> c_int;
+    fn dmesh_nimble_coc_encrypted() -> bool;
     fn dmesh_nimble_start_scan(duration_ms: c_uint) -> c_int;
     fn dmesh_nimble_stop_scan() -> c_int;
     fn dmesh_nimble_start_advertising(
@@ -57,6 +57,10 @@ extern "C" {
         max_units: c_ushort,
     ) -> c_int;
     fn dmesh_nimble_stop_service() -> c_int;
+}
+
+pub fn coc_encrypted() -> bool {
+    unsafe { dmesh_nimble_coc_encrypted() }
 }
 
 const DMESH_BLE_SERVICE_UUID16: u16 = 0x1820;
@@ -71,15 +75,37 @@ const DMESH_BLE_OPERATIONAL_UUID128: [u8; 16] = [
 ];
 fn idle_advertisement(paired: bool) -> [u8; 25] {
     let uuid16 = DMESH_BLE_SERVICE_UUID16.to_le_bytes();
-    let uuid128 = if paired { DMESH_BLE_OPERATIONAL_UUID128 } else { DMESH_BLE_PAIRING_UUID128 };
+    let uuid128 = if paired {
+        DMESH_BLE_OPERATIONAL_UUID128
+    } else {
+        DMESH_BLE_PAIRING_UUID128
+    };
     [
-        0x02, 0x01, 0x06,
-        0x03, 0x02, uuid16[0], uuid16[1],
-        0x11, 0x07,
-        uuid128[0], uuid128[1], uuid128[2], uuid128[3],
-        uuid128[4], uuid128[5], uuid128[6], uuid128[7],
-        uuid128[8], uuid128[9], uuid128[10], uuid128[11],
-        uuid128[12], uuid128[13], uuid128[14], uuid128[15],
+        0x02,
+        0x01,
+        0x06,
+        0x03,
+        0x02,
+        uuid16[0],
+        uuid16[1],
+        0x11,
+        0x07,
+        uuid128[0],
+        uuid128[1],
+        uuid128[2],
+        uuid128[3],
+        uuid128[4],
+        uuid128[5],
+        uuid128[6],
+        uuid128[7],
+        uuid128[8],
+        uuid128[9],
+        uuid128[10],
+        uuid128[11],
+        uuid128[12],
+        uuid128[13],
+        uuid128[14],
+        uuid128[15],
     ]
 }
 const ADVERTISING_INTERVAL_MIN_UNITS: c_ushort = 0x20;
@@ -117,11 +143,7 @@ pub fn stop_dmesh_service() -> Result<(), i32> {
         ADVERTISING.store(false, Ordering::Release);
         SCANNING.store(false, Ordering::Release);
     }
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(rc)
-    }
+    if rc == 0 { Ok(()) } else { Err(rc) }
 }
 
 pub fn start_scan(duration_ms: u32) -> Result<(), i32> {
@@ -132,11 +154,7 @@ pub fn start_scan(duration_ms: u32) -> Result<(), i32> {
     if rc == 0 {
         SCANNING.store(true, Ordering::Release);
     }
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(rc)
-    }
+    if rc == 0 { Ok(()) } else { Err(rc) }
 }
 
 pub fn stop_scan() -> Result<(), i32> {
@@ -144,11 +162,7 @@ pub fn stop_scan() -> Result<(), i32> {
     if rc == 0 {
         SCANNING.store(false, Ordering::Release);
     }
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(rc)
-    }
+    if rc == 0 { Ok(()) } else { Err(rc) }
 }
 
 pub fn coc_tx_pending() -> bool {
@@ -160,7 +174,10 @@ pub fn coc_connected() -> bool {
 }
 
 pub fn set_coc_rx_hook(hook: Option<fn(&[u8])>) {
-    COC_RX_HOOK.store(hook.map(|hook| hook as usize).unwrap_or(0), Ordering::Release);
+    COC_RX_HOOK.store(
+        hook.map(|hook| hook as usize).unwrap_or(0),
+        Ordering::Release,
+    );
 }
 
 pub fn set_coc_egress_ready_hook(hook: Option<fn()>) {
@@ -171,7 +188,10 @@ pub fn set_coc_egress_ready_hook(hook: Option<fn()>) {
 }
 
 pub fn set_coc_state_hook(hook: Option<fn(bool)>) {
-    COC_STATE_HOOK.store(hook.map(|hook| hook as usize).unwrap_or(0), Ordering::Release);
+    COC_STATE_HOOK.store(
+        hook.map(|hook| hook as usize).unwrap_or(0),
+        Ordering::Release,
+    );
 }
 
 fn coc_state_hook(connected: bool) {
@@ -200,11 +220,7 @@ pub fn connect_coc(peer: &[u8], peer_type: u8, psm: u16) -> Result<(), i32> {
         return Err(-22);
     }
     let rc = unsafe { dmesh_nimble_connect_coc(peer.as_ptr(), peer_type, psm) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(rc)
-    }
+    if rc == 0 { Ok(()) } else { Err(rc) }
 }
 
 /// Start NimBLE and publish the CoC server. Main calls this only after its
@@ -217,25 +233,16 @@ pub fn start_coc_server() -> Result<(), i32> {
         }
     }
     let rc = unsafe { dmesh_nimble_start_coc_server(COC_PSM) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(rc)
-    }
+    if rc == 0 { Ok(()) } else { Err(rc) }
 }
 
-/// Native CoC egress. Packet framing and queue ownership are installed by the
-/// Main adapter in a follow-up slice; this only preserves the bounded ABI.
+/// Submit one opaque QUIC-lite packet as one CoC SDU.
 pub fn send_coc_bytes(bytes: &[u8]) -> Result<(), i32> {
     if bytes.is_empty() || bytes.len() > COC_PACKET_CAPACITY {
         return Err(-1);
     }
     let rc = unsafe { dmesh_nimble_coc_send(bytes.as_ptr(), bytes.len() as c_ushort) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(rc)
-    }
+    if rc == 0 { Ok(()) } else { Err(rc) }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -308,9 +315,7 @@ pub unsafe extern "C" fn dmesh_nimble_on_ready(addr: *const c_uchar, addr_type: 
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dmesh_nimble_on_connect(
-    handle: c_ushort,
-) {
+pub unsafe extern "C" fn dmesh_nimble_on_connect(handle: c_ushort) {
     CONNECTION_HANDLE.store(handle, Ordering::Release);
     CONNECTION_GENERATION.fetch_add(1, Ordering::AcqRel);
     CONNECTED.store(true, Ordering::Release);

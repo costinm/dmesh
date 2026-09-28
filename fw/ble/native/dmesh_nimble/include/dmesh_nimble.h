@@ -19,6 +19,7 @@ int32_t dmesh_nimble_connect_coc(const uint8_t *peer_addr, uint8_t peer_addr_typ
                                  uint16_t psm);
 int32_t dmesh_nimble_coc_send(const uint8_t *data, uint16_t len);
 int32_t dmesh_nimble_coc_tx_pending(void);
+bool dmesh_nimble_coc_encrypted(void);
 
 void dmesh_nimble_on_ready(const uint8_t *addr, uint8_t addr_type);
 void dmesh_nimble_on_connect(uint16_t conn_handle);

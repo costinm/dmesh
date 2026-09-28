@@ -1867,15 +1867,12 @@ pub fn begin_sleepy_resume_capture(until_us: u64) -> bool {
 /// the conservative predicted phase below. Normal DW capture never exposes a
 /// lease here, so it cannot change the ordinary scheduler's cadence.
 pub fn sleepy_resume_capture_until_ms() -> Option<u64> {
-    (CAPTURING.load(Ordering::Acquire)
-        && SLEEPY_DW_PAIR_SECOND.load(Ordering::Acquire))
-    .then(|| u64::from(UNTIL_MS.load(Ordering::Acquire)))
+    (CAPTURING.load(Ordering::Acquire) && SLEEPY_DW_PAIR_SECOND.load(Ordering::Acquire))
+        .then(|| u64::from(UNTIL_MS.load(Ordering::Acquire)))
 }
 
 fn shorten_sleepy_resume_capture_after_beacon(received_us: u64) {
-    if !CAPTURING.load(Ordering::Acquire)
-        || !SLEEPY_DW_PAIR_SECOND.load(Ordering::Acquire)
-    {
+    if !CAPTURING.load(Ordering::Acquire) || !SLEEPY_DW_PAIR_SECOND.load(Ordering::Acquire) {
         return;
     }
     // The lease already spans the NAN DW, adjacent NOW DW, and its tail. A

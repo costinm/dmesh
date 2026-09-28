@@ -12,6 +12,9 @@ static DEADLINE_OWNER_TASK: core::sync::atomic::AtomicUsize =
 
 pub fn run() {
     esp_idf_sys::link_patches();
+    // Recovery shares Main's packet-memory capability and therefore reads the
+    // same durable ceiling before enabling any Wi-Fi callback.
+    crate::main_runtime::apply_packet_pool_capacity_from_nvs();
     // Recovery exposes only its running-image identity and the verified flash
     // operation. This is the same tagged QUIC handler used by Main and does
     // not install a diagnostic catalog, UART input, or another transport.
@@ -60,21 +63,7 @@ pub fn run() {
     // This is the exact raw association and physical adapter selected by
     // Main's STA epoch. Recovery exposes only the common signed discovery
     // request directly; the normal QUIC stream dispatcher owns flashing.
-    let association = crate::core_runtime::prepare_raw_association(&profile);
-    let receive_limits = association
-        .association
-        .receive_limits(crate::TRANSPORT_MTU as u64, 4);
-    unsafe {
-        esp_idf_sys::esp_rom_printf(
-            b"DMESH recovery: QUIC receive profile internal_free=%u packets=%u max_data=%u max_stream_data=%u\n\0"
-                .as_ptr()
-                .cast(),
-            association.internal_available_bytes as u32,
-            association.association.initial_window_packets as u32,
-            receive_limits.max_data as u32,
-            receive_limits.max_stream_data as u32,
-        );
-    }
+    crate::core_runtime::prepare_raw_association(&profile);
     crate::wifi_raw_udp6_esp::set_sta_driver_tx(profile.sta_driver_tx);
     if !crate::wifi_esp::start_raw_udp6(
         crate::core_runtime::receive_raw_udp6,
@@ -100,7 +89,6 @@ fn serve_upload(started_us: u64) -> ! {
     let mut last_stats_ms = 0;
     let mut stats_reports = 0_u8;
     let mut last_udp_tx = 0_u32;
-    let mut completion_gate = dmesh_server::transport::TerminalCompletionGate::default();
     DEADLINE_OWNER_TASK.store(
         unsafe { esp_idf_sys::xTaskGetCurrentTaskHandle() as usize },
         core::sync::atomic::Ordering::Release,
@@ -136,14 +124,6 @@ fn serve_upload(started_us: u64) -> ! {
 
         if crate::flash::take_durable_flash_completion() {
             log(b"DMESH recovery: durable completion observed\n\0");
-            completion_gate.application_complete();
-        }
-        if crate::core_runtime::take_terminal_response_delivered() {
-            log(b"DMESH recovery: terminal response acknowledged\n\0");
-            completion_gate.response_delivered();
-        }
-        if completion_gate.take_complete() && complete_at_ms.is_none() {
-            log(b"DMESH recovery: terminal reply delivered\n\0");
             complete_at_ms = Some(elapsed);
         }
         if let Some(completed) = complete_at_ms {

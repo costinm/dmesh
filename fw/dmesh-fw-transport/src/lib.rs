@@ -18,6 +18,7 @@ pub mod profile;
 /// Main desired-profile publication. This is separate from the Main applied
 /// radio state so bearer ingress cannot mutate a live driver epoch directly.
 pub mod profile_store;
+mod raw_udp6;
 
 // These modules are the shared ESP-IDF runtime.  The crate is built only by
 // firmware targets; portable profile/schema/queue tests stay in dmesh-server
@@ -40,18 +41,17 @@ pub mod power_esp;
 pub mod recovery_runtime;
 /// Main-only bounded DCID forwarding state. Recovery intentionally does not
 /// register this handler or accept transit rules.
-pub mod relay_main;
 /// Shared Stage2 retained-memory handoff/health contract for Main and
 /// Recovery. This is hardware state only, never a transport control plane.
 pub mod rtc;
 mod sta_profile_esp;
 pub mod state;
-mod stream_handlers;
 pub mod task_esp;
 pub mod uart_esp;
 // One device-wide pool is also the UART packet handoff. It is available in a
 // UART-only Recovery/Main build so a later Wi-Fi bearer does not create a
 // second packet budget.
+mod quic_node_esp;
 pub mod shared_ingress_esp;
 pub mod wifi_esp;
 pub mod wifi_espnow_esp;
@@ -63,7 +63,7 @@ pub mod wifi_raw_udp6_esp;
 
 /// The one packet payload limit used by every bearer. A bearer that cannot
 /// carry this must reject it at bring-up; it must not fragment at this layer.
-pub const TRANSPORT_MTU: usize = quic_lite::DEFAULT_MAX_DATAGRAM_SIZE;
+pub const TRANSPORT_MTU: usize = quic_lite::DEFAULT_MAX_PACKET_SIZE;
 /// Safety ceiling for one retained association's outstanding packet ledger.
 /// The actual heap-backed ledger is selected from current memory at admission,
 /// using the same `Vec` representation and policy exercised by host tests.
@@ -78,8 +78,8 @@ pub const CONNECTION_HISTORY_CAPACITY: usize = 64;
 /// memory (not this 64-packet ceiling). When full, zero-stream peers are
 /// reclaimed oldest-first; there is deliberately no firmware wall-clock
 /// expiry by default.
+/// Maximum simultaneous QUIC associations admitted by ESP firmware. QuicNode
+/// keeps the common first association inline and allocates overflow storage
+/// only when another association is actually admitted.
 pub const MAX_QUIC_ASSOCIATIONS: usize = 12;
-pub type ConnectionServer =
-    dmesh_server::transport::ConnectionServer<CONNECTION_HISTORY_CAPACITY, { TRANSPORT_MTU }>;
-
 pub use profile::TransportProfile;
