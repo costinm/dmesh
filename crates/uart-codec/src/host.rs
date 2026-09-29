@@ -650,6 +650,7 @@ impl<const SLOTS: usize, const MTU: usize> TokioUartReader<SLOTS, MTU> {
                 ),
                 PooledFrame::Log(bytes) => result.log_records.push(bytes),
                 PooledFrame::PoolUnavailable => result.pool_drops += 1,
+                PooledFrame::Wake => {}
             });
         if let Some(log_file) = &self.log_file {
             let mut log_file = log_file

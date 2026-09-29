@@ -1247,6 +1247,11 @@ fn consume_uart_bytes(
                 crate::quic_node_esp::receive_uart(packet);
                 notify_ingress();
             }
+            PooledFrame::Wake => {
+                activate_window_for(60_000);
+                let _ = send_debug_text(b"DMESH uart: wake request");
+                crate::main_runtime::request_uart_wake();
+            }
             PooledFrame::PoolUnavailable => {
                 let _ = send_debug_text(b"DMESH uart: packet pool unavailable");
             }

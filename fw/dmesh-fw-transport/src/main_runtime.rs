@@ -43,6 +43,12 @@ const IDENTITY_NVS_KEY: &[u8] = b"id_p256\0";
 const CONTROL_PLANE_NVS_KEY: &[u8] = b"cp\0";
 const SHARED_SECRET_NVS_KEY: &[u8] = b"key\0";
 const PAIRING_WINDOW_MS: u32 = 60_000;
+/// Diagnostic awake lease used after boot and an explicit UART wake record.
+/// Keep it long enough to attach a host and persist `mode=active` while
+/// debugging sleepy-device transport bring-up.
+const DEBUG_AWAKE_GRACE_MS: u64 = 60_000;
+static UART_WAKE_REQUESTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 static PAIRING_WINDOW_UNTIL_MS: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 
@@ -656,6 +662,13 @@ pub(crate) fn maybe_enter_sleep(
     now_ms: u64,
     sleepy_awake_until_ms: &mut u64,
 ) -> bool {
+    if role == 1 && is_sleepy_profile(profile)
+        && UART_WAKE_REQUESTED.swap(false, Ordering::AcqRel)
+    {
+        *sleepy_awake_until_ms = now_ms.saturating_add(DEBUG_AWAKE_GRACE_MS);
+        crate::commands::send_response(b"UART wake: radio active for 60 seconds");
+        return true;
+    }
     if role != 1
         || !is_sleepy_profile(profile)
         || !*nan_now_started
@@ -680,7 +693,7 @@ pub(crate) fn maybe_enter_sleep(
             true,
             false,
         );
-        *sleepy_awake_until_ms = now_ms.saturating_add(5_000);
+        *sleepy_awake_until_ms = now_ms.saturating_add(DEBUG_AWAKE_GRACE_MS);
         return true;
     }
 
@@ -710,6 +723,7 @@ pub(crate) fn maybe_enter_sleep(
             u64::from(beacon_after_wake_us),
         ),
     ]);
+    crate::commands::send_response(b"DMESH sleep enter");
     // UART is not a light-sleep precondition. Retain it across DW8 so the
     // device remains observable and we do not churn the physical serial
     // driver on every wake cycle.
@@ -784,6 +798,7 @@ pub(crate) fn maybe_enter_sleep(
         crate::wifi_nan_dw_capture_esp::mark_sleep_wake(u64::from(woke_us));
     }
     crate::uart_esp::rearm_after_wake();
+    crate::commands::send_response(b"DMESH sleep exit");
     let planned_capture_in_us = target_capture_us.saturating_sub(boundary_us);
     crate::commands::send_stats(&[
         (b"sleep plan interval", u64::from(profile.nan_dw_interval)),
@@ -826,7 +841,7 @@ pub(crate) fn maybe_enter_sleep(
     // boundary; otherwise a PM-lock rejection can become a stop/start loop
     // every time the one-shot deadline is evaluated.
     if !entered_sleep {
-        *sleepy_awake_until_ms = now_ms.saturating_add(5_000);
+        *sleepy_awake_until_ms = now_ms.saturating_add(DEBUG_AWAKE_GRACE_MS);
         crate::commands::send_stats(&[
             (b"sleep rejected requested_us", duration_us),
             (
@@ -2075,6 +2090,14 @@ fn receive_roc_completion() {
 /// completed association.
 fn receive_sta_lifecycle(_associated: bool, _reason: u8) {
     enqueue_adapter_completion(DEADLINE_STA_LIFECYCLE);
+}
+
+/// UART's small out-of-band wake record is deliberately separate from QUIC.
+/// It only schedules Main-owner policy work; the L2 task does not mutate radio
+/// state or block on Wi-Fi operations.
+pub(crate) fn request_uart_wake() {
+    UART_WAKE_REQUESTED.store(true, Ordering::Release);
+    request_deadline_recheck();
 }
 
 /// Compute the nearest actual adapter or sleepy-policy deadline, preserving
@@ -3372,7 +3395,7 @@ impl MainCoordinator {
                 // Arm a single deadline after the radio transition settles.
                 // Without this, a volatile DW8 request has no subsequent
                 // Main-owner wake on which to evaluate explicit light sleep.
-                self.radio.sleepy_awake_until_ms = work.now_ms.saturating_add(5_000);
+                self.radio.sleepy_awake_until_ms = work.now_ms.saturating_add(DEBUG_AWAKE_GRACE_MS);
                 crate::commands::send_response(b"sleep DW armed: command window 5000ms");
             }
             record_power_completion(&mut self.runtime_state);
@@ -3808,10 +3831,10 @@ impl MainRadioState {
             applied_nan_dw_interval: None,
             applied_uart: None,
             last_discovery_announce_ms: 0,
-            // A light-sleep wake needs one whole command window before a new
-            // sleep decision. At cold boot this uses the same five seconds.
+            // A sleepy boot gets a full debug attachment window before the
+            // first physical sleep decision.
             sleepy_awake_until_ms: if sleepy_boot {
-                now_ms.saturating_add(5_000)
+                now_ms.saturating_add(DEBUG_AWAKE_GRACE_MS)
             } else {
                 0
             },

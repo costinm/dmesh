@@ -4,13 +4,15 @@ use alloc::vec::Vec;
 use quic_lite::{OwnedPacket, PacketPool, PacketWriter};
 
 use crate::{
-    PACKET_MARKER,
+    PACKET_MARKER, WAKE_MARKER,
     codec::{DEFAULT_RECORD_MAX, UART_ESCAPE, UART_ESCAPE_XOR, UART_FLAG},
 };
 
 pub enum PooledFrame<B> {
     /// A complete marked record backed by the shared QUIC packet pool.
     Packet(OwnedPacket<B>),
+    /// One exact, non-QUIC wake request record.
+    Wake,
     /// Unmarked UART sideband. It is diagnostic/log data, never a packet for
     /// QUIC or an application-control handler.
     Log(Vec<u8>),
@@ -32,7 +34,8 @@ pub struct PooledDecoder<P: PacketPool + 'static> {
     discard: bool,
     /// Classification of the current record's first decoded byte. `None`
     /// means that the marker/sideband decision has not yet been made.
-    marked: Option<bool>,
+    marked: Option<FrameKind>,
+    wake_payload_len: usize,
     /// Reserved immediately after decoding [`PACKET_MARKER`]. Marked payload
     /// bytes are written here directly and the writer is committed at EOF.
     writer: Option<P::Writer>,
@@ -45,6 +48,13 @@ pub struct PooledDecoder<P: PacketPool + 'static> {
     other: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum FrameKind {
+    Packet,
+    Wake,
+    Log,
+}
+
 impl<P: PacketPool + 'static> PooledDecoder<P> {
     pub fn new(pool: &'static P) -> Self {
         Self {
@@ -53,6 +63,7 @@ impl<P: PacketPool + 'static> PooledDecoder<P> {
             escaped: false,
             discard: false,
             marked: None,
+            wake_payload_len: 0,
             writer: None,
             len: 0,
             packet_limit: 0,
@@ -65,6 +76,7 @@ impl<P: PacketPool + 'static> PooledDecoder<P> {
         self.escaped = false;
         self.discard = false;
         self.marked = None;
+        self.wake_payload_len = 0;
         self.writer = None;
         self.len = 0;
         self.packet_limit = 0;
@@ -84,14 +96,17 @@ impl<P: PacketPool + 'static> PooledDecoder<P> {
                 // to the callback without copying its decoded bytes.
                 if self.in_frame && !self.escaped && !self.discard {
                     match self.marked {
-                        Some(true) if self.len != 0 => {
+                        Some(FrameKind::Packet) if self.len != 0 => {
                             if let Some(writer) = self.writer.take()
                                 && let Some(packet) = writer.commit(self.len)
                             {
                                 frame(PooledFrame::Packet(packet));
                             }
                         }
-                        Some(false) if !self.other.is_empty() => {
+                        Some(FrameKind::Wake) if self.wake_payload_len == 0 => {
+                            frame(PooledFrame::Wake);
+                        }
+                        Some(FrameKind::Log) if !self.other.is_empty() => {
                             frame(PooledFrame::Log(core::mem::take(&mut self.other)));
                         }
                         _ => {}
@@ -101,6 +116,7 @@ impl<P: PacketPool + 'static> PooledDecoder<P> {
                 self.escaped = false;
                 self.discard = false;
                 self.marked = None;
+                self.wake_payload_len = 0;
                 self.writer = None;
                 self.len = 0;
                 self.packet_limit = 0;
@@ -125,9 +141,15 @@ impl<P: PacketPool + 'static> PooledDecoder<P> {
                 // Classification happens once, on the first decoded byte. It
                 // chooses either a pool lease or the sideband Vec for the
                 // entire record.
-                let marked = byte == PACKET_MARKER;
-                self.marked = Some(marked);
-                if marked {
+                let kind = if byte == PACKET_MARKER {
+                    FrameKind::Packet
+                } else if byte == WAKE_MARKER {
+                    FrameKind::Wake
+                } else {
+                    FrameKind::Log
+                };
+                self.marked = Some(kind);
+                if kind == FrameKind::Packet {
                     // The marker is only a UART envelope byte. Reserve the QUIC
                     // pool slot now, then decode every following byte directly
                     // into its payload area; no complete-frame scratch buffer or
@@ -145,12 +167,12 @@ impl<P: PacketPool + 'static> PooledDecoder<P> {
                             self.discard = true;
                         }
                     }
-                } else {
+                } else if kind == FrameKind::Log {
                     self.other.push(byte);
                 }
                 continue;
             }
-            if self.marked == Some(true) {
+            if self.marked == Some(FrameKind::Packet) {
                 // Dropping an uncommitted writer returns its slot to the pool.
                 // Keep discarding until a flag resynchronizes the decoder.
                 if self.len >= self.packet_limit {
@@ -164,6 +186,11 @@ impl<P: PacketPool + 'static> PooledDecoder<P> {
                     .expect("marked frame owns a writer")
                     .payload_mut()[self.len] = byte;
                 self.len += 1;
+            } else if self.marked == Some(FrameKind::Wake) {
+                self.wake_payload_len += 1;
+                if self.wake_payload_len > 0 {
+                    self.discard = true;
+                }
             } else if self.other.len() < DEFAULT_RECORD_MAX {
                 self.other.push(byte);
             } else {

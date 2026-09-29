@@ -16,6 +16,9 @@ pub mod pool;
 /// Every QUIC-lite packet type uses this envelope; packet classification stays
 /// in QUIC-lite.
 pub const PACKET_MARKER: u8 = 0xf7;
+/// Sideband control record that asks a sleepy Main device to remain awake for
+/// its configured debug grace period. It is not a QUIC packet.
+pub const WAKE_MARKER: u8 = 0xf8;
 
 #[deprecated(note = "UART carries opaque QUIC packets; use PACKET_MARKER")]
 pub const DATAGRAM_MARKER: u8 = PACKET_MARKER;
@@ -63,6 +66,11 @@ pub fn encode_packet(packet: &[u8]) -> codec::Result<codec::Encoder<'_>> {
     )
 }
 
+/// Construct the single-record UART wake request.
+pub fn encode_wake() -> codec::Result<codec::Encoder<'static>> {
+    codec::Encoder::new(&[WAKE_MARKER], 1)
+}
+
 #[deprecated(note = "UART carries opaque QUIC packets; use decode_packet")]
 pub fn decode_datagram(payload: &[u8]) -> Result<&[u8], DatagramFrameError> {
     decode_packet(payload).map_err(|error| match error {
@@ -96,5 +104,17 @@ mod datagram_tests {
         let records = decoder.push(&wire[..used]).unwrap();
         assert_eq!(decode_packet(&records[0]), Ok(&[0xc0, 1, 2][..]));
         assert_eq!(decode_packet(&[1, 2]), Err(PacketFrameError::NotPacket));
+    }
+
+    #[test]
+    fn wake_record_is_a_single_non_quic_sideband_marker() {
+        let mut encoder = encode_wake().unwrap();
+        let mut wire = [0u8; 8];
+        let used = encoder.write(&mut wire);
+        assert!(encoder.is_finished());
+        let mut decoder = codec::Decoder::with_max(8);
+        let records = decoder.push(&wire[..used]).unwrap();
+        assert_eq!(records, alloc::vec![alloc::vec![WAKE_MARKER]]);
+        assert_eq!(decode_packet(&records[0]), Err(PacketFrameError::NotPacket));
     }
 }
