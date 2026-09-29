@@ -9,10 +9,10 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use quic_lite::{
-    nostd::NoStdRuntime,
-    packet_pool::{PacketPool, PoolBufferLease},
     BearerContext, BearerInfo, BearerName, EgressSubmission, OwnedPacket, PacketBearer,
     PacketEgress, PacketMeta, PacketSubmitError, PeerL2Address, QuicNodeEgressError, QuicStream,
+    nostd::NoStdRuntime,
+    packet_pool::{PacketPool, PoolBufferLease},
 };
 
 const PACKETS: usize = 8;
@@ -23,12 +23,7 @@ pub(crate) type FirmwarePacket = OwnedPacket<PoolBufferLease<'static, PACKETS, S
 // Every local association owns one receive CID in the node's shared DCID
 // registry. Firmware does not currently reserve additional entries for relay
 // forwarding, but a zero-entry registry would reject the first association.
-type FirmwareRuntime = NoStdRuntime<
-    (),
-    { crate::MAX_QUIC_ASSOCIATIONS },
-    { crate::MAX_QUIC_ASSOCIATIONS },
-    FirmwarePool,
->;
+type FirmwareRuntime = NoStdRuntime<FirmwarePool>;
 
 static POOL: FirmwarePool = FirmwarePool::new();
 static UART_READY: AtomicBool = AtomicBool::new(false);
@@ -37,15 +32,15 @@ static INGRESS_ERROR_REPORTED: AtomicBool = AtomicBool::new(false);
 static mut UART_CONTEXT: core::mem::MaybeUninit<BearerContext<FirmwarePool>> =
     core::mem::MaybeUninit::uninit();
 static READY: AtomicBool = AtomicBool::new(false);
-// The node contains association tables and stream state. Keeping it in a
-// static `MaybeUninit` reserves that complete maximum in `.bss`, which does
-// not fit classic ESP32 internal DRAM. Allocate it once after ESP-IDF has
+// The node contains association and stream state. Keeping it in a static
+// `MaybeUninit` reserves the complete value in `.bss`, which does not fit
+// classic ESP32 internal DRAM. Allocate it once after ESP-IDF has
 // initialized the heap; the leaked box remains the device-wide owner.
 static mut RUNTIME: *mut FirmwareRuntime = core::ptr::null_mut();
 // The stream position is unchanged when the UART bearer retains an ACK or
 // another packet. Keep the application response until send completion wakes
 // the node owner, then retry the same bytes without a second packet copy.
-static mut PENDING_RESPONSE: Option<(QuicStream, Vec<u8>)> = None;
+static mut PENDING_RESPONSE: Option<(QuicStream, Vec<u8>, usize)> = None;
 
 struct UartBearer;
 
@@ -91,12 +86,19 @@ impl PacketBearer<FirmwarePool> for UartBearer {
 
 unsafe fn runtime() -> &'static mut FirmwareRuntime {
     if !READY.load(Ordering::Acquire) {
+        let embedded = quic_lite::AssociationLimits::embedded();
         let mut value = FirmwareRuntime::try_new_boxed(
             crate::main_runtime::stateless_reset_key(),
             &POOL,
-            quic_lite::ConnectionLimits::default(),
+            embedded.connection,
         )
         .expect("firmware QUIC runtime allocation succeeds");
+        value
+            .set_limits(quic_lite::NodeLimits::embedded())
+            .expect("firmware QUIC node limits are valid");
+        value
+            .set_default_association_limits(embedded)
+            .expect("firmware QUIC association limits are valid");
         value
             .add_bearer(UartBearer)
             .expect("static UART bearer registration succeeds");
@@ -146,15 +148,17 @@ pub(crate) fn receive_uart(packet: FirmwarePacket) {
 /// wake that owner.
 pub(crate) fn progress() {
     let runtime = unsafe { runtime() };
-    if let Some((mut stream, response)) = unsafe { PENDING_RESPONSE.take() } {
-        if let Err(error) = runtime
-            .write_stream(&mut stream, &response)
-            .and_then(|_| runtime.finish_stream(&mut stream))
-        {
-            if stream_write_retryable(error) {
-                unsafe { PENDING_RESPONSE = Some((stream, response)) };
+    if let Some((mut stream, response, offset)) = unsafe { PENDING_RESPONSE.take() } {
+        match write_response(runtime, &mut stream, &response, offset) {
+            Ok(next) if next < response.len() => {
+                unsafe { PENDING_RESPONSE = Some((stream, response, next)) };
                 return;
             }
+            Err(error) if error.is_retryable() => {
+                unsafe { PENDING_RESPONSE = Some((stream, response, offset)) };
+                return;
+            }
+            _ => {}
         }
     }
     let mut received_response = None;
@@ -181,6 +185,7 @@ pub(crate) fn progress() {
                     }
                     QuicNodeEgressError::Transport(quic_lite::Error::Truncated) => b"truncated",
                     QuicNodeEgressError::Transport(quic_lite::Error::Invalid) => b"invalid",
+                    QuicNodeEgressError::Transport(quic_lite::Error::Blocked) => b"blocked",
                     QuicNodeEgressError::Transport(quic_lite::Error::InvalidVarint) => {
                         b"invalid-varint"
                     }
@@ -222,39 +227,43 @@ pub(crate) fn progress() {
         }
     }
     if let Some((mut stream, response)) = received_response {
-        if let Err(error) = runtime
-            .write_stream(&mut stream, &response)
-            .and_then(|_| runtime.finish_stream(&mut stream))
-        {
-            if stream_write_retryable(error) {
-                unsafe { PENDING_RESPONSE = Some((stream, response)) };
+        match write_response(runtime, &mut stream, &response, 0) {
+            Ok(next) if next < response.len() => {
+                unsafe { PENDING_RESPONSE = Some((stream, response, next)) };
                 return;
             }
+            Err(error) if error.is_retryable() => {
+                unsafe { PENDING_RESPONSE = Some((stream, response, 0)) };
+                return;
+            }
+            _ => {}
         }
     }
     while let Some(mut chunk) = runtime.next_stream_chunk() {
         if chunk.offset == 0 && chunk.fin {
             if let Some(response) = dmesh_server::services::dispatch_tagged_stream(&chunk.bytes) {
-                if let Err(error) = runtime
-                    .write_stream(&mut chunk.stream, &response)
-                    .and_then(|_| runtime.finish_stream(&mut chunk.stream))
-                {
-                    if stream_write_retryable(error) {
-                        unsafe { PENDING_RESPONSE = Some((chunk.stream, response)) };
+                match write_response(runtime, &mut chunk.stream, &response, 0) {
+                    Ok(next) if next < response.len() => {
+                        unsafe { PENDING_RESPONSE = Some((chunk.stream, response, next)) };
                         break;
                     }
+                    Err(error) if error.is_retryable() => {
+                        unsafe { PENDING_RESPONSE = Some((chunk.stream, response, 0)) };
+                        break;
+                    }
+                    _ => {}
                 }
             }
         }
     }
 }
 
-fn stream_write_retryable(error: QuicNodeEgressError) -> bool {
-    matches!(
-        error,
-        QuicNodeEgressError::BearerBusy
-            | QuicNodeEgressError::PoolUnavailable
-            | QuicNodeEgressError::Transport(quic_lite::Error::FlowControl)
-            | QuicNodeEgressError::Transport(quic_lite::Error::HistoryFull)
-    )
+fn write_response(
+    runtime: &mut FirmwareRuntime,
+    stream: &mut QuicStream,
+    response: &[u8],
+    offset: usize,
+) -> Result<usize, QuicNodeEgressError> {
+    let accepted = runtime.write_stream_and_finish(stream, &response[offset..])?;
+    Ok(offset.saturating_add(accepted))
 }

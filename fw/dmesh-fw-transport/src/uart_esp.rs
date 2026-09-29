@@ -214,8 +214,8 @@ pub unsafe fn start_l2_task() -> bool {
 
 /// Start the common UART/USB pool, handlers and L2 task after
 /// `install_l2_driver`. Both marked QUIC-lite datagrams and unmarked opaque
-/// direct packets are admitted to the common pool; only dispatcher callbacks
-/// differ. The UART adapter does not decode either packet form.
+/// QUIC packets are admitted to the common pool. The UART adapter does not
+/// decode the transport packet.
 pub unsafe fn start_shared_l2() -> bool {
     start_l2_task()
 }
@@ -778,55 +778,6 @@ fn notify_egress_ready() {
     }
 }
 
-/// Emit one complete QUIC-lite packet on the physical UART. This is an ESP32
-/// adapter only: the marker and PPP framing are L2 details, while routing and
-/// retransmission remain in the shared connection owner.
-pub fn send_transport_packet(packet: &[u8]) -> bool {
-    if !physical_bearer_active() {
-        // `uart=off` means no parser, packet handling, or physical egress on
-        // a real bridge. USB-JTAG is excluded so C6 debug/recovery remains
-        // independently available in radio-only profiles.
-        return false;
-    }
-    if packet.is_empty() || packet.len() >= UART_MAX_PACKET {
-        return false;
-    }
-    // Compatibility path for connectionless output. Normal QUIC egress uses
-    // `EspUartBearer` and transfers its pool lease without this copy.
-    enqueue_uart_payload(UART_EGRESS_PPP, packet)
-}
-
-/// Write one private QUIC-lite direct payload through the physical PPP bearer.
-/// The adapter does not inspect CBOR, text, service tags, or command
-/// responses; it delegates the long-header envelope to the shared direct
-/// endpoint.
-pub fn send_direct_record(record: &[u8]) -> bool {
-    if !physical_bearer_active() {
-        return false;
-    }
-    if record.is_empty() || record.len() > UART_MAX_PACKET.saturating_sub(6) {
-        return false;
-    }
-    let mut packet = [0u8; UART_MAX_PACKET];
-    let Some(used) = crate::core_runtime::encode_connectionless_message(record, &mut packet) else {
-        return false;
-    };
-    send_transport_packet(&packet[..used])
-}
-
-/// Write one already-encoded connectionless packet through PPP. This is the
-/// response half of the shared direct endpoint; UART remains a frame writer
-/// and must not create a second envelope around it.
-pub fn send_connectionless_packet(packet: &[u8]) -> bool {
-    if !physical_bearer_active() {
-        return false;
-    }
-    if packet.is_empty() || packet.len() > UART_MAX_PACKET {
-        return false;
-    }
-    send_transport_packet(packet)
-}
-
 /// Queue one raw ASCII diagnostic line for the sole physical UART writer.
 ///
 /// This is deliberately not a service or a command response. It is the
@@ -1135,7 +1086,7 @@ fn classic_rx_task(event_queue: *mut esp_idf_sys::QueueDefinition) {
 }
 
 /// The matching classic ESP32 writer. Pool-backed QUIC submissions wake it
-/// directly; legacy text/direct records remain in their compatibility queue.
+/// directly; local diagnostic text remains in the auxiliary queue.
 #[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
 fn classic_tx_task() {
     loop {
@@ -1156,8 +1107,8 @@ fn classic_tx_task() {
     }
 }
 
-/// Dedicated nonblocking UART L2 task. It owns only PPP decode and bounded
-/// ingress queues; all direct-record and QUIC-lite dispatch happens above it.
+/// Dedicated nonblocking UART L2 task. It owns only PPP decode and fixed-size
+/// ingress queues; QUIC-lite dispatch happens above it.
 fn command_task() {
     let mut decoder = PooledDecoder::new(crate::quic_node_esp::uart_pool());
     let mut bytes = [0u8; 256];

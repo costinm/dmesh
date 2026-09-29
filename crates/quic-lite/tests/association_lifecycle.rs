@@ -8,8 +8,8 @@ use quic_lite::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 type Pool = PacketPool<8, { quic_lite::DEFAULT_PACKET_POOL_SLOT_SIZE }>;
-type OneAssociationNode = QuicNode<(), 1, 1, Pool>;
-type TwoAssociationNode = QuicNode<(), 2, 2, Pool>;
+type OneAssociationNode = QuicNode<Pool>;
+type TwoAssociationNode = QuicNode<Pool>;
 
 async fn client_request(
     node: &mut OneAssociationNode,

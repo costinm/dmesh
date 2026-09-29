@@ -13,7 +13,7 @@ use tracing::{debug, error, warn};
 
 pub type HostPacketPool =
     quic_lite::packet_pool::PacketPool<32, { quic_lite::DEFAULT_PACKET_POOL_SLOT_SIZE }>;
-pub type HostQuicNode = quic_lite::QuicNode<(), 32, 32, HostPacketPool>;
+pub type HostQuicNode = quic_lite::QuicNode<HostPacketPool>;
 
 /// Keep host multicast presence aligned with NAN/NOW/ESP refreshes. Operators
 /// may still override this through `LMESH_ANNOUNCE_INTERVAL_SECS`.
@@ -88,8 +88,10 @@ async fn run_server(
     node: HostQuicNode,
     espnow_ingress: Arc<dyn crate::espnow_bearer::EspNowIngress>,
 ) -> Result<()> {
-    let (node, driver) =
-        quic_lite::tokio::TokioNodeDriver::new(node, quic_lite::ConnectionLimits::default());
+    let (node, driver) = quic_lite::tokio::TokioNodeDriver::new(
+        node,
+        quic_lite::AssociationLimits::host().connection,
+    );
     tokio::task::spawn_local(async move {
         if let Err(error) = driver.run().await {
             warn!(?error, "lmesh_quic_driver_stopped");

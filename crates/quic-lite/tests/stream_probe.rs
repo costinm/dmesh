@@ -21,7 +21,7 @@ const PROBE_BYTES: usize = 128 * 1024;
 const WRITE_CHUNK: usize = 997;
 type ProbePool =
     quic_lite::packet_pool::PacketPool<32, { quic_lite::DEFAULT_PACKET_POOL_SLOT_SIZE }>;
-type ProbeNode = QuicNode<(), 2, 2, ProbePool>;
+type ProbeNode = QuicNode<ProbePool>;
 
 fn probe_byte(offset: usize) -> u8 {
     let mixed = (offset as u64)
@@ -101,13 +101,26 @@ async fn run_quic_probe(
     mut server_node: ProbeNode,
     address: PacketMeta,
 ) -> io::Result<()> {
+    // The test deliberately uses a 32-slot fixed packet pool. Keep each
+    // direction's retransmission ledger below that shared pool while retaining
+    // the generous host flow-control and stream defaults.
+    let limits = quic_lite::AssociationLimits {
+        history_packets: 8,
+        ..quic_lite::AssociationLimits::host()
+    };
+    client_node
+        .set_default_association_limits(limits)
+        .map_err(|error| io::Error::other(format!("{error:?}")))?;
+    server_node
+        .set_default_association_limits(limits)
+        .map_err(|error| io::Error::other(format!("{error:?}")))?;
     let association = client_node
         .associate(address, 0)
         .map_err(|error| io::Error::other(format!("{error:?}")))?;
     let exchange = async {
         let server = async {
             let accepted = server_node
-                .accept_stream(quic_lite::ConnectionLimits::default())
+                .accept_stream(quic_lite::AssociationLimits::host().connection)
                 .await
                 .map_err(|error| io::Error::other(format!("{error:?}")))?;
             let mut stream = server_node.accepted_stream(accepted);
@@ -249,51 +262,6 @@ async fn udp_bearer_uses_the_same_stream_probe_as_tcp() {
     )
     .await
     .unwrap();
-}
-
-#[tokio::test]
-async fn direct_message_uses_the_same_tokio_stream_operations() {
-    static CLIENT_POOL: ProbePool = ProbePool::new();
-    static SERVER_POOL: ProbePool = ProbePool::new();
-    let (client_bearer, server_bearer) = FakePacketBearer::<ProbePool>::pair(
-        BearerName::new("message-client").unwrap(),
-        BearerName::new("message-server").unwrap(),
-    );
-    let mut client_node = ProbeNode::new(None, &CLIENT_POOL);
-    let mut server_node = ProbeNode::new(None, &SERVER_POOL);
-    let client_bearer = client_node.add_bearer(client_bearer).unwrap();
-    server_node.add_bearer(server_bearer).unwrap();
-    let request = client_node.open_message(PacketMeta {
-        bearer: client_bearer,
-        peer_l2_address: PeerL2Address::new(1).unwrap(),
-        received_at_us: 0,
-    });
-
-    let server = async {
-        let accepted = server_node
-            .accept_stream(quic_lite::ConnectionLimits::default())
-            .await
-            .unwrap();
-        let mut stream = server_node.accepted_stream(accepted);
-        let mut request = Vec::new();
-        stream.read_to_end(&mut request).await.unwrap();
-        assert_eq!(request, b"ping");
-        stream.write_all(b"pong").await.unwrap();
-        stream.shutdown().await.unwrap();
-    };
-    let client = async {
-        let mut stream = client_node.stream(request);
-        stream.write_all(b"ping").await.unwrap();
-        stream.shutdown().await.unwrap();
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).await.unwrap();
-        assert_eq!(response, b"pong");
-    };
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        tokio::join!(server, client);
-    })
-    .await
-    .expect("direct message stream stalled");
 }
 
 #[tokio::test]

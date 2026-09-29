@@ -12,7 +12,7 @@ use quic_lite::{
 };
 
 type Pool = PacketPool<8, { quic_lite::DEFAULT_PACKET_POOL_SLOT_SIZE }>;
-type Node = QuicNode<(), 2, 2, Pool>;
+type Node = QuicNode<Pool>;
 
 static CLIENT_POOL: Pool = Pool::new();
 static SERVER_POOL: Pool = Pool::new();

@@ -7,7 +7,7 @@ use quic_lite::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 type Pool = PacketPool<16, { quic_lite::DEFAULT_PACKET_POOL_SLOT_SIZE }>;
-type Node = QuicNode<(), 2, 2, Pool>;
+type Node = QuicNode<Pool>;
 
 #[tokio::test]
 async fn owned_handles_exchange_two_concurrent_streams() {

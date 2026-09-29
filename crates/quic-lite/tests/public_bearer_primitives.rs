@@ -95,7 +95,7 @@ fn compact_bearer_identifiers_reject_reserved_or_invalid_values() {
 fn common_node_reports_its_owned_pool_capacity() {
     static POOL: FixedPacketPool<3, { quic_lite::DEFAULT_PACKET_POOL_SLOT_SIZE }> =
         FixedPacketPool::new();
-    let node = QuicNode::<(), 1, 0, _>::new(None, &POOL);
+    let node = QuicNode::<_>::new(None, &POOL);
     assert_eq!(node.packet_capacity(), 3);
     assert_eq!(node.available_packets(), 3);
 }
@@ -109,7 +109,10 @@ fn public_connection_limits_and_reset_key_validate_application_input() {
     assert_eq!(profile.max_streams_uni, 4);
     let window = ConnectionLimits::with_receive_window(2048);
     assert_eq!(window.max_data, 2048);
-    assert_eq!(window.max_stream_data, 2048);
+    assert_eq!(
+        window.max_stream_data,
+        quic_lite::DEFAULT_MAX_PACKET_SIZE as u64
+    );
     assert!(StatelessResetKey::from_device_secret(&[0; 15]).is_err());
     assert!(StatelessResetKey::from_device_secret(&[0; 16]).is_ok());
 }

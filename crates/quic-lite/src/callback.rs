@@ -95,13 +95,6 @@ pub(crate) trait CopyingStreamEvents {
     fn stream_reset(&mut self, _stream: u64, _code: u64) {}
 }
 
-/// Stream identity used for one connectionless direct long packet.
-///
-/// Ordinary QUIC stream IDs are at most 2^62-1, so this value cannot collide
-/// with an associated stream. Each direct packet is delivered synchronously as
-/// a fresh transient stream: one offset-zero chunk with FIN, then finished.
-pub(crate) const DIRECT_MESSAGE_STREAM_ID: u64 = u64::MAX;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Invalid ordering, completion, or storage state in callback delivery.
 pub enum CallbackError {
@@ -306,12 +299,13 @@ pub(crate) fn retention_for_receive_window(
         .max(minimum)
 }
 
-/// Bounded ordered delivery state for one connection. The transport calls
-/// `receive` after validating the complete packet.
+/// Size-limited ordered delivery state for one connection. The transport calls
+/// `receive` after validating the complete packet and suppresses frames whose
+/// receive side is already complete. Stream retirement belongs to the endpoint;
+/// this helper retains only live ordering and backpressure state.
 #[derive(Clone)]
 pub struct CallbackStreams<P: PacketLease> {
     streams: Vec<OrderedStream<P>>,
-    retired: Vec<u64>,
     max_streams: usize,
     max_retained_bytes: usize,
     retained_bytes: usize,
@@ -322,11 +316,67 @@ impl<P: PacketLease> CallbackStreams<P> {
     pub fn new(max_streams: usize, max_retained_bytes: usize) -> Self {
         Self {
             streams: Vec::new(),
-            retired: Vec::new(),
             max_streams,
             max_retained_bytes,
             retained_bytes: 0,
         }
+    }
+
+    /// Replace future admission ceilings without discarding retained stream
+    /// state. Values below current use take effect as that state drains.
+    pub(crate) fn set_limits(&mut self, max_streams: usize, max_retained_bytes: usize) {
+        self.max_streams = max_streams;
+        self.max_retained_bytes = max_retained_bytes;
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn limits(&self) -> (usize, usize) {
+        (self.max_streams, self.max_retained_bytes)
+    }
+
+    /// Validate the stream identities and final sizes carried by one packet
+    /// without cloning or mutating retained delivery state.
+    pub(crate) fn validate_packet_frames(
+        &self,
+        frames: &[(u64, u64, usize, bool)],
+    ) -> Result<(), CallbackError> {
+        let mut new_streams = Vec::new();
+        let mut packet_finals = Vec::new();
+        for &(id, offset, len, fin) in frames {
+            let end = offset
+                .checked_add(len as u64)
+                .ok_or(CallbackError::InvalidFin)?;
+            let existing = self.streams.iter().find(|stream| stream.id == id);
+            if existing.is_none() && !new_streams.contains(&id) {
+                new_streams
+                    .try_reserve(1)
+                    .map_err(|_| CallbackError::Capacity)?;
+                new_streams.push(id);
+            }
+            let known_final = existing.and_then(|stream| stream.final_size).or_else(|| {
+                packet_finals
+                    .iter()
+                    .find_map(|(stream, size)| (*stream == id).then_some(*size))
+            });
+            if let Some(final_size) = known_final {
+                if end > final_size || (fin && end != final_size) {
+                    return Err(CallbackError::InvalidFin);
+                }
+            } else if fin {
+                packet_finals
+                    .try_reserve(1)
+                    .map_err(|_| CallbackError::Capacity)?;
+                packet_finals.push((id, end));
+            }
+        }
+        if self.streams.len().saturating_add(new_streams.len()) > self.max_streams {
+            return Err(CallbackError::Capacity);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn retention_may_exceed(&self, additional_bytes: usize) -> bool {
+        self.retained_bytes.saturating_add(additional_bytes) > self.max_retained_bytes
     }
 
     fn stream_mut(&mut self, id: u64) -> Result<&mut OrderedStream<P>, CallbackError> {
@@ -344,12 +394,6 @@ impl<P: PacketLease> CallbackStreams<P> {
         Ok(self.streams.last_mut().unwrap())
     }
 
-    fn retire(&mut self, id: u64) {
-        if id != DIRECT_MESSAGE_STREAM_ID && !self.retired.contains(&id) {
-            self.retired.push(id);
-        }
-    }
-
     /// Insert one retained packet range and emit the next ordered leased chunk.
     pub fn receive_leased<E: StreamEvents<P>>(
         &mut self,
@@ -360,9 +404,6 @@ impl<P: PacketLease> CallbackStreams<P> {
         fin: bool,
         events: &mut E,
     ) -> Result<(), CallbackError> {
-        if self.retired.contains(&stream) {
-            return Ok(());
-        }
         let bytes = range.len();
         // A retransmission can arrive after the retained window is full. Do
         // not reject it before OrderedStream has identified it as an exact
@@ -401,9 +442,6 @@ impl<P: PacketLease> CallbackStreams<P> {
         fin: bool,
         events: &mut E,
     ) -> Result<(), CopyingError<E::Error>> {
-        if self.retired.contains(&stream) {
-            return Ok(());
-        }
         let bytes = range.len();
         // A range at the consumer cursor drains synchronously and therefore
         // does not compete with retained out-of-order storage.
@@ -454,9 +492,6 @@ impl<P: PacketLease> CallbackStreams<P> {
         E: CopyingStreamEvents,
         F: FnOnce() -> P,
     {
-        if self.retired.contains(&stream) {
-            return Ok(());
-        }
         let len = bytes.len() as u64;
         let end = offset
             .checked_add(len)
@@ -489,7 +524,6 @@ impl<P: PacketLease> CallbackStreams<P> {
                     .map_err(CopyingError::Transport)?;
                 state.consumed = offset + consumed as u64;
                 let retained = bytes.len().saturating_sub(consumed);
-                let _ = state;
                 self.retained_bytes = self.retained_bytes.saturating_add(retained);
                 return Ok(());
             }
@@ -500,15 +534,12 @@ impl<P: PacketLease> CallbackStreams<P> {
             if fin {
                 state.finished = true;
                 events.stream_finished(stream);
-                let _ = state;
                 self.streams.retain(|state| state.id != stream);
-                self.retire(stream);
                 return Ok(());
             }
             // A borrowed prefix may close a gap in already retained ranges.
             // Drain those ordinary ordered ranges now when the consumer took
             // the full prefix, preserving the historical copying behaviour.
-            let _ = state;
             self.resume_copying(stream, events)?;
             return Ok(());
         }
@@ -572,7 +603,6 @@ impl<P: PacketLease> CallbackStreams<P> {
                 state.finished = true;
                 events.stream_finished(stream);
                 self.streams.remove(index);
-                self.retire(stream);
                 return Ok(total);
             }
         }
@@ -599,7 +629,6 @@ impl<P: PacketLease> CallbackStreams<P> {
         if finished {
             events.stream_finished(completion.stream);
             self.streams.remove(index);
-            self.retire(completion.stream);
             return Ok(());
         }
         if self.streams[index].outstanding.is_none() {
@@ -848,7 +877,11 @@ mod tests {
         assert_eq!(sink.data, b"abc");
         assert_eq!(sink.finished, vec![4]);
         assert_eq!(streams.resume_copying(4, &mut sink).unwrap(), 0);
-        assert_eq!(sink.finished, vec![4], "the FIN must not be delivered again");
+        assert_eq!(
+            sink.finished,
+            vec![4],
+            "the FIN must not be delivered again"
+        );
     }
 
     #[test]
@@ -959,7 +992,7 @@ mod tests {
     }
 
     #[test]
-    fn copying_delivery_is_ordered_and_duplicate_safe_under_reordering() {
+    fn copying_delivery_is_ordered_under_reordering() {
         let mut streams = CallbackStreams::new(4, 32);
         let mut sink = CopySink::default();
         let tail = Arc::new(b"tail".to_vec());
@@ -968,11 +1001,6 @@ mod tests {
             .receive_copying(7, tail, 4, 0..4, true, &mut sink)
             .unwrap();
         assert!(sink.data.is_empty());
-        streams
-            .receive_copying(7, head.clone(), 0, 0..4, false, &mut sink)
-            .unwrap();
-        assert_eq!(sink.data, b"headtail");
-        // A retransmitted identical range is accepted but never delivered.
         streams
             .receive_copying(7, head, 0, 0..4, false, &mut sink)
             .unwrap();

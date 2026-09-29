@@ -8,56 +8,68 @@
 
 extern crate alloc;
 
+use core::fmt::{self, Write};
+
 use dmesh_server::{
     connection::{self, ConnectionManager, ConnectionPolicy},
     control::{self, Handler, TransportConfig, TransportKind},
     firmware_profile::{
         apply_connection_policy, apply_transport_config, clear_sta_passphrase, set_ssid,
     },
-    services::{encode_status_numeric, encode_status_text},
 };
 
 use crate::TransportProfile;
 
-/// Emit a pre-encoded schema record through the selected direct bearer.
-/// This is the bounded UART bootstrap fallback only: it is used before a
-/// stream client can request status/events. Normal on-demand replies belong
-/// on their requesting stream, and state transitions belong in event history.
-pub fn send_record(record: &[u8]) -> bool {
-    #[cfg(feature = "uart-transport")]
-    {
-        crate::uart_esp::send_direct_record(record)
-    }
-    #[cfg(not(feature = "uart-transport"))]
-    {
-        let _ = record;
-        false
-    }
-}
-
-/// Emit the shared diagnostic envelope over the registered direct-record
-/// bearer. The selected bearer is a runtime policy, not a command concern.
+/// Emit human-readable diagnostics on UART's reserved debug channel. These
+/// records are local diagnostics, not QUIC application packets.
 pub fn send_response(message: &[u8]) {
-    let Some(cbor) = encode_status_text(message) else {
-        return;
-    };
-    let _ = send_record(&cbor);
+    let _ = crate::uart_esp::send_debug_text(message);
 }
 
 pub fn send_stat(prefix: &[u8], value: u64) {
-    let Some(cbor) = encode_status_numeric(prefix, value) else {
-        return;
-    };
-    let _ = send_record(&cbor);
+    let mut line = DiagnosticLine::new();
+    line.extend(prefix);
+    let _ = write!(line, "{value}");
+    let _ = crate::uart_esp::send_debug_text(line.bytes());
 }
 
-/// Emit one bounded multi-field diagnostic event. Values describing a single
-/// physical boundary remain together in a passive UART/NOW observation.
+/// Emit a group of related values on the UART debug channel.
 pub fn send_stats(entries: &[(&[u8], u64)]) {
-    let Some(cbor) = dmesh_server::services::encode_status_numbers(entries) else {
-        return;
-    };
-    let _ = send_record(&cbor);
+    for &(prefix, value) in entries {
+        send_stat(prefix, value);
+    }
+}
+
+struct DiagnosticLine {
+    bytes: [u8; 192],
+    len: usize,
+}
+
+impl DiagnosticLine {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; 192],
+            len: 0,
+        }
+    }
+
+    fn extend(&mut self, value: &[u8]) {
+        let available = self.bytes.len().saturating_sub(self.len);
+        let copied = core::cmp::min(available, value.len());
+        self.bytes[self.len..self.len + copied].copy_from_slice(&value[..copied]);
+        self.len += copied;
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+impl Write for DiagnosticLine {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        self.extend(value.as_bytes());
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

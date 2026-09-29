@@ -3,7 +3,7 @@
 use std::{net::SocketAddr, time::Duration};
 
 use quic_lite::{
-    BearerName, ConnectionLimits, PacketMeta, PeerL2Address, QuicNode, QuicNodeEgressError,
+    BearerName, PacketMeta, PeerL2Address, QuicNode, QuicNodeEgressError,
     packet_pool::PacketPool,
     tokio::{TokioAssociation, TokioNodeDriver},
 };
@@ -12,7 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const POOL_SLOTS: usize = 16;
 const SLOT_SIZE: usize = quic_lite::DEFAULT_PACKET_POOL_SLOT_SIZE;
 type Pool = PacketPool<POOL_SLOTS, SLOT_SIZE>;
-type Node = QuicNode<(), 2, 2, Pool>;
+type Node = QuicNode<Pool>;
 
 static UDP_POOL: Pool = Pool::new();
 static UART_POOL: Pool = Pool::new();
@@ -112,10 +112,15 @@ pub(crate) async fn request_udp(
             .register_peer(peer)
             .map_err(|error| format!("register UDP peer: {error:?}"))?;
         let mut node = Node::new(None, &UDP_POOL);
+        node.set_limits(quic_lite::NodeLimits::host())
+            .expect("host QUIC node limits are valid");
+        node.set_default_association_limits(quic_lite::AssociationLimits::host())
+            .expect("host QUIC association limits are valid");
         let bearer = node
             .add_bearer(bearer_impl)
             .map_err(|error| format!("attach UDP bearer: {error:?}"))?;
-        let (client, driver) = TokioNodeDriver::new(node, ConnectionLimits::default());
+        let (client, driver) =
+            TokioNodeDriver::new(node, quic_lite::AssociationLimits::host().connection);
         let operation = async {
             let association = client
                 .associate(
@@ -155,10 +160,15 @@ pub(crate) async fn flash_udp(
             .register_peer(peer)
             .map_err(|error| format!("register UDP peer: {error:?}"))?;
         let mut node = Node::new(None, &UDP_POOL);
+        node.set_limits(quic_lite::NodeLimits::host())
+            .expect("host QUIC node limits are valid");
+        node.set_default_association_limits(quic_lite::AssociationLimits::host())
+            .expect("host QUIC association limits are valid");
         let bearer = node
             .add_bearer(bearer_impl)
             .map_err(|error| format!("attach UDP bearer: {error:?}"))?;
-        let (client, driver) = TokioNodeDriver::new(node, ConnectionLimits::default());
+        let (client, driver) =
+            TokioNodeDriver::new(node, quic_lite::AssociationLimits::host().connection);
         let operation = async {
             let association = client
                 .associate(
@@ -195,10 +205,15 @@ pub(crate) async fn request_uart(
         .map_err(|error| error.to_string())?;
     let future = async {
         let mut node = Node::new(None, &UART_POOL);
+        node.set_limits(quic_lite::NodeLimits::host())
+            .expect("host QUIC node limits are valid");
+        node.set_default_association_limits(quic_lite::AssociationLimits::host())
+            .expect("host QUIC association limits are valid");
         let bearer = node
             .add_bearer(bearer_impl)
             .map_err(|error| format!("attach UART bearer: {error:?}"))?;
-        let (client, driver) = TokioNodeDriver::new(node, ConnectionLimits::default());
+        let (client, driver) =
+            TokioNodeDriver::new(node, quic_lite::AssociationLimits::host().connection);
         let operation = async {
             let association = client
                 .associate(

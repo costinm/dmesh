@@ -198,8 +198,3 @@ pub(crate) fn poll_espnow(
 ) -> Option<usize> {
     None
 }
-/// Compatibility hook for non-UDP connectionless transports. Multicast
-/// discovery does not use this QUIC envelope path.
-pub(crate) fn encode_connectionless_message(_payload: &[u8], _output: &mut [u8]) -> Option<usize> {
-    None
-}

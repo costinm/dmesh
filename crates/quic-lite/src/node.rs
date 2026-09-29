@@ -19,7 +19,8 @@ use crate::bearer::{
     PacketWriter, PeerL2Address,
 };
 use crate::connection::{
-    ClientAssociation, ServerPacket, ServerStreamConnection, classify_server_packet,
+    ClientAssociation, ServerPacket, ServerStreamConfig, ServerStreamConnection,
+    classify_server_packet,
 };
 use crate::relay::{
     DcidRegistryError, ForwardDestination, ForwardRule, PacketRouter, RouterTarget,
@@ -32,13 +33,100 @@ use crate::{ConnectionId, Error, StatelessResetKey};
 pub(crate) const DEFAULT_INITIAL_PTO_US: u64 = 250_000;
 const DEFAULT_IDLE_TIMEOUT_US: u64 = 30_000_000;
 
+/// Runtime node-wide admission and memory limits.
+///
+/// These values are policy rather than storage layout. Raising a limit takes
+/// effect for later admission; lowering one never evicts live state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NodeLimits {
+    /// Maximum simultaneously live associations admitted by this node.
+    pub max_associations: usize,
+    /// Maximum combined local and relay DCID routes.
+    pub max_routes: usize,
+}
+
+impl NodeLimits {
+    /// Generous defaults for heap-backed Linux and Android processes.
+    pub const fn host() -> Self {
+        Self {
+            max_associations: 4_096,
+            max_routes: 8_192,
+        }
+    }
+
+    /// Conservative defaults for low-RAM firmware. Products may override
+    /// these from NVS before admitting associations.
+    pub const fn embedded() -> Self {
+        Self {
+            max_associations: 4,
+            max_routes: 8,
+        }
+    }
+}
+
+impl Default for NodeLimits {
+    fn default() -> Self {
+        Self::host()
+    }
+}
+
+/// Runtime defaults and growth ceilings for newly admitted associations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AssociationLimits {
+    /// Receive windows and peer stream concurrency growth policy.
+    pub connection: crate::ConnectionLimits,
+    /// Maximum retained retransmission packets for either endpoint role.
+    pub history_packets: usize,
+    /// Maximum live ordered-delivery stream records.
+    pub max_pending_streams: usize,
+    /// Maximum chunks queued for one Tokio stream reader before receive
+    /// credit is withheld for that stream.
+    pub max_queued_chunks_per_stream: usize,
+    /// Maximum bytes retained for out-of-order or backpressured delivery.
+    pub max_buffered_stream_bytes: usize,
+}
+
+impl AssociationLimits {
+    /// Generous defaults for heap-backed Linux and Android processes.
+    pub const fn host() -> Self {
+        Self {
+            connection: crate::ConnectionLimits::with_receive_profile(
+                16 * 1024 * 1024,
+                4 * 1024 * 1024,
+                256,
+            ),
+            history_packets: 128,
+            max_pending_streams: 256,
+            max_queued_chunks_per_stream: 64,
+            max_buffered_stream_bytes: 16 * 1024 * 1024,
+        }
+    }
+
+    /// Conservative defaults for low-RAM firmware.
+    pub const fn embedded() -> Self {
+        Self {
+            connection: crate::ConnectionLimits::with_receive_profile(32 * 1024, 8 * 1024, 4),
+            history_packets: 8,
+            max_pending_streams: 4,
+            max_queued_chunks_per_stream: 2,
+            max_buffered_stream_bytes: 32 * 1024,
+        }
+    }
+}
+
+impl Default for AssociationLimits {
+    fn default() -> Self {
+        Self::host()
+    }
+}
+
 /// Stable handle for one locally terminated association.
 ///
 /// The slot and generation are intentionally private. A removed handle never
 /// names a later association which reuses the same fixed-capacity slot.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct QuicAssociation {
-    slot: u16,
+    slot: u32,
     generation: u64,
 }
 
@@ -53,19 +141,11 @@ pub struct QuicStream {
     id: u64,
     send_offset: u64,
     send_finished: bool,
-    direct_buffer: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StreamOwner {
     Association(QuicAssociation),
-    Direct(DirectReply),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct DirectReply {
-    pub meta: PacketMeta,
-    pub packet_number: u32,
 }
 
 impl QuicStream {
@@ -81,24 +161,12 @@ impl QuicStream {
             id,
             send_offset: 0,
             send_finished: false,
-            direct_buffer: Vec::new(),
-        }
-    }
-
-    pub(crate) fn direct(reply: DirectReply, id: u64) -> Self {
-        Self {
-            owner: StreamOwner::Direct(reply),
-            id,
-            send_offset: 0,
-            send_finished: false,
-            direct_buffer: Vec::new(),
         }
     }
 
     pub(crate) const fn association(&self) -> Option<QuicAssociation> {
         match self.owner {
             StreamOwner::Association(association) => Some(association),
-            StreamOwner::Direct(_) => None,
         }
     }
 
@@ -107,29 +175,12 @@ impl QuicStream {
     }
 
     pub(crate) fn matches(&self, owner: StreamOwner, id: u64) -> bool {
-        let same_owner = match (self.owner, owner) {
-            (StreamOwner::Association(left), StreamOwner::Association(right)) => left == right,
-            (StreamOwner::Direct(left), StreamOwner::Direct(right)) => left.meta == right.meta,
-            _ => false,
-        };
+        let same_owner = self.owner == owner;
         same_owner && self.id == id
     }
 
     pub(crate) const fn send_finished(&self) -> bool {
         self.send_finished
-    }
-
-    pub(crate) const fn is_direct(&self) -> bool {
-        matches!(self.owner, StreamOwner::Direct(_))
-    }
-
-    pub(crate) fn finish_direct_send(&mut self, bytes: usize) {
-        self.send_offset = bytes as u64;
-        self.send_finished = true;
-    }
-
-    pub(crate) const fn can_send_direct(&self) -> bool {
-        !self.send_finished && self.send_offset == 0
     }
 }
 
@@ -157,6 +208,97 @@ pub(crate) struct QueuedStreamChunk {
     pub bytes: Vec<u8>,
 }
 
+/// Per-stream admission of received chunks into the Tokio chunk queue.
+///
+/// Each association stream may have at most `limit` chunks waiting for its
+/// reader. Beyond that the callback accepts 0 bytes: QUIC-lite retains them
+/// without granting receive credit, so a slow reader backpressures only its
+/// own stream (through flow control) instead of stopping node ingress.
+/// A zero-length FIN cannot be refused and is always queued.
+#[cfg(feature = "tokio")]
+pub(crate) struct ChunkAdmission {
+    queued: Vec<(StreamOwner, u64, usize)>,
+    default_limit: usize,
+    association_limits: Vec<(QuicAssociation, usize)>,
+    pub chunks: Vec<QueuedStreamChunk>,
+    pub deferred: Vec<(QuicAssociation, u64)>,
+}
+
+#[cfg(feature = "tokio")]
+impl ChunkAdmission {
+    pub(crate) fn new(
+        queue: &std::collections::VecDeque<QueuedStreamChunk>,
+        default_limit: usize,
+        association_limits: Vec<(QuicAssociation, usize)>,
+    ) -> Self {
+        let mut queued: Vec<(StreamOwner, u64, usize)> = Vec::new();
+        for chunk in queue {
+            match queued
+                .iter_mut()
+                .find(|(owner, stream, _)| *owner == chunk.owner && *stream == chunk.stream)
+            {
+                Some(entry) => entry.2 += 1,
+                None => queued.push((chunk.owner, chunk.stream, 1)),
+            }
+        }
+        Self {
+            queued,
+            default_limit: default_limit.max(1),
+            association_limits,
+            chunks: Vec::new(),
+            deferred: Vec::new(),
+        }
+    }
+
+    pub(crate) fn offer(
+        &mut self,
+        source: ApplicationStreamSource,
+        stream: u64,
+        offset: u64,
+        fin: bool,
+        bytes: &[u8],
+    ) -> Result<usize, Error> {
+        let ApplicationStreamSource::Association(association) = source;
+        let owner = StreamOwner::Association(association);
+        let limit = self
+            .association_limits
+            .iter()
+            .find_map(|(owner, limit)| (*owner == association).then_some(*limit))
+            .unwrap_or(self.default_limit)
+            .max(1);
+        let queued = self
+            .queued
+            .iter()
+            .find(|(queued_owner, queued_stream, _)| {
+                *queued_owner == owner && *queued_stream == stream
+            })
+            .map_or(0, |entry| entry.2);
+        if !bytes.is_empty() && queued >= limit {
+            if !self.deferred.contains(&(association, stream)) {
+                self.deferred.push((association, stream));
+            }
+            return Ok(0);
+        }
+        match self
+            .queued
+            .iter_mut()
+            .find(|(queued_owner, queued_stream, _)| {
+                *queued_owner == owner && *queued_stream == stream
+            }) {
+            Some(entry) => entry.2 += 1,
+            None => self.queued.push((owner, stream, 1)),
+        }
+        self.chunks.push(QueuedStreamChunk {
+            owner,
+            stream,
+            offset,
+            fin,
+            bytes: bytes.to_vec(),
+        });
+        Ok(bytes.len())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Failure while locating or changing association state owned by a node.
 ///
@@ -171,6 +313,8 @@ pub enum QuicNodeError {
     WrongAssociationRole,
     /// The node could not install or remove the private CID route.
     Routing,
+    /// A runtime resource policy contains a zero or unrepresentable limit.
+    InvalidLimits,
 }
 
 /// Why an owned packet could not enter an established local association.
@@ -187,47 +331,20 @@ pub(crate) enum QuicNodePacketRejection {
 /// Node policy for admitting one validated Initial.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct InitialAdmission {
-    pub server_cid: ConnectionId,
     pub local_limits: crate::ConnectionLimits,
 }
 
-/// Packet emitted without an association, such as a direct response or reset.
+/// Packet emitted without an association, such as a stateless reset.
 pub(crate) struct NodePacket<B> {
     pub bearer: BearerId,
     pub peer_l2_address: PeerL2Address,
     pub packet: OwnedPacket<B>,
 }
 
-/// One parsed direct request retaining its original packet lease.
-pub(crate) struct DirectNodeIngress<B> {
-    meta: PacketMeta,
-    packet: OwnedPacket<B>,
-    payload: core::ops::Range<usize>,
-    packet_number: u32,
-}
-
 /// Owner of an application stream delivered by [`QuicNode::receive_packet`].
-///
-/// `Direct` is a transient connectionless stream. It uses the same byte
-/// callback as an associated client or server stream, so an application never
-/// needs to know whether its bytes came from a long or short packet.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ApplicationStreamSource {
     Association(QuicAssociation),
-    Direct,
-}
-
-impl<B: AsRef<[u8]>> DirectNodeIngress<B> {
-    pub(crate) fn payload(&self) -> &[u8] {
-        &self.packet.bytes()[self.payload.clone()]
-    }
-
-    pub(crate) const fn reply(&self) -> DirectReply {
-        DirectReply {
-            meta: self.meta,
-            packet_number: self.packet_number,
-        }
-    }
 }
 
 /// Complete outcome of submitting one opaque packet to [`QuicNode`].
@@ -236,7 +353,6 @@ pub(crate) enum NodeIngress<B, EgressBuffer, NextHop> {
         association: AssociationIngress,
         packet: OwnedPacket<B>,
     },
-    Direct(DirectNodeIngress<B>),
     Initial {
         association: QuicAssociation,
         response: NodePacket<EgressBuffer>,
@@ -346,6 +462,18 @@ pub enum AssociationEvent {
         /// Association that was retired.
         association: QuicAssociation,
     },
+    /// The peer did not complete association setup before the Initial retry
+    /// limit was reached.
+    SetupTimeout {
+        /// Client association that was retired.
+        association: QuicAssociation,
+    },
+    /// Lifecycle notifications were discarded because the application did not
+    /// drain the fixed-capacity event queue before more associations ended.
+    EventsDropped {
+        /// Number of notifications discarded since the previous report.
+        count: u64,
+    },
 }
 
 /// Progress from an explicit local association close.
@@ -389,7 +517,11 @@ pub enum QuicNodeEgressError {
 
 impl QuicNodeEgressError {
     /// Whether unchanged stream bytes may be retried after node progress.
-    pub(crate) const fn is_stream_retryable(self) -> bool {
+    ///
+    /// A retryable result never commits the supplied stream bytes or FIN.
+    /// Callers must first make node, bearer, packet-pool, or flow-control
+    /// progress, then retry the same operation unchanged.
+    pub const fn is_retryable(self) -> bool {
         matches!(
             self,
             Self::BearerBusy
@@ -429,16 +561,7 @@ impl From<DcidRegistryError> for QuicNodeError {
     }
 }
 
-impl<
-    NextHop,
-    const ASSOCIATIONS: usize,
-    const ROUTES: usize,
-    P,
-    const CLIENT_HISTORY: usize,
-    const SERVER_STREAMS: usize,
-    const SERVER_HISTORY: usize,
-    const PACKET: usize,
-> QuicNode<NextHop, ASSOCIATIONS, ROUTES, P, CLIENT_HISTORY, SERVER_STREAMS, SERVER_HISTORY, PACKET>
+impl<P, const PACKET: usize> QuicNode<P, PACKET>
 where
     P: PacketPool + 'static,
     P::Buffer: Send,
@@ -577,7 +700,9 @@ where
             Ok(()) => Ok(()),
             Err(QuicNodeEgressError::PoolUnavailable | QuicNodeEgressError::BearerBusy) => {
                 if !self.pending_controls.contains(&association) {
-                    if self.pending_controls.len() == self.pending_controls.capacity() {
+                    if self.pending_controls.len() >= self.node_limits.max_associations
+                        || self.pending_controls.try_reserve(1).is_err()
+                    {
                         return Err(QuicNodeEgressError::StreamEventsFull);
                     }
                     self.pending_controls.push_back(association);
@@ -623,6 +748,7 @@ struct AssociationSlot<Client, Server> {
     close_code: Option<u64>,
     last_activity_us: u64,
     client_delivery: crate::callback::CallbackStreams<Arc<Vec<u8>>>,
+    limits: AssociationLimits,
 }
 
 #[derive(Clone, Copy)]
@@ -677,13 +803,7 @@ where
 /// happen in the caller's current event context; this type owns no worker or
 /// scheduling loop.
 pub struct QuicNode<
-    NextHop,
-    const ASSOCIATIONS: usize,
-    const ROUTES: usize,
     P: PacketPool + 'static,
-    const CLIENT_HISTORY: usize = 8,
-    const SERVER_STREAMS: usize = 8,
-    const SERVER_HISTORY: usize = 8,
     const PACKET: usize = { crate::DEFAULT_MAX_PACKET_SIZE },
 > {
     pub(crate) pool: &'static P,
@@ -691,19 +811,13 @@ pub struct QuicNode<
     // spills this collection to the heap instead of reserving every complete
     // connection state at node construction.
     associations: SmallVec<
-        [Option<
-            AssociationSlot<
-                ClientAssociation<CLIENT_HISTORY, PACKET>,
-                ServerStreamConnection<SERVER_STREAMS, SERVER_HISTORY, PACKET>,
-            >,
-        >; 1],
+        [Option<AssociationSlot<ClientAssociation<PACKET>, ServerStreamConnection<PACKET>>>; 1],
     >,
     generations: Vec<u64>,
     next_local_cid: u64,
-    next_direct_packet_number: u32,
     clock_us: u64,
     idle_timeout_us: u64,
-    router: PacketRouter<QuicAssociation, NextHop, ROUTES>,
+    router: PacketRouter<QuicAssociation, u32>,
     pub(crate) bearers: BearerRegistry<P::Buffer, 8>,
     pub(crate) completions: Arc<CompletionQueue<P::Buffer>>,
     #[cfg(feature = "tokio")]
@@ -714,42 +828,31 @@ pub struct QuicNode<
     pub(crate) stream_chunks: std::collections::VecDeque<QueuedStreamChunk>,
     #[cfg(feature = "tokio")]
     pub(crate) stream_chunk_limit: usize,
+    /// Streams whose delivery stopped at the per-stream queue limit. Their
+    /// bytes stay retained by QUIC-lite without receive credit until
+    /// `resume_deferred_streams` can queue them.
+    #[cfg(feature = "tokio")]
+    pub(crate) deferred_streams: Vec<(QuicAssociation, u64)>,
     #[cfg(feature = "tokio")]
     pub(crate) packet_capture: Option<crate::tokio::PacketCapture>,
     pending_controls: VecDeque<QuicAssociation>,
     association_events: VecDeque<AssociationEvent>,
+    dropped_association_events: u64,
+    node_limits: NodeLimits,
+    default_association_limits: AssociationLimits,
 }
 
-impl<
-    NextHop,
-    const ASSOCIATIONS: usize,
-    const ROUTES: usize,
-    P: PacketPool,
-    const CLIENT_HISTORY: usize,
-    const SERVER_STREAMS: usize,
-    const SERVER_HISTORY: usize,
-    const PACKET: usize,
->
-    QuicNode<
-        NextHop,
-        ASSOCIATIONS,
-        ROUTES,
-        P,
-        CLIENT_HISTORY,
-        SERVER_STREAMS,
-        SERVER_HISTORY,
-        PACKET,
-    >
-{
+impl<P: PacketPool, const PACKET: usize> QuicNode<P, PACKET> {
     /// Create a node with the packet pool it owns for all ingress and egress.
     ///
     /// The pool is deliberately selected here rather than by individual
     /// bearers or stream operations. Its leases and current use are therefore
     /// visible to the node's memory and receive-window policy.
     pub fn new(reset_key: Option<StatelessResetKey>, pool: &'static P) -> Self {
-        assert!(ASSOCIATIONS <= u16::MAX as usize);
+        let node_limits = NodeLimits::host();
+        let association_limits = AssociationLimits::host();
         let mut associations = SmallVec::new();
-        if ASSOCIATIONS != 0 {
+        if node_limits.max_associations != 0 {
             associations.push(None);
         }
         #[cfg(feature = "tokio")]
@@ -757,16 +860,19 @@ impl<
         Self {
             pool,
             associations,
-            generations: if ASSOCIATIONS == 0 {
+            generations: if node_limits.max_associations == 0 {
                 Vec::new()
             } else {
                 vec![0]
             },
             next_local_cid: 1,
-            next_direct_packet_number: 0,
             clock_us: 0,
             idle_timeout_us: DEFAULT_IDLE_TIMEOUT_US,
-            router: PacketRouter::new(reset_key),
+            router: {
+                let mut router = PacketRouter::new(reset_key);
+                router.set_max_entries(node_limits.max_routes);
+                router
+            },
             bearers: BearerRegistry::new(),
             completions: Arc::new(CompletionQueue::new(pool.capacity().max(1))),
             #[cfg(feature = "tokio")]
@@ -774,22 +880,25 @@ impl<
             #[cfg(feature = "tokio")]
             ingress,
             #[cfg(feature = "tokio")]
-            stream_chunks: std::collections::VecDeque::with_capacity(
-                ASSOCIATIONS.saturating_mul(SERVER_STREAMS).max(1),
-            ),
+            stream_chunks: std::collections::VecDeque::new(),
             #[cfg(feature = "tokio")]
-            stream_chunk_limit: ASSOCIATIONS.saturating_mul(SERVER_STREAMS).max(1),
+            stream_chunk_limit: association_limits.max_queued_chunks_per_stream,
+            #[cfg(feature = "tokio")]
+            deferred_streams: Vec::new(),
             #[cfg(feature = "tokio")]
             packet_capture: crate::tokio::PacketCapture::from_env(),
-            pending_controls: VecDeque::with_capacity(ASSOCIATIONS.max(1)),
+            pending_controls: VecDeque::new(),
             association_events: VecDeque::new(),
+            dropped_association_events: 0,
+            node_limits,
+            default_association_limits: association_limits,
         }
     }
 
     /// Initialize a no-std node directly in its final storage.
     ///
-    /// Embedded runtimes use this for fixed-capacity association tables that
-    /// are intentionally larger than an RTOS packet task's stack. The caller
+    /// Embedded runtimes use this when complete node state is intentionally
+    /// larger than an RTOS packet task's stack. The caller
     /// supplies uninitialized heap or static storage; every field is written
     /// before the returned reference becomes observable.
     pub(crate) unsafe fn new_in_place<'a>(
@@ -797,7 +906,8 @@ impl<
         reset_key: Option<StatelessResetKey>,
         pool: &'static P,
     ) -> &'a mut Self {
-        assert!(ASSOCIATIONS <= u16::MAX as usize);
+        let node_limits = NodeLimits::host();
+        let association_limits = AssociationLimits::host();
         // SAFETY: `storage` is one aligned, uninitialized `Self`. Every field
         // is written exactly once before the initialized reference escapes.
         unsafe {
@@ -805,19 +915,22 @@ impl<
             core::ptr::addr_of_mut!((*node).pool).write(pool);
             let associations = core::ptr::addr_of_mut!((*node).associations);
             associations.write(SmallVec::new());
-            if ASSOCIATIONS != 0 {
+            if node_limits.max_associations != 0 {
                 (*associations).push(None);
             }
-            core::ptr::addr_of_mut!((*node).generations).write(if ASSOCIATIONS == 0 {
-                Vec::new()
-            } else {
-                vec![0]
-            });
+            core::ptr::addr_of_mut!((*node).generations).write(
+                if node_limits.max_associations == 0 {
+                    Vec::new()
+                } else {
+                    vec![0]
+                },
+            );
             core::ptr::addr_of_mut!((*node).next_local_cid).write(1);
-            core::ptr::addr_of_mut!((*node).next_direct_packet_number).write(0);
             core::ptr::addr_of_mut!((*node).clock_us).write(0);
             core::ptr::addr_of_mut!((*node).idle_timeout_us).write(DEFAULT_IDLE_TIMEOUT_US);
-            core::ptr::addr_of_mut!((*node).router).write(PacketRouter::new(reset_key));
+            let mut router = PacketRouter::new(reset_key);
+            router.set_max_entries(node_limits.max_routes);
+            core::ptr::addr_of_mut!((*node).router).write(router);
             core::ptr::addr_of_mut!((*node).bearers).write(BearerRegistry::new());
             core::ptr::addr_of_mut!((*node).completions)
                 .write(Arc::new(CompletionQueue::new(pool.capacity().max(1))));
@@ -827,19 +940,19 @@ impl<
                     crate::bearer::tokio::channel(pool.capacity().max(1));
                 core::ptr::addr_of_mut!((*node).ingress_sender).write(ingress_sender);
                 core::ptr::addr_of_mut!((*node).ingress).write(ingress);
-                core::ptr::addr_of_mut!((*node).stream_chunks).write(
-                    std::collections::VecDeque::with_capacity(
-                        ASSOCIATIONS.saturating_mul(SERVER_STREAMS).max(1),
-                    ),
-                );
+                core::ptr::addr_of_mut!((*node).stream_chunks)
+                    .write(std::collections::VecDeque::new());
                 core::ptr::addr_of_mut!((*node).stream_chunk_limit)
-                    .write(ASSOCIATIONS.saturating_mul(SERVER_STREAMS).max(1));
+                    .write(association_limits.max_queued_chunks_per_stream);
+                core::ptr::addr_of_mut!((*node).deferred_streams).write(Vec::new());
                 core::ptr::addr_of_mut!((*node).packet_capture)
                     .write(crate::tokio::PacketCapture::from_env());
             }
-            core::ptr::addr_of_mut!((*node).pending_controls)
-                .write(VecDeque::with_capacity(ASSOCIATIONS.max(1)));
+            core::ptr::addr_of_mut!((*node).pending_controls).write(VecDeque::new());
             core::ptr::addr_of_mut!((*node).association_events).write(VecDeque::new());
+            core::ptr::addr_of_mut!((*node).dropped_association_events).write(0);
+            core::ptr::addr_of_mut!((*node).node_limits).write(node_limits);
+            core::ptr::addr_of_mut!((*node).default_association_limits).write(association_limits);
             storage.assume_init_mut()
         }
     }
@@ -852,6 +965,112 @@ impl<
     /// pool as it moves through ingress, forwarding, egress, and completion.
     pub(crate) fn acquire_packet_writer(&self, headroom: usize) -> Option<P::Writer> {
         self.pool.acquire_writer(headroom, 0)
+    }
+
+    /// Replace node-wide runtime admission limits. Lower values do not evict
+    /// active associations or routes; they only stop later admission until
+    /// usage falls below the new ceiling.
+    pub fn set_limits(&mut self, limits: NodeLimits) -> Result<(), QuicNodeError> {
+        if limits.max_associations == 0
+            || limits.max_associations > u32::MAX as usize
+            || limits.max_routes == 0
+        {
+            return Err(QuicNodeError::InvalidLimits);
+        }
+        self.router.set_max_entries(limits.max_routes);
+        self.node_limits = limits;
+        Ok(())
+    }
+
+    /// Return the current node-wide runtime limits.
+    pub const fn limits(&self) -> NodeLimits {
+        self.node_limits
+    }
+
+    /// Select defaults for associations admitted after this call.
+    pub fn set_default_association_limits(
+        &mut self,
+        limits: AssociationLimits,
+    ) -> Result<(), QuicNodeError> {
+        if limits.history_packets == 0
+            || limits.max_pending_streams == 0
+            || limits.max_queued_chunks_per_stream == 0
+            || limits.max_buffered_stream_bytes == 0
+            || limits.connection.max_data == 0
+            || limits.connection.max_stream_data == 0
+        {
+            return Err(QuicNodeError::InvalidLimits);
+        }
+        self.default_association_limits = limits;
+        #[cfg(feature = "tokio")]
+        {
+            self.stream_chunk_limit = limits.max_queued_chunks_per_stream;
+        }
+        Ok(())
+    }
+
+    /// Return defaults used for associations admitted after the latest update.
+    pub const fn default_association_limits(&self) -> AssociationLimits {
+        self.default_association_limits
+    }
+
+    /// Change one live association's growth policy. Already advertised peer
+    /// credit and retained retransmissions are preserved; lower values take
+    /// effect as current commitments drain.
+    pub fn set_association_limits(
+        &mut self,
+        association: QuicAssociation,
+        limits: AssociationLimits,
+    ) -> Result<(), QuicNodeEgressError> {
+        if limits.history_packets == 0
+            || limits.max_pending_streams == 0
+            || limits.max_queued_chunks_per_stream == 0
+            || limits.max_buffered_stream_bytes == 0
+            || limits.connection.max_data == 0
+            || limits.connection.max_stream_data == 0
+        {
+            return Err(QuicNodeEgressError::Transport(Error::Invalid));
+        }
+        let slot = self
+            .slot_mut(association)
+            .ok_or(QuicNodeEgressError::Association(
+                QuicNodeError::MissingAssociation,
+            ))?;
+        match &mut slot.state {
+            Association::Client(client) => client
+                .set_runtime_limits(limits)
+                .map_err(QuicNodeEgressError::Transport)?,
+            Association::Server(server) => server
+                .set_runtime_limits(limits)
+                .map_err(QuicNodeEgressError::Transport)?,
+        }
+        slot.client_delivery
+            .set_limits(limits.max_pending_streams, limits.max_buffered_stream_bytes);
+        slot.limits = limits;
+        Ok(())
+    }
+
+    /// Return the live growth policy for one association.
+    pub fn association_limits(&self, association: QuicAssociation) -> Option<AssociationLimits> {
+        Some(self.slot(association)?.limits)
+    }
+
+    #[cfg(feature = "tokio")]
+    pub(crate) fn association_chunk_limits(&self) -> Vec<(QuicAssociation, usize)> {
+        self.associations
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, entry)| {
+                let entry = entry.as_ref()?;
+                Some((
+                    QuicAssociation {
+                        slot: slot as u32,
+                        generation: entry.generation,
+                    },
+                    entry.limits.max_queued_chunks_per_stream,
+                ))
+            })
+            .collect()
     }
 
     /// Current active packet slots managed by this node.
@@ -875,7 +1094,7 @@ impl<
     pub(crate) fn add_client(
         &mut self,
         receive_cid: ConnectionId,
-        association: ClientAssociation<CLIENT_HISTORY, PACKET>,
+        association: ClientAssociation<PACKET>,
     ) -> Result<QuicAssociation, QuicNodeError> {
         self.insert(receive_cid, Association::Client(association))
     }
@@ -883,7 +1102,7 @@ impl<
     pub(crate) fn add_server(
         &mut self,
         receive_cid: ConnectionId,
-        association: ServerStreamConnection<SERVER_STREAMS, SERVER_HISTORY, PACKET>,
+        association: ServerStreamConnection<PACKET>,
     ) -> Result<QuicAssociation, QuicNodeError> {
         self.insert(receive_cid, Association::Server(association))
     }
@@ -891,16 +1110,16 @@ impl<
     fn insert(
         &mut self,
         receive_cid: ConnectionId,
-        state: Association<
-            ClientAssociation<CLIENT_HISTORY, PACKET>,
-            ServerStreamConnection<SERVER_STREAMS, SERVER_HISTORY, PACKET>,
-        >,
+        state: Association<ClientAssociation<PACKET>, ServerStreamConnection<PACKET>>,
     ) -> Result<QuicAssociation, QuicNodeError> {
         let slot = self
             .associations
             .iter()
             .position(Option::is_none)
-            .or_else(|| (self.associations.len() < ASSOCIATIONS).then_some(self.associations.len()))
+            .or_else(|| {
+                (self.associations.len() < self.node_limits.max_associations)
+                    .then_some(self.associations.len())
+            })
             .ok_or(QuicNodeError::AssociationTableFull)?;
         if slot == self.generations.len() {
             self.generations
@@ -912,7 +1131,7 @@ impl<
             .checked_add(1)
             .expect("association generation exhausted");
         let id = QuicAssociation {
-            slot: slot as u16,
+            slot: slot as u32,
             generation,
         };
         self.router.register_endpoint(receive_cid, id)?;
@@ -934,9 +1153,10 @@ impl<
             close_code: None,
             last_activity_us: self.clock_us,
             client_delivery: crate::callback::CallbackStreams::new(
-                crate::DEFAULT_STREAM_STATE_LIMIT,
-                client_retention,
+                self.default_association_limits.max_pending_streams,
+                client_retention.min(self.default_association_limits.max_buffered_stream_bytes),
             ),
+            limits: self.default_association_limits,
         });
         if slot == self.associations.len() {
             self.associations.push(entry);
@@ -949,7 +1169,7 @@ impl<
     pub(crate) fn register_forward(
         &mut self,
         receive_cid: ConnectionId,
-        rule: ForwardRule<NextHop>,
+        rule: ForwardRule<u32>,
     ) -> Result<(), QuicNodeError> {
         self.router.register_forward(receive_cid, rule)?;
         Ok(())
@@ -960,7 +1180,7 @@ impl<
     }
 
     #[cfg(test)]
-    fn client(&self, id: QuicAssociation) -> Option<&ClientAssociation<CLIENT_HISTORY, PACKET>> {
+    fn client(&self, id: QuicAssociation) -> Option<&ClientAssociation<PACKET>> {
         match &self.slot(id)?.state {
             Association::Client(client) => Some(client),
             Association::Server(_) => None,
@@ -968,10 +1188,7 @@ impl<
     }
 
     #[cfg(test)]
-    fn server(
-        &self,
-        id: QuicAssociation,
-    ) -> Option<&ServerStreamConnection<SERVER_STREAMS, SERVER_HISTORY, PACKET>> {
+    fn server(&self, id: QuicAssociation) -> Option<&ServerStreamConnection<PACKET>> {
         match &self.slot(id)?.state {
             Association::Server(server) => Some(server),
             Association::Client(_) => None,
@@ -1011,7 +1228,7 @@ impl<
     pub(crate) fn remove_client(
         &mut self,
         id: QuicAssociation,
-    ) -> Result<ClientAssociation<CLIENT_HISTORY, PACKET>, QuicNodeError> {
+    ) -> Result<ClientAssociation<PACKET>, QuicNodeError> {
         if !matches!(
             self.slot(id).map(|slot| &slot.state),
             Some(Association::Client(_))
@@ -1032,7 +1249,7 @@ impl<
     fn remove_server(
         &mut self,
         id: QuicAssociation,
-    ) -> Result<ServerStreamConnection<SERVER_STREAMS, SERVER_HISTORY, PACKET>, QuicNodeError> {
+    ) -> Result<ServerStreamConnection<PACKET>, QuicNodeError> {
         if !matches!(
             self.slot(id).map(|slot| &slot.state),
             Some(Association::Server(_))
@@ -1052,13 +1269,8 @@ impl<
     fn remove(
         &mut self,
         id: QuicAssociation,
-    ) -> Result<
-        Association<
-            ClientAssociation<CLIENT_HISTORY, PACKET>,
-            ServerStreamConnection<SERVER_STREAMS, SERVER_HISTORY, PACKET>,
-        >,
-        QuicNodeError,
-    > {
+    ) -> Result<Association<ClientAssociation<PACKET>, ServerStreamConnection<PACKET>>, QuicNodeError>
+    {
         let slot = self
             .slot_index(id)
             .ok_or(QuicNodeError::MissingAssociation)?;
@@ -1083,7 +1295,20 @@ impl<
 
     /// Take the next terminal association lifecycle event.
     pub fn next_association_event(&mut self) -> Option<AssociationEvent> {
+        if self.dropped_association_events != 0 {
+            let count = core::mem::take(&mut self.dropped_association_events);
+            return Some(AssociationEvent::EventsDropped { count });
+        }
         self.association_events.pop_front()
+    }
+
+    fn push_association_event(&mut self, event: AssociationEvent) {
+        let capacity = self.node_limits.max_associations.max(1);
+        if self.association_events.len() >= capacity {
+            self.association_events.pop_front();
+            self.dropped_association_events = self.dropped_association_events.saturating_add(1);
+        }
+        self.association_events.push_back(event);
     }
 
     /// Set the inactivity deadline applied to every live association.
@@ -1104,8 +1329,12 @@ impl<
         })
     }
 
+    pub(crate) fn contains_association(&self, id: QuicAssociation) -> bool {
+        self.slot(id).is_some()
+    }
+
     pub(crate) fn allocate_local_cid(&mut self) -> Result<ConnectionId, QuicNodeError> {
-        for _ in 0..=ASSOCIATIONS {
+        for _ in 0..=self.node_limits.max_associations {
             let value = self.next_local_cid;
             self.next_local_cid = self.next_local_cid.saturating_add(1).max(1);
             let cid = ConnectionId::new(value).expect("node CID counter stays in range");
@@ -1119,24 +1348,15 @@ impl<
     fn slot(
         &self,
         id: QuicAssociation,
-    ) -> Option<
-        &AssociationSlot<
-            ClientAssociation<CLIENT_HISTORY, PACKET>,
-            ServerStreamConnection<SERVER_STREAMS, SERVER_HISTORY, PACKET>,
-        >,
-    > {
+    ) -> Option<&AssociationSlot<ClientAssociation<PACKET>, ServerStreamConnection<PACKET>>> {
         self.associations.get(self.slot_index(id)?)?.as_ref()
     }
 
     fn slot_mut(
         &mut self,
         id: QuicAssociation,
-    ) -> Option<
-        &mut AssociationSlot<
-            ClientAssociation<CLIENT_HISTORY, PACKET>,
-            ServerStreamConnection<SERVER_STREAMS, SERVER_HISTORY, PACKET>,
-        >,
-    > {
+    ) -> Option<&mut AssociationSlot<ClientAssociation<PACKET>, ServerStreamConnection<PACKET>>>
+    {
         let slot = self.slot_index(id)?;
         self.associations.get_mut(slot)?.as_mut()
     }
@@ -1173,16 +1393,7 @@ impl<
     }
 }
 
-impl<
-    NextHop,
-    const CLIENT_HISTORY: usize,
-    const SERVER_STREAMS: usize,
-    const SERVER_HISTORY: usize,
-    const PACKET: usize,
-    const ASSOCIATIONS: usize,
-    const ROUTES: usize,
-    P,
-> QuicNode<NextHop, ASSOCIATIONS, ROUTES, P, CLIENT_HISTORY, SERVER_STREAMS, SERVER_HISTORY, PACKET>
+impl<P, const PACKET: usize> QuicNode<P, PACKET>
 where
     P: PacketPool,
 {
@@ -1280,7 +1491,12 @@ where
         address: PacketMeta,
         now: u64,
     ) -> Result<NodeEgress<P::Buffer>, QuicNodeEgressError> {
-        let mut client = ClientAssociation::new(receive_cid);
+        let limits = self.default_association_limits;
+        let mut client = ClientAssociation::with_runtime_limits(
+            receive_cid,
+            limits.connection,
+            limits.history_packets,
+        );
         if let Some(token) = self.router.reset_token_for(receive_cid) {
             client.connection_mut().set_local_reset_token(token);
         }
@@ -1317,14 +1533,18 @@ where
         let mut server = None;
         let reset_token = self.router.reset_token_for(server_cid);
         let response = Self::build_packet(self.pool, |output| {
-            let (accepted, used) =
-                ServerStreamConnection::accept_open_with_limits_and_reset_token_into(
-                    packet,
-                    server_cid,
-                    local_limits,
-                    reset_token,
-                    output,
-                )?;
+            let (accepted, used) = ServerStreamConnection::accept_open_with_config_into(
+                packet,
+                server_cid,
+                local_limits,
+                ServerStreamConfig {
+                    history_packets: self.default_association_limits.history_packets,
+                    max_pending_streams: self.default_association_limits.max_pending_streams,
+                    max_stream_bytes: self.default_association_limits.max_buffered_stream_bytes,
+                },
+                reset_token,
+                output,
+            )?;
             server = Some(accepted);
             Ok(used)
         })?;
@@ -1367,31 +1587,7 @@ where
             id,
             send_offset: 0,
             send_finished: false,
-            direct_buffer: Vec::new(),
         })
-    }
-
-    pub(crate) fn open_direct_stream(&mut self, address: PacketMeta) -> QuicStream {
-        let packet_number = self.next_direct_packet_number;
-        self.next_direct_packet_number = self.next_direct_packet_number.wrapping_add(2);
-        QuicStream::direct(
-            DirectReply {
-                meta: address,
-                packet_number: packet_number.wrapping_sub(1),
-            },
-            crate::callback::DIRECT_MESSAGE_STREAM_ID,
-        )
-    }
-
-    /// Create a stream-shaped handle for one pre-association message.
-    ///
-    /// Its first write must contain the complete payload and FIN because the
-    /// pre-handshake representation occupies one long-header packet. A peer
-    /// receives it through the same stream callback or runtime adapter used by
-    /// established streams, so application handlers do not inspect packet
-    /// form.
-    pub fn open_message(&mut self, address: PacketMeta) -> QuicStream {
-        self.open_direct_stream(address)
     }
 
     /// Submit one ordered stream chunk through the stream's selected bearer.
@@ -1410,15 +1606,6 @@ where
         P::Buffer: Send,
     {
         self.drain_bearer_events();
-        if let StreamOwner::Direct(reply) = stream.owner() {
-            if !stream.can_send_direct() || !fin || bytes.is_empty() {
-                return Err(QuicNodeEgressError::Transport(Error::Invalid));
-            }
-            let packet = self.respond_direct_to(reply, bytes)?;
-            self.submit_unassociated_packet(packet)?;
-            stream.finish_direct_send(bytes.len());
-            return Ok(());
-        }
         let association = stream
             .association()
             .ok_or(QuicNodeEgressError::Transport(Error::Invalid))?;
@@ -1451,22 +1638,22 @@ where
         if bytes.is_empty() {
             return Ok(0);
         }
+        self.write_stream_chunk(stream, bytes, false)
+    }
+
+    /// Send the largest prefix of non-empty `bytes` that fits one packet and
+    /// the send window. FIN is set only when `finish` and the whole slice fit.
+    fn write_stream_chunk(
+        &mut self,
+        stream: &mut QuicStream,
+        bytes: &[u8],
+        finish: bool,
+    ) -> Result<usize, QuicNodeEgressError>
+    where
+        P::Buffer: Send,
+    {
         if stream.send_finished {
             return Err(QuicNodeEgressError::Transport(Error::Invalid));
-        }
-        if stream.is_direct() {
-            let remaining =
-                crate::DEFAULT_MAX_STREAM_PAYLOAD.saturating_sub(stream.direct_buffer.len());
-            let count = remaining.min(bytes.len());
-            if count == 0 {
-                return Err(QuicNodeEgressError::Transport(Error::Blocked));
-            }
-            stream
-                .direct_buffer
-                .try_reserve(count)
-                .map_err(|_| QuicNodeEgressError::PoolUnavailable)?;
-            stream.direct_buffer.extend_from_slice(&bytes[..count]);
-            return Ok(count);
         }
         let window = self.stream_send_window(stream)?;
         let count = bytes
@@ -1476,8 +1663,28 @@ where
         if count == 0 {
             return Err(QuicNodeEgressError::Transport(Error::Blocked));
         }
-        self.write_stream_packet(stream, &bytes[..count], false)?;
+        self.write_stream_packet(stream, &bytes[..count], finish && count == bytes.len())?;
         Ok(count)
+    }
+
+    /// Accept as much of the final application byte slice as fits one packet
+    /// and the peer's current flow-control window. When the complete slice is
+    /// accepted, its packet also carries FIN. If only a prefix is accepted,
+    /// the stream remains open and the caller retries the unchanged suffix
+    /// after progress. An empty slice sends a standalone FIN.
+    pub fn write_stream_and_finish(
+        &mut self,
+        stream: &mut QuicStream,
+        bytes: &[u8],
+    ) -> Result<usize, QuicNodeEgressError>
+    where
+        P::Buffer: Send,
+    {
+        if bytes.is_empty() {
+            self.finish_stream(stream)?;
+            return Ok(0);
+        }
+        self.write_stream_chunk(stream, bytes, true)
     }
 
     /// Close the stream's sending half after all accepted bytes.
@@ -1488,32 +1695,13 @@ where
         if stream.send_finished {
             return Ok(());
         }
-        if stream.is_direct() {
-            if stream.direct_buffer.is_empty() {
-                return Err(QuicNodeEgressError::Transport(Error::Invalid));
-            }
-            let bytes = core::mem::take(&mut stream.direct_buffer);
-            match self.write_stream_packet(stream, &bytes, true) {
-                Ok(()) => Ok(()),
-                Err(error) => {
-                    stream.direct_buffer = bytes;
-                    Err(error)
-                }
-            }
-        } else {
-            self.write_stream_packet(stream, &[], true)
-        }
+        self.write_stream_packet(stream, &[], true)
     }
 
     /// Peer-advertised byte credit at the stream's current ordered position.
     pub fn stream_send_window(&self, stream: &QuicStream) -> Result<u64, QuicNodeEgressError> {
-        match stream.owner {
-            StreamOwner::Association(association) => {
-                self.stream_flow_control_window(association, stream.id, stream.send_offset)
-            }
-            StreamOwner::Direct(_) if stream.send_finished => Ok(0),
-            StreamOwner::Direct(_) => Ok(crate::DEFAULT_MAX_STREAM_PAYLOAD as u64),
-        }
+        let StreamOwner::Association(association) = stream.owner;
+        self.stream_flow_control_window(association, stream.id, stream.send_offset)
     }
 
     /// Write one ordered chunk and return the packet which carries it.
@@ -1754,7 +1942,6 @@ where
     pub(crate) fn timer_expired(
         &mut self,
         now: u64,
-        pto: u64,
     ) -> Result<Option<NodeTimer<P::Buffer>>, QuicNodeEgressError> {
         if let Some((slot_index, _)) = self
             .associations
@@ -1773,12 +1960,11 @@ where
                 .as_ref()
                 .expect("selected association remains installed");
             let association = QuicAssociation {
-                slot: slot_index as u16,
+                slot: slot_index as u32,
                 generation: slot.generation,
             };
             self.remove(association)?;
-            self.association_events
-                .push_back(AssociationEvent::IdleTimeout { association });
+            self.push_association_event(AssociationEvent::IdleTimeout { association });
             return Ok(Some(NodeTimer::IdleTimedOut { association }));
         }
         let slot_index = self
@@ -1789,10 +1975,16 @@ where
                 let slot = slot.as_ref()?;
                 let deadline = slot.bootstrap.map_or_else(
                     || match &slot.state {
-                        Association::Client(client) => client.next_bearer_deadline(pto),
-                        Association::Server(server) => server.next_bearer_deadline(pto),
+                        Association::Client(client) => client.next_bearer_deadline(),
+                        Association::Server(server) => server.next_bearer_deadline(),
                     },
-                    |bootstrap| Some(bootstrap.last_attempt_at.saturating_add(pto.max(1))),
+                    |bootstrap| {
+                        Some(
+                            bootstrap
+                                .last_attempt_at
+                                .saturating_add(DEFAULT_INITIAL_PTO_US),
+                        )
+                    },
                 )?;
                 (deadline <= now).then_some((index, deadline))
             })
@@ -1806,7 +1998,7 @@ where
                 .as_ref()
                 .expect("selected association remains installed");
             QuicAssociation {
-                slot: slot_index as u16,
+                slot: slot_index as u32,
                 generation: slot.generation,
             }
         };
@@ -1816,6 +2008,7 @@ where
         {
             if bootstrap.next_attempt >= CLIENT_BOOTSTRAP_ATTEMPTS {
                 self.remove_client(association)?;
+                self.push_association_event(AssociationEvent::SetupTimeout { association });
                 return Ok(Some(NodeTimer::BootstrapTimedOut { association }));
             }
             let slot = self.associations[slot_index]
@@ -1849,12 +2042,12 @@ where
             .active_address
             .ok_or(QuicNodeEgressError::MissingEgressAddress)?;
         let packet = match &mut slot.state {
-            Association::Client(client) => Self::build_optional_packet(self.pool, |output| {
-                client.poll_timer(now, pto, output)
-            })?,
-            Association::Server(server) => Self::build_optional_packet(self.pool, |output| {
-                server.poll_timer(now, pto, output)
-            })?,
+            Association::Client(client) => {
+                Self::build_optional_packet(self.pool, |output| client.poll_timer(now, output))?
+            }
+            Association::Server(server) => {
+                Self::build_optional_packet(self.pool, |output| server.poll_timer(now, output))?
+            }
         };
         Ok(packet.map(|packet| {
             NodeTimer::Egress(NodeEgress {
@@ -1876,18 +2069,16 @@ where
     /// each stream. Today QUIC-lite retains ranges received behind a gap and
     /// calls the handler only when the missing prefix arrives. A future
     /// explicitly selected mode may permit out-of-order callbacks; it will not
-    /// change this ordered default silently. Direct messages are delivered as
-    /// one `Direct` chunk at offset zero with `fin == true`.
+    /// change this ordered default silently.
     pub(crate) fn receive_packet<B, Admit, StreamEvent>(
         &mut self,
         meta: PacketMeta,
         packet: OwnedPacket<B>,
         mut admit_initial: Admit,
         mut on_stream: StreamEvent,
-    ) -> Result<NodeIngress<B, P::Buffer, NextHop>, RejectedNodePacket<B>>
+    ) -> Result<NodeIngress<B, P::Buffer, u32>, RejectedNodePacket<B>>
     where
         B: AsRef<[u8]>,
-        NextHop: Copy,
         Admit: FnMut(crate::BootstrapOpen) -> Option<InitialAdmission>,
         StreamEvent:
             FnMut(ApplicationStreamSource, u64, u64, bool, &[u8]) -> Result<usize, crate::Error>,
@@ -1924,8 +2115,7 @@ where
                 // Retire the association regardless of which bearer carried
                 // the reset; bearer state is only path state.
                 let _ = self.remove(id);
-                self.association_events
-                    .push_back(AssociationEvent::Reset { association: id });
+                self.push_association_event(AssociationEvent::Reset { association: id });
                 return Ok(NodeIngress::PeerReset {
                     association: id,
                     packet,
@@ -1934,33 +2124,6 @@ where
         };
 
         match classified {
-            ServerPacket::Direct => {
-                let request = match crate::receive_direct_message_request(bytes) {
-                    Ok(request) => request,
-                    Err(error) => return Ok(NodeIngress::NonQuic { error, packet }),
-                };
-                let start = request.payload().as_ptr() as usize - bytes.as_ptr() as usize;
-                let end = start + request.payload().len();
-                let packet_number = request.packet_number;
-                if let Err(error) = on_stream(
-                    ApplicationStreamSource::Direct,
-                    crate::callback::DIRECT_MESSAGE_STREAM_ID,
-                    0,
-                    true,
-                    request.payload(),
-                ) {
-                    return Err(RejectedNodePacket {
-                        reason: QuicNodePacketRejection::Application(error),
-                        packet,
-                    });
-                }
-                Ok(NodeIngress::Direct(DirectNodeIngress {
-                    meta,
-                    packet,
-                    payload: start..end,
-                    packet_number,
-                }))
-            }
             ServerPacket::Initial(open) => {
                 let replay = self
                     .associations
@@ -1974,7 +2137,7 @@ where
                             {
                                 Some((
                                     QuicAssociation {
-                                        slot: index as u16,
+                                        slot: index as u32,
                                         generation: slot.generation,
                                     },
                                     server,
@@ -2010,18 +2173,42 @@ where
                 let Some(admission) = admit_initial(open) else {
                     return Ok(NodeIngress::InitialDeclined { packet });
                 };
-                let response = match self.accept_initial(
-                    meta,
-                    bytes,
-                    admission.server_cid,
-                    admission.local_limits,
-                ) {
-                    Ok(response) => response,
+                // Allocate only after the validated Initial has passed
+                // application admission. The current bootstrap wire contract
+                // requires distinct numeric client and server CIDs, so a fresh
+                // symmetric peer may require one additional allocation here.
+                let mut server_cid = match self.allocate_local_cid() {
+                    Ok(cid) => cid,
                     Err(error) => {
-                        let reason = QuicNodePacketRejection::Egress(error);
-                        return Err(RejectedNodePacket { reason, packet });
+                        return Err(RejectedNodePacket {
+                            reason: QuicNodePacketRejection::Egress(
+                                QuicNodeEgressError::Association(error),
+                            ),
+                            packet,
+                        });
                     }
                 };
+                if server_cid == open.client_receive_cid {
+                    server_cid = match self.allocate_local_cid() {
+                        Ok(cid) => cid,
+                        Err(error) => {
+                            return Err(RejectedNodePacket {
+                                reason: QuicNodePacketRejection::Egress(
+                                    QuicNodeEgressError::Association(error),
+                                ),
+                                packet,
+                            });
+                        }
+                    };
+                }
+                let response =
+                    match self.accept_initial(meta, bytes, server_cid, admission.local_limits) {
+                        Ok(response) => response,
+                        Err(error) => {
+                            let reason = QuicNodePacketRejection::Egress(error);
+                            return Err(RejectedNodePacket { reason, packet });
+                        }
+                    };
                 Ok(NodeIngress::Initial {
                     association: response.association,
                     response: NodePacket {
@@ -2053,15 +2240,16 @@ where
                             }),
                             Err(QuicNodePacketRejection::Packet(Error::PeerRestarted)) => {
                                 let _ = self.remove(id);
-                                self.association_events
-                                    .push_back(AssociationEvent::Reset { association: id });
+                                self.push_association_event(AssociationEvent::Reset {
+                                    association: id,
+                                });
                                 Ok(NodeIngress::PeerReset {
                                     association: id,
                                     packet,
                                 })
                             }
                             Err(QuicNodePacketRejection::PeerClosed(code)) => {
-                                self.association_events.push_back(AssociationEvent::Closed {
+                                self.push_association_event(AssociationEvent::Closed {
                                     association: id,
                                     code,
                                 });
@@ -2126,32 +2314,6 @@ where
         }
     }
 
-    pub(crate) fn respond_direct<B>(
-        &mut self,
-        request: DirectNodeIngress<B>,
-        payload: &[u8],
-    ) -> Result<NodePacket<P::Buffer>, QuicNodeEgressError>
-    where
-        B: AsRef<[u8]>,
-    {
-        self.respond_direct_to(request.reply(), payload)
-    }
-
-    pub(crate) fn respond_direct_to(
-        &mut self,
-        reply: DirectReply,
-        payload: &[u8],
-    ) -> Result<NodePacket<P::Buffer>, QuicNodeEgressError> {
-        let packet = Self::build_packet(self.pool, |output| {
-            crate::encode_direct_packet(reply.packet_number.wrapping_add(1), payload, output)
-        })?;
-        Ok(NodePacket {
-            bearer: reply.meta.bearer,
-            peer_l2_address: reply.meta.peer_l2_address,
-            packet,
-        })
-    }
-
     fn receive_association_bytes<StreamEvent>(
         &mut self,
         id: QuicAssociation,
@@ -2194,32 +2356,34 @@ where
                         .receive_stream_payload_packet(meta, bytes)
                         .map_err(QuicNodePacketRejection::Packet)?
                     {
-                        let mut sink = OrderedNodeSink {
-                            association: id,
-                            handler: on_stream,
-                            consumed: 0,
-                        };
-                        slot.client_delivery
-                            .receive_copying_borrowed(
-                                payload.stream_id,
-                                payload.data,
-                                payload.offset,
-                                payload.fin,
-                                || Arc::new(payload.data.to_vec()),
-                                &mut sink,
-                            )
-                            .map_err(|error| match error {
-                                crate::callback::CopyingError::Transport(_) => {
-                                    QuicNodePacketRejection::Packet(Error::Invalid)
-                                }
-                                crate::callback::CopyingError::Callback(error) => {
-                                    QuicNodePacketRejection::Application(error)
-                                }
-                            })?;
-                        if sink.consumed != 0 {
-                            client
-                                .stream_consumed(payload.stream_id, sink.consumed, false)
-                                .map_err(QuicNodePacketRejection::Packet)?;
+                        if !payload.delivery_complete_before_packet {
+                            let mut sink = OrderedNodeSink {
+                                association: id,
+                                handler: on_stream,
+                                consumed: 0,
+                            };
+                            slot.client_delivery
+                                .receive_copying_borrowed(
+                                    payload.stream_id,
+                                    payload.data,
+                                    payload.offset,
+                                    payload.fin,
+                                    || Arc::new(payload.data.to_vec()),
+                                    &mut sink,
+                                )
+                                .map_err(|error| match error {
+                                    crate::callback::CopyingError::Transport(_) => {
+                                        QuicNodePacketRejection::Packet(Error::Invalid)
+                                    }
+                                    crate::callback::CopyingError::Callback(error) => {
+                                        QuicNodePacketRejection::Application(error)
+                                    }
+                                })?;
+                            if sink.consumed != 0 {
+                                client
+                                    .stream_consumed(payload.stream_id, sink.consumed, false)
+                                    .map_err(QuicNodePacketRejection::Packet)?;
+                            }
                         }
                     }
                     AssociationIngress::Client(id)
@@ -2335,17 +2499,21 @@ where
     /// Earliest Initial retry, ACK, loss, or PTO deadline across the node.
     /// The platform arms its native timer for this value and does not maintain
     /// a second per-transport retry schedule.
-    pub(crate) fn next_deadline(&self, pto: u64) -> Option<u64> {
+    pub(crate) fn next_deadline(&self) -> Option<u64> {
         self.associations
             .iter()
             .flatten()
             .filter_map(|slot| {
                 let idle = slot.last_activity_us.saturating_add(self.idle_timeout_us);
                 let transport = match slot.bootstrap {
-                    Some(bootstrap) => Some(bootstrap.last_attempt_at.saturating_add(pto.max(1))),
+                    Some(bootstrap) => Some(
+                        bootstrap
+                            .last_attempt_at
+                            .saturating_add(DEFAULT_INITIAL_PTO_US),
+                    ),
                     None => match &slot.state {
-                        Association::Client(client) => client.next_bearer_deadline(pto),
-                        Association::Server(server) => server.next_bearer_deadline(pto),
+                        Association::Client(client) => client.next_bearer_deadline(),
+                        Association::Server(server) => server.next_bearer_deadline(),
                     },
                 };
                 Some(transport.map_or(idle, |deadline| deadline.min(idle)))
@@ -2379,6 +2547,70 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn established_ingress_does_not_consume_server_connection_ids() {
+        const PACKET: usize = 256;
+        const SLOT: usize = PACKET_PREFIX_RESERVE + PACKET + PACKET_SUFFIX_RESERVE;
+        type Pool = crate::packet_pool::PacketPool<2, SLOT>;
+        type Node = QuicNode<Pool, PACKET>;
+        static POOL: Pool = Pool::new();
+
+        let mut node = Node::new(None, &POOL);
+        for client_cid in [cid(0x31), cid(0x32)] {
+            if client_cid == cid(0x32) {
+                for packet_number in 0..1_000_u32 {
+                    let mut bytes = [0u8; PACKET];
+                    let used = ShortHeader {
+                        flags: FLAG_FIXED,
+                        dcid: cid(1),
+                        packet_number,
+                        packet_number_len: 2,
+                    }
+                    .encode(&mut bytes)
+                    .unwrap();
+                    let used = used + crate::Frame::Ping.encode(&mut bytes[used..]).unwrap();
+                    let ingress = node
+                        .receive_packet(
+                            ingress_meta(),
+                            OwnedPacket::new(bytes, 0..used).unwrap(),
+                            |_| None,
+                            |_, _, _, _, data| Ok(data.len()),
+                        )
+                        .unwrap();
+                    assert!(matches!(ingress, NodeIngress::Association { .. }));
+                }
+            }
+            let mut bytes = [0u8; PACKET];
+            let used = crate::encode_bootstrap_open_packet(client_cid, 0, &mut bytes).unwrap();
+            let ingress = node
+                .receive_packet(
+                    ingress_meta(),
+                    OwnedPacket::new(bytes, 0..used).unwrap(),
+                    |_| {
+                        Some(InitialAdmission {
+                            local_limits: ConnectionLimits::default(),
+                        })
+                    },
+                    |_, _, _, _, data| Ok(data.len()),
+                )
+                .unwrap();
+            let NodeIngress::Initial {
+                association,
+                response,
+            } = ingress
+            else {
+                panic!("Initial must be admitted");
+            };
+            let expected = if client_cid == cid(0x31) {
+                cid(1)
+            } else {
+                cid(2)
+            };
+            assert_eq!(node.receive_cid(association), Some(expected));
+            drop(response);
+        }
+    }
+
     fn ingress_meta() -> PacketMeta {
         PacketMeta {
             bearer: BearerId::new(1).unwrap(),
@@ -2389,7 +2621,7 @@ mod tests {
 
     #[test]
     fn second_association_spills_storage_to_heap() {
-        let mut node = QuicNode::<(), 2, 2, TestPool>::new(None, &TEST_POOL);
+        let mut node = QuicNode::<TestPool>::new(None, &TEST_POOL);
         assert!(!node.associations.spilled());
 
         node.add_client(cid(1), ClientAssociation::new(cid(1)))
@@ -2403,8 +2635,44 @@ mod tests {
     }
 
     #[test]
+    fn association_event_queue_reports_overflow_without_growing_past_capacity() {
+        let mut node = QuicNode::<TestPool>::new(None, &TEST_POOL);
+        node.set_limits(NodeLimits {
+            max_associations: 2,
+            max_routes: 2,
+        })
+        .unwrap();
+        let association = QuicAssociation {
+            slot: 0,
+            generation: 1,
+        };
+        for code in 1..=3 {
+            node.push_association_event(AssociationEvent::Closed { association, code });
+        }
+        assert_eq!(node.association_events.len(), 2);
+        assert_eq!(
+            node.next_association_event(),
+            Some(AssociationEvent::EventsDropped { count: 1 })
+        );
+        assert_eq!(
+            node.next_association_event(),
+            Some(AssociationEvent::Closed {
+                association,
+                code: 2,
+            })
+        );
+        assert_eq!(
+            node.next_association_event(),
+            Some(AssociationEvent::Closed {
+                association,
+                code: 3,
+            })
+        );
+    }
+
+    #[test]
     fn removing_an_association_invalidates_its_generation_checked_id() {
-        let mut node = QuicNode::<(), 1, 1, TestPool>::new(None, &TEST_POOL);
+        let mut node = QuicNode::<TestPool>::new(None, &TEST_POOL);
         let first = node
             .add_client(cid(1), ClientAssociation::new(cid(1)))
             .unwrap();
@@ -2421,7 +2689,7 @@ mod tests {
 
     #[test]
     fn cid_collision_does_not_install_or_replace_association_state() {
-        let mut node = QuicNode::<(), 2, 2, TestPool>::new(None, &TEST_POOL);
+        let mut node = QuicNode::<TestPool>::new(None, &TEST_POOL);
         let client = node
             .add_client(cid(1), ClientAssociation::new(cid(1)))
             .unwrap();
@@ -2435,7 +2703,7 @@ mod tests {
 
     #[test]
     fn wrong_role_removal_leaves_association_installed() {
-        let mut node = QuicNode::<(), 1, 1, TestPool>::new(None, &TEST_POOL);
+        let mut node = QuicNode::<TestPool>::new(None, &TEST_POOL);
         let client = node
             .add_client(cid(1), ClientAssociation::new(cid(1)))
             .unwrap();
@@ -2449,7 +2717,7 @@ mod tests {
 
     #[test]
     fn bearer_borrows_packet_storage_from_the_node_pool() {
-        let node = QuicNode::<(), 1, 1, TestPool>::new(None, &TEST_POOL);
+        let node = QuicNode::<TestPool>::new(None, &TEST_POOL);
         assert_eq!(node.packet_capacity(), 1);
         let writer = node
             .acquire_packet_writer(PACKET_PREFIX_RESERVE)
@@ -2465,7 +2733,7 @@ mod tests {
         const PACKET: usize = 256;
         const SLOT: usize = PACKET_PREFIX_RESERVE + PACKET + PACKET_SUFFIX_RESERVE;
         type Pool = crate::packet_pool::PacketPool<2, SLOT>;
-        type Node = QuicNode<(), 4, 4, Pool, 8, 4, 8, PACKET>;
+        type Node = QuicNode<Pool, PACKET>;
         static POOL: Pool = Pool::new();
 
         let udp = PacketMeta {
@@ -2479,7 +2747,6 @@ mod tests {
             received_at_us: 20,
         };
         let client_cid = cid(0x31);
-        let server_cid = cid(0x47);
         let mut node = Node::new(None, &POOL);
         let open = node.start_association(client_cid, udp, 0).unwrap();
         let association = open.association;
@@ -2490,7 +2757,6 @@ mod tests {
                 open.packet,
                 |_| {
                     Some(InitialAdmission {
-                        server_cid,
                         local_limits: ConnectionLimits::default(),
                     })
                 },
@@ -2579,7 +2845,7 @@ mod tests {
         const PACKET: usize = 256;
         const SLOT: usize = PACKET_PREFIX_RESERVE + PACKET + PACKET_SUFFIX_RESERVE;
         type Pool = crate::packet_pool::PacketPool<4, SLOT>;
-        type Node = QuicNode<(), 2, 2, Pool, 8, 4, 8, PACKET>;
+        type Node = QuicNode<Pool, PACKET>;
         static POOL: Pool = Pool::new();
 
         let meta = ingress_meta();
@@ -2593,7 +2859,6 @@ mod tests {
                 open.packet,
                 |_| {
                     Some(InitialAdmission {
-                        server_cid: cid(0x72),
                         local_limits: ConnectionLimits::default(),
                     })
                 },
@@ -2674,7 +2939,7 @@ mod tests {
         const PACKET: usize = 256;
         const SLOT: usize = PACKET_PREFIX_RESERVE + PACKET + PACKET_SUFFIX_RESERVE;
         type Pool = crate::packet_pool::PacketPool<2, SLOT>;
-        type Node = QuicNode<(), 4, 4, Pool, 8, 4, 8, PACKET>;
+        type Node = QuicNode<Pool, PACKET>;
         static CLIENT_POOL: Pool = Pool::new();
         static SERVER_POOL: Pool = Pool::new();
 
@@ -2689,7 +2954,6 @@ mod tests {
             received_at_us: 2,
         };
         let client_cid = cid(0x51);
-        let server_cid = cid(0x61);
         let mut client_node = Node::new(None, &CLIENT_POOL);
         let open = client_node
             .start_association(client_cid, client_meta, 0)
@@ -2702,7 +2966,6 @@ mod tests {
                 open.packet,
                 |_| {
                     Some(InitialAdmission {
-                        server_cid,
                         local_limits: ConnectionLimits::default(),
                     })
                 },
@@ -2724,13 +2987,13 @@ mod tests {
                 |_, _, _, _, bytes| Ok(bytes.len()),
             )
             .unwrap();
-        assert!(client_node.next_deadline(100).is_some());
+        assert!(client_node.next_deadline().is_some());
 
         let request = client_node.send_message(client_id, b"request").unwrap();
         assert_eq!(request.packet.prefix_capacity(), PACKET_PREFIX_RESERVE);
         assert!(request.packet.suffix_capacity() >= PACKET_SUFFIX_RESERVE);
-        let deadline = client_node.next_deadline(100).unwrap();
-        let retransmission = match client_node.timer_expired(deadline, 100).unwrap().unwrap() {
+        let deadline = client_node.next_deadline().unwrap();
+        let retransmission = match client_node.timer_expired(deadline).unwrap().unwrap() {
             NodeTimer::Egress(egress) => egress,
             NodeTimer::BootstrapTimedOut { .. } => panic!("established association timed out"),
             NodeTimer::IdleTimedOut { .. } => panic!("established association idled"),
@@ -2917,7 +3180,7 @@ mod tests {
         const PACKET: usize = 256;
         const SLOT: usize = PACKET_PREFIX_RESERVE + PACKET + PACKET_SUFFIX_RESERVE;
         type Pool = crate::packet_pool::PacketPool<1, SLOT>;
-        type Node = QuicNode<(), 2, 2, Pool, 4, 4, 4, PACKET>;
+        type Node = QuicNode<Pool, PACKET>;
         static POOL: Pool = Pool::new();
 
         let meta = PacketMeta {
@@ -2934,17 +3197,18 @@ mod tests {
         assert_eq!(header.packet_number, 0);
         drop(initial);
 
-        assert_eq!(node.next_deadline(100), Some(110));
-        assert!(node.timer_expired(109, 100).unwrap().is_none());
+        let first_deadline = 10 + DEFAULT_INITIAL_PTO_US;
+        assert_eq!(node.next_deadline(), Some(first_deadline));
+        assert!(node.timer_expired(first_deadline - 1).unwrap().is_none());
         let held_slot = POOL.acquire_with(&[0x55]).unwrap();
         assert!(matches!(
-            node.timer_expired(110, 100),
+            node.timer_expired(first_deadline),
             Err(QuicNodeEgressError::PoolUnavailable)
         ));
         drop(held_slot);
         for attempt in 1..CLIENT_BOOTSTRAP_ATTEMPTS {
-            let now = 10 + u64::from(attempt) * 100;
-            let retry = match node.timer_expired(now, 100).unwrap().unwrap() {
+            let now = 10 + u64::from(attempt) * DEFAULT_INITIAL_PTO_US;
+            let retry = match node.timer_expired(now).unwrap().unwrap() {
                 NodeTimer::Egress(egress) => egress,
                 NodeTimer::BootstrapTimedOut { .. } => panic!("attempt must be emitted"),
                 NodeTimer::IdleTimedOut { .. } => panic!("bootstrap association idled"),
@@ -2956,12 +3220,14 @@ mod tests {
                 crate::decode_bootstrap_open_packet_with_limits(retry.packet.bytes()).unwrap();
             assert_eq!(header.packet_number, attempt);
             drop(retry);
-            assert_eq!(node.next_deadline(100), Some(now + 100));
+            assert_eq!(node.next_deadline(), Some(now + DEFAULT_INITIAL_PTO_US));
         }
         assert_eq!(node.association_count(), 1);
 
         assert!(matches!(
-            node.timer_expired(10 + u64::from(CLIENT_BOOTSTRAP_ATTEMPTS) * 100, 100)
+            node.timer_expired(
+                10 + u64::from(CLIENT_BOOTSTRAP_ATTEMPTS) * DEFAULT_INITIAL_PTO_US,
+            )
                 .unwrap(),
             Some(NodeTimer::BootstrapTimedOut { association: timed_out })
                 if timed_out == association
@@ -2969,7 +3235,11 @@ mod tests {
         assert_eq!(node.association_count(), 0);
         assert!(node.client(association).is_none());
         assert_eq!(node.receive_cid(association), None);
-        assert_eq!(node.next_deadline(100), None);
+        assert_eq!(
+            node.next_association_event(),
+            Some(AssociationEvent::SetupTimeout { association })
+        );
+        assert_eq!(node.next_deadline(), None);
     }
 
     #[test]
@@ -2977,7 +3247,7 @@ mod tests {
         const PACKET: usize = 256;
         const SLOT: usize = PACKET_PREFIX_RESERVE + PACKET + PACKET_SUFFIX_RESERVE;
         type Pool = crate::packet_pool::PacketPool<4, SLOT>;
-        type Node = QuicNode<(), 2, 2, Pool, 8, 4, 8, PACKET>;
+        type Node = QuicNode<Pool, PACKET>;
         static POOL: Pool = Pool::new();
 
         let meta = ingress_meta();
@@ -3018,7 +3288,7 @@ mod tests {
         const PACKET: usize = 256;
         const SLOT: usize = PACKET_PREFIX_RESERVE + PACKET + PACKET_SUFFIX_RESERVE;
         type Pool = crate::packet_pool::PacketPool<4, SLOT>;
-        type Node = QuicNode<u8, 4, 5, Pool, 8, 4, 8, PACKET>;
+        type Node = QuicNode<Pool, PACKET>;
         static INPUT_POOL: Pool = Pool::new();
         static OUTPUT_POOL: Pool = Pool::new();
 
@@ -3120,7 +3390,7 @@ mod tests {
         const PACKET: usize = 256;
         const SLOT: usize = PACKET_PREFIX_RESERVE + PACKET + PACKET_SUFFIX_RESERVE;
         type Pool = crate::packet_pool::PacketPool<4, SLOT>;
-        type Node = QuicNode<(), 2, 2, Pool, 8, 4, 8, PACKET>;
+        type Node = QuicNode<Pool, PACKET>;
         static CLIENT_POOL: Pool = Pool::new();
         static SERVER_POOL: Pool = Pool::new();
 
@@ -3137,7 +3407,6 @@ mod tests {
                 initial.packet,
                 |_| {
                     Some(InitialAdmission {
-                        server_cid: cid(0x62),
                         local_limits: crate::ConnectionLimits::default(),
                     })
                 },
@@ -3178,11 +3447,10 @@ mod tests {
         const PACKET: usize = 256;
         const SLOT: usize = PACKET_PREFIX_RESERVE + PACKET + PACKET_SUFFIX_RESERVE;
         type Pool = crate::packet_pool::PacketPool<2, SLOT>;
-        type Node = QuicNode<(), 2, 2, Pool, 8, 4, 8, PACKET>;
+        type Node = QuicNode<Pool, PACKET>;
         static POOL: Pool = Pool::new();
 
         let client_cid = cid(0x61);
-        let server_cid = cid(0x62);
         let mut initial = [0u8; PACKET];
         let initial_len = crate::encode_bootstrap_open_packet(client_cid, 0, &mut initial).unwrap();
         let mut node = Node::new(None, &POOL);
@@ -3192,7 +3460,6 @@ mod tests {
                 OwnedPacket::new(initial, 0..initial_len).unwrap(),
                 |_| {
                     Some(InitialAdmission {
-                        server_cid,
                         local_limits: ConnectionLimits::default(),
                     })
                 },
@@ -3251,5 +3518,35 @@ mod tests {
             })
         ));
         assert_eq!(node.association_count(), 1);
+    }
+
+    #[test]
+    fn runtime_limits_can_grow_past_legacy_type_defaults_and_shrink_without_eviction() {
+        type Pool = crate::packet_pool::PacketPool<1, DEFAULT_PACKET_POOL_SLOT_SIZE>;
+        type Node = QuicNode<Pool>;
+        static POOL: Pool = Pool::new();
+
+        let mut node = Node::new(None, &POOL);
+        node.set_limits(NodeLimits {
+            max_associations: 3,
+            max_routes: 3,
+        })
+        .unwrap();
+        for value in 1..=3 {
+            let id = cid(value);
+            node.add_client(id, ClientAssociation::new(id)).unwrap();
+        }
+        assert_eq!(node.association_count(), 3);
+
+        node.set_limits(NodeLimits {
+            max_associations: 1,
+            max_routes: 1,
+        })
+        .unwrap();
+        assert_eq!(node.association_count(), 3);
+        assert_eq!(
+            node.add_client(cid(4), ClientAssociation::new(cid(4))),
+            Err(QuicNodeError::AssociationTableFull)
+        );
     }
 }

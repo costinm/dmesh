@@ -22,7 +22,7 @@ use std::{
 use ::tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use ::tokio::sync::{mpsc, oneshot};
 
-use crate::bearer::{AddBearerError, PacketBearer};
+use crate::bearer::{AddBearerError, PacketBearer, ReceivedPacket};
 use crate::{
     BearerId, PacketPool, QuicAssociation, QuicNode, QuicNodeEgressError, QuicStream,
     ReceivedStreamChunk,
@@ -402,25 +402,10 @@ struct PendingOpen {
 
 /// The single Tokio task which owns and advances one [`QuicNode`].
 pub struct TokioNodeDriver<
-    NextHop,
-    const ASSOCIATIONS: usize,
-    const ROUTES: usize,
     P: PacketPool + 'static,
-    const CLIENT_HISTORY: usize = 8,
-    const SERVER_STREAMS: usize = 8,
-    const SERVER_HISTORY: usize = 8,
     const PACKET: usize = { crate::DEFAULT_MAX_PACKET_SIZE },
 > {
-    node: QuicNode<
-        NextHop,
-        ASSOCIATIONS,
-        ROUTES,
-        P,
-        CLIENT_HISTORY,
-        SERVER_STREAMS,
-        SERVER_HISTORY,
-        PACKET,
-    >,
+    node: QuicNode<P, PACKET>,
     limits: crate::ConnectionLimits,
     commands: mpsc::UnboundedReceiver<DriverCommand>,
     command_sender: mpsc::UnboundedSender<DriverCommand>,
@@ -437,49 +422,19 @@ pub struct TokioNodeDriver<
         QuicAssociation,
         oneshot::Sender<Result<(), QuicNodeEgressError>>,
     )>,
+    closing_associations: Vec<QuicAssociation>,
 }
 
-impl<
-    NextHop,
-    const ASSOCIATIONS: usize,
-    const ROUTES: usize,
-    P,
-    const CLIENT_HISTORY: usize,
-    const SERVER_STREAMS: usize,
-    const SERVER_HISTORY: usize,
-    const PACKET: usize,
->
-    TokioNodeDriver<
-        NextHop,
-        ASSOCIATIONS,
-        ROUTES,
-        P,
-        CLIENT_HISTORY,
-        SERVER_STREAMS,
-        SERVER_HISTORY,
-        PACKET,
-    >
+impl<P, const PACKET: usize> TokioNodeDriver<P, PACKET>
 where
-    NextHop: Copy,
     P: PacketPool + 'static,
     P::Buffer: Send,
 {
     /// Transfer a fully configured node to its sole Tokio driver.
-    pub fn new(
-        node: QuicNode<
-            NextHop,
-            ASSOCIATIONS,
-            ROUTES,
-            P,
-            CLIENT_HISTORY,
-            SERVER_STREAMS,
-            SERVER_HISTORY,
-            PACKET,
-        >,
-        limits: crate::ConnectionLimits,
-    ) -> (TokioNode, Self) {
+    pub fn new(node: QuicNode<P, PACKET>, limits: crate::ConnectionLimits) -> (TokioNode, Self) {
         let (commands, receiver) = mpsc::unbounded_channel();
-        let (accepted, incoming) = mpsc::channel(SERVER_STREAMS.max(1));
+        let (accepted, incoming) =
+            mpsc::channel(node.default_association_limits().max_pending_streams.max(1));
         let (event_sender, events) = mpsc::unbounded_channel();
         let handle = TokioNode {
             commands: commands.clone(),
@@ -500,6 +455,7 @@ where
                 pending_writes: Vec::new(),
                 pending_opens: Vec::new(),
                 finish_waiters: Vec::new(),
+                closing_associations: Vec::new(),
             },
         )
     }
@@ -507,21 +463,12 @@ where
     /// Run until every command handle has been dropped or the node fails.
     pub async fn run(mut self) -> Result<(), QuicNodeEgressError> {
         loop {
-            while let Some(event) = self.node.next_association_event() {
-                let _ = self.event_sender.send(event);
-            }
-            let blocked = self.dispatch_stream_chunks();
+            self.dispatch_stream_chunks();
+            self.dispatch_association_events();
             self.resolve_establishment_waiters();
             self.retry_pending_opens();
             self.retry_pending_writes();
             self.retry_finishes();
-            if blocked {
-                let Some(command) = self.commands.recv().await else {
-                    return Ok(());
-                };
-                self.handle_command(command)?;
-                continue;
-            }
             ::tokio::select! {
                 command = self.commands.recv() => {
                     let Some(command) = command else { return Ok(()); };
@@ -533,6 +480,57 @@ where
                     event?;
                 }
             }
+        }
+    }
+
+    fn dispatch_association_events(&mut self) {
+        while let Some(event) = self.node.next_association_event() {
+            if matches!(event, crate::AssociationEvent::EventsDropped { .. }) {
+                self.routes.retain(|route| match route.owner {
+                    crate::node::StreamOwner::Association(association) => {
+                        self.node.contains_association(association)
+                    }
+                });
+                let _ = self.event_sender.send(event);
+                continue;
+            }
+            let association = match event {
+                crate::AssociationEvent::Closed { association, .. }
+                | crate::AssociationEvent::Reset { association }
+                | crate::AssociationEvent::IdleTimeout { association }
+                | crate::AssociationEvent::SetupTimeout { association } => association,
+                crate::AssociationEvent::EventsDropped { .. } => unreachable!(),
+            };
+            if matches!(event, crate::AssociationEvent::Closed { .. }) {
+                if !self.closing_associations.contains(&association) {
+                    self.closing_associations.push(association);
+                }
+                self.node
+                    .deferred_streams
+                    .retain(|(owner, _)| *owner != association);
+                let _ = self.event_sender.send(event);
+                continue;
+            }
+            self.routes
+                .retain(|route| route.owner != crate::node::StreamOwner::Association(association));
+            self.node
+                .stream_chunks
+                .retain(|chunk| chunk.owner != crate::node::StreamOwner::Association(association));
+            self.node
+                .deferred_streams
+                .retain(|(owner, _)| *owner != association);
+            if matches!(event, crate::AssociationEvent::SetupTimeout { .. }) {
+                let mut pending = Vec::new();
+                for (waiting, reply) in self.establishment_waiters.drain(..) {
+                    if waiting == association {
+                        let _ = reply.send(Err(QuicNodeEgressError::AssociationTimedOut));
+                    } else {
+                        pending.push((waiting, reply));
+                    }
+                }
+                self.establishment_waiters = pending;
+            }
+            let _ = self.event_sender.send(event);
         }
     }
 
@@ -600,21 +598,9 @@ where
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             if pending.fin && !pending.bytes.is_empty() {
-                if stream.is_direct() {
-                    self.node
-                        .write_stream(&mut stream, &pending.bytes)
-                        .and_then(|accepted| {
-                            if accepted != pending.bytes.len() {
-                                return Err(QuicNodeEgressError::Transport(crate::Error::Blocked));
-                            }
-                            self.node.finish_stream(&mut stream)?;
-                            Ok(accepted)
-                        })
-                } else {
-                    self.node
-                        .write_stream_packet(&mut stream, &pending.bytes, true)
-                        .map(|()| pending.bytes.len())
-                }
+                self.node
+                    .write_stream_packet(&mut stream, &pending.bytes, true)
+                    .map(|()| pending.bytes.len())
             } else if pending.fin {
                 self.node.finish_stream(&mut stream).map(|()| 0)
             } else if pending.partial {
@@ -625,7 +611,7 @@ where
                     .map(|()| pending.bytes.len())
             }
         };
-        if matches!(&result, Err(error) if error.is_stream_retryable()) {
+        if matches!(&result, Err(error) if error.is_retryable()) {
             self.pending_writes.push(pending);
         } else {
             let _ = pending.reply.send(result);
@@ -665,7 +651,7 @@ where
                 Ok(crate::node::NodeClose::Control(packet)) => {
                     match self.node.submit_node_packet(packet) {
                         Ok(()) => self.finish_waiters.push((association, reply)),
-                        Err(error) if error.is_stream_retryable() => {
+                        Err(error) if error.is_retryable() => {
                             self.finish_waiters.push((association, reply));
                         }
                         Err(error) => {
@@ -676,7 +662,7 @@ where
                 Ok(crate::node::NodeClose::Closed(packet)) => {
                     let _ = reply.send(self.node.submit_node_packet(packet));
                 }
-                Err(error) if error.is_stream_retryable() => {
+                Err(error) if error.is_retryable() => {
                     self.finish_waiters.push((association, reply));
                 }
                 Err(error) => {
@@ -709,8 +695,27 @@ where
         }
     }
 
-    fn dispatch_stream_chunks(&mut self) -> bool {
+    /// Move queued chunks to their stream readers.
+    ///
+    /// A stream whose reader channel is full keeps its remaining chunks, in
+    /// order, in the node queue; other streams continue. A full accept
+    /// channel holds back only new streams. Nothing here stops the driver
+    /// from polling the node: per-stream backpressure reaches the peer
+    /// through withheld receive credit (see `ChunkAdmission`).
+    fn dispatch_stream_chunks(&mut self) {
+        if self.node.stream_chunks.is_empty() {
+            self.finish_graceful_closes();
+            return;
+        }
+        let mut kept = std::collections::VecDeque::new();
+        let mut held: Vec<(crate::node::StreamOwner, u64)> = Vec::new();
+        let mut accept_full = false;
         while let Some(chunk) = self.node.stream_chunks.pop_front() {
+            let key = (chunk.owner, chunk.stream);
+            if held.contains(&key) {
+                kept.push_back(chunk);
+                continue;
+            }
             let route = self
                 .routes
                 .iter()
@@ -718,20 +723,21 @@ where
             let index = if let Some(index) = route {
                 index
             } else {
-                let stream = match chunk.owner {
-                    crate::node::StreamOwner::Association(association) => {
-                        QuicStream::incoming(association, chunk.stream)
-                    }
-                    crate::node::StreamOwner::Direct(reply) => {
-                        QuicStream::direct(reply, chunk.stream)
-                    }
-                };
+                if accept_full {
+                    held.push(key);
+                    kept.push_back(chunk);
+                    continue;
+                }
+                let crate::node::StreamOwner::Association(association) = chunk.owner;
+                let stream = QuicStream::incoming(association, chunk.stream);
                 let handle = self.register_stream(stream);
                 let index = self.routes.len() - 1;
                 if self.accepted.try_send(handle).is_err() {
                     self.routes.remove(index);
-                    self.node.stream_chunks.push_front(chunk);
-                    return true;
+                    accept_full = true;
+                    held.push(key);
+                    kept.push_back(chunk);
+                    continue;
                 }
                 index
             };
@@ -749,23 +755,44 @@ where
                     }
                 }
                 Err(mpsc::error::TrySendError::Full(data)) => {
-                    self.node
-                        .stream_chunks
-                        .push_front(crate::node::QueuedStreamChunk {
-                            owner: self.routes[index].owner,
-                            stream: self.routes[index].stream_id,
-                            offset: data.offset,
-                            fin: data.fin,
-                            bytes: data.bytes,
-                        });
-                    return true;
+                    held.push(key);
+                    kept.push_back(crate::node::QueuedStreamChunk {
+                        owner: key.0,
+                        stream: key.1,
+                        offset: data.offset,
+                        fin: data.fin,
+                        bytes: data.bytes,
+                    });
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
-                    self.routes.remove(index);
+                    // The reader was dropped. Keep the route until FIN so later
+                    // chunks are discarded rather than accepted as a new stream.
+                    if fin {
+                        self.routes.remove(index);
+                    }
                 }
             }
         }
-        false
+        self.node.stream_chunks = kept;
+        self.finish_graceful_closes();
+    }
+
+    fn finish_graceful_closes(&mut self) {
+        let mut pending = Vec::new();
+        for association in self.closing_associations.drain(..) {
+            let owner = crate::node::StreamOwner::Association(association);
+            if self
+                .node
+                .stream_chunks
+                .iter()
+                .any(|chunk| chunk.owner == owner)
+            {
+                pending.push(association);
+                continue;
+            }
+            self.routes.retain(|route| route.owner != owner);
+        }
+        self.closing_associations = pending;
     }
 }
 
@@ -848,31 +875,15 @@ impl PacketCapture {
 /// association.
 pub struct BorrowedTokioStream<
     'a,
-    NextHop,
-    const ASSOCIATIONS: usize,
-    const ROUTES: usize,
     P: PacketPool + 'static,
-    const CLIENT_HISTORY: usize = 8,
-    const SERVER_STREAMS: usize = 8,
-    const SERVER_HISTORY: usize = 8,
     const PACKET: usize = { crate::DEFAULT_MAX_PACKET_SIZE },
 > {
-    node: &'a mut QuicNode<
-        NextHop,
-        ASSOCIATIONS,
-        ROUTES,
-        P,
-        CLIENT_HISTORY,
-        SERVER_STREAMS,
-        SERVER_HISTORY,
-        PACKET,
-    >,
+    node: &'a mut QuicNode<P, PACKET>,
     stream: QuicStream,
     read_bytes: Vec<u8>,
     read_cursor: usize,
     next_read_offset: u64,
     read_finished: bool,
-    direct_write: Option<Vec<u8>>,
     pending_write: Vec<u8>,
     clock_started: ::tokio::time::Instant,
     clock_base_us: u64,
@@ -880,16 +891,7 @@ pub struct BorrowedTokioStream<
     timer_deadline_us: Option<u64>,
 }
 
-impl<
-    NextHop,
-    const ASSOCIATIONS: usize,
-    const ROUTES: usize,
-    P,
-    const CLIENT_HISTORY: usize,
-    const SERVER_STREAMS: usize,
-    const SERVER_HISTORY: usize,
-    const PACKET: usize,
-> QuicNode<NextHop, ASSOCIATIONS, ROUTES, P, CLIENT_HISTORY, SERVER_STREAMS, SERVER_HISTORY, PACKET>
+impl<P, const PACKET: usize> QuicNode<P, PACKET>
 where
     P: PacketPool + 'static,
     P::Buffer: Send,
@@ -899,6 +901,52 @@ where
         // committed, every application chunk from that packet must remain
         // available even if the batch crosses the normal queue limit.
         self.stream_chunks.extend(chunks);
+    }
+
+    /// Queue the chunks one packet admitted and remember streams whose
+    /// remaining bytes were left retained at the per-stream limit.
+    fn admit_stream_chunks(&mut self, admission: crate::node::ChunkAdmission) {
+        self.retain_admitted_stream_chunks(admission.chunks);
+        for deferred in admission.deferred {
+            if !self.deferred_streams.contains(&deferred) {
+                self.deferred_streams.push(deferred);
+            }
+        }
+    }
+
+    /// Queue retained bytes for deferred streams whose per-stream queue has
+    /// room again, and publish the receive credit they release. Returns
+    /// whether any chunk was queued.
+    pub(crate) fn resume_deferred_streams(&mut self) -> Result<bool, QuicNodeEgressError> {
+        let mut progressed = false;
+        let mut pending = core::mem::take(&mut self.deferred_streams).into_iter();
+        while let Some((association, stream)) = pending.next() {
+            let mut admission = crate::node::ChunkAdmission::new(
+                &self.stream_chunks,
+                self.stream_chunk_limit,
+                self.association_chunk_limits(),
+            );
+            let resumed = self.resume_stream_delivery(
+                association,
+                stream,
+                &mut |source, stream, offset, fin, bytes| {
+                    admission.offer(source, stream, offset, fin, bytes)
+                },
+            );
+            let Ok(consumed) = resumed else {
+                // The association is gone; its retained bytes went with it.
+                continue;
+            };
+            progressed |= !admission.chunks.is_empty();
+            self.admit_stream_chunks(admission);
+            if consumed != 0 {
+                if let Err(error) = self.submit_or_defer_control(association) {
+                    self.deferred_streams.extend(pending);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(progressed)
     }
 
     /// Add one physical packet bearer using Tokio ingress delivery.
@@ -930,23 +978,7 @@ where
     /// continues to own packet routing, flow control, retransmission state,
     /// bearers, and storage. The exclusive borrow prevents an application from
     /// running a second competing node driver while this stream is active.
-    pub fn stream<'a>(
-        &'a mut self,
-        stream: QuicStream,
-    ) -> BorrowedTokioStream<
-        'a,
-        NextHop,
-        ASSOCIATIONS,
-        ROUTES,
-        P,
-        CLIENT_HISTORY,
-        SERVER_STREAMS,
-        SERVER_HISTORY,
-        PACKET,
-    >
-    where
-        NextHop: Copy,
-    {
+    pub fn stream<'a>(&'a mut self, stream: QuicStream) -> BorrowedTokioStream<'a, P, PACKET> {
         BorrowedTokioStream::new(self, stream, Vec::new(), 0, false)
     }
 
@@ -959,20 +991,7 @@ where
     pub fn accepted_stream<'a>(
         &'a mut self,
         accepted: ReceivedStreamChunk,
-    ) -> BorrowedTokioStream<
-        'a,
-        NextHop,
-        ASSOCIATIONS,
-        ROUTES,
-        P,
-        CLIENT_HISTORY,
-        SERVER_STREAMS,
-        SERVER_HISTORY,
-        PACKET,
-    >
-    where
-        NextHop: Copy,
-    {
+    ) -> BorrowedTokioStream<'a, P, PACKET> {
         let next_read_offset = accepted.offset.saturating_add(accepted.bytes.len() as u64);
         BorrowedTokioStream::new(
             self,
@@ -989,12 +1008,8 @@ where
         stream_id: u64,
     ) -> Option<ReceivedStreamChunk> {
         let index = self.stream_chunks.iter().position(|chunk| {
-            let probe = match owner {
-                crate::node::StreamOwner::Association(association) => {
-                    QuicStream::incoming(association, stream_id)
-                }
-                crate::node::StreamOwner::Direct(reply) => QuicStream::direct(reply, stream_id),
-            };
+            let crate::node::StreamOwner::Association(association) = owner;
+            let probe = QuicStream::incoming(association, stream_id);
             probe.matches(chunk.owner, chunk.stream)
         })?;
         let chunk = self
@@ -1002,11 +1017,9 @@ where
             .remove(index)
             .expect("position names an existing queued stream chunk");
         Some(ReceivedStreamChunk {
-            stream: match chunk.owner {
-                crate::node::StreamOwner::Association(association) => {
-                    QuicStream::incoming(association, chunk.stream)
-                }
-                crate::node::StreamOwner::Direct(reply) => QuicStream::direct(reply, chunk.stream),
+            stream: {
+                let crate::node::StreamOwner::Association(association) = chunk.owner;
+                QuicStream::incoming(association, chunk.stream)
             },
             offset: chunk.offset,
             fin: chunk.fin,
@@ -1014,79 +1027,29 @@ where
         })
     }
 
-    pub(crate) fn poll_one_event(
+    fn process_received_packet(
         &mut self,
-        context: &mut Context<'_>,
+        received: ReceivedPacket<P::Buffer>,
         local_limits: Option<crate::ConnectionLimits>,
-    ) -> Poll<Result<(), QuicNodeEgressError>>
-    where
-        NextHop: Copy,
-    {
-        if self.drain_bearer_events() {
-            return Poll::Ready(Ok(()));
-        }
-        match self.retry_one_pending_control() {
-            Ok(true) => return Poll::Ready(Ok(())),
-            Ok(false) => {}
-            Err(error) => return Poll::Ready(Err(error)),
-        }
-        if self.stream_chunks.len() >= self.stream_chunk_limit {
-            return Poll::Ready(Err(QuicNodeEgressError::StreamEventsFull));
-        }
-        let received = match self.ingress.poll_receive(context) {
-            Poll::Ready(received) => received,
-            Poll::Pending => {
-                self.completions.register_waker(context.waker());
-                if self.drain_bearer_events() {
-                    return Poll::Ready(Ok(()));
-                }
-                return Poll::Pending;
-            }
-        };
+    ) -> Result<(), QuicNodeEgressError> {
         if let Some(capture) = &self.packet_capture {
             capture.record(true, received.meta.bearer, received.packet.bytes());
         }
-        let first_server_cid = local_limits
-            .map(|_| self.allocate_local_cid())
-            .transpose()?;
-        let second_server_cid = local_limits
-            .map(|_| self.allocate_local_cid())
-            .transpose()?;
-        let mut chunks = Vec::new();
-        let mut direct_chunk = None;
+        let mut admission = crate::node::ChunkAdmission::new(
+            &self.stream_chunks,
+            self.stream_chunk_limit,
+            self.association_chunk_limits(),
+        );
         let ingress = self
             .receive_packet(
                 received.meta,
                 received.packet,
-                |open| {
+                |_| {
                     let local_limits = local_limits?;
-                    let first_server_cid = first_server_cid?;
-                    let second_server_cid = second_server_cid?;
-                    Some(crate::node::InitialAdmission {
-                        server_cid: if first_server_cid == open.client_receive_cid {
-                            second_server_cid
-                        } else {
-                            first_server_cid
-                        },
-                        local_limits,
-                    })
+                    Some(crate::node::InitialAdmission { local_limits })
                 },
                 |source, stream, offset, fin, bytes| {
-                    match source {
-                        crate::node::ApplicationStreamSource::Association(association) => {
-                            chunks.push(crate::node::QueuedStreamChunk {
-                                owner: crate::node::StreamOwner::Association(association),
-                                stream,
-                                offset,
-                                fin,
-                                bytes: bytes.to_vec(),
-                            });
-                        }
-                        crate::node::ApplicationStreamSource::Direct => {
-                            direct_chunk = Some((stream, offset, fin, bytes.to_vec()));
-                        }
-                    }
-                    Ok(bytes.len())
+                    admission.offer(source, stream, offset, fin, bytes)
                 },
             )
             .map_err(|rejected| match rejected.reason {
@@ -1107,28 +1070,44 @@ where
             crate::node::NodeIngress::Association { association, .. } => {
                 self.submit_or_defer_control(association.association())?;
             }
-            crate::node::NodeIngress::Direct(request) => {
-                if let Some((stream, offset, fin, bytes)) = direct_chunk {
-                    chunks.push(crate::node::QueuedStreamChunk {
-                        owner: crate::node::StreamOwner::Direct(request.reply()),
-                        stream,
-                        offset,
-                        fin,
-                        bytes,
-                    });
-                }
-            }
             crate::node::NodeIngress::Forward { .. } => {
-                return Poll::Ready(Err(QuicNodeEgressError::RelayUnavailable));
+                return Err(QuicNodeEgressError::RelayUnavailable);
             }
             _ => {}
         }
-        // The packet has now committed receive state. Retain every application
-        // chunk it admitted, even when this one packet crosses the queue's
-        // normal high-water mark. A later packet is held at the preflight
-        // check above until the application drains these chunks.
-        self.retain_admitted_stream_chunks(chunks);
-        Poll::Ready(Ok(()))
+        self.admit_stream_chunks(admission);
+        Ok(())
+    }
+
+    pub(crate) fn poll_one_event(
+        &mut self,
+        context: &mut Context<'_>,
+        local_limits: Option<crate::ConnectionLimits>,
+    ) -> Poll<Result<(), QuicNodeEgressError>> {
+        if self.drain_bearer_events() {
+            return Poll::Ready(Ok(()));
+        }
+        match self.resume_deferred_streams() {
+            Ok(true) => return Poll::Ready(Ok(())),
+            Ok(false) => {}
+            Err(error) => return Poll::Ready(Err(error)),
+        }
+        match self.retry_one_pending_control() {
+            Ok(true) => return Poll::Ready(Ok(())),
+            Ok(false) => {}
+            Err(error) => return Poll::Ready(Err(error)),
+        }
+        let received = match self.ingress.poll_receive(context) {
+            Poll::Ready(received) => received,
+            Poll::Pending => {
+                self.completions.register_waker(context.waker());
+                if self.drain_bearer_events() {
+                    return Poll::Ready(Ok(()));
+                }
+                return Poll::Pending;
+            }
+        };
+        Poll::Ready(self.process_received_packet(received, local_limits))
     }
 
     /// Take one packet from the node-owned ingress queue and run the common
@@ -1139,24 +1118,10 @@ where
     /// accepted streams. The no-std/RTOS surface reaches the same common state
     /// transition through one queued [`crate::nostd::NoStdRuntime::progress`]
     /// event instead.
-    pub(crate) async fn receive_next<Admit, StreamEvent>(
+    async fn receive_one(
         &mut self,
-        admit_initial: Admit,
-        on_stream: StreamEvent,
-    ) -> Result<crate::node::NodeIngress<P::Buffer, P::Buffer, NextHop>, QuicNodeEgressError>
-    where
-        NextHop: Copy,
-        Admit: FnMut(crate::BootstrapOpen) -> Option<crate::node::InitialAdmission>,
-        StreamEvent: FnMut(
-            crate::node::ApplicationStreamSource,
-            u64,
-            u64,
-            bool,
-            &[u8],
-        ) -> Result<usize, crate::Error>,
-    {
-        let mut admit_initial = admit_initial;
-        let mut on_stream = on_stream;
+        local_limits: Option<crate::ConnectionLimits>,
+    ) -> Result<(), QuicNodeEgressError> {
         let clock_started = ::tokio::time::Instant::now();
         let clock_base_us = self.clock_us();
         loop {
@@ -1165,7 +1130,7 @@ where
                 u64::try_from(clock_started.elapsed().as_micros()).unwrap_or(u64::MAX),
             );
             self.advance_clock(now);
-            let deadline = self.next_deadline(crate::node::DEFAULT_INITIAL_PTO_US);
+            let deadline = self.next_deadline();
             let timer = async move {
                 match deadline {
                     Some(deadline) => {
@@ -1180,30 +1145,13 @@ where
             tokio::pin!(timer);
             tokio::select! {
                 received = self.ingress.receive() => {
-                    if let Some(capture) = &self.packet_capture {
-                        capture.record(true, received.meta.bearer, received.packet.bytes());
-                    }
-                    return self.receive_packet(
-                        received.meta,
-                        received.packet,
-                        &mut admit_initial,
-                        &mut on_stream,
-                    ).map_err(|rejected| match rejected.reason {
-                        crate::node::QuicNodePacketRejection::Egress(error) => error,
-                        crate::node::QuicNodePacketRejection::Packet(error)
-                        | crate::node::QuicNodePacketRejection::Application(error) => {
-                            QuicNodeEgressError::Transport(error)
-                        }
-                        crate::node::QuicNodePacketRejection::PeerClosed(_) => {
-                            unreachable!("peer close is converted to NodeIngress::PeerClosed")
-                        }
-                    });
+                    return self.process_received_packet(received, local_limits);
                 }
                 () = self.completions.changed() => {}
                 () = &mut timer => {
                     let now = deadline.unwrap_or(now);
                     self.advance_clock(now);
-                    match self.timer_expired(now, crate::node::DEFAULT_INITIAL_PTO_US)? {
+                    match self.timer_expired(now)? {
                         Some(crate::node::NodeTimer::Egress(packet)) => {
                             self.submit_node_packet(packet)?;
                         }
@@ -1219,82 +1167,15 @@ where
 
     /// Process at most one already-queued ingress event. Public operations use
     /// this to consume ACK/credit progress without introducing a polling loop.
-    fn drive_one_queued_packet(&mut self) -> Result<bool, QuicNodeEgressError>
-    where
-        NextHop: Copy,
-    {
+    fn drive_one_queued_packet(&mut self) -> Result<bool, QuicNodeEgressError> {
         self.drain_bearer_events();
-        if self.stream_chunks.len() >= self.stream_chunk_limit {
-            return Err(QuicNodeEgressError::StreamEventsFull);
+        if self.resume_deferred_streams()? {
+            return Ok(true);
         }
         let Some(received) = self.ingress.try_receive() else {
             return Ok(false);
         };
-        if let Some(capture) = &self.packet_capture {
-            capture.record(true, received.meta.bearer, received.packet.bytes());
-        }
-        let mut chunks = alloc::vec::Vec::new();
-        let mut direct_chunk = None;
-        let ingress = self
-            .receive_packet(
-                received.meta,
-                received.packet,
-                |_| None,
-                |source, stream, offset, fin, bytes| {
-                    match source {
-                        crate::node::ApplicationStreamSource::Association(association) => {
-                            chunks.push(crate::node::QueuedStreamChunk {
-                                owner: crate::node::StreamOwner::Association(association),
-                                stream,
-                                offset,
-                                fin,
-                                bytes: bytes.to_vec(),
-                            });
-                        }
-                        crate::node::ApplicationStreamSource::Direct => {
-                            direct_chunk = Some((stream, offset, fin, bytes.to_vec()));
-                        }
-                    }
-                    Ok(bytes.len())
-                },
-            )
-            .map_err(|rejected| match rejected.reason {
-                crate::node::QuicNodePacketRejection::Egress(error) => error,
-                crate::node::QuicNodePacketRejection::Packet(error)
-                | crate::node::QuicNodePacketRejection::Application(error) => {
-                    QuicNodeEgressError::Transport(error)
-                }
-                crate::node::QuicNodePacketRejection::PeerClosed(_) => {
-                    unreachable!("peer close is converted to NodeIngress::PeerClosed")
-                }
-            })?;
-        match ingress {
-            crate::node::NodeIngress::StatelessReset { response } => {
-                self.submit_unassociated_packet(response)?;
-            }
-            crate::node::NodeIngress::Association { association, .. } => {
-                self.submit_or_defer_control(association.association())?;
-            }
-            crate::node::NodeIngress::Direct(request) => {
-                if let Some((stream, offset, fin, bytes)) = direct_chunk {
-                    chunks.push(crate::node::QueuedStreamChunk {
-                        owner: crate::node::StreamOwner::Direct(request.reply()),
-                        stream,
-                        offset,
-                        fin,
-                        bytes,
-                    });
-                }
-            }
-            crate::node::NodeIngress::Forward { .. } => {
-                return Err(QuicNodeEgressError::RelayUnavailable);
-            }
-            _ => {}
-        }
-        // Receive state has committed; this batch must remain durable. The
-        // next packet observes the full queue before entering the state
-        // machine and supplies backpressure while this batch is drained.
-        self.retain_admitted_stream_chunks(chunks);
+        self.process_received_packet(received, None)?;
         Ok(true)
     }
 
@@ -1302,27 +1183,18 @@ where
     ///
     /// This is the server-side equivalent of accepting and reading a TCP or
     /// HTTP stream. The node admits new associations, handles duplicate
-    /// Initial packets, routes established packets, and normalizes a
-    /// connectionless long-message request into the same [`QuicStream`] type.
+    /// Initial packets and routes established packets.
     /// A service therefore reads `offset`, bytes, and FIN and writes its reply
     /// through the returned stream without inspecting packet form or CIDs.
     pub async fn accept_stream(
         &mut self,
         local_limits: crate::ConnectionLimits,
-    ) -> Result<ReceivedStreamChunk, QuicNodeEgressError>
-    where
-        NextHop: Copy,
-    {
+    ) -> Result<ReceivedStreamChunk, QuicNodeEgressError> {
         loop {
+            self.resume_deferred_streams()?;
             if let Some(chunk) = self.stream_chunks.pop_front() {
-                let stream = match chunk.owner {
-                    crate::node::StreamOwner::Association(association) => {
-                        QuicStream::incoming(association, chunk.stream)
-                    }
-                    crate::node::StreamOwner::Direct(reply) => {
-                        QuicStream::direct(reply, chunk.stream)
-                    }
-                };
+                let crate::node::StreamOwner::Association(association) = chunk.owner;
+                let stream = QuicStream::incoming(association, chunk.stream);
                 return Ok(ReceivedStreamChunk {
                     stream,
                     offset: chunk.offset,
@@ -1330,73 +1202,7 @@ where
                     bytes: chunk.bytes,
                 });
             }
-            if self.stream_chunks.len() >= self.stream_chunk_limit {
-                return Err(QuicNodeEgressError::StreamEventsFull);
-            }
-            let first_server_cid = self.allocate_local_cid()?;
-            let second_server_cid = self.allocate_local_cid()?;
-            let mut chunks = alloc::vec::Vec::new();
-            let mut direct_chunk = None;
-            let ingress = self
-                .receive_next(
-                    |open| {
-                        let server_cid = if first_server_cid == open.client_receive_cid {
-                            second_server_cid
-                        } else {
-                            first_server_cid
-                        };
-                        Some(crate::node::InitialAdmission {
-                            server_cid,
-                            local_limits,
-                        })
-                    },
-                    |source, stream, offset, fin, bytes| {
-                        match source {
-                            crate::node::ApplicationStreamSource::Association(association) => {
-                                chunks.push(crate::node::QueuedStreamChunk {
-                                    owner: crate::node::StreamOwner::Association(association),
-                                    stream,
-                                    offset,
-                                    fin,
-                                    bytes: bytes.to_vec(),
-                                });
-                            }
-                            crate::node::ApplicationStreamSource::Direct => {
-                                direct_chunk = Some((stream, offset, fin, bytes.to_vec()));
-                            }
-                        }
-                        Ok(bytes.len())
-                    },
-                )
-                .await?;
-            match ingress {
-                crate::node::NodeIngress::Initial { response, .. }
-                | crate::node::NodeIngress::StatelessReset { response } => {
-                    self.submit_unassociated_packet(response)?;
-                }
-                crate::node::NodeIngress::Association { association, .. } => {
-                    self.submit_or_defer_control(association.association())?;
-                }
-                crate::node::NodeIngress::Direct(request) => {
-                    if let Some((stream, offset, fin, bytes)) = direct_chunk {
-                        chunks.push(crate::node::QueuedStreamChunk {
-                            owner: crate::node::StreamOwner::Direct(request.reply()),
-                            stream,
-                            offset,
-                            fin,
-                            bytes,
-                        });
-                    }
-                }
-                crate::node::NodeIngress::Forward { .. } => {
-                    return Err(QuicNodeEgressError::RelayUnavailable);
-                }
-                _ => {}
-            }
-            // Do not discard an already-admitted batch. One packet may cross
-            // the queue's normal high-water mark; subsequent packets wait for
-            // the application to drain it.
-            self.retain_admitted_stream_chunks(chunks);
+            self.receive_one(Some(local_limits)).await?;
         }
     }
 
@@ -1405,54 +1211,9 @@ where
     pub async fn wait_established(
         &mut self,
         association: QuicAssociation,
-    ) -> Result<(), QuicNodeEgressError>
-    where
-        NextHop: Copy,
-    {
+    ) -> Result<(), QuicNodeEgressError> {
         while !self.association_is_established(association) {
-            if self.stream_chunks.len() >= self.stream_chunk_limit {
-                return Err(QuicNodeEgressError::StreamEventsFull);
-            }
-            let mut chunks = Vec::new();
-            let mut direct_chunk = None;
-            let ingress = self
-                .receive_next(
-                    |_| None,
-                    |source, stream, offset, fin, bytes| {
-                        match source {
-                            crate::node::ApplicationStreamSource::Association(association) => {
-                                chunks.push(crate::node::QueuedStreamChunk {
-                                    owner: crate::node::StreamOwner::Association(association),
-                                    stream,
-                                    offset,
-                                    fin,
-                                    bytes: bytes.to_vec(),
-                                });
-                            }
-                            crate::node::ApplicationStreamSource::Direct => {
-                                direct_chunk = Some((stream, offset, fin, bytes.to_vec()));
-                            }
-                        }
-                        Ok(bytes.len())
-                    },
-                )
-                .await?;
-            if let crate::node::NodeIngress::StatelessReset { response } = ingress {
-                self.submit_unassociated_packet(response)?;
-            } else if let crate::node::NodeIngress::Association { association, .. } = ingress {
-                self.submit_or_defer_control(association.association())?;
-            } else if let crate::node::NodeIngress::Direct(request) = ingress
-                && let Some((stream, offset, fin, bytes)) = direct_chunk
-            {
-                chunks.push(crate::node::QueuedStreamChunk {
-                    owner: crate::node::StreamOwner::Direct(request.reply()),
-                    stream,
-                    offset,
-                    fin,
-                    bytes,
-                });
-            }
-            self.retain_admitted_stream_chunks(chunks);
+            self.receive_one(None).await?;
         }
         Ok(())
     }
@@ -1473,10 +1234,7 @@ where
     pub async fn finish_association(
         &mut self,
         association: QuicAssociation,
-    ) -> Result<(), QuicNodeEgressError>
-    where
-        NextHop: Copy,
-    {
+    ) -> Result<(), QuicNodeEgressError> {
         loop {
             self.drain_bearer_events();
             match self.close_association(association, 0) {
@@ -1487,7 +1245,7 @@ where
                     self.submit_node_packet(packet)?;
                     return Ok(());
                 }
-                Err(error) if error.is_stream_retryable() => {
+                Err(error) if error.is_retryable() => {
                     core::future::poll_fn(|context| self.poll_one_event(context, None)).await?;
                 }
                 Err(error) => return Err(error),
@@ -1500,10 +1258,7 @@ where
         stream: &mut QuicStream,
         bytes: &[u8],
         fin: bool,
-    ) -> Result<(), QuicNodeEgressError>
-    where
-        NextHop: Copy,
-    {
+    ) -> Result<(), QuicNodeEgressError> {
         let _ = self.drive_one_queued_packet()?;
         self.write_stream_packet(stream, bytes, fin)
     }
@@ -1521,16 +1276,42 @@ mod tests {
     use alloc::vec;
 
     type Pool = PacketPool<4, { crate::DEFAULT_PACKET_POOL_SLOT_SIZE }>;
-    type Node = QuicNode<(), 1, 1, Pool, 8, 1>;
+    type Node = QuicNode<Pool>;
 
     #[test]
-    fn committed_packet_batch_is_retained_when_it_crosses_the_queue_limit() {
+    fn per_stream_chunk_limit_does_not_scale_with_node_size() {
+        static POOL: Pool = Pool::new();
+        let mut node = Node::new(None, &POOL);
+        node.set_limits(crate::NodeLimits {
+            max_associations: 1_000_000,
+            max_routes: 1_000_000,
+        })
+        .unwrap();
+        assert_eq!(
+            node.stream_chunk_limit,
+            crate::AssociationLimits::host().max_queued_chunks_per_stream
+        );
+    }
+
+    #[test]
+    fn committed_packet_batch_is_retained_and_ingress_continues_at_the_queue_limit() {
         static POOL: Pool = Pool::new();
         let (bearer, _peer) = FakePacketBearer::<Pool>::pair(
             BearerName::new("batch-node").unwrap(),
             BearerName::new("batch-peer").unwrap(),
         );
         let mut node = Node::new(None, &POOL);
+        node.set_limits(crate::NodeLimits {
+            max_associations: 1,
+            max_routes: 1,
+        })
+        .unwrap();
+        node.set_default_association_limits(crate::AssociationLimits {
+            max_pending_streams: 1,
+            max_queued_chunks_per_stream: 1,
+            ..crate::AssociationLimits::host()
+        })
+        .unwrap();
         let bearer = node.add_bearer(bearer).unwrap();
         let association = node
             .associate(
@@ -1587,63 +1368,32 @@ mod tests {
             packet,
         );
 
+        // A full queue for one stream must not stop node ingress: the limit
+        // is per stream and enforced through withheld receive credit, so the
+        // next packet is still processed (here it is not QUIC and is ignored).
         let waker = std::task::Waker::noop();
         let mut context = Context::from_waker(waker);
         assert!(matches!(
             node.poll_one_event(&mut context, None),
-            Poll::Ready(Err(QuicNodeEgressError::StreamEventsFull))
+            Poll::Ready(Ok(()))
         ));
-        assert!(
-            node.ingress.try_receive().is_some(),
-            "queue pressure must not dequeue and discard the next ingress packet"
-        );
+        assert!(node.ingress.try_receive().is_none());
+        assert_eq!(node.stream_chunks.len(), 1, "queued chunk stays queued");
     }
 }
 
-impl<
-    'a,
-    NextHop,
-    const ASSOCIATIONS: usize,
-    const ROUTES: usize,
-    P,
-    const CLIENT_HISTORY: usize,
-    const SERVER_STREAMS: usize,
-    const SERVER_HISTORY: usize,
-    const PACKET: usize,
->
-    BorrowedTokioStream<
-        'a,
-        NextHop,
-        ASSOCIATIONS,
-        ROUTES,
-        P,
-        CLIENT_HISTORY,
-        SERVER_STREAMS,
-        SERVER_HISTORY,
-        PACKET,
-    >
+impl<'a, P, const PACKET: usize> BorrowedTokioStream<'a, P, PACKET>
 where
-    NextHop: Copy,
     P: PacketPool + 'static,
     P::Buffer: Send,
 {
     fn new(
-        node: &'a mut QuicNode<
-            NextHop,
-            ASSOCIATIONS,
-            ROUTES,
-            P,
-            CLIENT_HISTORY,
-            SERVER_STREAMS,
-            SERVER_HISTORY,
-            PACKET,
-        >,
+        node: &'a mut QuicNode<P, PACKET>,
         stream: QuicStream,
         read_bytes: Vec<u8>,
         next_read_offset: u64,
         read_finished: bool,
     ) -> Self {
-        let direct_write = stream.is_direct().then(Vec::new);
         let clock_base_us = node.clock_us();
         Self {
             node,
@@ -1652,7 +1402,6 @@ where
             read_cursor: 0,
             next_read_offset,
             read_finished,
-            direct_write,
             pending_write: Vec::new(),
             clock_started: ::tokio::time::Instant::now(),
             clock_base_us,
@@ -1679,7 +1428,7 @@ where
         }
         let now = self.now_us();
         self.node.advance_clock(now);
-        let Some(deadline) = self.node.next_deadline(crate::node::DEFAULT_INITIAL_PTO_US) else {
+        let Some(deadline) = self.node.next_deadline() else {
             self.timer = None;
             self.timer_deadline_us = None;
             return Poll::Pending;
@@ -1700,10 +1449,7 @@ where
         self.timer_deadline_us = None;
         let now = self.now_us().max(deadline);
         self.node.advance_clock(now);
-        match self
-            .node
-            .timer_expired(now, crate::node::DEFAULT_INITIAL_PTO_US)
-        {
+        match self.node.timer_expired(now) {
             Ok(Some(crate::node::NodeTimer::Egress(packet))) => {
                 match self.node.submit_node_packet(packet) {
                     Ok(()) => Poll::Ready(Ok(())),
@@ -1773,29 +1519,8 @@ where
     }
 }
 
-impl<
-    NextHop,
-    const ASSOCIATIONS: usize,
-    const ROUTES: usize,
-    P,
-    const CLIENT_HISTORY: usize,
-    const SERVER_STREAMS: usize,
-    const SERVER_HISTORY: usize,
-    const PACKET: usize,
-> AsyncRead
-    for BorrowedTokioStream<
-        '_,
-        NextHop,
-        ASSOCIATIONS,
-        ROUTES,
-        P,
-        CLIENT_HISTORY,
-        SERVER_STREAMS,
-        SERVER_HISTORY,
-        PACKET,
-    >
+impl<P, const PACKET: usize> AsyncRead for BorrowedTokioStream<'_, P, PACKET>
 where
-    NextHop: Copy + Unpin,
     P: PacketPool + Unpin + 'static,
     P::Buffer: Send,
 {
@@ -1840,29 +1565,8 @@ where
     }
 }
 
-impl<
-    NextHop,
-    const ASSOCIATIONS: usize,
-    const ROUTES: usize,
-    P,
-    const CLIENT_HISTORY: usize,
-    const SERVER_STREAMS: usize,
-    const SERVER_HISTORY: usize,
-    const PACKET: usize,
-> AsyncWrite
-    for BorrowedTokioStream<
-        '_,
-        NextHop,
-        ASSOCIATIONS,
-        ROUTES,
-        P,
-        CLIENT_HISTORY,
-        SERVER_STREAMS,
-        SERVER_HISTORY,
-        PACKET,
-    >
+impl<P, const PACKET: usize> AsyncWrite for BorrowedTokioStream<'_, P, PACKET>
 where
-    NextHop: Copy + Unpin,
     P: PacketPool + Unpin + 'static,
     P::Buffer: Send,
 {
@@ -1880,18 +1584,6 @@ where
                 "QUIC stream write half is closed",
             )));
         }
-        if let Some(buffer) = self.direct_write.as_mut() {
-            let remaining = crate::DEFAULT_MAX_STREAM_PAYLOAD.saturating_sub(buffer.len());
-            if remaining == 0 {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "direct message exceeds one QUIC packet",
-                )));
-            }
-            let count = remaining.min(bytes.len());
-            buffer.extend_from_slice(&bytes[..count]);
-            return Poll::Ready(Ok(count));
-        }
         if !self.pending_write.is_empty() {
             let pending = core::mem::take(&mut self.pending_write);
             let result = {
@@ -1904,7 +1596,7 @@ where
                     context.waker().wake_by_ref();
                     return Poll::Pending;
                 }
-                Err(error) if error.is_stream_retryable() => {
+                Err(error) if error.is_retryable() => {
                     self.pending_write = pending;
                     return match self.poll_progress(context) {
                         Poll::Ready(Ok(())) => {
@@ -1941,7 +1633,7 @@ where
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if self.direct_write.is_some() || self.pending_write.is_empty() {
+        if self.pending_write.is_empty() {
             return Poll::Ready(Ok(()));
         }
         let pending = core::mem::take(&mut self.pending_write);
@@ -1952,7 +1644,7 @@ where
         };
         match result {
             Ok(()) => Poll::Ready(Ok(())),
-            Err(error) if error.is_stream_retryable() => {
+            Err(error) if error.is_retryable() => {
                 self.pending_write = pending;
                 match self.poll_progress(context) {
                     Poll::Ready(Ok(())) => {
@@ -1971,18 +1663,15 @@ where
         if self.stream.send_finished() {
             return Poll::Ready(Ok(()));
         }
-        let direct = self.direct_write.take();
         let associated = core::mem::take(&mut self.pending_write);
         let result = {
             let this = &mut *self;
-            let bytes = direct.as_deref().unwrap_or(&associated);
             this.node
-                .write_stream_after_queued_progress(&mut this.stream, bytes, true)
+                .write_stream_after_queued_progress(&mut this.stream, &associated, true)
         };
         match result {
             Ok(()) => Poll::Ready(Ok(())),
-            Err(error) if error.is_stream_retryable() => {
-                self.direct_write = direct;
+            Err(error) if error.is_retryable() => {
                 self.pending_write = associated;
                 match self.poll_progress(context) {
                     Poll::Ready(Ok(())) => {

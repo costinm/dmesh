@@ -109,7 +109,7 @@ fn copy_into_pool(
 fn slow_queue_consumer_receives_complete_stream() {
     let (client_bearer, client_context, client_sent) = Capture::<Pool>::new("client");
     let mut client = NoStdRuntime::new(
-        QuicNode::<(), 1, 2, Pool>::new(None, &CLIENT_POOL),
+        QuicNode::<Pool>::new(None, &CLIENT_POOL),
         ConnectionLimits::default(),
     );
     let client_bearer_id = client.add_bearer(client_bearer).unwrap();
@@ -120,7 +120,7 @@ fn slow_queue_consumer_receives_complete_stream() {
     };
     let (server_bearer, server_context, server_sent) = Capture::<Pool>::new("server");
     let mut server = NoStdRuntime::new(
-        QuicNode::<(), 1, 2, Pool>::new(None, &SERVER_POOL),
+        QuicNode::<Pool>::new(None, &SERVER_POOL),
         ConnectionLimits::default(),
     );
     let server_bearer_id = server.add_bearer(server_bearer).unwrap();

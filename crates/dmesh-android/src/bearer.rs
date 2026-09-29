@@ -5,7 +5,7 @@ use quic_lite::bearer::{
 };
 use quic_lite::packet_pool::PacketPool as FixedPacketPool;
 use quic_lite::{
-    ConnectionLimits, DEFAULT_PACKET_POOL_SLOT_SIZE, PACKET_PREFIX_RESERVE, PacketMeta,
+    DEFAULT_PACKET_POOL_SLOT_SIZE, PACKET_PREFIX_RESERVE, PacketMeta,
     PacketPool as PacketPoolTrait, PacketWriter, PeerL2Address, QuicNode,
 };
 use serde_json::{Value, json};
@@ -24,7 +24,7 @@ const PEER: PeerL2Address = match PeerL2Address::new(1) {
 };
 
 type Pool = FixedPacketPool<POOL_SLOTS, DEFAULT_PACKET_POOL_SLOT_SIZE>;
-type Node = QuicNode<(), 16, 8, Pool>;
+type Node = QuicNode<Pool>;
 
 static PACKET_POOL: Pool = Pool::new();
 
@@ -137,6 +137,12 @@ impl BearerRuntime {
                     .expect("create Android QUIC driver runtime");
                 driver_runtime.block_on(async move {
                     let mut raw_node = Node::new(None, &PACKET_POOL);
+                    raw_node
+                        .set_limits(quic_lite::NodeLimits::host())
+                        .expect("Android QUIC node limits are valid");
+                    raw_node
+                        .set_default_association_limits(quic_lite::AssociationLimits::host())
+                        .expect("Android QUIC association limits are valid");
                     let mut bearers = HashMap::new();
                     for name in ["usb", "ble"] {
                         let bearer = JavaPacketBearer {
@@ -172,7 +178,7 @@ impl BearerRuntime {
                     }
                     let (node, driver) = quic_lite::tokio::TokioNodeDriver::new(
                         raw_node,
-                        ConnectionLimits::default(),
+                        quic_lite::AssociationLimits::host().connection,
                     );
                     if ready.send((node, bearers)).is_err() {
                         return;

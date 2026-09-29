@@ -13,7 +13,7 @@ use quic_lite::{
 
 const BEARER: BearerId = BearerId::new(1).unwrap();
 type Pool = quic_lite::packet_pool::PacketPool<8, { quic_lite::DEFAULT_PACKET_POOL_SLOT_SIZE }>;
-type Node = QuicNode<(), 4, 4, Pool>;
+type Node = QuicNode<Pool>;
 static CLIENT_POOL: Pool = Pool::new();
 
 struct AttachFailure;
@@ -109,7 +109,13 @@ fn bearer_attachment_and_registry_capacity_errors_are_public_and_distinct() {
 #[test]
 fn node_reports_association_and_route_capacity_without_exposing_tables() {
     static ASSOCIATION_POOL: Pool = Pool::new();
-    let mut association_full = QuicNode::<(), 1, 1, Pool>::new(None, &ASSOCIATION_POOL);
+    let mut association_full = QuicNode::<Pool>::new(None, &ASSOCIATION_POOL);
+    association_full
+        .set_limits(quic_lite::NodeLimits {
+            max_associations: 1,
+            max_routes: 1,
+        })
+        .unwrap();
     let bearer = association_full
         .add_bearer(FakePacketBearer::<Pool>::new(
             BearerName::new("association-full").unwrap(),
@@ -130,24 +136,40 @@ fn node_reports_association_and_route_capacity_without_exposing_tables() {
     assert_eq!(association_full.association_count(), 1);
 
     static ROUTE_POOL: Pool = Pool::new();
-    let mut route_full = QuicNode::<(), 1, 0, Pool>::new(None, &ROUTE_POOL);
+    let mut route_full = QuicNode::<Pool>::new(None, &ROUTE_POOL);
+    route_full
+        .set_limits(quic_lite::NodeLimits {
+            max_associations: 2,
+            max_routes: 1,
+        })
+        .unwrap();
     let bearer = route_full
         .add_bearer(FakePacketBearer::<Pool>::new(
             BearerName::new("route-full").unwrap(),
         ))
         .unwrap();
-    assert_eq!(
-        route_full.associate(
+    route_full
+        .associate(
             PacketMeta {
                 bearer,
                 peer_l2_address: PeerL2Address::new(1).unwrap(),
                 received_at_us: 0,
             },
             0,
+        )
+        .unwrap();
+    assert_eq!(
+        route_full.associate(
+            PacketMeta {
+                bearer,
+                peer_l2_address: PeerL2Address::new(2).unwrap(),
+                received_at_us: 1,
+            },
+            1,
         ),
         Err(QuicNodeEgressError::Association(QuicNodeError::Routing))
     );
-    assert_eq!(route_full.association_count(), 0);
+    assert_eq!(route_full.association_count(), 1);
 }
 
 #[test]
@@ -307,51 +329,6 @@ async fn paired_fake_establishes_and_delivers_multi_packet_fin_through_public_ap
     assert!(!second.fin);
     assert!(fin.bytes.is_empty());
     assert!(fin.fin);
-}
-
-#[tokio::test]
-async fn direct_message_and_associated_stream_use_the_same_public_handler_surface() {
-    static FIRST_POOL: Pool = Pool::new();
-    static SECOND_POOL: Pool = Pool::new();
-    let (first_bearer, second_bearer) = FakePacketBearer::<Pool>::pair(
-        BearerName::new("message-a").unwrap(),
-        BearerName::new("message-b").unwrap(),
-    );
-    let mut client = Node::new(None, &FIRST_POOL);
-    let mut server = Node::new(None, &SECOND_POOL);
-    let client_bearer = client.add_bearer(first_bearer).unwrap();
-    server.add_bearer(second_bearer).unwrap();
-    let address = PacketMeta {
-        bearer: client_bearer,
-        peer_l2_address: PeerL2Address::new(1).unwrap(),
-        received_at_us: 0,
-    };
-
-    let mut request = client.open_message(address);
-    assert_eq!(
-        client.stream_send_window(&request).unwrap(),
-        quic_lite::DEFAULT_MAX_STREAM_PAYLOAD as u64
-    );
-    client.write_stream(&mut request, b"ping").unwrap();
-    client.finish_stream(&mut request).unwrap();
-    assert_eq!(client.stream_send_window(&request).unwrap(), 0);
-    let mut received = server
-        .accept_stream(quic_lite::ConnectionLimits::default())
-        .await
-        .unwrap();
-    assert_eq!(received.offset, 0);
-    assert_eq!(received.bytes, b"ping");
-    assert!(received.fin);
-    server.write_stream(&mut received.stream, b"pong").unwrap();
-    server.finish_stream(&mut received.stream).unwrap();
-
-    let response = client
-        .accept_stream(quic_lite::ConnectionLimits::default())
-        .await
-        .unwrap();
-    assert_eq!(response.offset, 0);
-    assert_eq!(response.bytes, b"pong");
-    assert!(response.fin);
 }
 
 #[tokio::test]

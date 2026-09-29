@@ -73,7 +73,7 @@ impl PacketBearer<Pool> for DeferredBearer {
 fn would_block_retries_the_same_lease_and_completion_restores_node_capacity() {
     let context = Arc::new(Mutex::new(None));
     let state = Arc::new(Mutex::new(SendState::default()));
-    let mut node = QuicNode::<(), 4, 4, Pool>::new(None, &POOL);
+    let mut node = QuicNode::<Pool>::new(None, &POOL);
     let bearer = node
         .add_bearer(DeferredBearer {
             context: context.clone(),

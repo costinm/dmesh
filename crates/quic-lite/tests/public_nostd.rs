@@ -7,12 +7,21 @@ use std::sync::{Arc, Mutex};
 use quic_lite::{
     BearerContext, BearerInfo, BearerName, ConnectionLimits, EgressSubmission, PacketBearer,
     PacketEgress, PacketMeta, PacketPool as PacketPoolTrait, PacketSendOutcome, PacketSubmitError,
-    PacketWriter, PeerL2Address, QuicNode, nostd::NoStdRuntime, packet_pool::PacketPool,
+    PacketWriter, PeerL2Address, QuicNode, QuicNodeEgressError, nostd::NoStdRuntime,
+    packet_pool::PacketPool,
 };
 
 type Pool = PacketPool<8, { quic_lite::DEFAULT_PACKET_POOL_SLOT_SIZE }>;
 static CLIENT_POOL: Pool = Pool::new();
 static SERVER_POOL: Pool = Pool::new();
+
+#[test]
+fn retryability_is_available_to_external_no_std_drivers() {
+    assert!(QuicNodeEgressError::BearerBusy.is_retryable());
+    assert!(QuicNodeEgressError::PoolUnavailable.is_retryable());
+    assert!(QuicNodeEgressError::Transport(quic_lite::Error::FlowControl).is_retryable());
+    assert!(!QuicNodeEgressError::MissingBearer.is_retryable());
+}
 
 struct Capture<P: PacketPoolTrait + 'static> {
     name: BearerName,
@@ -97,7 +106,7 @@ fn copy_into_pool(
 #[test]
 fn synchronous_driver_receives_and_replies_to_stream_shaped_message() {
     let (client_bearer, client_context, client_sent) = Capture::<Pool>::new("client-uart");
-    let client = QuicNode::<(), 2, 2, Pool>::new(None, &CLIENT_POOL);
+    let client = QuicNode::<Pool>::new(None, &CLIENT_POOL);
     let mut client = NoStdRuntime::new(client, ConnectionLimits::default());
     let client_bearer_id = client.add_bearer(client_bearer).unwrap();
     let client_address = PacketMeta {
@@ -106,7 +115,7 @@ fn synchronous_driver_receives_and_replies_to_stream_shaped_message() {
         received_at_us: 1,
     };
     let (server_bearer, server_context, server_sent) = Capture::<Pool>::new("server-uart");
-    let server = QuicNode::<(), 2, 2, Pool>::new(None, &SERVER_POOL);
+    let server = QuicNode::<Pool>::new(None, &SERVER_POOL);
     let mut server = NoStdRuntime::new(server, ConnectionLimits::default());
     let server_bearer_id = server.add_bearer(server_bearer).unwrap();
     let server_address = PacketMeta {
@@ -136,9 +145,14 @@ fn synchronous_driver_receives_and_replies_to_stream_shaped_message() {
     assert!(client.association_is_established(association));
 
     let mut request = client.open_stream(association).unwrap();
-    assert_eq!(client.write_stream(&mut request, b"ping").unwrap(), 4);
-    client.finish_stream(&mut request).unwrap();
+    assert_eq!(
+        client
+            .write_stream_and_finish(&mut request, b"ping")
+            .unwrap(),
+        4
+    );
     let request_packets = core::mem::take(&mut *client_sent.lock().unwrap());
+    assert_eq!(request_packets.len(), 1);
     let mut received_stream = None;
     let mut received_bytes = Vec::new();
     let mut received_fin = false;
@@ -173,9 +187,13 @@ fn synchronous_driver_receives_and_replies_to_stream_shaped_message() {
     let mut received = received_stream.unwrap();
 
     let control_packets = server_sent.lock().unwrap().len();
-    server.write_stream(&mut received, b"pong").unwrap();
-    server.finish_stream(&mut received).unwrap();
-    assert_eq!(server_sent.lock().unwrap().len(), control_packets + 2);
+    assert_eq!(
+        server
+            .write_stream_and_finish(&mut received, b"pong")
+            .unwrap(),
+        4
+    );
+    assert_eq!(server_sent.lock().unwrap().len(), control_packets + 1);
     assert!(
         server
             .write_stream(&mut received, b"second response")
@@ -193,9 +211,7 @@ fn synchronous_driver_receives_and_replies_to_stream_shaped_message() {
     }
     let response = client.next_stream_chunk().unwrap();
     assert_eq!(response.bytes, b"pong");
-    assert!(!response.fin);
-    let response_fin = client.next_stream_chunk().unwrap();
-    assert!(response_fin.bytes.is_empty());
-    assert!(response_fin.fin);
+    assert!(response.fin);
+    assert!(client.next_stream_chunk().is_none());
     assert!(!client.progress().unwrap());
 }

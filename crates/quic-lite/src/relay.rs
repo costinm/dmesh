@@ -6,11 +6,13 @@
 //! endpoint processing or next-hop egress; it must not maintain a competing
 //! relay lookup table.
 
+use alloc::vec::Vec;
+
 #[cfg(test)]
 use crate::connection::{ServerPacket, classify_server_packet};
 use crate::{
-    ConnectionId, Error, ShortHeaderPrefix, decode_direct_packet, decode_routing_prefix,
-    rewrite_bootstrap_destination, rewrite_dcid,
+    ConnectionId, Error, ShortHeaderPrefix, decode_routing_prefix, rewrite_bootstrap_destination,
+    rewrite_dcid,
 };
 
 /// Destination selected by an opaque relay rule.
@@ -62,14 +64,10 @@ pub(crate) enum RouterTarget<'a, Endpoint, NextHop> {
 }
 
 /// Outcome of classifying one complete bearer packet.  Forwarding has
-/// already copied the rewritten packet into caller-owned storage.  Direct and
-/// endpoint outcomes retain borrowed input because neither path needs an
-/// intermediate packet copy.
+/// already copied the rewritten packet into caller-owned storage. Endpoint
+/// outcomes retain borrowed input because they need no intermediate copy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DcidPacket<'a, Endpoint, NextHop> {
-    Direct {
-        payload: &'a [u8],
-    },
     Endpoint {
         /// DCID selected by this shared QUIC-lite router. Adapters may use it
         /// only to locate their association; packet headers remain private.
@@ -102,7 +100,6 @@ pub(crate) enum DcidPacketError {
 /// `PacketMeta` and uses it only after the selected QUIC owner accepts the
 /// packet.
 pub(crate) enum PacketRoute<'a, Endpoint, NextHop> {
-    Direct(crate::DirectMessageRequest<'a>),
     Initial(crate::BootstrapOpen),
     Endpoint {
         destination: ConnectionId,
@@ -133,17 +130,21 @@ pub(crate) enum PacketRoute<'a, Endpoint, NextHop> {
 /// The registry remains an implementation detail of the node owner. Bearers
 /// submit complete bytes and never inspect a long/short header or use their
 /// physical peer L2 address to select an association.
-pub(crate) struct PacketRouter<Endpoint, NextHop, const ENTRIES: usize> {
-    registry: DcidRegistry<Endpoint, NextHop, ENTRIES>,
+pub(crate) struct PacketRouter<Endpoint, NextHop> {
+    registry: DcidRegistry<Endpoint, NextHop>,
     _reset_key: Option<crate::StatelessResetKey>,
 }
 
-impl<Endpoint, NextHop, const ENTRIES: usize> PacketRouter<Endpoint, NextHop, ENTRIES> {
+impl<Endpoint, NextHop> PacketRouter<Endpoint, NextHop> {
     pub(crate) fn new(reset_key: Option<crate::StatelessResetKey>) -> Self {
         Self {
             registry: DcidRegistry::new(),
             _reset_key: reset_key,
         }
+    }
+
+    pub(crate) fn set_max_entries(&mut self, max_entries: usize) {
+        self.registry.set_max_entries(max_entries);
     }
 
     pub(crate) fn register_endpoint(
@@ -170,27 +171,25 @@ impl<Endpoint, NextHop, const ENTRIES: usize> PacketRouter<Endpoint, NextHop, EN
     where
         Endpoint: PartialEq,
     {
-        let Some(entry) = self.registry.entries.iter_mut().find(|entry| {
-            entry.as_ref().is_some_and(|(key, target)| {
-                *key == dcid
-                    && matches!(target, DcidTarget::Endpoint(endpoint) if endpoint == expected)
-            })
-        }) else {
+        let Ok(index) = self.registry.find(dcid) else {
             return false;
         };
-        entry.take();
+        if !matches!(&self.registry.entries[index].1, DcidTarget::Endpoint(endpoint) if endpoint == expected)
+        {
+            return false;
+        }
+        self.registry.entries.remove(index);
         true
     }
 
     pub(crate) fn remove_forward(&mut self, dcid: ConnectionId) -> bool {
-        let Some(entry) = self.registry.entries.iter_mut().find(|entry| {
-            entry.as_ref().is_some_and(|(key, target)| {
-                *key == dcid && matches!(target, DcidTarget::Forward(_))
-            })
-        }) else {
+        let Ok(index) = self.registry.find(dcid) else {
             return false;
         };
-        entry.take();
+        if !matches!(self.registry.entries[index].1, DcidTarget::Forward(_)) {
+            return false;
+        }
+        self.registry.entries.remove(index);
         true
     }
 
@@ -267,10 +266,6 @@ impl<Endpoint, NextHop, const ENTRIES: usize> PacketRouter<Endpoint, NextHop, EN
             }
         };
         match classified {
-            ServerPacket::Direct => {
-                let request = crate::DirectMessageEndpoint::new().receive_request(input)?;
-                Ok(PacketRoute::Direct(request))
-            }
             ServerPacket::Initial(open) => Ok(PacketRoute::Initial(open)),
             classified @ (ServerPacket::BootstrapAck { destination }
             | ServerPacket::Established { destination }) => {
@@ -320,18 +315,11 @@ impl<Endpoint, NextHop, const ENTRIES: usize> PacketRouter<Endpoint, NextHop, EN
 /// `output` is deliberately caller-owned because ESP Main must use its shared
 /// packet pool and host/Android own their socket buffers. This function owns no
 /// queues, clock, transport metadata, or next-hop policy.
-pub(crate) fn dispatch_packet<'a, Endpoint, NextHop, const ENTRIES: usize>(
-    registry: &'a DcidRegistry<Endpoint, NextHop, ENTRIES>,
+pub(crate) fn dispatch_packet<'a, Endpoint, NextHop>(
+    registry: &'a DcidRegistry<Endpoint, NextHop>,
     input: &'a [u8],
     output: &mut [u8],
 ) -> Result<DcidPacket<'a, Endpoint, NextHop>, DcidPacketError> {
-    // Direct traffic is its own custom-version long-header form.  Classify it
-    // before DCID routing so neither this registry nor a bearer treats an
-    // empty Initial destination as a synthetic numeric CID.
-    if crate::DirectMessageEndpoint::is_packet(input) {
-        let (_, payload) = decode_direct_packet(input).map_err(DcidPacketError::Header)?;
-        return Ok(DcidPacket::Direct { payload });
-    }
     let prefix = decode_routing_prefix(input).map_err(DcidPacketError::Header)?;
     match registry
         .ingress(prefix)
@@ -358,32 +346,38 @@ pub(crate) fn dispatch_packet<'a, Endpoint, NextHop, const ENTRIES: usize>(
 
 /// Fixed-capacity registry for all non-zero local DCIDs.
 #[derive(Clone)]
-pub(crate) struct DcidRegistry<Endpoint, NextHop, const ENTRIES: usize> {
-    entries: [Option<(ConnectionId, DcidTarget<Endpoint, NextHop>)>; ENTRIES],
+pub(crate) struct DcidRegistry<Endpoint, NextHop> {
+    entries: Vec<(ConnectionId, DcidTarget<Endpoint, NextHop>)>,
+    max_entries: usize,
 }
 
-impl<Endpoint, NextHop, const ENTRIES: usize> Default for DcidRegistry<Endpoint, NextHop, ENTRIES> {
+impl<Endpoint, NextHop> Default for DcidRegistry<Endpoint, NextHop> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<Endpoint, NextHop, const ENTRIES: usize> DcidRegistry<Endpoint, NextHop, ENTRIES> {
+impl<Endpoint, NextHop> DcidRegistry<Endpoint, NextHop> {
     pub(crate) fn new() -> Self {
         Self {
-            entries: core::array::from_fn(|_| None),
+            entries: Vec::new(),
+            max_entries: usize::MAX,
         }
     }
 
+    pub(crate) fn set_max_entries(&mut self, max_entries: usize) {
+        self.max_entries = max_entries;
+    }
+
     pub(crate) fn len(&self) -> usize {
-        self.entries.iter().filter(|entry| entry.is_some()).count()
+        self.entries.len()
     }
 
     /// Whether a non-zero local DCID is already owned by any endpoint or
     /// forwarding target. Reconciliation uses this to reject a replacement
     /// before removing the currently active rule.
     pub(crate) fn contains(&self, dcid: ConnectionId) -> bool {
-        self.entries.iter().flatten().any(|(key, _)| *key == dcid)
+        self.find(dcid).is_ok()
     }
 
     pub(crate) fn insert_endpoint(
@@ -416,12 +410,8 @@ impl<Endpoint, NextHop, const ENTRIES: usize> DcidRegistry<Endpoint, NextHop, EN
         if dcid.value() == 0 {
             return Err(DcidRegistryError::InvalidConnectionId);
         }
-        if let Some((_, target)) = self
-            .entries
-            .iter()
-            .filter_map(Option::as_ref)
-            .find(|(key, _)| *key == dcid)
-        {
+        if let Ok(index) = self.find(dcid) {
+            let target = &self.entries[index].1;
             return match target {
                 DcidTarget::Forward(existing) if *existing == rule => Ok(false),
                 _ => Err(DcidRegistryError::Occupied),
@@ -438,16 +428,10 @@ impl<Endpoint, NextHop, const ENTRIES: usize> DcidRegistry<Endpoint, NextHop, EN
         dcid: ConnectionId,
         rule: ForwardRule<NextHop>,
     ) -> Result<(), DcidRegistryError> {
-        let Some(entry) = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.as_ref().is_some_and(|(key, _)| *key == dcid))
-        else {
+        let Ok(index) = self.find(dcid) else {
             return Err(DcidRegistryError::Missing);
         };
-        let Some((_, target)) = entry.as_mut() else {
-            return Err(DcidRegistryError::Missing);
-        };
+        let target = &mut self.entries[index].1;
         if !matches!(target, DcidTarget::Forward(_)) {
             return Err(DcidRegistryError::WrongTarget);
         }
@@ -456,37 +440,33 @@ impl<Endpoint, NextHop, const ENTRIES: usize> DcidRegistry<Endpoint, NextHop, EN
     }
 
     pub(crate) fn remove(&mut self, dcid: ConnectionId) -> Option<DcidTarget<Endpoint, NextHop>> {
-        let entry = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.as_ref().is_some_and(|(key, _)| *key == dcid))?;
-        entry.take().map(|(_, target)| target)
+        let index = self.find(dcid).ok()?;
+        Some(self.entries.remove(index).1)
     }
 
     pub(crate) fn ingress(
         &self,
         prefix: ShortHeaderPrefix,
     ) -> Result<DcidIngress<'_, Endpoint, NextHop>, DcidRegistryError> {
-        let (_, target) = self
-            .entries
-            .iter()
-            .filter_map(Option::as_ref)
-            .find(|(key, _)| *key == prefix.dcid)
-            .ok_or(DcidRegistryError::Missing)?;
+        let index = self
+            .find(prefix.dcid)
+            .map_err(|_| DcidRegistryError::Missing)?;
+        let target = &self.entries[index].1;
         Ok(match target {
             DcidTarget::Endpoint(endpoint) => DcidIngress::Endpoint(prefix, endpoint),
             DcidTarget::Forward(rule) => DcidIngress::Forward(prefix, rule),
         })
     }
 
+    fn find(&self, dcid: ConnectionId) -> Result<usize, usize> {
+        self.entries.binary_search_by_key(&dcid, |(key, _)| *key)
+    }
+
     fn endpoint_matching(&self, mut predicate: impl FnMut(&Endpoint) -> bool) -> Option<&Endpoint> {
-        self.entries
-            .iter()
-            .filter_map(Option::as_ref)
-            .find_map(|(_, target)| match target {
-                DcidTarget::Endpoint(endpoint) if predicate(endpoint) => Some(endpoint),
-                _ => None,
-            })
+        self.entries.iter().find_map(|(_, target)| match target {
+            DcidTarget::Endpoint(endpoint) if predicate(endpoint) => Some(endpoint),
+            _ => None,
+        })
     }
 
     fn insert(
@@ -497,19 +477,17 @@ impl<Endpoint, NextHop, const ENTRIES: usize> DcidRegistry<Endpoint, NextHop, EN
         if dcid.value() == 0 {
             return Err(DcidRegistryError::InvalidConnectionId);
         }
-        if self
-            .entries
-            .iter()
-            .any(|entry| entry.as_ref().is_some_and(|(key, _)| *key == dcid))
-        {
-            return Err(DcidRegistryError::Occupied);
+        let index = match self.find(dcid) {
+            Ok(_) => return Err(DcidRegistryError::Occupied),
+            Err(index) => index,
+        };
+        if self.entries.len() >= self.max_entries {
+            return Err(DcidRegistryError::Full);
         }
-        let entry = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.is_none())
-            .ok_or(DcidRegistryError::Full)?;
-        *entry = Some((dcid, target));
+        self.entries
+            .try_reserve(1)
+            .map_err(|_| DcidRegistryError::Full)?;
+        self.entries.insert(index, (dcid, target));
         Ok(())
     }
 }
@@ -517,13 +495,14 @@ impl<Endpoint, NextHop, const ENTRIES: usize> DcidRegistry<Endpoint, NextHop, EN
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FLAG_FIXED, ShortHeader, encode_direct_packet};
+    use crate::{FLAG_FIXED, ShortHeader};
 
     #[test]
     fn endpoint_and_forward_target_share_one_registry() {
         let endpoint = ConnectionId::new(4).unwrap();
         let relay = ConnectionId::relay_local(2, 1).unwrap();
-        let mut registry = DcidRegistry::<u8, u16, 2>::new();
+        let mut registry = DcidRegistry::<u8, u16>::new();
+        registry.set_max_entries(2);
         registry.insert_endpoint(endpoint, 7).unwrap();
         registry
             .install_forward(
@@ -567,10 +546,11 @@ mod tests {
     }
 
     #[test]
-    fn dispatches_direct_endpoint_and_forward_once() {
+    fn dispatches_endpoint_and_forward_once() {
         let endpoint = ConnectionId::new(4).unwrap();
         let relay = ConnectionId::relay_local(2, 1).unwrap();
-        let mut registry = DcidRegistry::<u8, u16, 2>::new();
+        let mut registry = DcidRegistry::<u8, u16>::new();
+        registry.set_max_entries(2);
         registry.insert_endpoint(endpoint, 7).unwrap();
         registry
             .install_forward(
@@ -582,13 +562,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut direct = [0; 32];
-        let direct_len = encode_direct_packet(3, &[0xa0], &mut direct).unwrap();
         let mut output = [0; 32];
-        assert!(matches!(
-            dispatch_packet(&registry, &direct[..direct_len], &mut output),
-            Ok(DcidPacket::Direct { payload }) if payload == [0xa0]
-        ));
 
         let mut endpoint_packet = [0; 16];
         let endpoint_len = ShortHeader {
@@ -631,7 +605,8 @@ mod tests {
     fn bootstrap_forwarding_uses_an_empty_long_header_destination() {
         let relay = ConnectionId::relay_local(2, 1).unwrap();
         let source = ConnectionId::new(11).unwrap();
-        let mut registry = DcidRegistry::<(), u16, 1>::new();
+        let mut registry = DcidRegistry::<(), u16>::new();
+        registry.set_max_entries(1);
         registry
             .install_forward(
                 relay,
@@ -664,9 +639,9 @@ mod tests {
     }
 
     #[test]
-    fn an_initial_with_an_empty_destination_is_not_direct_traffic() {
+    fn an_initial_with_an_empty_destination_is_not_a_registry_route() {
         let source = ConnectionId::new(11).unwrap();
-        let registry = DcidRegistry::<(), u16, 1>::new();
+        let registry = DcidRegistry::<(), u16>::new();
         let mut packet = [0; 64];
         let packet_len = crate::encode_long_packet(
             crate::LONG_PACKET_INITIAL,
@@ -690,7 +665,8 @@ mod tests {
         let server_cid = ConnectionId::new(0x41).unwrap();
         let client_cid = ConnectionId::new(0x42).unwrap();
         let relay_cid = ConnectionId::relay_local(2, 1).unwrap();
-        let mut router = PacketRouter::<u8, u16, 3>::new(None);
+        let mut router = PacketRouter::<u8, u16>::new(None);
+        router.set_max_entries(3);
         router.register_endpoint(server_cid, 1).unwrap();
         router.register_endpoint(client_cid, 2).unwrap();
         router
@@ -704,12 +680,6 @@ mod tests {
             .unwrap();
         let mut packet = [0u8; 128];
         let mut output = [0u8; 128];
-
-        let direct_len = encode_direct_packet(3, b"direct", &mut packet).unwrap();
-        assert!(matches!(
-            router.route(&packet[..direct_len], &mut output),
-            Ok(PacketRoute::Direct(request)) if request.payload() == b"direct"
-        ));
 
         let source = ConnectionId::new(0x43).unwrap();
         let initial_len = crate::encode_bootstrap_open_packet(source, 0, &mut packet).unwrap();
@@ -770,7 +740,7 @@ mod tests {
     #[test]
     fn packet_router_generates_reset_only_for_unknown_short_dcid() {
         let reset_key = crate::StatelessResetKey::from_device_secret(&[0x71; 32]).unwrap();
-        let router = PacketRouter::<u8, u16, 1>::new(Some(reset_key));
+        let router = PacketRouter::<u8, u16>::new(Some(reset_key));
         let unknown = ConnectionId::new(0x55).unwrap();
         let mut packet = [0x44u8; 48];
         let header_len = ShortHeader {
@@ -810,7 +780,7 @@ mod tests {
         let peer_key = crate::StatelessResetKey::from_device_secret(&[0x81; 32]).unwrap();
         let client_cid = ConnectionId::new(0x61).unwrap();
         let old_server_cid = ConnectionId::new(0x62).unwrap();
-        let mut router = PacketRouter::<ClientState, (), 1>::new(None);
+        let mut router = PacketRouter::<ClientState, ()>::new(None);
         router
             .register_endpoint(
                 client_cid,
@@ -859,7 +829,8 @@ mod tests {
             ConnectionId::relay_local(2, 1).unwrap(),
             ConnectionId::relay_local(2, 2).unwrap(),
         ];
-        let mut router = PacketRouter::<Endpoint, u8, 6>::new(None);
+        let mut router = PacketRouter::<Endpoint, u8>::new(None);
+        router.set_max_entries(6);
         for (index, cid) in clients.into_iter().enumerate() {
             router
                 .register_endpoint(cid, Endpoint::Client(index as u8))
@@ -991,7 +962,7 @@ mod tests {
         let peer_key = crate::StatelessResetKey::from_device_secret(&[0x91; 32]).unwrap();
         let peer_cids = [0x301, 0x302].map(|value| ConnectionId::new(value).unwrap());
         let local_cids = [0x401, 0x402, 0x403].map(|value| ConnectionId::new(value).unwrap());
-        let mut router = PacketRouter::<Endpoint, (), 3>::new(None);
+        let mut router = PacketRouter::<Endpoint, ()>::new(None);
         router
             .register_endpoint(
                 local_cids[0],

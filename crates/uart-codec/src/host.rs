@@ -995,7 +995,7 @@ mod tests {
                 BearerName::new("uart0").unwrap(),
             )
             .unwrap();
-        let mut node = quic_lite::QuicNode::<(), 2, 2, _>::new(None, &NODE_POOL);
+        let mut node = quic_lite::QuicNode::<_>::new(None, &NODE_POOL);
         let bearer_id = node.add_bearer(bearer).unwrap();
         node.associate(
             PacketMeta {

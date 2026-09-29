@@ -57,7 +57,7 @@ Request/response helpers may be built on top of a stream, like an HTTP client
 convenience method, but they are not the transport interface. Large requests,
 uploads, downloads, and diagnostic probes use the same stream API.
 
-## Long headers, direct messages, and forwarding labels
+## Long headers and forwarding labels
 
 Pre-connection traffic uses the RFC 9000 long-header field layout with the
 DMesh extension version `0x444d0001`. An Initial-type packet carries connection
@@ -65,11 +65,6 @@ setup: the request has an empty DCID and the client's receive CID in SCID; the
 response addresses that CID in DCID and advertises the server receive CID in
 SCID. Initial protection and full QUIC transport-parameter negotiation are not
 implemented yet, which is why this must not claim QUIC version 1.
-
-The custom-version 0-RTT type carries bounded connectionless tagged-CBOR. Both
-CID fields are empty and the four-byte packet number is self-contained; it has
-no stream, ACK, retransmission, flow-control, or endpoint state. Packet type,
-not a serialized zero DCID, distinguishes this exceptional direct plane.
 
 Every nonzero local DCID has exactly one unified target at a node: either a
 local endpoint or an opaque forwarding rule. A forwarding rule replaces only

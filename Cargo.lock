@@ -3461,6 +3461,7 @@ dependencies = [
 [[package]]
 name = "mesh"
 version = "0.1.0"
+source = "git+https://github.com/costinm/ssh-mesh#601f9003e315558707ce271d946f38157f1fddb0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3484,6 +3485,7 @@ dependencies = [
 [[package]]
 name = "mesh-api"
 version = "0.1.0"
+source = "git+https://github.com/costinm/ssh-mesh#601f9003e315558707ce271d946f38157f1fddb0"
 dependencies = [
  "serde",
 ]
@@ -3491,6 +3493,7 @@ dependencies = [
 [[package]]
 name = "mesh-mcp"
 version = "0.1.0"
+source = "git+https://github.com/costinm/ssh-mesh#601f9003e315558707ce271d946f38157f1fddb0"
 dependencies = [
  "mesh",
  "serde",
@@ -5654,6 +5657,7 @@ dependencies = [
 [[package]]
 name = "sftp-server"
 version = "0.1.0"
+source = "git+https://github.com/costinm/ssh-mesh#601f9003e315558707ce271d946f38157f1fddb0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -6159,6 +6163,7 @@ dependencies = [
 [[package]]
 name = "ssh-config"
 version = "0.57.0"
+source = "git+https://github.com/costinm/ssh-mesh#601f9003e315558707ce271d946f38157f1fddb0"
 dependencies = [
  "futures",
  "glob",
@@ -6221,6 +6226,7 @@ dependencies = [
 [[package]]
 name = "ssh-mesh"
 version = "0.1.0"
+source = "git+https://github.com/costinm/ssh-mesh#601f9003e315558707ce271d946f38157f1fddb0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8108,6 +8114,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 [[package]]
 name = "ws"
 version = "0.1.0"
+source = "git+https://github.com/costinm/ssh-mesh#601f9003e315558707ce271d946f38157f1fddb0"
 dependencies = [
  "async-trait",
  "axum",

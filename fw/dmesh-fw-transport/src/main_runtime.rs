@@ -525,10 +525,9 @@ pub(crate) fn send_startup_records_on_now(boot_message: &[u8], role: u8, partiti
     );
 }
 
-/// Emit Main's initial discovery record on UART and arm it for later NAN SD.
+/// Build Main's initial discovery record and arm it for later NAN SD.
 /// Called once after the common UART ingress task starts and before Main's
-/// initial NAN+NOW epoch, so serial diagnostics establish boot identity even
-/// if radio initialization later fails.
+/// initial NAN+NOW epoch. Discovery is not injected into the QUIC UART bearer.
 pub(crate) fn send_startup_discovery_uart(role: u8, partition: u8) {
     if let Some((record, used)) = announce_record(
         dmesh_server::announce::ANNOUNCE_DISCOVERY,
@@ -536,7 +535,6 @@ pub(crate) fn send_startup_discovery_uart(role: u8, partition: u8) {
         role,
         partition,
     ) {
-        let _ = crate::commands::send_record(&record[..used]);
         // Boot runs before the initial NAN epoch selects channel 6, so retain
         // the record for that later start. STA transitions gate publication
         // below once their actual channel is known.
@@ -577,13 +575,12 @@ pub(crate) fn send_transition_announce(
     sta_active: bool,
 ) {
     if let Some((record, used)) = announce_record(kind, uptime_secs, 0, 0) {
-        let _ = crate::commands::send_record(&record[..used]);
         let _ = crate::wifi_nan_dw_capture_esp::configure_active_publish(
             crate::wifi_nan_dw_capture_esp::active_on_nan_channel(),
             &record[..used],
         );
         if now_active {
-            let _ = crate::wifi_espnow_esp::broadcast_record(&record[..used]);
+            let _ = crate::wifi_espnow_esp::broadcast_discovery(&record[..used]);
         }
         if sta_active {
             let _ = broadcast_udp_discovery_announce(&record[..used]);
@@ -1424,7 +1421,7 @@ fn apply_sta_live_settings(profile: &crate::TransportProfile, state: &mut MainRa
 
 fn send_announce_on_now(kind: u64, uptime_secs: u64, role: u8, partition: u8) {
     if let Some((record, used)) = announce_record(kind, uptime_secs, role, partition) {
-        let _ = crate::wifi_espnow_esp::broadcast_record(&record[..used]);
+        let _ = crate::wifi_espnow_esp::broadcast_discovery(&record[..used]);
     }
 }
 
@@ -1892,7 +1889,7 @@ const DEADLINE_ACTIVE_DISCOVERY: u8 = 1 << 7;
 /// append a copyable event, but only the Main task receives and acts on it.
 static EVENT_QUEUE: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(core::ptr::null_mut());
 /// A stream `transport.set` must leave its terminal reply deliverable on the
-/// current bearer before the owner is allowed to stop that bearer. Direct
+/// current bearer before the owner is allowed to stop that bearer. Connectionless
 /// NAN/NOW control has its own immediate response and does not use this slot.
 static PROFILE_CHANGE_AFTER_RESPONSE: AtomicU32 = AtomicU32::new(0);
 /// A NAN wake is a deliberate request to make the device reachable, not a
@@ -2265,9 +2262,9 @@ pub(crate) fn receive_tagged_control(
     receive_tagged_control_with_delivery(record, true)
 }
 
-/// Direct NAN/NOW control sends its copied reply before returning, so its
+/// Connectionless NAN/NOW control sends its copied reply before returning, so its
 /// profile transition can proceed immediately without a QUIC ACK edge.
-fn receive_direct_tagged_control(
+fn receive_connectionless_tagged_control(
     record: dmesh_server::tagged::Record<'_>,
 ) -> Option<alloc::vec::Vec<u8>> {
     receive_tagged_control_with_delivery(record, false)
@@ -2600,12 +2597,12 @@ pub(crate) fn receive_nan_service_info(peer: [u8; 6], packet: &[u8]) {
     // SDF receipt; this records the semantic result only for the one mutable
     // direct record that can wake a sleeping node into STA.
     let is_transport_set = matches!(
-        dmesh_server::direct::classify(packet),
-        Some(dmesh_server::direct::DirectMessageKind::TransportSet)
+        dmesh_server::connectionless::classify(packet),
+        Some(dmesh_server::connectionless::ConnectionlessKind::TransportSet)
     );
     // NAN carries the same direct allowlist as every other bearer. The
     // bearer-specific closure only selects the Follow-up return path.
-    if receive_direct_request(packet, |response| {
+    if receive_connectionless_request(packet, |response| {
         // This callback is itself the accepted NAN Service Info ingress. A
         // common control response belongs to that source peer even if a
         // later repeated Android Subscribe raced the one-slot marker. Clear
@@ -2655,31 +2652,33 @@ pub(crate) fn receive_nan_service_info(peer: [u8; 6], packet: &[u8]) {
         ]);
     }
     crate::commands::send_stat(
-        b"nan direct rejected peer=",
+        b"nan connectionless rejected peer=",
         u64::from_le_bytes([peer[0], peer[1], peer[2], peer[3], peer[4], peer[5], 0, 0]),
     );
 }
 
-/// Apply the one bootstrap-safe mutable direct record and emit at most one
+/// Apply the one bootstrap-safe connectionless record and emit at most one
 /// copied response through the caller-selected bearer. Discovery itself uses
 /// the signed `announce.discovery` request/reply record; every other handler
 /// remains on a normal QUIC stream.
-pub(crate) fn receive_direct_transport_set_record<F>(packet: &[u8], send_response: F) -> bool
+pub(crate) fn receive_connectionless_transport_set_record<F>(
+    packet: &[u8],
+    send_response: F,
+) -> bool
 where
     F: FnOnce(&[u8]),
 {
-    if dmesh_server::direct::classify(packet)
-        != Some(dmesh_server::direct::DirectMessageKind::TransportSet)
+    if dmesh_server::connectionless::classify(packet)
+        != Some(dmesh_server::connectionless::ConnectionlessKind::TransportSet)
     {
         return false;
     }
     let Some(record) = dmesh_server::tagged::decode(packet) else {
         return false;
     };
-    // Direct is only a short request/response transport form.  It invokes
-    // this exact canonical tagged handler used by a normal QUIC stream;
-    // QUIC-lite provides the framing/correlation around its payload.
-    let Some(response) = receive_direct_tagged_control(record) else {
+    // This bootstrap-safe record invokes the same canonical tagged handler
+    // used by a normal QUIC stream, without acquiring a QUIC envelope.
+    let Some(response) = receive_connectionless_tagged_control(record) else {
         return false;
     };
     crate::state::direct_record_accepted();
@@ -2687,10 +2686,10 @@ where
     true
 }
 
-/// Dispatch one discovery request or mutable direct-control record without
+/// Dispatch one discovery request or mutable connectionless control record without
 /// knowledge of its bearer. Discovery is an application datagram shared by
 /// UDP multicast, BLE, NAN, and NOW; it does not enter the QUIC direct plane.
-pub(crate) fn receive_direct_request<F>(packet: &[u8], send_response: F) -> bool
+pub(crate) fn receive_connectionless_request<F>(packet: &[u8], send_response: F) -> bool
 where
     F: FnOnce(&[u8]),
 {
@@ -2704,8 +2703,8 @@ where
         send_response(&response);
         return true;
     }
-    match dmesh_server::direct::classify(packet) {
-        Some(dmesh_server::direct::DirectMessageKind::PairWakeup) => {
+    match dmesh_server::connectionless::classify(packet) {
+        Some(dmesh_server::connectionless::ConnectionlessKind::PairWakeup) => {
             let Some(record) = dmesh_server::tagged::decode(packet) else {
                 return false;
             };
@@ -2739,7 +2738,8 @@ where
             let Some(control_record) = dmesh_server::tagged::decode(&encoded[..used]) else {
                 return false;
             };
-            let Some(control_response) = receive_direct_tagged_control(control_record) else {
+            let Some(control_response) = receive_connectionless_tagged_control(control_record)
+            else {
                 return false;
             };
             if dmesh_server::tagged::decode(&control_response)
@@ -2761,8 +2761,8 @@ where
             }
             true
         }
-        Some(dmesh_server::direct::DirectMessageKind::TransportSet) => {
-            receive_direct_transport_set_record(packet, send_response)
+        Some(dmesh_server::connectionless::ConnectionlessKind::TransportSet) => {
+            receive_connectionless_transport_set_record(packet, send_response)
         }
         _ => false,
     }

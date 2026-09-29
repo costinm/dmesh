@@ -66,7 +66,7 @@ const NOW_ACTION_TX_SERVER_WAIT_MS: u32 = 1_000;
 const PUBLIC_ACTION_TX_WAIT_MS: u32 = 10;
 static HANDLER: AtomicUsize = AtomicUsize::new(0);
 static POLL_HANDLER: AtomicUsize = AtomicUsize::new(0);
-// Direct NOW frames are unicast by default, so let the Wi-Fi hardware retry a
+// Unicast NOW frames use the Wi-Fi hardware retry path by default, so let the
 // missed hop before QUIC-lite's end-to-end PTO is needed.  Broadcast records
 // override this below: 802.11 does not acknowledge group-addressed frames.
 static MAC_ACK_ENABLED: AtomicBool = AtomicBool::new(true);
@@ -579,7 +579,7 @@ fn admit_now_payload(source: [u8; 6], payload: &[u8]) {
         return;
     }
     if dmesh_server::tagged::decode(payload).is_some() {
-        let _ = crate::main_runtime::receive_direct_request(payload, |response| {
+        let _ = crate::main_runtime::receive_connectionless_request(payload, |response| {
             let _ = transmit(EspNowPeer { mac: source }, response);
         });
         return;
@@ -793,16 +793,12 @@ fn transmit_submitted(peer: EspNowPeer, payload: &[u8], wait_time_ms: u32) -> bo
     }
 }
 
-/// Emit a bounded unsolicited control/event record on the active NOW radio.
-/// Direct records are QUIC-lite custom long-header packets even though they
-/// are connectionless.  This matches UART and UDP6 and prevents a legacy CID sentinel or
-/// a bare tagged-CBOR shape from becoming a bearer-specific protocol.
-pub fn broadcast_record(record: &[u8]) -> bool {
-    let mut packet = [0u8; crate::TRANSPORT_MTU];
-    let Some(used) = crate::core_runtime::encode_connectionless_message(record, &mut packet) else {
-        return false;
-    };
-    transmit(EspNowPeer { mac: [0xff; 6] }, &packet[..used])
+/// Broadcast one application discovery record outside QUIC. Receive admission
+/// recognizes the tagged discovery schema before handing opaque packets to the
+/// registered QUIC bearer.
+pub fn broadcast_discovery(record: &[u8]) -> bool {
+    dmesh_server::announce::decode_announce(record).is_some()
+        && transmit(EspNowPeer { mac: [0xff; 6] }, record)
 }
 
 /// Send a pre-built public action body through the same ESP-IDF action-TX

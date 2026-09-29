@@ -2161,7 +2161,7 @@ async fn request_udp_stream_local(peer: SocketAddr, payload: &[u8]) -> Result<Ve
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     type Pool = quic_lite::packet_pool::PacketPool<8, { quic_lite::DEFAULT_PACKET_POOL_SLOT_SIZE }>;
-    type Node = quic_lite::QuicNode<(), 2, 2, Pool>;
+    type Node = quic_lite::QuicNode<Pool>;
     static POOL: Pool = Pool::new();
 
     let bind = quic_lite::bearer_udp::wildcard_bind(peer, 0);
@@ -2172,6 +2172,10 @@ async fn request_udp_stream_local(peer: SocketAddr, payload: &[u8]) -> Result<Ve
         .register_peer(peer)
         .map_err(|error| anyhow::anyhow!("register UDP peer: {error:?}"))?;
     let mut node = Node::new(None, &POOL);
+    node.set_limits(quic_lite::NodeLimits::host())
+        .expect("host QUIC node limits are valid");
+    node.set_default_association_limits(quic_lite::AssociationLimits::host())
+        .expect("host QUIC association limits are valid");
     let bearer = node
         .add_bearer(bearer_impl)
         .map_err(|error| anyhow::anyhow!("attach outbound UDP bearer: {error:?}"))?;

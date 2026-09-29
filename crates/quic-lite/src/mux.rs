@@ -14,7 +14,56 @@ struct ValidationSink;
 struct ApplicationStreamSink<'a, F> {
     handler: &'a mut F,
     bytes: usize,
-    finished: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lowered_retention_rejects_out_of_order_packet_before_ack() {
+        const PACKET: usize = 256;
+        let limits = crate::ConnectionLimits::with_receive_profile(1024, 1024, 4);
+        let client = crate::ConnectionId::new(0x31).unwrap();
+        let server = crate::ConnectionId::new(0x47).unwrap();
+        let mut sender = StreamMux::<PACKET>::new_with_history_capacity(
+            Role::Client,
+            limits,
+            PACKET as u64,
+            1,
+            4,
+            1024,
+            4,
+        );
+        sender.install_connection_ids(client, server).unwrap();
+        let mut receiver = StreamMux::<PACKET>::new_with_history_capacity(
+            Role::Server,
+            limits,
+            PACKET as u64,
+            1,
+            4,
+            1024,
+            4,
+        );
+        receiver.install_connection_ids(server, client).unwrap();
+        receiver.set_delivery_limits(4, 32);
+
+        let mut packet = [0u8; PACKET];
+        let (used, _) = sender
+            .encode_response_at(
+                crate::FIRST_CLIENT_BIDI_STREAM_ID,
+                64,
+                &[7; 64],
+                false,
+                &mut packet,
+            )
+            .unwrap();
+        receiver
+            .receive_stream_events(&packet[..used], |_, _, _, bytes| Ok(bytes.len()))
+            .unwrap();
+
+        assert_eq!(receiver.endpoint.received_packet_count(), 0);
+    }
 }
 
 impl<F> CopyingStreamEvents for ApplicationStreamSink<'_, F>
@@ -37,20 +86,11 @@ where
         self.bytes = self.bytes.saturating_add(consumed);
         Ok(consumed)
     }
-
-    fn stream_finished(&mut self, _stream: u64) {
-        self.finished = true;
-    }
-}
-
-#[derive(Debug)]
-pub(crate) enum StreamDeliveryError {
-    Packet(Error),
-    Application(Error),
 }
 
 impl CopyingStreamEvents for ValidationSink {
     type Error = ();
+
     fn stream_chunk(
         &mut self,
         _stream: u64,
@@ -62,19 +102,28 @@ impl CopyingStreamEvents for ValidationSink {
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum StreamDeliveryError {
+    Packet(Error),
+    Application(Error),
+}
+
 /// Persistent connection state plus bounded stream lifecycle management.
-pub(crate) struct StreamMux<
-    const N: usize,
-    const H: usize = 16,
-    const P: usize = { crate::DEFAULT_MAX_PACKET_SIZE },
-> {
-    pub endpoint: EndpointState<N, H, P>,
-    completed: Vec<u64>,
-    max_pending_streams: usize,
+pub(crate) struct StreamMux<const P: usize = { crate::DEFAULT_MAX_PACKET_SIZE }> {
+    pub endpoint: EndpointState<P>,
     ordered: CallbackStreams<Arc<Vec<u8>>>,
 }
 
-impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
+impl<const P: usize> StreamMux<P> {
+    pub(crate) fn set_delivery_limits(&mut self, max_streams: usize, max_bytes: usize) {
+        self.ordered.set_limits(max_streams, max_bytes);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delivery_limits(&self) -> (usize, usize) {
+        self.ordered.limits()
+    }
+
     pub(crate) unsafe fn init_in_place(
         out: *mut Self,
         role: Role,
@@ -92,8 +141,6 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
                 max_packet_size,
                 history_capacity,
             );
-            core::ptr::addr_of_mut!((*out).completed).write(Vec::new());
-            core::ptr::addr_of_mut!((*out).max_pending_streams).write(max_pending_streams);
             core::ptr::addr_of_mut!((*out).ordered)
                 .write(CallbackStreams::new(max_pending_streams, max_stream_bytes));
         }
@@ -114,8 +161,6 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
                 max_packet_size,
                 history_capacity,
             ),
-            completed: Vec::new(),
-            max_pending_streams,
             ordered: CallbackStreams::new(max_pending_streams, max_stream_bytes),
         }
     }
@@ -148,31 +193,21 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
                 .map_err(StreamDeliveryError::Packet)?;
         let mut offset = header_len;
         let mut has_stream = false;
-        let mut staged = self.ordered.clone();
+        let mut completed_before_packet = Vec::new();
+        let mut packet_frames = Vec::new();
         while offset < input.len() {
             let (frame, used) =
                 crate::decode_frame(&input[offset..]).map_err(StreamDeliveryError::Packet)?;
             if let crate::Frame::Stream(stream) = frame {
                 has_stream = true;
-                let mut sink = ValidationSink;
-                match staged.receive_copying_borrowed(
-                    stream.id,
-                    stream.data,
-                    stream.offset,
-                    stream.fin,
-                    || Arc::new(stream.data.to_vec()),
-                    &mut sink,
-                ) {
-                    Ok(()) => {}
-                    Err(CopyingError::Transport(CallbackError::Capacity)) => {
-                        // Leave the packet unacknowledged. Normal loss recovery
-                        // retries it after the missing ordered prefix arrives.
-                        return Ok(());
+                if self.endpoint.stream_delivery_complete(stream.id) {
+                    if !completed_before_packet.contains(&stream.id) {
+                        completed_before_packet.push(stream.id);
                     }
-                    Err(CopyingError::Transport(_)) | Err(CopyingError::Callback(_)) => {
-                        return Err(StreamDeliveryError::Packet(Error::Invalid));
-                    }
+                    offset += used;
+                    continue;
                 }
+                packet_frames.push((stream.id, stream.offset, stream.data.len(), stream.fin));
             }
             offset += used;
         }
@@ -181,6 +216,51 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
                 .receive_packet(input)
                 .map_err(StreamDeliveryError::Packet)?;
             return Ok(());
+        }
+        match self.ordered.validate_packet_frames(&packet_frames) {
+            Ok(()) => {}
+            Err(CallbackError::Capacity) => {
+                // Leave the packet unacknowledged. Normal loss recovery
+                // retries it after live delivery state drains.
+                return Ok(());
+            }
+            Err(_) => return Err(StreamDeliveryError::Packet(Error::Invalid)),
+        }
+        let packet_stream_bytes = packet_frames
+            .iter()
+            .fold(0usize, |total, (_, _, len, _)| total.saturating_add(*len));
+        if self.ordered.retention_may_exceed(packet_stream_bytes) {
+            // A lowered live retention policy can be smaller than credit the
+            // peer has already received. Dry-run only this exceptional case
+            // before endpoint state ACKs the packet.
+            let mut staged = self.ordered.clone();
+            let mut offset = header_len;
+            while offset < input.len() {
+                let (decoded, used) =
+                    crate::decode_frame(&input[offset..]).map_err(StreamDeliveryError::Packet)?;
+                offset += used;
+                let crate::Frame::Stream(frame) = decoded else {
+                    continue;
+                };
+                if completed_before_packet.contains(&frame.id) {
+                    continue;
+                }
+                let mut sink = ValidationSink;
+                match staged.receive_copying_borrowed(
+                    frame.id,
+                    frame.data,
+                    frame.offset,
+                    frame.fin,
+                    || Arc::new(frame.data.to_vec()),
+                    &mut sink,
+                ) {
+                    Ok(()) => {}
+                    Err(CopyingError::Transport(CallbackError::Capacity)) => return Ok(()),
+                    Err(CopyingError::Transport(_)) | Err(CopyingError::Callback(_)) => {
+                        return Err(StreamDeliveryError::Packet(Error::Invalid));
+                    }
+                }
+            }
         }
         self.endpoint
             .receive_packet(input)
@@ -194,13 +274,12 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
             let crate::Frame::Stream(frame) = decoded else {
                 continue;
             };
-            if self.completed.contains(&frame.id) {
+            if completed_before_packet.contains(&frame.id) {
                 continue;
             }
             let mut sink = ApplicationStreamSink {
                 handler: &mut on_stream,
                 bytes: 0,
-                finished: false,
             };
             match self.ordered.receive_copying_borrowed(
                 frame.id,
@@ -223,12 +302,6 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
                     .stream_consumed(frame.id, sink.bytes)
                     .map_err(StreamDeliveryError::Packet)?;
             }
-            if sink.finished {
-                if self.completed.len() >= self.max_pending_streams {
-                    self.completed.remove(0);
-                }
-                self.completed.push(frame.id);
-            }
         }
         Ok(())
     }
@@ -247,7 +320,6 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
         let mut sink = ApplicationStreamSink {
             handler: &mut on_stream,
             bytes: 0,
-            finished: false,
         };
         self.ordered
             .resume_copying(stream_id, &mut sink)
@@ -259,12 +331,6 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
             self.endpoint
                 .stream_consumed(stream_id, sink.bytes)
                 .map_err(StreamDeliveryError::Packet)?;
-        }
-        if sink.finished {
-            if self.completed.len() >= self.max_pending_streams {
-                self.completed.remove(0);
-            }
-            self.completed.push(stream_id);
         }
         Ok(sink.bytes)
     }

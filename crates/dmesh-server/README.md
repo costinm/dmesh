@@ -78,11 +78,9 @@ use the envelope above.
 ## Core settings and radio lifecycle
 
 Component `1` is the common device-control component. Its requests and
-responses are ordinary tagged records: they may use a direct message when the
-result fits, or a QUIC-lite stream when ordering/reliability or a larger result
-is needed. A NAN SD/follow-up, raw action, LoRa/FSK message, UART record, and
-UDP6 direct datagram therefore carry identical bytes. None gets a private
-firmware command grammar.
+responses use QUIC-lite streams. Discovery and wake records remain separate
+application datagrams on NAN, NOW, BLE, and UDP multicast; they do not acquire
+a QUIC envelope or a private firmware command grammar.
 
 | Method | Name | Fields | Result / adapter responsibility |
 | ---: | --- | --- | --- |
@@ -136,17 +134,11 @@ association so the next QUIC-lite OPEN receives one coherent profile. It does
 not restart STA, change channel, or reconfigure radio callbacks. Path policy
 and timeout remain connection-manager settings and are not radio controls.
 
-## Direct messages and DCID forwarding setup
+## DCID forwarding setup
 
-A direct message carries the DMesh custom-version QUIC long header with empty
-DCID/SCID fields and a four-byte packet number, followed directly by one
-tagged-CBOR record. Its version-specific packet type distinguishes it from
-connection setup; it does not carry a QUIC frame, create endpoint
-state, consume stream credit, ACK, retransmit, or use flow control. Direct
-messages are appropriate for idempotent desired-state commands and small
-responses; a record with key `3` (`id`) requests a correlated response on a
-separately routed direct message. Connection setup uses the Initial-shaped long
-header and its official source/destination CID fields.
+Connection setup uses the Initial-shaped long header and its official
+source/destination CID fields. Application requests and responses use streams;
+connectionless discovery and wake records remain outside QUIC.
 
 Component `5` configures independent one-way forwarding rules. It is accepted
 through the stream handler surface; the first portable
@@ -171,8 +163,7 @@ port do not fit in this compact value. During `relay.pair`, Main binds that
 token to the complete request-ingress tuple. The two rules are transactionally
 reconciled locally but remain independent directional DCID entries.
 The relay accepts a proposed local DCID or later returns a locally allocated
-one. `outbound_dcid=0` means the final next hop receives a direct message;
-nonzero values select another relay rule or a QUIC endpoint. A forward and its
+one. A nonzero outbound DCID selects another relay rule or a QUIC endpoint. A forward and its
 return path remain separate setup records. Repeating an equal allocation with
 the same request `id` is an idempotent retry: it returns the current result and
 does not consume another rule slot; a different target for the same local DCID

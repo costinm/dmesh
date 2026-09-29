@@ -15,10 +15,10 @@ pub mod announce;
 pub mod cbor;
 /// Tagged entry point for bearer-neutral QUIC-lite connection policy.
 pub mod connection;
+/// Explicit connectionless application-message allowlist and replay support.
+pub mod connectionless;
 /// Tagged-CBOR control handlers shared by direct records and streams.
 pub mod control;
-/// Explicit connectionless application-message allowlist and replay support.
-pub mod direct;
 /// Shared receiver-side facts exposed by every platform's discovered-device
 /// list. Radio callbacks and retention remain adapter-owned.
 pub mod discovery;
@@ -71,7 +71,7 @@ pub mod tagged;
 /// Portable local discovery status and transport-owned metric views.
 pub mod telemetry;
 /// Common ingress provenance and policy-driven egress selection shared by
-/// QUIC-lite, direct messages, radio adapters, and future relay paths.
+/// QUIC-lite, discovery/control adapters, and future relay paths.
 pub mod transport_path;
 pub mod transport_state;
 /// Cross-platform selection of NAN observers for waking a sleepy peer.

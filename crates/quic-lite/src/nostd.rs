@@ -51,25 +51,10 @@ impl<B: AsRef<[u8]> + Send> crate::bearer::PacketIngressQueue<B> for IngressQueu
 /// physical submission callback. Those remain owned by `QuicNode` and the
 /// common bearer interface.
 pub struct NoStdRuntime<
-    NextHop,
-    const ASSOCIATIONS: usize,
-    const ROUTES: usize,
     P: PacketPool + 'static,
-    const CLIENT_HISTORY: usize = 8,
-    const SERVER_STREAMS: usize = 8,
-    const SERVER_HISTORY: usize = 8,
     const PACKET: usize = { crate::DEFAULT_MAX_PACKET_SIZE },
 > {
-    node: QuicNode<
-        NextHop,
-        ASSOCIATIONS,
-        ROUTES,
-        P,
-        CLIENT_HISTORY,
-        SERVER_STREAMS,
-        SERVER_HISTORY,
-        PACKET,
-    >,
+    node: QuicNode<P, PACKET>,
     limits: ConnectionLimits,
     ingress: Arc<IngressQueue<P::Buffer>>,
     accepted: VecDeque<QuicAssociation>,
@@ -127,7 +112,7 @@ mod tests {
     #[test]
     fn immediate_driver_uses_registered_bearer_pool_without_ingress_queue() {
         let retained = Arc::new(Mutex::new(None));
-        let node = QuicNode::<(), 2, 2, Pool>::new(
+        let node = QuicNode::<Pool>::new(
             Some(StatelessResetKey::from_device_secret(&[9; 32]).unwrap()),
             &POOL,
         );
@@ -154,7 +139,7 @@ mod tests {
     #[test]
     fn immediate_driver_starts_client_association_without_exposing_role_state() {
         let retained = Arc::new(Mutex::new(None));
-        let node = QuicNode::<(), 2, 2, Pool>::new(
+        let node = QuicNode::<Pool>::new(
             Some(StatelessResetKey::from_device_secret(&[7; 32]).unwrap()),
             &POOL,
         );
@@ -174,7 +159,7 @@ mod tests {
 
     #[test]
     fn boxed_runtime_initializes_in_final_storage() {
-        let mut runtime = NoStdRuntime::<(), 12, 0, Pool>::try_new_boxed(
+        let mut runtime = NoStdRuntime::<Pool>::try_new_boxed(
             Some(StatelessResetKey::from_device_secret(&[5; 32]).unwrap()),
             &POOL,
             ConnectionLimits::default(),
@@ -186,53 +171,44 @@ mod tests {
     }
 }
 
-impl<
-    NextHop,
-    const ASSOCIATIONS: usize,
-    const ROUTES: usize,
-    P,
-    const CLIENT_HISTORY: usize,
-    const SERVER_STREAMS: usize,
-    const SERVER_HISTORY: usize,
-    const PACKET: usize,
->
-    NoStdRuntime<
-        NextHop,
-        ASSOCIATIONS,
-        ROUTES,
-        P,
-        CLIENT_HISTORY,
-        SERVER_STREAMS,
-        SERVER_HISTORY,
-        PACKET,
-    >
+impl<P, const PACKET: usize> NoStdRuntime<P, PACKET>
 where
-    NextHop: Copy,
     P: PacketPool + 'static,
     P::Buffer: Send,
 {
+    /// Replace node-wide runtime admission limits.
+    pub fn set_limits(&mut self, limits: crate::NodeLimits) -> Result<(), crate::QuicNodeError> {
+        self.node.set_limits(limits)
+    }
+
+    /// Select limits for associations admitted after this call.
+    pub fn set_default_association_limits(
+        &mut self,
+        limits: crate::AssociationLimits,
+    ) -> Result<(), crate::QuicNodeError> {
+        self.limits = limits.connection;
+        self.node.set_default_association_limits(limits)
+    }
+
+    /// Change one live association's growth policy.
+    pub fn set_association_limits(
+        &mut self,
+        association: crate::QuicAssociation,
+        limits: crate::AssociationLimits,
+    ) -> Result<(), crate::QuicNodeEgressError> {
+        self.node.set_association_limits(association, limits)
+    }
+
     /// Bind fixed server admission limits to a node registered with its
     /// physical bearers.
-    pub fn new(
-        node: QuicNode<
-            NextHop,
-            ASSOCIATIONS,
-            ROUTES,
-            P,
-            CLIENT_HISTORY,
-            SERVER_STREAMS,
-            SERVER_HISTORY,
-            PACKET,
-        >,
-        limits: ConnectionLimits,
-    ) -> Self {
+    pub fn new(node: QuicNode<P, PACKET>, limits: ConnectionLimits) -> Self {
         let ingress = Arc::new(IngressQueue::new(node.packet_capacity().max(1)));
         Self {
             node,
             limits,
             ingress,
-            accepted: VecDeque::with_capacity(ASSOCIATIONS),
-            streams: VecDeque::with_capacity(ASSOCIATIONS.saturating_mul(SERVER_STREAMS).max(1)),
+            accepted: VecDeque::new(),
+            streams: VecDeque::new(),
         }
     }
 
@@ -240,7 +216,7 @@ where
     /// location.
     ///
     /// This is exported for RTOS integrations whose packet task stack cannot
-    /// hold the fixed-capacity association table even temporarily. It exposes
+    /// hold the complete node state even temporarily. It exposes
     /// no transport internals: callers receive the same opaque runtime as
     /// [`Self::new`], with allocation failure reported before initialization.
     pub fn try_new_boxed(
@@ -255,29 +231,15 @@ where
         unsafe {
             let runtime = allocation[0].as_mut_ptr();
             let node_storage = &mut *core::ptr::addr_of_mut!((*runtime).node)
-                .cast::<core::mem::MaybeUninit<
-                    QuicNode<
-                        NextHop,
-                        ASSOCIATIONS,
-                        ROUTES,
-                        P,
-                        CLIENT_HISTORY,
-                        SERVER_STREAMS,
-                        SERVER_HISTORY,
-                        PACKET,
-                    >,
-                >>();
+                .cast::<core::mem::MaybeUninit<QuicNode<P, PACKET>>>();
             let capacity = QuicNode::new_in_place(node_storage, reset_key, pool)
                 .packet_capacity()
                 .max(1);
             core::ptr::addr_of_mut!((*runtime).limits).write(limits);
             core::ptr::addr_of_mut!((*runtime).ingress)
                 .write(Arc::new(IngressQueue::new(capacity)));
-            core::ptr::addr_of_mut!((*runtime).accepted)
-                .write(VecDeque::with_capacity(ASSOCIATIONS));
-            core::ptr::addr_of_mut!((*runtime).streams).write(VecDeque::with_capacity(
-                ASSOCIATIONS.saturating_mul(SERVER_STREAMS).max(1),
-            ));
+            core::ptr::addr_of_mut!((*runtime).accepted).write(VecDeque::new());
+            core::ptr::addr_of_mut!((*runtime).streams).write(VecDeque::new());
             let raw = Box::into_raw(allocation) as *mut core::mem::MaybeUninit<Self>;
             Ok(Box::from_raw(raw.cast::<Self>()))
         }
@@ -334,16 +296,22 @@ where
     ///
     /// Temporary pool, flow-control, congestion, or bearer pressure leaves
     /// the stream position unchanged so the caller can retry the same bytes.
-    /// A pre-association direct message uses this same interface; QUIC-lite
-    /// buffers accepted bytes until [`Self::finish_stream`] selects its
-    /// long-packet response representation without exposing that distinction
-    /// to a handler.
     pub fn write_stream(
         &mut self,
         stream: &mut crate::QuicStream,
         bytes: &[u8],
     ) -> Result<usize, QuicNodeEgressError> {
         self.node.write_stream(stream, bytes)
+    }
+
+    /// Write the final application bytes, carrying FIN on the packet that
+    /// accepts the complete remaining slice.
+    pub fn write_stream_and_finish(
+        &mut self,
+        stream: &mut crate::QuicStream,
+        bytes: &[u8],
+    ) -> Result<usize, QuicNodeEgressError> {
+        self.node.write_stream_and_finish(stream, bytes)
     }
 
     /// Close the stream's sending half after all accepted bytes.
@@ -386,9 +354,6 @@ where
     /// receive credit for it. A zero-length chunk (a bare FIN) cannot be
     /// refused: returning 0 for it accepts the end of the stream. In-order
     /// chunks therefore require no per-chunk
-    /// allocation. Connectionless direct messages continue through
-    /// [`Self::next_stream_chunk`] because their reply handle is constructed
-    /// only after packet classification completes.
     pub fn progress_with_stream<F>(&mut self, mut on_stream: F) -> Result<bool, QuicNodeEgressError>
     where
         F: FnMut(crate::QuicStream, u64, bool, &[u8]) -> Result<usize, crate::Error>,
@@ -404,21 +369,13 @@ where
     /// Advance transport timers and retain any terminal association event.
     pub fn advance_time(&mut self, now_us: u64) -> Result<bool, QuicNodeEgressError> {
         self.node.advance_clock(now_us);
-        match self
-            .node
-            .timer_expired(now_us, crate::node::DEFAULT_INITIAL_PTO_US)?
-        {
+        match self.node.timer_expired(now_us)? {
             Some(crate::node::NodeTimer::Egress(packet)) => {
                 self.node.submit_node_packet(packet)?;
                 Ok(true)
             }
-            Some(crate::node::NodeTimer::BootstrapTimedOut { .. }) => {
-                Err(QuicNodeEgressError::AssociationTimedOut)
-            }
-            Some(crate::node::NodeTimer::IdleTimedOut { association }) => {
-                let _ = association;
-                Ok(true)
-            }
+            Some(crate::node::NodeTimer::BootstrapTimedOut { .. }) => Ok(true),
+            Some(crate::node::NodeTimer::IdleTimedOut { .. }) => Ok(true),
             None => Ok(false),
         }
     }
@@ -433,47 +390,46 @@ where
         F: FnMut(crate::QuicStream, u64, bool, &[u8]) -> Result<usize, crate::Error>,
     {
         self.node.drain_bearer_events();
-        let first_cid = self.node.allocate_local_cid()?;
-        let second_cid = self.node.allocate_local_cid()?;
         let limits = self.limits;
+        let node_limits = self.node.limits();
+        let stream_queue_limit = node_limits
+            .max_associations
+            .saturating_mul(self.node.default_association_limits().max_pending_streams)
+            .max(1);
         let streams = &mut self.streams;
         let ingress = self
             .node
             .receive_packet(
                 meta,
                 packet,
-                |open| {
+                |_| {
                     Some(InitialAdmission {
-                        server_cid: if first_cid == open.client_receive_cid {
-                            second_cid
-                        } else {
-                            first_cid
-                        },
                         local_limits: limits,
                     })
                 },
                 |source, stream, offset, fin, bytes| {
-                    if let ApplicationStreamSource::Association(association) = source {
-                        if let Some(handler) = on_stream.as_deref_mut() {
-                            return handler(
-                                crate::QuicStream::incoming(association, stream),
-                                offset,
-                                fin,
-                                bytes,
-                            );
-                        }
-                        // A zero-length FIN cannot be refused (it has no bytes
-                        // to retain), so it is queued even at capacity.
-                        if !bytes.is_empty() && streams.len() == streams.capacity() {
-                            return Ok(0);
-                        }
-                        streams.push_back(ReceivedStreamChunk {
-                            stream: crate::QuicStream::incoming(association, stream),
+                    let ApplicationStreamSource::Association(association) = source;
+                    if let Some(handler) = on_stream.as_deref_mut() {
+                        return handler(
+                            crate::QuicStream::incoming(association, stream),
                             offset,
                             fin,
-                            bytes: bytes.to_vec(),
-                        });
+                            bytes,
+                        );
                     }
+                    // A zero-length FIN cannot be refused (it has no bytes
+                    // to retain), so it is queued even at capacity.
+                    if !bytes.is_empty()
+                        && (streams.len() >= stream_queue_limit || streams.try_reserve(1).is_err())
+                    {
+                        return Ok(0);
+                    }
+                    streams.push_back(ReceivedStreamChunk {
+                        stream: crate::QuicStream::incoming(association, stream),
+                        offset,
+                        fin,
+                        bytes: bytes.to_vec(),
+                    });
                     Ok(bytes.len())
                 },
             )
@@ -493,7 +449,9 @@ where
                 association,
                 response,
             } => {
-                if self.accepted.len() < self.accepted.capacity() {
+                if self.accepted.len() < node_limits.max_associations
+                    && self.accepted.try_reserve(1).is_ok()
+                {
                     self.accepted.push_back(association);
                 }
                 self.node.submit_egress(
@@ -519,20 +477,6 @@ where
                 response.peer_l2_address,
                 response.packet,
             )?,
-            NodeIngress::Direct(request) => {
-                if self.streams.len() == self.streams.capacity() {
-                    return Err(QuicNodeEgressError::StreamEventsFull);
-                }
-                self.streams.push_back(ReceivedStreamChunk {
-                    stream: crate::QuicStream::direct(
-                        request.reply(),
-                        crate::callback::DIRECT_MESSAGE_STREAM_ID,
-                    ),
-                    offset: 0,
-                    fin: true,
-                    bytes: request.payload().to_vec(),
-                });
-            }
             NodeIngress::PeerReset { .. } | NodeIngress::PeerClosed { .. } => {}
             NodeIngress::Forward { .. } => {
                 return Err(QuicNodeEgressError::RelayUnavailable);
@@ -553,17 +497,23 @@ where
     pub fn next_stream_chunk(&mut self) -> Option<ReceivedStreamChunk> {
         let chunk = self.streams.pop_front()?;
         if let Some(association) = chunk.stream.association() {
+            let stream_queue_limit = self
+                .node
+                .limits()
+                .max_associations
+                .saturating_mul(self.node.default_association_limits().max_pending_streams)
+                .max(1);
             let streams = &mut self.streams;
             let resumed = self.node.resume_stream_delivery(
                 association,
                 chunk.stream.id(),
                 &mut |source, stream, offset, fin, bytes| {
-                    let ApplicationStreamSource::Association(association) = source else {
-                        return Ok(bytes.len());
-                    };
+                    let ApplicationStreamSource::Association(association) = source;
                     // A zero-length FIN cannot be refused (it has no bytes to
                     // retain), so it is queued even at capacity.
-                    if !bytes.is_empty() && streams.len() == streams.capacity() {
+                    if !bytes.is_empty()
+                        && (streams.len() >= stream_queue_limit || streams.try_reserve(1).is_err())
+                    {
                         return Ok(0);
                     }
                     streams.push_back(ReceivedStreamChunk {
