@@ -290,7 +290,7 @@ async fn wait_for_init_services(daemon: &std::sync::Arc<Daemon>) {
                 .iter()
                 .filter(|name| match services.get(*name) {
                     Some(proc) => {
-                        !(proc.state == mesh_init::protocol::ServiceState::Stopped
+                        !(proc.state == mesh_init::states::ServiceState::Stopped
                             && proc.pid.is_none())
                     }
                     None => false,
@@ -326,7 +326,7 @@ async fn wait_for_service_exit(daemon: &std::sync::Arc<Daemon>, name: &str) {
     {
         let services = daemon.services.lock();
         if let Some(proc) = services.get(name) {
-            if proc.state == mesh_init::protocol::ServiceState::Stopped && proc.pid.is_none() {
+            if proc.state == mesh_init::states::ServiceState::Stopped && proc.pid.is_none() {
                 return;
             }
         } else {
@@ -338,7 +338,7 @@ async fn wait_for_service_exit(daemon: &std::sync::Arc<Daemon>, name: &str) {
         if exited_name == name {
             let services = daemon.services.lock();
             if let Some(proc) = services.get(name) {
-                if proc.state == mesh_init::protocol::ServiceState::Stopped && proc.pid.is_none() {
+                if proc.state == mesh_init::states::ServiceState::Stopped && proc.pid.is_none() {
                     break;
                 }
             } else {

@@ -17,6 +17,18 @@ document.
 |---:|---|---|---|
 | 1 | `name` | `string` | |
 
+### Response (JSON object; untagged)
+
+Alongside the base state report, the response carries provenance fields added
+with the idle-freeze and pressure work:
+
+- `stop_reason` — `exited`, `requested`, `idle`, `evicted`, or `crash_limit`
+  when the service is stopped.
+- `freeze_reason` — `user`, `idle`, or `pressure` when the service is frozen.
+- `activity` — the last reported counts: `connections`, `requests`, `holds`.
+- `idle` — whether the last activity report was all-zero.
+- `memory_bytes` — current `memory.current` of the service cgroup.
+
 ## 2. `start` — Start a configured service by name
 
 ### Request
@@ -38,11 +50,16 @@ document.
 
 ## 4. `freeze` — Suspend a running service
 
+Writes `cgroup.freeze=1` and waits for the kernel to confirm the frozen
+state. Freezing is refused for services without a cgroup; there is no
+SIGSTOP fallback.
+
 ### Request
 
 | Tag | Field | Type | Description |
 |---:|---|---|---|
 | 1 | `name` | `string` | |
+| 2 | `reason` | `string` | Optional. `user` (default) waits for an explicit unfreeze; `pressure` also thaws on activity or when pressure clears. |
 
 ## 5. `unfreeze` — Resume a frozen service
 
@@ -87,6 +104,16 @@ document.
 | 1 | `path` | `string` | |
 
 ## 11. `pressure` — Return pressure watch state
+
+### Request
+
+### Response (JSON object; untagged)
+
+Nice to read alongside the cgroup observation data: the pressure policy
+maintains a current `level` of `none`, `low`, `medium`, `high`, or
+`critical`, plus a list of recent actions (trim rounds, memory reclaims,
+idle freezes, evictions, kills). The idle-freeze policy status is visible
+through `status` on individual services; `pressure` answers for the host.
 
 ## 12. `cgroup_high` — Set memory.high for a cgroup based on current memory usage
 

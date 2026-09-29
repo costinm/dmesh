@@ -254,6 +254,45 @@ pub fn freeze_cgroup(cgroup_path: &str, freeze: bool) -> Result<(), CgroupError>
     Ok(())
 }
 
+/// Push pages out of a cgroup with `memory.reclaim`.
+///
+/// Requires Linux >= 5.19. On kernels without the file this logs and
+/// returns Ok: swap setup is the host administrator's choice, not ours, and
+/// waking the flow would otherwise appear as a hard failure.
+pub fn reclaim_memory(cgroup_path: &str, bytes: u64) -> Result<(), CgroupError> {
+    let path = format!("{cgroup_path}/memory.reclaim");
+    if !Path::new(&path).exists() {
+        debug!(
+            path = %cgroup_path,
+            "memory_reclaim_unsupported_kernel"
+        );
+        return Ok(());
+    }
+    match write_cgroup_file(cgroup_path, "memory.reclaim", &bytes.to_string()) {
+        Ok(()) => info!(path = %cgroup_path, bytes, "memory_reclaimed"),
+        Err(e) => {
+            // A partial reclaim is still progress; timeouts are expected
+            // when the cgroup cannot give back the requested amount.
+            debug!(path = %cgroup_path, error = %e, "memory_reclaim_partial")
+        }
+    }
+    Ok(())
+}
+
+/// Kill every process in a cgroup subtree with `cgroup.kill` (Linux >= 5.14).
+///
+/// Used by the stop path so the entire scope dies, not just the main PID.
+pub fn kill_scope(cgroup_path: &str) -> Result<(), CgroupError> {
+    let path = format!("{cgroup_path}/cgroup.kill");
+    if !Path::new(&path).exists() {
+        debug!(path = %cgroup_path, "cgroup_kill_unsupported");
+        return Ok(());
+    }
+    fs::write(&path, "1").map_err(CgroupError::Io)?;
+    info!(path = %cgroup_path, "cgroup_killed");
+    Ok(())
+}
+
 /// Remove an empty cgroup directory.
 pub fn remove_cgroup(cgroup_path: &str) -> Result<(), CgroupError> {
     if Path::new(cgroup_path).exists() {

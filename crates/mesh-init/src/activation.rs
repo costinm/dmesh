@@ -75,7 +75,11 @@ fn activation_semaphore() -> Arc<Semaphore> {
         .clone()
 }
 
-fn register_service_listener_fd(
+/// Register one listener for a service in the daemon-held registry.
+///
+/// Listeners arrive from activations and from FDSTORE notifications; both
+/// feed warm restarts and the LISTEN_FDS hand-off.
+pub(crate) fn register_service_listener_fd(
     service_name: &str,
     order: usize,
     fd: &OwnedFd,
@@ -118,6 +122,27 @@ pub(crate) fn service_listener_fds(service_name: &str) -> Vec<ActivationListenFd
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Edge-free readability check for a listener socket.
+///
+/// Tokio's `AsyncFd` is edge-triggered, so a connection that was already
+/// queued before a freeze produced no fresh readiness event. After each
+/// freeze, run one `poll(fd, 0)` pass over the listeners; any connection
+/// already pending thaws the service at once.
+pub(crate) fn has_pending_connection(fd: i32) -> bool {
+    let mut pollfd = [libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    }];
+    // Non-blocking read check: timeout 0 returns immediately.
+    let rc = unsafe { libc::poll(pollfd.as_mut_ptr(), 1, 0) };
+    if rc <= 0 {
+        return false;
+    }
+    let revents = pollfd[0].revents;
+    revents & (libc::POLLIN | libc::POLLRDNORM | libc::POLLRDHUP) != 0
 }
 
 // ============================================================================
@@ -493,9 +518,12 @@ fn start_activation_socket_target(
 ) -> anyhow::Result<()> {
     let already_running = {
         let services = daemon.services.lock();
-        services
-            .get(service_name)
-            .is_some_and(|p| p.state == ServiceState::Running || p.state == ServiceState::Starting)
+        services.get(service_name).is_some_and(|p| {
+            matches!(
+                p.protocol_state(),
+                ServiceState::Running | ServiceState::Starting
+            )
+        })
     };
 
     if already_running {
@@ -1169,10 +1197,44 @@ async fn handle_listener(
 
         if wait {
             // Accept=false: pass the listening FD to the child using systemd-style activation.
+            // Phase 1: a Frozen or Freezing service is woken, not started a second time.
+            let state_probe = {
+                let services = daemon.services.lock();
+                services.get(&service_name).map(|p| p.state)
+            };
+            if let Some(state) = state_probe {
+                match state {
+                    crate::states::ServiceState::Frozen { .. }
+                    | crate::states::ServiceState::Freezing { .. } => {
+                        // One poll(fd, 0) sweep first: an already-queued
+                        // connection must thaw the service right away.
+                        let has_queued = has_pending_connection(async_fd.get_ref().as_raw_fd());
+                        info!(
+                            service = %service_name,
+                            queued = has_queued,
+                            "activation_wake_thaw_service"
+                        );
+                        if let Err(error) = daemon.ensure_running(&service_name, None, None).await {
+                            error!(service = %service_name, error = %error, "wake_service_failed");
+                        }
+                        guard.clear_ready();
+                        continue;
+                    }
+                    // Starting/Running/Stopping: already tracked by the daemon.
+                    _ => {
+                        guard.clear_ready();
+                        continue;
+                    }
+                }
+            }
+
             let already_running = {
                 let services = daemon.services.lock();
                 services.get(&service_name).is_some_and(|p| {
-                    p.state == ServiceState::Running || p.state == ServiceState::Starting
+                    matches!(
+                        p.protocol_state(),
+                        ServiceState::Running | ServiceState::Starting
+                    )
                 })
             };
             if already_running {
@@ -1196,7 +1258,10 @@ async fn handle_listener(
                     fds.push(ActivationListenFd { fd, name: None });
                 }
                 let passed_fd = Some(ActivationFd::Listen(fds));
-                if let Err(e) = daemon.start_service_with_config(config, passed_fd) {
+                if let Err(e) = daemon
+                    .ensure_running(&service_name, Some(config), passed_fd)
+                    .await
+                {
                     error!(service = %service_name, error = %e, "activate_service_failed");
                 }
             }

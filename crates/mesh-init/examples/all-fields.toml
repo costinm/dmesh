@@ -69,7 +69,9 @@ ExecReload = ["/bin/true"]
 # Applies to: service lifecycle.
 # Supported values: oneshot (runs once at startup), exec (long-running daemon
 # started at boot; with [Socket] Accept=false, mesh-init passes the listening
-# fds through LISTEN_FDS/LISTEN_FDNAMES at startup).
+# fds through LISTEN_FDS/LISTEN_FDNAMES at startup), notify (readiness via
+# READY=1 on NOTIFY_SOCKET; mesh-init always sets NOTIFY_SOCKET for children,
+# or "none" to disable the channel).
 # If Type is omitted or empty, the service does not auto-start at boot and must be started via socket activation or an explicit start command.
 Type = "oneshot"
 
@@ -151,6 +153,33 @@ WatchdogSec = 30
 # Applies to: service scale-to-zero / idle termination.
 # Stop the service after this many seconds of being idle (active=0 and no stderr output).
 IdleTerminationSec = 300
+
+# Applies to: idle freeze (phase 2).
+# What mesh-init does once the service reports itself idle for
+# IdleFreezeSec: freeze (cgroup.freeze until activity), stop (terminate),
+# or none (do nothing). Defaults to "none"; a configured IdleFreezeSec
+# implies "freeze" when IdleAction is omitted.
+IdleAction = "freeze"
+
+# Applies to: idle freeze (phase 2).
+# Window of self-reported idle time before mesh-init runs the prepare-freeze
+# handshake and freezes the cgroup. Connects snap into the listener backlog
+# and wake the service.
+IdleFreezeSec = 30
+
+# Applies to: idle freeze (phase 2e, reserved).
+# Detection mode for services without self-reports. Only "socket" is defined;
+# requires mesh-init-owned listeners.
+IdleDetect = "socket"
+
+# Applies to: pressure policy (phase 3).
+# When false or omitted, the service may be evicted under memory pressure.
+# Set to true to shield the service from trimming, freezing, and eviction.
+Evictable = true
+
+# Applies to: idle freeze (phase 3).
+# When true, writing memory.reclaim to the service cgroup after a freeze.
+MemoryReclaimOnFreeze = true
 
 # Applies to: child process credentials.
 # Supplementary group names or numeric GID strings.

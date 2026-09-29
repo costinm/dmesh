@@ -1,3 +1,4 @@
+pub mod activity;
 /// Generated API data types from the normative mesh API.md catalog.
 #[doc(hidden)]
 pub mod api;

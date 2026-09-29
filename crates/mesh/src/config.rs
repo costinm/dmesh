@@ -123,6 +123,17 @@ pub struct ServiceSection {
     /// `/home/<service>/run/<service>/control.sock` when omitted.
     #[serde(rename = "MeshActivationSocket")]
     pub activation_socket: Option<String>,
+    /// What mesh-init does after the idleFreezeSec window elapses while the
+    /// service reports itself idle. `freeze` (default when a freeze window is
+    /// configured), `stop`, or `none`.
+    #[serde(rename = "IdleAction")]
+    pub idle_action: Option<String>,
+    /// Freeze the service after this much self-reported idle time.
+    #[serde(rename = "IdleFreezeSec")]
+    pub idle_freeze_sec: Option<serde_json::Value>,
+    /// Optional `socket` detection option (phase 2e), reserved.
+    #[serde(rename = "IdleDetect")]
+    pub idle_detect: Option<String>,
     #[serde(rename = "User")]
     pub user: Option<String>,
     #[serde(rename = "Group")]
@@ -174,11 +185,18 @@ pub struct ServiceSection {
     )]
     pub allow_dangerous_env: Vec<String>,
     /// `Type=oneshot` marks the service as one-shot and disables restart.
+    /// `Type=notify` enables readiness via `READY=1` on NOTIFY_SOCKET.
     #[serde(rename = "Type")]
     pub service_type: Option<String>,
     /// OOM score adjustment (-1000 to 1000).
     #[serde(rename = "OOMScoreAdjust")]
     pub oom_score_adjust: Option<i32>,
+    /// Shield this service from pressure eviction entirely.
+    #[serde(rename = "Evictable")]
+    pub evictable: Option<bool>,
+    /// Reclaim memory from the service when it is frozen.
+    #[serde(rename = "MemoryReclaimOnFreeze")]
+    pub memory_reclaim_on_freeze: Option<bool>,
     #[serde(default, rename = "NoNewPrivileges")]
     pub no_new_privileges: bool,
     #[serde(default, rename = "PrivateTmp")]
@@ -294,6 +312,19 @@ pub enum KillMode {
     ControlGroup,
     Mixed,
     Process,
+    None,
+}
+
+/// What the supervisor does when a service has been idle for its window.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum IdleAction {
+    /// Freeze the cgroup until a connection wakes the service.
+    Freeze,
+    /// Terminate the service, like IdleTerminationSec alone.
+    Stop,
+    /// Leave the service running.
+    #[default]
     None,
 }
 
@@ -508,6 +539,10 @@ pub struct AppConfig {
     pub watchdog_match: Option<String>,
     pub watchdog_sec: Option<u64>,
     pub idle_termination_sec: Option<u64>,
+    pub idle_action: IdleAction,
+    pub idle_freeze_sec: Option<u64>,
+    pub evictable: Option<bool>,
+    pub memory_reclaim_on_freeze: Option<bool>,
     pub activation_mode: ServiceActivationMode,
     pub activation_socket: Option<String>,
     pub oom_score_adjust: Option<i32>,
@@ -1104,13 +1139,23 @@ pub fn parse_service(content: &str, service_name: Option<&str>) -> Result<AppCon
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        if !t.eq_ignore_ascii_case("oneshot") && !t.eq_ignore_ascii_case("exec") {
+        if !t.eq_ignore_ascii_case("oneshot")
+            && !t.eq_ignore_ascii_case("exec")
+            && !t.eq_ignore_ascii_case("notify")
+        {
             return Err(ConfigError::Invalid(format!(
-                "unsupported Type '{}'; supported values are: oneshot, exec",
+                "unsupported Type '{}'; supported values are: oneshot, exec, notify",
                 t
             )));
         }
     }
+
+    let idle_action = parse_idle_action(
+        file.service.idle_action.as_deref(),
+        file.service.idle_freeze_sec.is_some(),
+    )?;
+    let idle_freeze_sec =
+        parse_duration_from_value(file.service.idle_freeze_sec.as_ref(), "IdleFreezeSec")?;
 
     let (uid, primary_gid) = resolve_user(file.service.user.as_deref())?;
     let gid = resolve_group(file.service.group.as_deref())?.or(primary_gid);
@@ -1182,6 +1227,10 @@ pub fn parse_service(content: &str, service_name: Option<&str>) -> Result<AppCon
         }),
         watchdog_sec,
         idle_termination_sec,
+        idle_action,
+        idle_freeze_sec,
+        evictable: file.service.evictable,
+        memory_reclaim_on_freeze: file.service.memory_reclaim_on_freeze,
         oom_score_adjust: file.service.oom_score_adjust,
         no_new_privileges: file.service.no_new_privileges,
         private_tmp: file.service.private_tmp,
@@ -1227,6 +1276,29 @@ fn priority_from_oom_score(oom_score_adjust: Option<i32>) -> u32 {
     match oom_score_adjust {
         Some(score) => (score + 1000).clamp(0, 2000) as u32,
         None => 1000,
+    }
+}
+
+fn parse_idle_action(
+    value: Option<&str>,
+    freeze_sec_configured: bool,
+) -> Result<IdleAction, ConfigError> {
+    let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        // A freeze window implies the freeze action even when IdleAction is
+        // not written out.
+        return Ok(if freeze_sec_configured {
+            IdleAction::Freeze
+        } else {
+            IdleAction::None
+        });
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "freeze" => Ok(IdleAction::Freeze),
+        "stop" => Ok(IdleAction::Stop),
+        "none" => Ok(IdleAction::None),
+        other => Err(ConfigError::Invalid(format!(
+            "IdleAction must be freeze, stop, or none: {other}"
+        ))),
     }
 }
 
@@ -1526,12 +1598,13 @@ AllowDangerousEnv = ["PATH", "LD_LIBRARY_PATH"]
             )
             .is_err()
         );
+        // Type=notify is supported since mesh-init owns NOTIFY_SOCKET.
         assert!(
             parse_service(
                 "[Service]\nExecStart = \"/bin/true\"\nType = \"notify\"",
                 Some("t6")
             )
-            .is_err()
+            .is_ok()
         );
         assert!(
             parse_service(

@@ -140,10 +140,7 @@ pub struct TcpClient;
 #[async_trait::async_trait]
 impl MeshClient for TcpClient {
     async fn open_stream(&self, target: &crate::client::MeshTarget) -> Result<Box<dyn MeshStream>> {
-        let destination = target
-            .path
-            .clone()
-            .unwrap_or_else(|| target.node.clone());
+        let destination = target.path.clone().unwrap_or_else(|| target.node.clone());
         let address = tcp_destination(&Value::String(destination))
             .context("TCP route requires a host:port destination")?;
         let stream = TcpStream::connect(&address)
@@ -175,10 +172,7 @@ pub struct UdsClient;
 #[async_trait::async_trait]
 impl MeshClient for UdsClient {
     async fn open_stream(&self, target: &crate::client::MeshTarget) -> Result<Box<dyn MeshStream>> {
-        let destination = target
-            .path
-            .clone()
-            .unwrap_or_else(|| target.node.clone());
+        let destination = target.path.clone().unwrap_or_else(|| target.node.clone());
         let path = uds_destination(&Value::String(destination))
             .context("UDS route requires an absolute socket path")?;
         let stream = UnixStream::connect(&path)
@@ -212,10 +206,7 @@ impl<H: TaggedRecordHandler> TaggedRecordHandler for ForwardingHandler<H> {
     }
 
     async fn forward_record(&self, record: TaggedRecord) -> Result<Option<TaggedRecord>> {
-        self.router
-            .forward_record(record)
-            .await
-            .map(Some)
+        self.router.forward_record(record).await.map(Some)
     }
 }
 
@@ -318,7 +309,9 @@ mod tests {
         }
 
         fn client(&self) -> Arc<dyn MeshClient> {
-            Arc::new(DuplexClient(Mutex::new(self.0.lock().expect("mutex").take())))
+            Arc::new(DuplexClient(Mutex::new(
+                self.0.lock().expect("mutex").take(),
+            )))
         }
     }
 
@@ -344,9 +337,7 @@ mod tests {
     async fn router_uses_the_first_accepting_route_and_reports_missing() -> AnyResult<()> {
         let (client_stream, mut peer_stream) = tokio::io::duplex(2048);
         let peer = tokio::spawn(async move {
-            let request = read_cbor_record(&mut peer_stream)
-                .await?
-                .expect("request");
+            let request = read_cbor_record(&mut peer_stream).await?.expect("request");
             assert_eq!(request.to, None, "destination is routing metadata");
             write_cbor_record(
                 &mut peer_stream,
@@ -388,9 +379,7 @@ mod tests {
     async fn forwarding_handler_splits_local_and_directed_records() -> AnyResult<()> {
         let (client_stream, mut peer_stream) = tokio::io::duplex(2048);
         let peer = tokio::spawn(async move {
-            let request = read_cbor_record(&mut peer_stream)
-                .await?
-                .expect("request");
+            let request = read_cbor_record(&mut peer_stream).await?.expect("request");
             write_cbor_record(
                 &mut peer_stream,
                 &response_ok(request.id.expect("id"), json!({"echo": "forwarded"})),

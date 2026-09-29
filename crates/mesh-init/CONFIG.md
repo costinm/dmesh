@@ -117,14 +117,36 @@ Custom mesh-init health and lifecycle fields:
 - `ReadyMatch` (string): substring to search for in stderr. The service is considered ready when this is seen.
 - `WatchdogMatch` (string): substring to search for in stderr. Only lines containing this pattern reset the watchdog timer. Defaults to `"active"` if `WatchdogSec` is set.
 - `WatchdogSec` (integer or duration string): watchdog timeout. If no line matching `WatchdogMatch` is printed in this duration, the service is killed and restarted.
-- `IdleTerminationSec` (integer or duration string): stop the service after this duration of being idle. A service is idle when the last reported `active` metric is `0`, `sess` is `0` or omitted, and no output has been written to stderr.
+- `IdleTerminationSec` (integer or duration string): stop the service after this duration of being idle, frozen or not. A service is idle when its activity counters (self-reported over NOTIFY_SOCKET or the legacy stderr metrics) are all zero and no output has been written to stderr.
+
+Idle freeze (the service self-reports idle over NOTIFY_SOCKET; see ENV.md):
+
+- `IdleAction` (string): `freeze`, `stop`, or `none`. `freeze` parks the cgroup
+  with `cgroup.freeze` after the idle window and wakes it on the next
+  connection; `stop` terminates the service; `none` (default) only counts.
+- `IdleFreezeSec` (integer or duration string): idle window before the
+  prepare-freeze handshake. A configured window implies `IdleAction = 
+  "freeze"` when `IdleAction` is omitted.
+- `IdleDetect` (string): detection for services without self-reports; only
+  `"socket"` is defined (reserved, phase 2e). Requires mesh-init-owned
+  listeners.
+
+Pressure policy (phase 3):
+
+- `Evictable` (boolean): set to `false` to shield the service from trim,
+  freeze, and eviction under memory pressure. Defaults to evictable.
+- `MemoryReclaimOnFreeze` (boolean): write `memory.reclaim` to the service
+  cgroup after an idle or pressure freeze.
 
 ### Unsupported systemd features
 
 The following systemd features are explicitly **not supported**:
-- `Type=notify` (readiness notifications via `sd_notify`) is not supported.
 - Service dependencies (`Wants=`, `Requires=`, `After=`, `Before=`) are not supported.
 - `ExecStopPost` is not supported (only `ExecStartPre`, `ExecStartPost`, `ExecStop`, and `ExecReload` are supported).
+
+`Type = "notify"` is supported: mesh-init sets `NOTIFY_SOCKET` for every
+service it spawns and treats `READY=1` as readiness, `WATCHDOG=1` as a
+watchdog ping, and `FDSTORE=1` as sockets to hand back on restart.
 
 mesh-init extension fields:
 

@@ -28,14 +28,20 @@ fn set_cloexec(fd: i32) {
 }
 
 pub enum MeshStream {
-    Uds(UnixStream),
+    /// A UDS stream plus the activity connection guard held for its lifetime.
+    Uds(UnixStream, Option<crate::activity::ConnectionGuard>),
     /// A UDS stream that has had its read side buffered (e.g. after consuming a
     /// leading delegation envelope line). Buffered bytes are preserved for
     /// subsequent reads.
-    UdsBuf(BufStream<UnixStream>),
+    UdsBuf(
+        BufStream<UnixStream>,
+        Option<crate::activity::ConnectionGuard>,
+    ),
     Stdio {
         stdin: tokio::io::Stdin,
         stdout: tokio::io::Stdout,
+        /// Activity held for the lifetime of a stdio-activated instance.
+        _guard: Option<crate::activity::ConnectionGuard>,
     },
 }
 
@@ -46,8 +52,8 @@ impl AsyncRead for MeshStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         match &mut *self {
-            MeshStream::Uds(s) => Pin::new(s).poll_read(cx, buf),
-            MeshStream::UdsBuf(s) => Pin::new(s).poll_read(cx, buf),
+            MeshStream::Uds(s, _) => Pin::new(s).poll_read(cx, buf),
+            MeshStream::UdsBuf(s, _) => Pin::new(s).poll_read(cx, buf),
             MeshStream::Stdio { stdin, .. } => Pin::new(stdin).poll_read(cx, buf),
         }
     }
@@ -60,24 +66,24 @@ impl AsyncWrite for MeshStream {
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         match &mut *self {
-            MeshStream::Uds(s) => Pin::new(s).poll_write(cx, buf),
-            MeshStream::UdsBuf(s) => Pin::new(s).poll_write(cx, buf),
+            MeshStream::Uds(s, _) => Pin::new(s).poll_write(cx, buf),
+            MeshStream::UdsBuf(s, _) => Pin::new(s).poll_write(cx, buf),
             MeshStream::Stdio { stdout, .. } => Pin::new(stdout).poll_write(cx, buf),
         }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match &mut *self {
-            MeshStream::Uds(s) => Pin::new(s).poll_flush(cx),
-            MeshStream::UdsBuf(s) => Pin::new(s).poll_flush(cx),
+            MeshStream::Uds(s, _) => Pin::new(s).poll_flush(cx),
+            MeshStream::UdsBuf(s, _) => Pin::new(s).poll_flush(cx),
             MeshStream::Stdio { stdout, .. } => Pin::new(stdout).poll_flush(cx),
         }
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match &mut *self {
-            MeshStream::Uds(s) => Pin::new(s).poll_shutdown(cx),
-            MeshStream::UdsBuf(s) => Pin::new(s).poll_shutdown(cx),
+            MeshStream::Uds(s, _) => Pin::new(s).poll_shutdown(cx),
+            MeshStream::UdsBuf(s, _) => Pin::new(s).poll_shutdown(cx),
             MeshStream::Stdio { stdout, .. } => Pin::new(stdout).poll_shutdown(cx),
         }
     }
@@ -201,6 +207,10 @@ impl MeshListener {
                     continue;
                 }
 
+                // Activity tracking (phase 2a): long-lived sessions keep the
+                // service busy for mesh-init's idle policy.
+                let guard = Some(crate::activity::connection());
+
                 // Delegation enforcement: if the peer UID is configured as a
                 // trusted delegate, require a DelegationEnvelope as the first
                 // line and validate it before serving any HTTP. This prevents a
@@ -210,7 +220,7 @@ impl MeshListener {
                     && a.get_delegate(peer_uid).is_some()
                 {
                     match Self::read_and_validate_delegation(stream, a, peer_uid).await {
-                        Ok(buf_stream) => return Ok(Some(MeshStream::UdsBuf(buf_stream))),
+                        Ok(buf_stream) => return Ok(Some(MeshStream::UdsBuf(buf_stream, guard))),
                         Err(reason) => {
                             warn!(
                                 "MeshListener: rejecting delegated connection from UID {}: {}",
@@ -221,7 +231,7 @@ impl MeshListener {
                     }
                 }
 
-                return Ok(Some(MeshStream::Uds(stream)));
+                return Ok(Some(MeshStream::Uds(stream, guard)));
             },
             ListenerMode::Stdio(yielded) => {
                 if *yielded {
@@ -234,6 +244,7 @@ impl MeshListener {
                 Ok(Some(MeshStream::Stdio {
                     stdin: tokio::io::stdin(),
                     stdout: tokio::io::stdout(),
+                    _guard: Some(crate::activity::connection()),
                 }))
             }
         }

@@ -189,9 +189,16 @@ pub enum Request {
         signal: Option<i32>,
     },
 
-    /// Freeze (suspend) a running service via SIGSTOP or cgroup.freeze.
+    /// Freeze (suspend) a running service via `cgroup.freeze`.
+    ///
+    /// The optional reason changes who may thaw: `user` waits for an explicit
+    /// unfreeze, `pressure` also thaws on activity or when pressure clears.
     #[serde(rename = "freeze")]
-    Freeze { name: String },
+    Freeze {
+        name: String,
+        #[serde(default)]
+        reason: Option<String>,
+    },
 
     /// Unfreeze (resume) a frozen service.
     #[serde(rename = "unfreeze")]
@@ -359,6 +366,42 @@ pub enum ServiceState {
     Failed,
 }
 
+/// Why a stopped service is stopped.
+///
+/// `Idle` and `Evicted` distinguish lifecycle decisions from a plain exit so
+/// the scheduler and the pressure policy can decide whether a Stopped service
+/// may restart on an activation or an admission check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StopReason {
+    Exited,
+    Requested,
+    Idle,
+    Evicted,
+    CrashLimit,
+}
+
+/// Why a service is frozen. The reason decides who may thaw: `User` waits for
+/// an explicit unfreeze, `Idle` thaws on activity, and `Pressure` thaws on
+/// activity or when pressure clears.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FreezeReason {
+    User,
+    Idle,
+    Pressure,
+}
+
+impl std::fmt::Display for FreezeReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::User => write!(f, "user"),
+            Self::Idle => write!(f, "idle"),
+            Self::Pressure => write!(f, "pressure"),
+        }
+    }
+}
+
 impl std::fmt::Display for ServiceState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -391,6 +434,22 @@ pub struct ServiceStatus {
     pub consecutive_failures: u32,
     pub next_restart_in_secs: Option<u64>,
     pub cgroup_path: Option<String>,
+    /// Why the service is stopped, when it is stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<StopReason>,
+    /// Why the service is frozen, when it is frozen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freeze_reason: Option<FreezeReason>,
+    /// Reported activity counters from the service (connections, requests,
+    /// holds) or stderr metrics, when any have been observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<serde_json::Value>,
+    /// Whether the service last reported itself idle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle: Option<bool>,
+    /// Current memory.current of the service cgroup in bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_bytes: Option<u64>,
 }
 
 // ============================================================================

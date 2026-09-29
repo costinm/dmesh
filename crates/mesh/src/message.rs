@@ -369,6 +369,7 @@ pub fn text_record_to_request(record: TextRecord) -> Result<crate::protocol::Req
         }),
         "freeze" => Ok(Request::Freeze {
             name: required_field(&record, "name")?,
+            reason: record.fields.get("reason").cloned(),
         }),
         "unfreeze" => Ok(Request::Unfreeze {
             name: required_field(&record, "name")?,

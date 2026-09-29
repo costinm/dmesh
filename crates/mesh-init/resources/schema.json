@@ -1,0 +1,366 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "oneOf": [
+    {
+      "properties": {
+        "method": {
+          "const": "mesh-init.status"
+        },
+        "name": {
+          "type": "string",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "string"
+        }
+      },
+      "required": [
+        "method"
+      ],
+      "type": "object",
+      "x-component-index": 3,
+      "x-method-index": 1
+    },
+    {
+      "properties": {
+        "args": {
+          "type": "array",
+          "x-protobuf-index": 2,
+          "x-protobuf-type": "array"
+        },
+        "env": {
+          "type": "object",
+          "x-protobuf-index": 3,
+          "x-protobuf-type": "object"
+        },
+        "method": {
+          "const": "mesh-init.start"
+        },
+        "name": {
+          "type": "string",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "string"
+        }
+      },
+      "required": [
+        "method"
+      ],
+      "type": "object",
+      "x-component-index": 3,
+      "x-method-index": 2
+    },
+    {
+      "properties": {
+        "method": {
+          "const": "mesh-init.stop"
+        },
+        "name": {
+          "type": "string",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "string"
+        },
+        "signal": {
+          "type": "integer",
+          "x-protobuf-index": 2,
+          "x-protobuf-type": "i32"
+        }
+      },
+      "required": [
+        "method"
+      ],
+      "type": "object",
+      "x-component-index": 3,
+      "x-method-index": 3
+    },
+    {
+      "properties": {
+        "method": {
+          "const": "mesh-init.freeze"
+        },
+        "name": {
+          "type": "string",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "string"
+        },
+        "reason": {
+          "type": "string",
+          "x-protobuf-index": 2,
+          "x-protobuf-type": "string"
+        }
+      },
+      "required": [
+        "method"
+      ],
+      "type": "object",
+      "x-component-index": 3,
+      "x-method-index": 4
+    },
+    {
+      "properties": {
+        "method": {
+          "const": "mesh-init.unfreeze"
+        },
+        "name": {
+          "type": "string",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "string"
+        }
+      },
+      "required": [
+        "method"
+      ],
+      "type": "object",
+      "x-component-index": 3,
+      "x-method-index": 5
+    },
+    {
+      "properties": {
+        "method": {
+          "const": "mesh-init.reload"
+        }
+      },
+      "required": [
+        "method"
+      ],
+      "type": "object",
+      "x-component-index": 3,
+      "x-method-index": 6
+    },
+    {
+      "properties": {
+        "method": {
+          "const": "mesh-init.reconcile"
+        }
+      },
+      "required": [
+        "method"
+      ],
+      "type": "object",
+      "x-component-index": 3,
+      "x-method-index": 14
+    },
+    {
+      "properties": {
+        "method": {
+          "const": "mesh-init.shutdown"
+        }
+      },
+      "required": [
+        "method"
+      ],
+      "type": "object",
+      "x-component-index": 3,
+      "x-method-index": 15
+    },
+    {
+      "properties": {
+        "method": {
+          "const": "mesh-init.processes"
+        }
+      },
+      "required": [
+        "method"
+      ],
+      "type": "object",
+      "x-component-index": 3,
+      "x-method-index": 7
+    },
+    {
+      "properties": {
+        "method": {
+          "const": "mesh-init.process"
+        },
+        "pid": {
+          "type": "integer",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "u32"
+        }
+      },
+      "required": [
+        "method"
+      ],
+      "type": "object",
+      "x-component-index": 3,
+      "x-method-index": 8
+    },
+    {
+      "properties": {
+        "method": {
+          "const": "mesh-init.cgroups"
+        }
+      },
+      "required": [
+        "method"
+      ],
+      "type": "object",
+      "x-component-index": 3,
+      "x-method-index": 9
+    },
+    {
+      "properties": {
+        "method": {
+          "const": "mesh-init.cgroup"
+        },
+        "path": {
+          "type": "string",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "string"
+        }
+      },
+      "required": [
+        "method"
+      ],
+      "type": "object",
+      "x-component-index": 3,
+      "x-method-index": 10
+    },
+    {
+      "properties": {
+        "method": {
+          "const": "mesh-init.pressure"
+        }
+      },
+      "required": [
+        "method"
+      ],
+      "type": "object",
+      "x-component-index": 3,
+      "x-method-index": 11
+    },
+    {
+      "properties": {
+        "interval": {
+          "type": "integer",
+          "x-protobuf-index": 3,
+          "x-protobuf-type": "u64"
+        },
+        "method": {
+          "const": "mesh-init.cgroup_high"
+        },
+        "path": {
+          "type": "string",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "string"
+        },
+        "percentage": {
+          "type": "number",
+          "x-protobuf-index": 2,
+          "x-protobuf-type": "f64"
+        }
+      },
+      "required": [
+        "method"
+      ],
+      "type": "object",
+      "x-component-index": 3,
+      "x-method-index": 12
+    },
+    {
+      "properties": {
+        "cgroup_name": {
+          "type": "string",
+          "x-protobuf-index": 2,
+          "x-protobuf-type": "string"
+        },
+        "method": {
+          "const": "mesh-init.move_process"
+        },
+        "pid": {
+          "type": "integer",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "u32"
+        }
+      },
+      "required": [
+        "method"
+      ],
+      "type": "object",
+      "x-component-index": 3,
+      "x-method-index": 13
+    },
+    {
+      "properties": {
+        "command": {
+          "type": "string",
+          "x-protobuf-index": 8,
+          "x-protobuf-type": "string"
+        },
+        "context": {
+          "type": "object",
+          "x-protobuf-index": 7,
+          "x-protobuf-type": "object"
+        },
+        "env": {
+          "type": "object",
+          "x-protobuf-index": 6,
+          "x-protobuf-type": "object"
+        },
+        "fd_count": {
+          "type": "integer",
+          "x-protobuf-index": 9,
+          "x-protobuf-type": "u32"
+        },
+        "gid": {
+          "type": "integer",
+          "x-protobuf-index": 4,
+          "x-protobuf-type": "u32"
+        },
+        "home": {
+          "type": "string",
+          "x-protobuf-index": 2,
+          "x-protobuf-type": "string"
+        },
+        "method": {
+          "const": "mesh-init.start_terminal"
+        },
+        "name": {
+          "type": "string",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "string"
+        },
+        "pty": {
+          "type": "boolean",
+          "x-protobuf-index": 5,
+          "x-protobuf-type": "bool"
+        },
+        "uid": {
+          "type": "integer",
+          "x-protobuf-index": 3,
+          "x-protobuf-type": "u32"
+        }
+      },
+      "required": [
+        "method"
+      ],
+      "type": "object",
+      "x-component-index": 3,
+      "x-method-index": 16
+    },
+    {
+      "properties": {
+        "kind": {
+          "type": "string",
+          "x-protobuf-index": 2,
+          "x-protobuf-type": "string"
+        },
+        "method": {
+          "const": "mesh-init.register_namespace"
+        },
+        "name": {
+          "type": "string",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "string"
+        },
+        "target_pid": {
+          "type": "integer",
+          "x-protobuf-index": 3,
+          "x-protobuf-type": "u32"
+        }
+      },
+      "required": [
+        "method"
+      ],
+      "type": "object",
+      "x-component-index": 3,
+      "x-method-index": 17
+    }
+  ]
+}

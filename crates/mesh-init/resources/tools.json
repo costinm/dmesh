@@ -121,6 +121,11 @@
           "type": "string",
           "x-protobuf-index": 1,
           "x-protobuf-type": "string"
+        },
+        "reason": {
+          "type": "string",
+          "x-protobuf-index": 2,
+          "x-protobuf-type": "string"
         }
       },
       "required": [],

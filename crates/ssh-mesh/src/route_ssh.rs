@@ -132,9 +132,12 @@ impl SshClient {
         }
         // Port 0 and empty user/server key defer to SSH config and the
         // manager's discovery directory.
-        self.manager.connect(node, 0, "", "").await.with_context(|| {
-            format!("connect SSH node {node}; configure it in SSH config or connect first")
-        })
+        self.manager
+            .connect(node, 0, "", "")
+            .await
+            .with_context(|| {
+                format!("connect SSH node {node}; configure it in SSH config or connect first")
+            })
     }
 }
 

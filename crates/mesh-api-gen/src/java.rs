@@ -164,12 +164,56 @@ fn java_field(value: &str) -> String {
 
 fn java_reserved() -> &'static [&'static str] {
     &[
-        "abstract", "assert", "boolean", "break", "byte", "case", "catch", "char", "class",
-        "const", "continue", "default", "do", "double", "else", "enum", "extends", "final",
-        "finally", "float", "for", "goto", "if", "implements", "import", "instanceof", "int",
-        "interface", "long", "native", "new", "package", "private", "protected", "public",
-        "return", "short", "static", "strictfp", "super", "switch", "synchronized", "this",
-        "throw", "throws", "transient", "try", "void", "volatile", "while",
+        "abstract",
+        "assert",
+        "boolean",
+        "break",
+        "byte",
+        "case",
+        "catch",
+        "char",
+        "class",
+        "const",
+        "continue",
+        "default",
+        "do",
+        "double",
+        "else",
+        "enum",
+        "extends",
+        "final",
+        "finally",
+        "float",
+        "for",
+        "goto",
+        "if",
+        "implements",
+        "import",
+        "instanceof",
+        "int",
+        "interface",
+        "long",
+        "native",
+        "new",
+        "package",
+        "private",
+        "protected",
+        "public",
+        "return",
+        "short",
+        "static",
+        "strictfp",
+        "super",
+        "switch",
+        "synchronized",
+        "this",
+        "throw",
+        "throws",
+        "transient",
+        "try",
+        "void",
+        "volatile",
+        "while",
     ]
 }
 
@@ -276,14 +320,17 @@ fn render_record_class(output: &mut String, method: &ApiMethod, shape: &str) {
             let _ = writeln!(
                 output,
                 "        /** API field `{}` (default {}). */",
-                field.name,
-                default
+                field.name, default
             );
         } else {
             let _ = writeln!(output, "        /** API field `{}`. */", field.name);
         }
         let (java, _) = java_type(&field.value_type, field.required);
-        let _ = writeln!(output, "        public {java} {};\n", java_field(&field.name));
+        let _ = writeln!(
+            output,
+            "        public {java} {};\n",
+            java_field(&field.name)
+        );
     }
 
     if shape == "request" {
@@ -325,10 +372,7 @@ fn render_record_class(output: &mut String, method: &ApiMethod, shape: &str) {
             let target = java_field(&field.name);
             let key = format!("FIELD_{}", crate::identifier(&field.name));
             if field.required {
-                let _ = writeln!(
-                    output,
-                    "            envelope.putField({key}, {target});"
-                );
+                let _ = writeln!(output, "            envelope.putField({key}, {target});");
             } else {
                 let _ = writeln!(
                     output,
@@ -501,8 +545,7 @@ fn render_dispatcher(output: &mut String, component: &ComponentGroup) {
             crate::pascal_identifier(&component.name),
             crate::pascal_identifier(&method.method)
         );
-        let method_constant =
-            crate::identifier(&format!("{}_{}", method.component, method.method));
+        let method_constant = crate::identifier(&format!("{}_{}", method.component, method.method));
         let request = type_class(method, "request");
         let response = type_class(method, "response");
         let _ = writeln!(
@@ -514,7 +557,9 @@ fn render_dispatcher(output: &mut String, component: &ComponentGroup) {
             "                {response} response = (({interface}) handler).{}({request}.decode(request));",
             java_field(&method.method)
         );
-        output.push_str("                return response == null ? null : response.encode(request.id);\n");
+        output.push_str(
+            "                return response == null ? null : response.encode(request.id);\n",
+        );
         output.push_str("            }\n");
     }
     let _ = writeln!(
@@ -557,9 +602,7 @@ mod tests {
         let output = java_api(&methods, None, "MeshApi");
         assert!(output.contains("envelope.componentTag = (long) COMPONENT_FULL;"));
         assert!(output.contains("envelope.methodTag = (long) METHOD_FULL_ECHO;"));
-        assert!(output.contains(
-            "if (value != null) envelope.putField(FIELD_VALUE, value);"
-        ));
+        assert!(output.contains("if (value != null) envelope.putField(FIELD_VALUE, value);"));
         assert!(output.contains("envelope.putResultField(FIELD_VALUE, value);"));
     }
 }

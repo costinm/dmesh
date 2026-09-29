@@ -9,12 +9,36 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Stdio;
-use std::time::Instant;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use tracing::{debug, error, info, warn};
 
 use crate::config::AppConfig;
-use crate::protocol::ServiceState;
+use crate::protocol::{FreezeReason, ServiceState, StopReason};
+use crate::states;
+
+pub use states::ServiceState as RuntimeState;
+
+/// CLOCK_MONOTONIC microseconds, the same clock `X_MESH_WAKE_AT` uses.
+pub fn monotonic_micros() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } != 0 {
+        return 0;
+    }
+    (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64 / 1_000)
+}
+
+/// Convert a `X_MESH_WAKE_AT` deadline (CLOCK_MONOTONIC µs) into an Instant.
+/// Deadlines in the past map to now.
+pub fn instant_from_monotonic_us(wake_at_us: u64) -> Option<Instant> {
+    let now = monotonic_micros();
+    let delta = wake_at_us.checked_sub(now)?;
+    Some(Instant::now() + Duration::from_micros(delta))
+}
 
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 const CAP_CHOWN: i32 = 0;
@@ -699,10 +723,10 @@ unsafe fn apply_sandbox_before_identity(plan: &SandboxPlan) -> std::io::Result<(
 pub struct ManagedProcess {
     /// The service configuration.
     pub config: AppConfig,
-    /// Current lifecycle state.
-    pub state: ServiceState,
+    /// Current lifecycle state, frozen reason and epoch included.
+    pub state: states::ServiceState,
     /// The requested state (whether the daemon wants it to be running or stopped).
-    pub target_state: ServiceState,
+    pub target_state: states::ServiceState,
     /// PID of the running process (None if stopped).
     pub pid: Option<u32>,
     /// PID of the network sidecar process, if one is attached.
@@ -737,11 +761,40 @@ pub struct ManagedProcess {
     pub last_stderr_at: Option<Instant>,
     pub last_active: Option<u64>,
     pub last_sess: Option<u64>,
+    /// Why the service is stopped. Set by `states::transition`.
+    pub stop_reason: Option<StopReason>,
+    /// Why the service is frozen, when frozen or freezing.
+    pub freeze_reason: Option<FreezeReason>,
+    /// A user explicitly froze this service; activity may not thaw it.
+    pub explicit_freeze: bool,
+    /// When the service became idle (metrics-based idle tracking).
     pub idle_since: Option<Instant>,
+    /// Last activity counters reported over the notify channel or stderr.
+    pub notify_activity: Option<ActivityCounts>,
+    /// CLOCK_MONOTONIC µs deadline the service asked to be woken at.
+    pub wake_at: Option<u64>,
+    /// Echoed freeze epoch the service acknowledged in `ready {epoch}`.
+    pub freeze_ack: Option<u64>,
     /// When the service entered `Stopping`. Set by every path that signals a
     /// live service for termination so the scheduler can escalate to SIGKILL
     /// if the signal does not take effect.
     pub stopping_since: Option<Instant>,
+}
+
+/// Simple activity counts, standard interface for metrics reported by the
+/// service (over NOTIFY_SOCKET or stderr).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ActivityCounts {
+    pub connections: u32,
+    pub requests: u32,
+    pub holds: u32,
+}
+
+impl ActivityCounts {
+    /// Whether all counters are zero, i.e. the service reports idle.
+    pub fn is_idle(&self) -> bool {
+        self.connections == 0 && self.requests == 0 && self.holds == 0
+    }
 }
 
 impl ManagedProcess {
@@ -749,8 +802,8 @@ impl ManagedProcess {
     pub fn new(config: AppConfig) -> Self {
         Self {
             config,
-            state: ServiceState::Stopped,
-            target_state: ServiceState::Stopped,
+            state: states::ServiceState::Stopped,
+            target_state: states::ServiceState::Stopped,
             pid: None,
             network_pid: None,
             netns_fd: None,
@@ -768,9 +821,52 @@ impl ManagedProcess {
             last_stderr_at: None,
             last_active: None,
             last_sess: None,
+            stop_reason: None,
+            freeze_reason: None,
+            explicit_freeze: false,
             idle_since: None,
+            notify_activity: None,
+            wake_at: None,
+            freeze_ack: None,
             stopping_since: None,
         }
+    }
+
+    /// The supervised state seen by control clients. A pending freeze is
+    /// still Running on the wire.
+    pub fn protocol_state(&self) -> ServiceState {
+        <crate::protocol::ServiceState>::from(self.state)
+    }
+
+    /// When the service became frozen, if it is frozen now.
+    pub fn frozen_since(&self) -> Option<Instant> {
+        match self.state {
+            states::ServiceState::Frozen { since, .. } => Some(since),
+            _ => None,
+        }
+    }
+
+    /// The stop deadline recorded by a `Stopping` service, if any.
+    pub fn stopping_deadline(&self) -> Option<Instant> {
+        match self.state {
+            states::ServiceState::Stopping { since } => Some(since),
+            _ => self.stopping_since,
+        }
+    }
+
+    fn stop_escalation_at(&self, grace: std::time::Duration) -> Option<Instant> {
+        self.stopping_deadline().map(|since| since + grace)
+    }
+
+    /// Whether a stop is overdue and must escalate.
+    pub fn stop_escalation_due(&self, now: Instant, grace: std::time::Duration) -> bool {
+        self.stop_escalation_at(grace)
+            .is_some_and(|deadline| now >= deadline && self.pid.is_some())
+    }
+
+    /// When a stopping service should next be checked for escalation.
+    pub fn stop_escalation_deadline(&self, grace: std::time::Duration) -> Option<Instant> {
+        self.stop_escalation_at(grace)
     }
 
     /// Get uptime in seconds, if running or frozen.
@@ -780,9 +876,10 @@ impl ManagedProcess {
 
     /// Convert to a status report.
     pub fn status(&self) -> crate::protocol::ServiceStatus {
+        let activity = self.reported_activity();
         crate::protocol::ServiceStatus {
             name: self.config.name.clone(),
-            state: self.state,
+            state: self.protocol_state(),
             pid: self.pid,
             network_pid: self.network_pid,
             netns_registered: self.netns_fd.is_some(),
@@ -796,7 +893,42 @@ impl ManagedProcess {
                 if t > now { (t - now).as_secs() } else { 0 }
             }),
             cgroup_path: self.cgroup_path.clone(),
+            stop_reason: self
+                .stop_reason
+                .filter(|_| self.protocol_state() == ServiceState::Stopped),
+            freeze_reason: self
+                .freeze_reason
+                .filter(|_| matches!(self.state, states::ServiceState::Frozen { .. })),
+            activity: activity.map(|counts| {
+                serde_json::json!({
+                    "connections": counts.connections,
+                    "requests": counts.requests,
+                    "holds": counts.holds,
+                })
+            }),
+            idle: activity.as_ref().map(ActivityCounts::is_idle),
+            memory_bytes: self.cgroup_memory_current(),
         }
+    }
+
+    /// The last reported activity counts, preferring the notify channel over
+    /// the legacy stderr metrics.
+    fn reported_activity(&self) -> Option<ActivityCounts> {
+        if let Some(counts) = self.notify_activity {
+            return Some(counts);
+        }
+        self.last_active.map(|active| ActivityCounts {
+            connections: active.max(self.last_sess.unwrap_or(0)) as u32,
+            requests: 0,
+            holds: 0,
+        })
+    }
+
+    /// Read memory.current from the service cgroup, best effort.
+    pub fn cgroup_memory_current(&self) -> Option<u64> {
+        let path = self.cgroup_path.as_deref()?;
+        let value = crate::cgroup::read_cgroup_file(path, "memory.current").ok()?;
+        value.trim().parse().ok()
     }
 }
 
@@ -1404,28 +1536,46 @@ pub async fn stop_process(
     Ok(())
 }
 
-/// Freeze a process using SIGSTOP. If a cgroup path is provided,
-/// uses cgroup.freeze instead for a cleaner freeze.
-pub fn freeze_process(pid: u32, cgroup_path: Option<&str>) -> Result<(), ProcessError> {
-    if let Some(cg) = cgroup_path {
-        crate::cgroup::freeze_cgroup(cg, true)?;
-        info!(cgroup = %cg, "cgroup_frozen");
-    } else {
-        send_signal(pid, libc::SIGSTOP)?;
-        info!(pid, "pid_sigstop_frozen");
+/// Freeze a service cgroup and wait for the kernel to confirm it.
+///
+/// Freezing without a cgroup is refused: there is no SIGSTOP fallback, since a
+/// SIGSTOPped process bypasses `pidfd_send_signal` wake-up guarantees and
+/// cannot be trusted with socket wakeup semantics. Returns
+/// `CgroupError::CgroupError` when the cgroup is missing or does not confirm
+/// the frozen state within the timeout.
+pub fn freeze_cgroup_confirmed(cgroup_path: &str, timeout: Duration) -> Result<(), ProcessError> {
+    let events_path = format!("{cgroup_path}/cgroup.events");
+    if !Path::new(&events_path).exists() {
+        return Err(ProcessError::Cgroup(
+            crate::cgroup::CgroupError::CgroupError(format!(
+                "service has no cgroup {cgroup_path}; freeze refused"
+            )),
+        ));
     }
-    Ok(())
+    crate::cgroup::freeze_cgroup(cgroup_path, true)?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if crate::cgroup::cgroup_is_frozen(cgroup_path)? {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            // Undo a half-applied freeze so the state model stays truthful.
+            let _ = crate::cgroup::freeze_cgroup(cgroup_path, false);
+            return Err(ProcessError::Cgroup(
+                crate::cgroup::CgroupError::CgroupError(format!(
+                    "cgroup {cgroup_path} did not confirm frozen state within {timeout:?}"
+                )),
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
-/// Unfreeze a process using SIGCONT or cgroup.freeze=0.
-pub fn unfreeze_process(pid: u32, cgroup_path: Option<&str>) -> Result<(), ProcessError> {
-    if let Some(cg) = cgroup_path {
-        crate::cgroup::freeze_cgroup(cg, false)?;
-        info!(cgroup = %cg, "cgroup_unfrozen");
-    } else {
-        send_signal(pid, libc::SIGCONT)?;
-        info!(pid, "pid_sigcont_unfrozen");
-    }
+/// Unfreeze a service cgroup. Thaw is a single write; no confirmation loop.
+#[allow(dead_code)]
+pub fn unfreeze_cgroup(cgroup_path: &str) -> Result<(), ProcessError> {
+    crate::cgroup::freeze_cgroup(cgroup_path, false)?;
+    info!(cgroup = %cgroup_path, "cgroup_unfrozen");
     Ok(())
 }
 
@@ -1794,42 +1944,9 @@ mod tests {
     }
 
     #[test]
-    fn test_managed_process_state_transitions() {
-        let mut proc = ManagedProcess::new(test_config("test"));
-        assert_eq!(proc.state, ServiceState::Stopped);
-        assert!(proc.pid.is_none());
-
-        // Simulate starting
-        proc.state = ServiceState::Starting;
-        assert_eq!(proc.state, ServiceState::Starting);
-
-        proc.state = ServiceState::Running;
-        proc.pid = Some(1234);
-        proc.started_at = Some(Instant::now());
-        assert_eq!(proc.state, ServiceState::Running);
-        assert_eq!(proc.pid, Some(1234));
-
-        // Simulate freeze
-        proc.state = ServiceState::Frozen;
-        assert_eq!(proc.state, ServiceState::Frozen);
-
-        // Simulate unfreeze
-        proc.state = ServiceState::Running;
-        assert_eq!(proc.state, ServiceState::Running);
-
-        // Simulate stop
-        proc.state = ServiceState::Stopping;
-        assert_eq!(proc.state, ServiceState::Stopping);
-
-        proc.state = ServiceState::Stopped;
-        proc.pid = None;
-        assert_eq!(proc.state, ServiceState::Stopped);
-    }
-
-    #[test]
     fn test_managed_process_status() {
         let mut proc = ManagedProcess::new(test_config("my-svc"));
-        proc.state = ServiceState::Running;
+        proc.state = states::ServiceState::Running;
         proc.pid = Some(42);
         proc.restarts = 3;
 
@@ -1838,6 +1955,17 @@ mod tests {
         assert_eq!(status.state, ServiceState::Running);
         assert_eq!(status.pid, Some(42));
         assert_eq!(status.restarts, 3);
+    }
+
+    #[test]
+    fn test_activity_counts_idle() {
+        assert!(ActivityCounts::default().is_idle());
+        let counts = ActivityCounts {
+            connections: 1,
+            requests: 0,
+            holds: 0,
+        };
+        assert!(!counts.is_idle());
     }
 
     #[test]

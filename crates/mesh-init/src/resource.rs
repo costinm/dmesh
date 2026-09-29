@@ -9,11 +9,10 @@ use std::fs;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use tracing::{debug, error, info, warn};
+use tracing::{info, warn};
 
 use crate::config::AppConfig;
 use crate::process::ManagedProcess;
-use crate::protocol::ServiceState;
 
 // ============================================================================
 // Pressure Levels
@@ -62,6 +61,38 @@ pub struct PressureData {
 pub fn read_memory_pressure() -> Option<PressureData> {
     let content = fs::read_to_string("/proc/pressure/memory").ok()?;
     parse_pressure(&content)
+}
+
+/// Read and parse `/proc/pressure/cpu`.
+pub fn read_cpu_pressure() -> Option<PressureData> {
+    let content = fs::read_to_string("/proc/pressure/cpu").ok()?;
+    parse_pressure(&content)
+}
+
+/// Read `MemTotal` from `/proc/meminfo` in bytes.
+pub fn read_mem_total() -> Option<u64> {
+    let content = fs::read_to_string("/proc/meminfo").ok()?;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kb = rest
+                .trim()
+                .trim_end_matches(" kB")
+                .trim()
+                .parse::<u64>()
+                .ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
+}
+
+/// Whether the host administrator has set up swap or zram at all.
+pub fn swap_exists() -> bool {
+    if let Ok(swaps) = fs::read_to_string("/proc/swaps") {
+        // First line is the header; any further line means a live swap.
+        return swaps.lines().skip(1).any(|line| !line.trim().is_empty());
+    }
+    false
 }
 
 /// Parse PSI pressure content.
@@ -153,59 +184,24 @@ pub fn classify_pressure(data: &PressureData) -> PressureLevel {
 // Resource Manager
 // ============================================================================
 
-/// Manages resource-based eviction of services.
+/// Admission-only resource manager; the pressure monitor itself lives in
+/// `pressure.rs` (phase 3) as an event-driven ladder.
 pub struct ResourceManager {
     services: Arc<Mutex<HashMap<String, ManagedProcess>>>,
-    running: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ResourceManager {
     /// Create a new resource manager.
     pub fn new(services: Arc<Mutex<HashMap<String, ManagedProcess>>>) -> Self {
-        Self {
-            services,
-            running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        }
-    }
-
-    /// Start the background pressure monitoring task.
-    pub fn start(&self) -> tokio::task::JoinHandle<()> {
-        let services = self.services.clone();
-        let running = self.running.clone();
-        running.store(true, std::sync::atomic::Ordering::SeqCst);
-
-        tokio::spawn(async move {
-            info!("resource_manager_started");
-            while running.load(std::sync::atomic::Ordering::SeqCst) {
-                if let Some(pressure) = read_memory_pressure() {
-                    let level = classify_pressure(&pressure);
-                    if level > PressureLevel::None {
-                        debug!(
-                            level = %level,
-                            avg10 = pressure.some_avg10,
-                            "memory_pressure_detected"
-                        );
-                        evict_by_priority(&services, level);
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            }
-            info!("resource_manager_stopped");
-        })
-    }
-
-    /// Stop the background monitoring.
-    pub fn stop(&self) {
-        self.running
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+        Self { services }
     }
 
     /// Check if a service can be started given current memory conditions.
     ///
     /// Returns false if:
     /// - Memory pressure is Critical (PSI avg10 >= 60%).
-    /// - The sum of `memory_low` reservations of all running services plus this
-    ///   service's `memory_low` would exceed available system memory.
+    /// - The sum of `memory_low` reservations of running and frozen services
+    ///   plus this service's `memory_low` would exceed available memory.
     pub fn can_start(&self, config: &AppConfig) -> bool {
         // 1. Check PSI pressure
         if let Some(pressure) = read_memory_pressure() {
@@ -250,87 +246,15 @@ impl ResourceManager {
 
     /// Sum of `memory_low` reservations for all currently running services.
     pub fn committed_memory_low(&self) -> u64 {
+        use crate::protocol::ServiceState;
         let services = self.services.lock();
         services
             .values()
-            .filter(|p| p.state == ServiceState::Running)
+            .filter(|p| p.protocol_state() == ServiceState::Running)
             .map(|p| p.config.resources.memory_low.unwrap_or(0))
             .sum()
     }
 }
-
-/// Evict services by priority based on pressure level.
-///
-/// Sorts running services by priority (highest number = least important first),
-/// then freezes or stops them depending on pressure level.
-fn evict_by_priority(services: &Arc<Mutex<HashMap<String, ManagedProcess>>>, level: PressureLevel) {
-    let mut svcs = services.lock();
-
-    // Collect running services sorted by priority (least important first)
-    let mut candidates: Vec<&String> = svcs
-        .iter()
-        .filter(|(_, p)| p.state == ServiceState::Running)
-        .map(|(name, _)| name)
-        .collect();
-
-    candidates.sort_by(|a, b| {
-        let pa = svcs.get(*a).map(|p| p.config.priority).unwrap_or(0);
-        let pb = svcs.get(*b).map(|p| p.config.priority).unwrap_or(0);
-        pb.cmp(&pa) // descending: highest priority number (least important) first
-    });
-
-    let candidate_names: Vec<String> = candidates.into_iter().cloned().collect();
-
-    for name in candidate_names {
-        if let Some(proc) = svcs.get_mut(&name) {
-            // Skip critical services (priority < 100)
-            if proc.config.priority < 100 {
-                continue;
-            }
-
-            if let Some(pid) = proc.pid {
-                match level {
-                    PressureLevel::Low | PressureLevel::Medium => {
-                        // Freeze
-                        info!(
-                            service = %name,
-                            priority = proc.config.priority,
-                            pressure = %level,
-                            "freezing_service_on_pressure"
-                        );
-                        if let Err(e) =
-                            crate::process::freeze_process(pid, proc.cgroup_path.as_deref())
-                        {
-                            error!(service = %name, error = %e, "freeze_service_failed");
-                        } else {
-                            proc.state = ServiceState::Frozen;
-                        }
-                        // Only freeze one at a time for Low pressure
-                        if level == PressureLevel::Low {
-                            return;
-                        }
-                    }
-                    PressureLevel::Critical => {
-                        // Stop
-                        info!(
-                            service = %name,
-                            priority = proc.config.priority,
-                            "stopping_service_on_critical_pressure"
-                        );
-                        let _ = crate::process::send_signal(pid, libc::SIGTERM);
-                        proc.state = ServiceState::Stopping;
-                        proc.stopping_since = Some(std::time::Instant::now());
-                    }
-                    PressureLevel::None => unreachable!(),
-                }
-            }
-        }
-    }
-}
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 // ============================================================================
 // System Memory
@@ -415,7 +339,7 @@ Cached:         32937264 kB
             ..Default::default()
         };
         let mut p = ManagedProcess::new(cfg);
-        p.state = ServiceState::Running;
+        p.state = crate::states::ServiceState::Running;
         p.pid = Some(100);
         services.lock().insert("svc1".to_string(), p);
 
@@ -536,7 +460,7 @@ full avg10=0.10 avg60=0.20 avg300=0.30 total=5678
     }
 
     #[test]
-    fn test_eviction_order() {
+    fn test_eviction_order_uses_pressure_plan() {
         use crate::config::{AppConfig, ResolvedResourceLimits};
 
         let make_config = |name: &str, priority: u32| AppConfig {
@@ -562,30 +486,67 @@ full avg10=0.10 avg60=0.20 avg300=0.30 total=5678
             let mut svcs = services.lock();
             // Critical service — should not be evicted
             let mut p = ManagedProcess::new(make_config("system_ui", 50));
-            p.state = ServiceState::Running;
+            p.state = crate::states::ServiceState::Running;
             p.pid = Some(100);
             svcs.insert("system_ui".to_string(), p);
 
             // Medium priority
             let mut p = ManagedProcess::new(make_config("browser", 500));
-            p.state = ServiceState::Running;
+            p.state = crate::states::ServiceState::Running;
             p.pid = Some(200);
             svcs.insert("browser".to_string(), p);
 
             // Expendable
             let mut p = ManagedProcess::new(make_config("background_sync", 900));
-            p.state = ServiceState::Running;
+            p.state = crate::states::ServiceState::Running;
             p.pid = Some(300);
             svcs.insert("background_sync".to_string(), p);
         }
 
-        // Low pressure — should freeze only the least important (background_sync)
-        // Note: we can't actually send signals in tests, but we can verify the state change intent
-        // The freeze will fail due to invalid PIDs, but state transitions are what we test
-        evict_by_priority(&services, PressureLevel::Low);
+        // Low pressure under the phase-3 ladder: trim first. Only services
+        // included in the snapshot participate — the protected system_ui
+        // never appears.
+        let snapshot = crate::pressure::PressureSnapshot {
+            memory_avg10: 5.0,
+            memory_avg60: 5.0,
+            cpu_avg10: 0.0,
+            mem_total: 8 << 30,
+            mem_available: 1 << 30,
+            swap_exists: false,
+            services: vec![crate::pressure::ServicePressure {
+                name: "background_sync".to_string(),
+                state: crate::states::ServiceState::Running,
+                priority: 900,
+                idle: true,
+                self_reports: false,
+                freeze_reason: None,
+                cgroup_path: "/sys/fs/cgroup/mesh.slice/background_sync.scope".to_string(),
+                memory_current: 0,
+                memory_low: 0,
+                protected: false,
+                freezable: true,
+            }],
+        };
+        let now = std::time::Instant::now();
+        let actions = crate::pressure::plan(
+            &snapshot,
+            &crate::pressure::PressurePolicy::default(),
+            &crate::pressure::PressureHistory::default(),
+            now,
+        );
+        // A fresh history applies the first ladder step immediately.
+        assert_eq!(
+            actions,
+            vec![crate::pressure::Action::Trim {
+                level: crate::pressure::TrimRound::Background,
+            }]
+        );
 
         let svcs = services.lock();
         // system_ui should be untouched (priority < 100)
-        assert_eq!(svcs["system_ui"].state, ServiceState::Running);
+        assert_eq!(
+            svcs["system_ui"].protocol_state(),
+            crate::protocol::ServiceState::Running
+        );
     }
 }

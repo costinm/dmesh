@@ -19,6 +19,22 @@ Common variables inherited from the `mesh` crate are documented in
 | `MESH_INIT_REAP_ALL` | `false` unless running as PID 1 | When `1` or `true`, the child reaper uses `waitpid(-1)` even when not PID 1. |
 | `MESH_INIT_MAX_CONTROL_CONNECTIONS` | `32` | Maximum concurrent control-socket connections. Excess connections wait for a slot to free up. Invalid, zero, or unset values use `32`. |
 
+## Child environment
+
+| Variable | Set for | Effect |
+| --- | --- | --- |
+| `NOTIFY_SOCKET` | every spawned service | Path of the service's sd_notify-compatible datagram channel. The service may send `READY=1`, `WATCHDOG=1`, `STOPPING=1`, `STATUS=…`, `FDSTORE=1`+`FDNAME=…`, and the mesh extensions `X_MESH_IDLE=1`/`X_MESH_BUSY=1` (with `X_MESH_ACTIVE=`, `X_MESH_CONNS=`, `X_MESH_WAKE_AT=`). mesh-init verifies the sender PID belongs to the service cgroup before applying anything. Set `NOTIFY_SOCKET = "none"` in `[Environment]` to disable the channel. |
+| `MESH_IDLE_GRACE` | every spawned service | Idle grace period in seconds for the mesh activity tracker (see `../mesh/`): all counters (connections, requests, holds) must be zero for this long before the service reports idle. Default 2 s. |
+
+## Pressure thresholds
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `MESH_INIT_PSI_LOW` | `5.0` | Memory PSI some avg10 entering the Low level (trim). |
+| `MESH_INIT_PSI_MEDIUM` | `20.0` | Enter Medium (reclaim frozen/idle cgroups). |
+| `MESH_INIT_PSI_HIGH` | `40.0` | Enter High (freeze idle services). |
+| `MESH_INIT_PSI_CRITICAL` | `60.0` | Enter Critical (stop evictions). |
+
 ## Privileged UIDs
 
 mesh-init requires a non-root system and ssh-mesh sidecar user. The three

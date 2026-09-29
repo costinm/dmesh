@@ -482,6 +482,10 @@ where
         raw.method = raw.method[service_prefix.len()..].to_string();
     }
 
+    // Activity tracking (phase 2a): every dispatched request counts toward
+    // supervisor idle decisions for its full duration.
+    let _activity = crate::activity::request();
+
     let response = match registry.dispatch(&raw.method, &raw.params).await {
         crate::registry::CommonDispatch::Response(response) => response,
         crate::registry::CommonDispatch::NotHandled => {
