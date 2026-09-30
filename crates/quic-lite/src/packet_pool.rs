@@ -10,6 +10,70 @@ use core::{
     sync::atomic::{AtomicU8, AtomicU32, Ordering},
 };
 
+/// Fixed-capacity queue of metadata and leases from a node-owned packet pool.
+/// It stores no packet bytes and never creates a transport-private MTU pool;
+/// dropping or removing an entry transfers or releases the original lease.
+pub struct PacketLeaseQueue<M: Copy, B: AsRef<[u8]>, const N: usize> {
+    state: spin::Mutex<PacketLeaseQueueState<M, B, N>>,
+}
+
+struct PacketLeaseQueueState<M: Copy, B: AsRef<[u8]>, const N: usize> {
+    entries: [Option<(M, crate::OwnedPacket<B>)>; N],
+    head: usize,
+    len: usize,
+}
+
+impl<M: Copy, B: AsRef<[u8]>, const N: usize> PacketLeaseQueue<M, B, N> {
+    /// Construct an empty fixed-capacity lease queue.
+    pub const fn new() -> Self {
+        assert!(N != 0, "packet lease queue capacity must be nonzero");
+        Self {
+            state: spin::Mutex::new(PacketLeaseQueueState {
+                entries: [const { None }; N],
+                head: 0,
+                len: 0,
+            }),
+        }
+    }
+
+    /// Try to enqueue without waiting. On lock contention or capacity pressure,
+    /// the caller retains the exact packet lease for drop or retry.
+    pub fn try_push(
+        &self,
+        metadata: M,
+        packet: crate::OwnedPacket<B>,
+    ) -> Result<(), (M, crate::OwnedPacket<B>)> {
+        let Some(mut state) = self.state.try_lock() else {
+            return Err((metadata, packet));
+        };
+        if state.len == N {
+            return Err((metadata, packet));
+        }
+        let tail = (state.head + state.len) % N;
+        state.entries[tail] = Some((metadata, packet));
+        state.len += 1;
+        Ok(())
+    }
+
+    /// Try to remove the oldest entry without waiting.
+    pub fn try_pop(&self) -> Option<(M, crate::OwnedPacket<B>)> {
+        let mut state = self.state.try_lock()?;
+        if state.len == 0 {
+            return None;
+        }
+        let head = state.head;
+        state.head = (head + 1) % N;
+        state.len -= 1;
+        state.entries[head].take()
+    }
+
+    /// Read queue emptiness without waiting; `None` means another owner holds
+    /// the brief metadata lock.
+    pub fn try_is_empty(&self) -> Option<bool> {
+        self.state.try_lock().map(|state| state.len == 0)
+    }
+}
+
 /// Opaque ownership token for one packet slot.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -417,6 +481,77 @@ const fn mask(slots: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PacketPool as _;
+
+    type TestPool = PacketPool<2, 16>;
+    type TestPacket = crate::OwnedPacket<PoolBufferLease<'static, 2, 16>>;
+    static QUEUE_POOL: TestPool = TestPool::new();
+    static QUEUE: PacketLeaseQueue<u8, PoolBufferLease<'static, 2, 16>, 2> =
+        PacketLeaseQueue::new();
+    static FULL_QUEUE_POOL: PacketPool<3, 16> = PacketPool::new();
+    static FULL_QUEUE: PacketLeaseQueue<u8, PoolBufferLease<'static, 3, 16>, 2> =
+        PacketLeaseQueue::new();
+
+    #[test]
+    fn lease_queue_moves_metadata_without_copying_packet_storage() {
+        let packet: TestPacket = QUEUE_POOL
+            .build_packet(3, 0, |output| -> Result<usize, ()> {
+                output[..6].copy_from_slice(b"packet");
+                Ok(6)
+            })
+            .unwrap();
+        assert_eq!(QUEUE_POOL.available(), 1);
+        QUEUE.try_push(7, packet).unwrap();
+        assert_eq!(QUEUE_POOL.available(), 1);
+
+        let (metadata, packet) = QUEUE.try_pop().unwrap();
+        assert_eq!(metadata, 7);
+        assert_eq!(packet.bytes(), b"packet");
+        assert_eq!(QUEUE_POOL.available(), 1);
+        drop(packet);
+        assert_eq!(QUEUE_POOL.available(), 2);
+        assert_eq!(QUEUE.try_is_empty(), Some(true));
+    }
+
+    #[test]
+    fn full_lease_queue_returns_the_packet_for_backpressure_without_leaking_a_slot() {
+        for metadata in 0..3 {
+            let packet = FULL_QUEUE_POOL
+                .build_packet(0, 0, |output| -> Result<usize, ()> {
+                    output[0] = metadata;
+                    Ok(1)
+                })
+                .unwrap();
+            match FULL_QUEUE.try_push(metadata, packet) {
+                Ok(()) if metadata < 2 => {}
+                Err((returned_metadata, packet)) if metadata == 2 => {
+                    assert_eq!(returned_metadata, metadata);
+                    assert_eq!(packet.bytes(), &[metadata]);
+                    drop(packet);
+                }
+                result => panic!("unexpected enqueue result for {metadata}: {result:?}"),
+            }
+        }
+        assert_eq!(FULL_QUEUE_POOL.available(), 1);
+        assert_eq!(
+            FULL_QUEUE.try_pop().map(|(metadata, packet)| {
+                let bytes = packet.bytes()[0];
+                drop(packet);
+                (metadata, bytes)
+            }),
+            Some((0, 0))
+        );
+        assert_eq!(FULL_QUEUE_POOL.available(), 2);
+        assert_eq!(
+            FULL_QUEUE.try_pop().map(|(metadata, packet)| {
+                let bytes = packet.bytes()[0];
+                drop(packet);
+                (metadata, bytes)
+            }),
+            Some((1, 1))
+        );
+        assert_eq!(FULL_QUEUE_POOL.available(), 3);
+    }
 
     #[test]
     fn relay_transfers_one_slot_without_an_egress_copy() {

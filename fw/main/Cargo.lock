@@ -374,6 +374,7 @@ dependencies = [
 name = "dmesh-server"
 version = "0.1.0"
 dependencies = [
+ "dmesh-rawnan",
  "mesh-api",
  "quic-lite",
  "sha2",

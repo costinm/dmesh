@@ -13,8 +13,15 @@ use quic_lite::bearer::{
 
 /// Type-erased receive side retained by the raw NAN monitor.
 pub trait EspNowIngress: Send + Sync {
-    /// Deliver one complete opaque QUIC packet received from `peer`.
-    fn receive(&self, peer: [u8; 6], packet: &[u8], received_at_us: u64);
+    /// Decode directly into the registered QUIC packet pool, then let the
+    /// radio owner consume connectionless records in place. Return `true`
+    /// only when the borrowed payload is an opaque packet for QUIC ingress.
+    fn receive_action_frame(
+        &self,
+        frame: &[u8],
+        received_at_us: u64,
+        admit: &mut dyn FnMut([u8; 6], &[u8]) -> bool,
+    );
 }
 
 struct Shared<P: PacketPool + 'static> {
@@ -26,7 +33,12 @@ where
     P: PacketPool + Sync + 'static,
     P::Buffer: Send,
 {
-    fn receive(&self, peer: [u8; 6], packet: &[u8], received_at_us: u64) {
+    fn receive_action_frame(
+        &self,
+        frame: &[u8],
+        received_at_us: u64,
+        admit: &mut dyn FnMut([u8; 6], &[u8]) -> bool,
+    ) {
         let context = self
             .context
             .lock()
@@ -39,16 +51,15 @@ where
         else {
             return;
         };
-        if packet.len()
-            > writer
-                .payload_mut()
-                .len()
-                .saturating_sub(quic_lite::PACKET_SUFFIX_RESERVE)
-        {
+        let Some((peer, len)) =
+            dmesh_rawnan::espnow::parse_action_frame_into(frame, writer.payload_mut())
+        else {
+            return;
+        };
+        if !admit(peer, &writer.payload_mut()[..len]) {
             return;
         }
-        writer.payload_mut()[..packet.len()].copy_from_slice(packet);
-        let Some(packet) = writer.commit(packet.len()) else {
+        let Some(packet) = writer.commit(len) else {
             return;
         };
         context.enqueue_packet(
@@ -156,4 +167,59 @@ pub fn peer_address(peer: [u8; 6]) -> PeerL2Address {
 fn address_peer(address: PeerL2Address) -> [u8; 6] {
     let bytes = address.value().to_be_bytes();
     bytes[2..].try_into().unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EspNowBearer, EspNowIngress, address_peer, peer_address};
+    use quic_lite::bearer::PacketBearer;
+
+    type TestPool =
+        quic_lite::packet_pool::PacketPool<4, { quic_lite::DEFAULT_PACKET_POOL_SLOT_SIZE }>;
+    static POOL: TestPool = TestPool::new();
+
+    #[test]
+    fn peer_handle_round_trips_full_mac_and_is_nonzero() {
+        for peer in [[0x02, 0x11, 0x22, 0x33, 0x44, 0x55], [0xff; 6]] {
+            let handle = peer_address(peer);
+            assert_ne!(handle.value(), 0);
+            assert_eq!(address_peer(handle), peer);
+        }
+    }
+
+    #[test]
+    fn action_payload_is_parsed_in_the_node_pool_and_can_be_consumed_in_place() {
+        let source = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let control = [0xa3, 1, 6, 2, 1, 3, 1];
+        let quic = [0x40, 0x01, 0x02, 0x03];
+        let frame =
+            dmesh_rawnan::espnow::build_action_frame([0xff; 6], source, [0xff; 6], &control)
+                .unwrap();
+        let (bearer, ingress) = EspNowBearer::<TestPool>::new("not-opened-by-receive-test");
+        let mut node: quic_lite::QuicNode<TestPool> = quic_lite::QuicNode::new(None, &POOL);
+        node.add_bearer(bearer).unwrap();
+
+        let available_before_control = POOL.available();
+        let mut observed = false;
+        ingress.receive_action_frame(&frame, 17, &mut |peer, payload| {
+            assert_eq!(peer, source);
+            assert_eq!(payload, control);
+            observed = true;
+            false // A control frame is handled here, not enqueued into QUIC.
+        });
+        assert!(observed);
+        assert_eq!(POOL.available(), available_before_control);
+
+        let quic_frame =
+            dmesh_rawnan::espnow::build_action_frame([0xff; 6], source, [0xff; 6], &quic).unwrap();
+        let available_before_quic = POOL.available();
+        ingress.receive_action_frame(&quic_frame, 18, &mut |peer, payload| {
+            assert_eq!(peer, source);
+            assert_eq!(payload, quic);
+            true
+        });
+        // Accepted opaque QUIC owns a pool lease in the node ingress queue;
+        // non-QUIC control above was handled in place and released its lease.
+        assert_eq!(POOL.available(), available_before_quic - 1);
+    }
 }

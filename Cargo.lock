@@ -1529,6 +1529,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "dmesh-rawnan",
  "hex",
  "mesh",
  "mesh-api",

@@ -7,11 +7,11 @@
 //! bootstrap, datagram receive/send, and QUIC-lite scheduling. The
 //! flashing module sees only ordered application stream callbacks.
 
-use crate::{commands as uart, TransportProfile};
+use crate::{TransportProfile, commands as uart};
 use alloc::{boxed::Box, vec::Vec};
 use core::{
     ffi::c_void,
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicU16, AtomicU32, AtomicU8, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU16, AtomicU32, AtomicUsize, Ordering},
 };
 
 // Recovery-only PHY policy. It is deliberately not an NVS setting: normal
@@ -1779,18 +1779,6 @@ pub fn stop_sta_extensions() {
         RADIO_MODE.store(RadioMode::StaRawUdp6 as u8, Ordering::Release);
         uart::send_response(b"wifi STA/NAN/NOW stopped");
     }
-}
-
-/// Admit one already-decoded NOW payload through the Wi-Fi-owned shared pool.
-/// The private action callback and all driver-buffer copies terminate above
-/// this boundary; no bearer module may allocate, retain, or enqueue a second
-/// radio packet queue.
-pub(crate) fn enqueue_now_payload(source: [u8; 6], payload: &[u8]) -> bool {
-    crate::shared_ingress_esp::enqueue(
-        crate::shared_ingress_esp::IngressKind::EspNow,
-        source,
-        payload,
-    )
 }
 
 /// End a bounded sleepy-node STA session.  The caller owns the session policy;

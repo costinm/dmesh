@@ -578,6 +578,12 @@ where
         T: PacketBearer<P> + 'static,
     {
         let info = bearer.info();
+        if info.max_packet_size < PACKET {
+            return Err(crate::AddBearerError::PacketTooSmall {
+                actual: info.max_packet_size,
+                required: PACKET,
+            });
+        }
         let id = self
             .bearers
             .reserve_id(info.name)
@@ -2593,13 +2599,14 @@ mod tests {
         static POOL: Pool = Pool::new();
 
         let mut node = Node::new(None, &POOL);
+        let first_server_cid = node.next_local_cid;
         for client_cid in [cid(0x31), cid(0x32)] {
             if client_cid == cid(0x32) {
                 for packet_number in 0..1_000_u32 {
                     let mut bytes = [0u8; PACKET];
                     let used = ShortHeader {
                         flags: FLAG_FIXED,
-                        dcid: cid(1),
+                        dcid: ConnectionId::new(first_server_cid).unwrap(),
                         packet_number,
                         packet_number_len: 2,
                     }
@@ -2638,11 +2645,8 @@ mod tests {
             else {
                 panic!("Initial must be admitted");
             };
-            let expected = if client_cid == cid(0x31) {
-                cid(1)
-            } else {
-                cid(2)
-            };
+            let expected =
+                ConnectionId::new(first_server_cid + u64::from(client_cid == cid(0x32))).unwrap();
             assert_eq!(node.receive_cid(association), Some(expected));
             drop(response);
         }

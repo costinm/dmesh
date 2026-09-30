@@ -918,6 +918,7 @@ pub(crate) fn service_radio_deadline(services: u8) {
     }
     if services & DEADLINE_QUIC_INGRESS != 0 {
         crate::quic_node_esp::progress();
+        crate::wifi_espnow_esp::dispatch_pending_control_response();
     }
     if services & DEADLINE_NAN_CAPTURE != 0 {
         crate::wifi_nan_dw_capture_esp::service_deadline();
@@ -1879,8 +1880,9 @@ pub(crate) enum MainRuntimeEvent {
 
 const DEADLINE_NAN_CAPTURE: u8 = 1 << 0;
 const DEADLINE_ROC: u8 = 1 << 1;
-/// A bearer enqueued a QUIC packet. Parsing and handler dispatch run on Main's
-/// owner task rather than on a UART or Wi-Fi adapter stack.
+/// A bearer enqueued a QUIC packet or a pool-backed connectionless response.
+/// Parsing and radio submission run on Main's owner task, never an adapter
+/// callback stack.
 const DEADLINE_QUIC_INGRESS: u8 = 1 << 2;
 /// A server-side connection PTO. Main only queues the typed event; the
 /// shared packet worker owns the service ledger and performs the egress turn.

@@ -117,7 +117,10 @@ fn action_path_id(peer: [u8; 6]) -> quic_lite::PeerL2Address {
 /// Discovery/status records are raw tagged CBOR on ESP-NOW. Every other
 /// action payload is an opaque QUIC packet for the ESP-NOW bearer.
 fn action_payload_is_discovery(packet: &[u8]) -> bool {
-    dmesh_server::tagged::decode(packet).is_some()
+    matches!(
+        dmesh_server::raw_wifi::classify_espnow_payload(packet),
+        dmesh_server::raw_wifi::EspNowPayloadClass::TaggedControl
+    )
 }
 
 fn action_path_peer(path: quic_lite::PeerL2Address) -> Option<[u8; 6]> {
@@ -10187,10 +10190,35 @@ fn monitor_receive_loop(
                     // broadcast action traffic). The vendor-action parser is
                     // the admission check for this bearer; do not apply the
                     // ordinary data-MAC filter before classifying it.
-                    let mut action_payload = [0_u8; quic_lite::DEFAULT_MAX_PACKET_SIZE];
-                    if let Some((peer, payload_len)) =
-                        dmesh_rawnan::espnow::parse_action_frame_into(frame, &mut action_payload)
-                    {
+                    let ingress = espnow_ingress
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                    if let Some(ingress) = ingress {
+                        ingress.receive_action_frame(
+                            frame,
+                            now_micros_u64(),
+                            &mut |peer, packet| {
+                        // The monitor VIF reflects locally injected frames.
+                        // Keep it observable, but separate it from received
+                        // peer actions so NOW receive metrics cannot mistake
+                        // our own TX echo for evidence of RF delivery.
+                        if local_action_addresses.iter().any(|local| *local == peer) {
+                            push_radio_event(
+                                &history,
+                                RadioEvent {
+                                    ts_millis: now_millis(),
+                                    key: "wifi.raw.action.reflection".to_string(),
+                                    source: monitor_iface.to_string(),
+                                    value: json!({
+                                        "peer": colon_mac(&peer),
+                                        "payload_len": packet.len(),
+                                    }),
+                                    message: None,
+                                },
+                            );
+                            return false;
+                        }
                         let local_source = iface_mac(iface).ok();
                         push_radio_event(
                             &history,
@@ -10201,19 +10229,16 @@ fn monitor_receive_loop(
                                 value: json!({
                                     "peer": colon_mac(&peer),
                                     "local": local_source.map(|mac| colon_mac(&mac)),
-                                    "payload_len": payload_len,
+                                    "payload_len": packet.len(),
                                 }),
                                 message: None,
                             },
                         );
-                        // The monitor VIF reflects locally injected frames.
-                        // Do not turn that reflection into a local server
-                        // response; only a different source MAC is a peer.
-                        if local_action_addresses.iter().any(|local| *local == peer) {
-                            continue;
-                        }
-                        let packet = &action_payload[..payload_len];
-                        if let Some(sync) = dmesh_rawnan::parse_now_sync_body(packet) {
+                        let admission = dmesh_server::raw_wifi::classify_espnow_payload(packet);
+                        if admission == dmesh_server::raw_wifi::EspNowPayloadClass::NowSync {
+                            let Some(sync) = dmesh_rawnan::parse_now_sync_body(packet) else {
+                                return false;
+                            };
                             handle_now_sync_as_nan(peer, &sync, now_micros_u64(), &rawnan_state);
                             if let Some(announce) =
                                 dmesh_server::announce::decode_announce(sync.service_info)
@@ -10229,11 +10254,11 @@ fn monitor_receive_loop(
                                         announce,
                                     );
                             }
-                            continue;
+                            return false;
                         }
                         // NOW discovery is raw tagged CBOR, just like NAN SDEA
                         // discovery; it is not a QUIC packet.
-                        if action_payload_is_discovery(packet) {
+                        if admission == dmesh_server::raw_wifi::EspNowPayloadClass::TaggedControl {
                             let payload = packet;
                             // Admit it before the raw endpoint so action-frame
                             // discovery updates the same registry as NAN SDF.
@@ -10308,7 +10333,7 @@ fn monitor_receive_loop(
                                         message: None,
                                     },
                                 );
-                                continue;
+                                return false;
                             }
                             // A newly booted device emits the same bounded CBOR
                             // status and identity records over NOW as UART. They
@@ -10330,7 +10355,7 @@ fn monitor_receive_loop(
                                         message: None,
                                     },
                                 );
-                                continue;
+                                return false;
                             }
                             // A direct envelope has either updated presence above
                             // or is a separately allowlisted connectionless
@@ -10338,15 +10363,11 @@ fn monitor_receive_loop(
                             // In particular, do not hand its inner tagged record
                             // to the QUIC dispatcher, and do not make ordinary
                             // short-header QUIC packets pass this direct decoder.
-                            continue;
+                            return false;
                         }
-                        if let Some(ingress) = espnow_ingress
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .clone()
-                        {
-                            ingress.receive(peer, packet, now_micros_u64());
-                        }
+                        true
+                            },
+                        );
                         continue;
                     }
                     if !matches!(action, RawNanAction::None) {
@@ -12931,6 +12952,34 @@ mod tests {
     use p256::SecretKey;
     use p256::ecdsa::SigningKey;
     use p256::ecdsa::signature::Signer;
+
+    #[test]
+    fn now_metrics_exclude_host_reflections_from_peer_action_count() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = RadioService::from_environment_with_discovery_log(
+            directory.path().join("discovery.jsonl"),
+        );
+        {
+            let mut history = service.history.lock().unwrap();
+            history.push_back(RadioEvent {
+                ts_millis: 1,
+                key: "wifi.raw.action.reflection".to_string(),
+                source: "wlan1mon".to_string(),
+                value: json!({"peer": "local"}),
+                message: None,
+            });
+            history.push_back(RadioEvent {
+                ts_millis: 2,
+                key: "wifi.raw.action".to_string(),
+                source: "wlan1mon".to_string(),
+                value: json!({"peer": "remote"}),
+                message: None,
+            });
+        }
+
+        let metrics = service.now_metrics(Some("wlan1".to_string()));
+        assert_eq!(metrics["action_seen"], 1);
+    }
 
     #[test]
     fn action_filter_admits_a_p2p_go_reply_address() {

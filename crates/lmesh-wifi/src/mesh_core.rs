@@ -2502,7 +2502,9 @@ impl LmeshService {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone()
-                .context("unsupported/no_quic_route: ESP-NOW bearer is not attached to the QUIC node")?;
+                .context(
+                    "unsupported/no_quic_route: ESP-NOW bearer is not attached to the QUIC node",
+                )?;
             let response = request_now_stream(node, bearer, peer, record).await?;
             return decode_stream_response(&response)
                 .context("decode directed ESP-NOW QUIC tagged response");

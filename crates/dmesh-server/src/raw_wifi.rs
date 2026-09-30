@@ -50,6 +50,28 @@ pub const RAW_WIFI_SNAPSHOT_MAX_BYTES: usize = 448;
 /// response below the common bearer MTU while allowing ten visible DMesh APs.
 pub const RAW_WIFI_RESPONSE_MAX_BYTES: usize = 768;
 
+/// Common admission result for an ESP-NOW action payload. Synchronization and
+/// tagged connectionless records stay on discovery/control handling; only an
+/// opaque payload reaches the QUIC packet bearer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EspNowPayloadClass {
+    NowSync,
+    TaggedControl,
+    QuicDatagram,
+}
+
+/// Classify one already-framed ESP-NOW payload before it enters QUIC. Kept in
+/// the portable server crate so Linux and ESP adapters apply the same rule.
+pub fn classify_espnow_payload(payload: &[u8]) -> EspNowPayloadClass {
+    if dmesh_rawnan::parse_now_sync_body(payload).is_some() {
+        EspNowPayloadClass::NowSync
+    } else if decode(payload).is_some() {
+        EspNowPayloadClass::TaggedControl
+    } else {
+        EspNowPayloadClass::QuicDatagram
+    }
+}
+
 /// Encode a complete tagged raw-action-injection request. The frame stays a
 /// borrowed byte string at the decoder boundary; this constructor does not
 /// fragment, copy into a transport queue, or imply that the selected adapter
@@ -2334,6 +2356,23 @@ pub fn decode_raw_wifi_handler_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn espnow_admission_separates_sync_control_and_opaque_quic() {
+        let sync = dmesh_rawnan::build_now_sync_body([1; 6], [2; 6], 3, 512, 0, &[]).unwrap();
+        let tagged_control = [0xa3, 1, 6, 2, 1, 3, 1];
+        let quic_datagram = [0x40, 0x01, 0x02, 0x03];
+
+        assert_eq!(classify_espnow_payload(&sync), EspNowPayloadClass::NowSync);
+        assert_eq!(
+            classify_espnow_payload(&tagged_control),
+            EspNowPayloadClass::TaggedControl
+        );
+        assert_eq!(
+            classify_espnow_payload(&quic_datagram),
+            EspNowPayloadClass::QuicDatagram
+        );
+    }
 
     #[test]
     fn capture_counters_are_bounded_and_classified_without_packet_storage() {

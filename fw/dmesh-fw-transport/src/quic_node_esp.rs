@@ -9,11 +9,11 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use quic_lite::{
-    nostd::NoStdRuntime,
-    packet_pool::{PacketPool, PoolBufferLease},
     BearerContext, BearerInfo, BearerName, EgressSubmission, OwnedPacket, PacketBearer,
     PacketEgress, PacketMeta, PacketPool as _, PacketSendOutcome, PacketSubmitError, PacketWriter,
     PeerL2Address, QuicNodeEgressError, QuicStream,
+    nostd::NoStdRuntime,
+    packet_pool::{PacketPool, PoolBufferLease},
 };
 
 const PACKETS: usize = 8;
@@ -29,6 +29,7 @@ type FirmwareRuntime = NoStdRuntime<FirmwarePool>;
 static POOL: FirmwarePool = FirmwarePool::new();
 static UART_READY: AtomicBool = AtomicBool::new(false);
 static UDP6_READY: AtomicBool = AtomicBool::new(false);
+static NOW_READY: AtomicBool = AtomicBool::new(false);
 static INGRESS_PROGRESS_REPORTED: AtomicBool = AtomicBool::new(false);
 static INGRESS_ERROR_REPORTED: AtomicBool = AtomicBool::new(false);
 static UDP6_INGRESS_REPORTED: AtomicUsize = AtomicUsize::new(0);
@@ -43,6 +44,8 @@ static PROBE_POOL_BLOCK_REPORTED: AtomicBool = AtomicBool::new(false);
 static mut UART_CONTEXT: core::mem::MaybeUninit<BearerContext<FirmwarePool>> =
     core::mem::MaybeUninit::uninit();
 static mut UDP6_CONTEXT: core::mem::MaybeUninit<BearerContext<FirmwarePool>> =
+    core::mem::MaybeUninit::uninit();
+static mut NOW_CONTEXT: core::mem::MaybeUninit<BearerContext<FirmwarePool>> =
     core::mem::MaybeUninit::uninit();
 static READY: AtomicBool = AtomicBool::new(false);
 // The node contains association and stream state. Keeping it in a static
@@ -63,6 +66,64 @@ static mut PENDING_PROBE_RESPONSE: Option<PendingProbeResponse> = None;
 const PROBE_CHUNK_SIZE: usize = quic_lite::DEFAULT_MAX_STREAM_PAYLOAD;
 static mut INCOMING_REQUESTS: dmesh_server::services::OrderedRecordAssembler<QuicStream> =
     dmesh_server::services::OrderedRecordAssembler::new();
+
+/// Connectionless responses retain node-pool leases while crossing from the
+/// Wi-Fi callback to Main's event owner. The generic QUIC-owned queue stores
+/// only metadata and packet handles, not a second payload buffer.
+static PENDING_NOW_CONTROL_TX: quic_lite::packet_pool::PacketLeaseQueue<
+    [u8; 6],
+    PoolBufferLease<'static, PACKETS, SLOT_SIZE>,
+    PACKETS,
+> = quic_lite::packet_pool::PacketLeaseQueue::new();
+
+pub(crate) enum NowReceiveError {
+    NotReady,
+    PoolFull,
+    InvalidFrame,
+    InvalidPeer,
+    CommitFailed,
+}
+
+/// Copy one generated non-QUIC response into the shared node pool and defer
+/// radio submission to Main's serialized owner. It never enters QUIC parsing.
+pub(crate) fn queue_now_control_response(
+    peer: crate::wifi_espnow_esp::EspNowPeer,
+    payload: &[u8],
+) -> bool {
+    if !NOW_READY.load(Ordering::Acquire) || payload.is_empty() {
+        return false;
+    }
+    let context = unsafe {
+        (&*core::ptr::addr_of!(NOW_CONTEXT).cast::<BearerContext<FirmwarePool>>()).clone()
+    };
+    let Some(mut writer) = context.pool().acquire_writer(0, 0) else {
+        return false;
+    };
+    if payload.len() > writer.payload_mut().len() {
+        return false;
+    }
+    writer.payload_mut()[..payload.len()].copy_from_slice(payload);
+    let Some(packet) = writer.commit(payload.len()) else {
+        return false;
+    };
+    if let Err((_peer, packet)) = PENDING_NOW_CONTROL_TX.try_push(peer.mac, packet) {
+        drop(packet);
+        return false;
+    }
+    crate::main_runtime::request_quic_ingress();
+    true
+}
+
+pub(crate) fn take_pending_now_control_response(
+) -> Option<(crate::wifi_espnow_esp::EspNowPeer, FirmwarePacket)> {
+    PENDING_NOW_CONTROL_TX
+        .try_pop()
+        .map(|(peer, packet)| (crate::wifi_espnow_esp::EspNowPeer { mac: peer }, packet))
+}
+
+pub(crate) fn now_control_response_pending() -> Option<bool> {
+    PENDING_NOW_CONTROL_TX.try_is_empty().map(|empty| !empty)
+}
 
 struct UartBearer;
 
@@ -167,6 +228,60 @@ impl PacketBearer<FirmwarePool> for Udp6Bearer {
     }
 }
 
+struct NowBearer;
+
+impl PacketEgress<<FirmwarePool as quic_lite::PacketPool>::Buffer> for NowBearer {
+    fn submit(
+        &mut self,
+        peer: PeerL2Address,
+        submission: EgressSubmission<<FirmwarePool as quic_lite::PacketPool>::Buffer>,
+    ) -> Result<(), PacketSubmitError<<FirmwarePool as quic_lite::PacketPool>::Buffer>> {
+        let sent = crate::wifi_espnow_esp::transmit_from_worker(
+            crate::wifi_espnow_esp::EspNowPeer {
+                mac: peer.value().to_be_bytes()[2..]
+                    .try_into()
+                    .expect("NOW peer handle contains six MAC bytes"),
+            },
+            submission.packet().bytes(),
+        );
+        submission.complete(
+            if sent {
+                PacketSendOutcome::Sent
+            } else {
+                PacketSendOutcome::Failed
+            },
+            0,
+        );
+        crate::main_runtime::request_quic_ingress();
+        Ok(())
+    }
+}
+
+impl PacketBearer<FirmwarePool> for NowBearer {
+    type AttachError = ();
+
+    fn info(&self) -> BearerInfo {
+        BearerInfo {
+            name: BearerName::new("espnow").expect("static bearer name is valid"),
+            max_packet_size: quic_lite::DEFAULT_MAX_PACKET_SIZE,
+            prefix_required: 0,
+            suffix_required: 0,
+            requires_packet_encryption: true,
+            secure_link: false,
+            nominal_bitrate_bps: 1_000_000,
+            local_mac: None,
+        }
+    }
+
+    fn attach(&mut self, context: BearerContext<FirmwarePool>) -> Result<(), Self::AttachError> {
+        unsafe {
+            core::ptr::addr_of_mut!(NOW_CONTEXT).write(core::mem::MaybeUninit::new(context));
+        }
+        NOW_READY.store(true, Ordering::Release);
+        Ok(())
+    }
+}
+
 unsafe fn runtime() -> &'static mut FirmwareRuntime {
     if !READY.load(Ordering::Acquire) {
         let embedded = quic_lite::AssociationLimits::embedded();
@@ -188,6 +303,9 @@ unsafe fn runtime() -> &'static mut FirmwareRuntime {
         value
             .add_bearer(Udp6Bearer)
             .expect("static UDP6 bearer registration succeeds");
+        value
+            .add_bearer(NowBearer)
+            .expect("static ESP-NOW bearer registration succeeds");
         core::ptr::addr_of_mut!(RUNTIME).write(Box::into_raw(value));
         READY.store(true, Ordering::Release);
     }
@@ -280,6 +398,54 @@ pub(crate) fn receive_udp6(path: PeerL2Address, bytes: &[u8]) {
     };
     context.enqueue_packet(meta, packet);
     crate::main_runtime::request_quic_ingress();
+}
+
+/// Parse a NOW frame directly into the shared QUIC packet pool. The admission
+/// callback may consume sync/discovery records from that same buffer; only an
+/// opaque QUIC datagram is committed and enqueued to the node.
+pub(crate) fn receive_now_with<F, A>(parse: F, admit: A) -> Result<bool, NowReceiveError>
+where
+    F: FnOnce(&mut [u8]) -> Option<([u8; 6], usize)>,
+    A: FnOnce(crate::wifi_espnow_esp::EspNowPeer, &[u8]) -> bool,
+{
+    if !NOW_READY.load(Ordering::Acquire) {
+        return Err(NowReceiveError::NotReady);
+    }
+    let context = unsafe {
+        (&*core::ptr::addr_of!(NOW_CONTEXT).cast::<BearerContext<FirmwarePool>>()).clone()
+    };
+    let Some(mut writer) = context.pool().acquire_writer(0, 0) else {
+        return Err(NowReceiveError::PoolFull);
+    };
+    let Some((mac, len)) = parse(writer.payload_mut()) else {
+        return Err(NowReceiveError::InvalidFrame);
+    };
+    if len > writer.payload_mut().len() {
+        return Err(NowReceiveError::InvalidFrame);
+    }
+    let peer = crate::wifi_espnow_esp::EspNowPeer { mac };
+    if !admit(peer, &writer.payload_mut()[..len]) {
+        return Ok(false);
+    }
+    let value = mac
+        .into_iter()
+        .fold(0_u64, |value, octet| (value << 8) | u64::from(octet));
+    let Some(peer_l2_address) = PeerL2Address::new(value.max(1)) else {
+        return Err(NowReceiveError::InvalidPeer);
+    };
+    let Some(packet) = writer.commit(len) else {
+        return Err(NowReceiveError::CommitFailed);
+    };
+    context.enqueue_packet(
+        PacketMeta {
+            bearer: context.bearer(),
+            peer_l2_address,
+            received_at_us: unsafe { esp_idf_sys::esp_timer_get_time().max(0) as u64 },
+        },
+        packet,
+    );
+    crate::main_runtime::request_quic_ingress();
+    Ok(true)
 }
 
 /// Advance queued bearer ingress and dispatch complete request streams.
@@ -378,9 +544,9 @@ pub(crate) fn progress() {
                         QuicNodeEgressError::Transport(quic_lite::Error::HistoryFull) => {
                             b"history-full"
                         }
-                        QuicNodeEgressError::Transport(quic_lite::Error::RetransmissionTooLarge) => {
-                            b"retransmission-too-large"
-                        }
+                        QuicNodeEgressError::Transport(
+                            quic_lite::Error::RetransmissionTooLarge,
+                        ) => b"retransmission-too-large",
                         QuicNodeEgressError::PoolUnavailable => b"pool-unavailable",
                         QuicNodeEgressError::InvalidPoolLayout => b"invalid-pool-layout",
                         QuicNodeEgressError::MissingEgressAddress => b"missing-egress-address",
@@ -444,10 +610,7 @@ pub(crate) fn progress() {
     }
 }
 
-fn dispatch_complete_request(
-    stream: QuicStream,
-    request: &[u8],
-) -> Option<(QuicStream, Vec<u8>)> {
+fn dispatch_complete_request(stream: QuicStream, request: &[u8]) -> Option<(QuicStream, Vec<u8>)> {
     if let Some(record) = dmesh_server::tagged::decode(request) {
         if let Some((_, probe_request)) = dmesh_server::probe::decode_probe_run_record(record) {
             if unsafe { PENDING_PROBE_RESPONSE.is_none() } {
@@ -462,8 +625,7 @@ fn dispatch_complete_request(
                             chunk_size,
                         })
                     };
-                    let _ =
-                        crate::uart_esp::send_debug_text(b"DMESH QUIC probe response started");
+                    let _ = crate::uart_esp::send_debug_text(b"DMESH QUIC probe response started");
                     crate::main_runtime::request_quic_ingress();
                     return None;
                 }
@@ -525,7 +687,10 @@ fn progress_probe_response(runtime: &mut FirmwareRuntime) {
         if !pending.sender.is_complete()
             && !PROBE_WINDOW_BLOCK_REPORTED.swap(true, Ordering::AcqRel)
         {
-            report_probe_value(b"DMESH QUIC probe window blocked bytes=", pending.sender.bytes_sent());
+            report_probe_value(
+                b"DMESH QUIC probe window blocked bytes=",
+                pending.sender.bytes_sent(),
+            );
         }
         unsafe { PENDING_PROBE_RESPONSE = Some(pending) };
         return;
@@ -549,7 +714,12 @@ fn progress_probe_response(runtime: &mut FirmwareRuntime) {
                 let reported = PROBE_PROGRESS_REPORTED.load(Ordering::Acquire);
                 if progress_mark > reported
                     && PROBE_PROGRESS_REPORTED
-                        .compare_exchange(reported, progress_mark, Ordering::AcqRel, Ordering::Acquire)
+                        .compare_exchange(
+                            reported,
+                            progress_mark,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
                         .is_ok()
                 {
                     report_probe_value(b"DMESH QUIC probe bytes sent=", sent);
@@ -565,7 +735,10 @@ fn progress_probe_response(runtime: &mut FirmwareRuntime) {
             if matches!(error, QuicNodeEgressError::PoolUnavailable)
                 && !PROBE_POOL_BLOCK_REPORTED.swap(true, Ordering::AcqRel)
             {
-                report_probe_value(b"DMESH QUIC probe pool blocked bytes=", pending.sender.bytes_sent());
+                report_probe_value(
+                    b"DMESH QUIC probe pool blocked bytes=",
+                    pending.sender.bytes_sent(),
+                );
             }
             unsafe { PENDING_PROBE_RESPONSE = Some(pending) };
         }

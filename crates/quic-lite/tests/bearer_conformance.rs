@@ -16,6 +16,32 @@ type Pool = quic_lite::packet_pool::PacketPool<8, { quic_lite::DEFAULT_PACKET_PO
 type Node = QuicNode<Pool>;
 static CLIENT_POOL: Pool = Pool::new();
 
+struct UndersizedBearer(FakePacketBearer<Pool>);
+
+impl PacketEgress<<Pool as PacketPoolTrait>::Buffer> for UndersizedBearer {
+    fn submit(
+        &mut self,
+        peer: PeerL2Address,
+        submission: EgressSubmission<<Pool as PacketPoolTrait>::Buffer>,
+    ) -> Result<(), PacketSubmitError<<Pool as PacketPoolTrait>::Buffer>> {
+        self.0.submit(peer, submission)
+    }
+}
+
+impl PacketBearer<Pool> for UndersizedBearer {
+    type AttachError = core::convert::Infallible;
+
+    fn info(&self) -> BearerInfo {
+        let mut info = self.0.info();
+        info.max_packet_size -= 1;
+        info
+    }
+
+    fn attach(&mut self, context: BearerContext<Pool>) -> Result<(), Self::AttachError> {
+        self.0.attach(context)
+    }
+}
+
 struct AttachFailure;
 
 impl PacketEgress<<Pool as PacketPoolTrait>::Buffer> for AttachFailure {
@@ -62,6 +88,24 @@ fn node_owns_the_complete_bearer() {
     assert_eq!(
         node.add_bearer(FakePacketBearer::<Pool>::new(name)),
         Err(AddBearerError::Registry(BearerRegistryError::DuplicateName))
+    );
+}
+
+#[test]
+fn node_rejects_bearers_below_the_common_packet_size_before_attachment() {
+    let mut node = Node::new(None, &CLIENT_POOL);
+    let name = BearerName::new("small-mtu").unwrap();
+    assert_eq!(
+        node.add_bearer(UndersizedBearer(FakePacketBearer::<Pool>::new(name))),
+        Err(AddBearerError::PacketTooSmall {
+            actual: quic_lite::DEFAULT_MAX_PACKET_SIZE - 1,
+            required: quic_lite::DEFAULT_MAX_PACKET_SIZE,
+        })
+    );
+    assert_eq!(
+        node.add_bearer(FakePacketBearer::<Pool>::new(name))
+            .unwrap(),
+        BEARER
     );
 }
 

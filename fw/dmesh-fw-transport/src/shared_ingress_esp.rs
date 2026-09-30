@@ -20,7 +20,6 @@ pub enum IngressKind {
     Work = 5,
     NanServiceInfo = 6,
     ConnectionTimer = 7,
-    EspNowTx = 8,
     UartEgressReady = 10,
     BleCoc = 11,
     BleCocEgressReady = 12,
@@ -112,9 +111,6 @@ pub fn enqueue_on_link(
     true
 }
 
-pub fn enqueue_espnow_tx(_peer: [u8; 6], _bytes: &[u8]) -> bool {
-    false
-}
 pub fn schedule_work(work: fn()) -> bool {
     work();
     true
