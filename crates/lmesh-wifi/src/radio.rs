@@ -9833,15 +9833,46 @@ fn send_open_ap_mgmt_response(
 /// Encode and send one bearer-neutral QUIC datagram as an ESP-NOW-like
 /// action. Keeping this in one helper makes immediate responses and timer
 /// retransmissions use identical address/rate/framing behavior.
-pub(crate) fn send_raw_action_datagram(
-    iface: &str,
-    peer: [u8; 6],
-    payload: &[u8],
-    tx_rate_mbps: u8,
-) -> Result<()> {
-    let monitor_iface = monitor_iface_name(iface);
-    let socket = MonitorTxSocket::open(&monitor_iface)?;
-    send_raw_action_datagram_on_socket(iface, &socket, peer, payload, tx_rate_mbps)
+/// Persistent transmit path for the ESP-NOW QUIC bearer. Creating an AF_PACKET
+/// socket for every datagram can race driver context changes and lose packets;
+/// retain the bound monitor socket between submissions. A failed submission
+/// retires the socket so the next QUIC retry can reopen it after radio/VIF
+/// recreation.
+pub(crate) struct RawActionTransmitter {
+    iface: String,
+    socket: Option<MonitorTxSocket>,
+}
+
+impl RawActionTransmitter {
+    pub(crate) fn new(iface: String) -> Self {
+        Self {
+            iface,
+            socket: None,
+        }
+    }
+
+    pub(crate) fn send(
+        &mut self,
+        peer: [u8; 6],
+        payload: &[u8],
+        tx_rate_mbps: u8,
+    ) -> Result<()> {
+        if self.socket.is_none() {
+            let monitor_iface = monitor_iface_name(&self.iface);
+            self.socket = Some(MonitorTxSocket::open(&monitor_iface)?);
+        }
+        let result = send_raw_action_datagram_on_socket(
+            &self.iface,
+            self.socket.as_ref().expect("socket opened above"),
+            peer,
+            payload,
+            tx_rate_mbps,
+        );
+        if result.is_err() {
+            self.socket.take();
+        }
+        result
+    }
 }
 
 /// Send using a caller-owned AF_PACKET socket.  The receive loop sends both
@@ -9892,15 +9923,24 @@ fn send_raw_action_datagram_on_socket(
     Ok(())
 }
 
-/// Broadcast Address-1 is the default ESP-NOW-compatible action path.  Host
-/// tests may select a peer Address-1 to compare MAC-ACK/unicast behavior
-/// without changing the shared QUIC or frame parser. Firmware keeps the
-/// broadcast default because its radio policy is association-specific.
+/// Address-1 used for a host-originated NOW QUIC packet. QUIC is directed
+/// unicast; the receive alias is reserved for the separate discovery probe
+/// and remains available only as an explicit diagnostic override.
 fn raw_action_response_address(peer: [u8; 6]) -> [u8; 6] {
-    if std::env::var("DMESH_RAW_ACTION_RESPONSE_A1").as_deref() == Ok("peer") {
-        peer
+    raw_action_response_address_with_alias_override(
+        peer,
+        std::env::var("DMESH_RAW_ACTION_RESPONSE_A1").as_deref() == Ok("receive_alias"),
+    )
+}
+
+fn raw_action_response_address_with_alias_override(
+    peer: [u8; 6],
+    use_receive_alias: bool,
+) -> [u8; 6] {
+    if use_receive_alias {
+        raw_receive_mac(peer)
     } else {
-        [0xff; 6]
+        directed_now_destination(peer)
     }
 }
 
@@ -12998,6 +13038,22 @@ mod tests {
         let peer = [0x14, 0xc1, 0x9f, 0xe4, 0x5d, 0x48];
         assert_eq!(directed_now_destination(peer), peer);
         assert_ne!(directed_now_destination(peer), raw_receive_mac(peer));
+    }
+
+    #[test]
+    fn raw_now_quic_uses_unicast_peer_by_default_and_alias_only_as_diagnostic() {
+        let peer = [0x20, 0x6e, 0xf1, 0x13, 0xa4, 0x00];
+        assert_eq!(
+            raw_action_response_address_with_alias_override(peer, false),
+            peer
+        );
+        assert_eq!(peer[0] & 1, 0, "the announced peer address is unicast");
+        let alias = raw_action_response_address_with_alias_override(peer, true);
+        assert_eq!(
+            alias,
+            [0x21, 0x6e, 0xf1, 0x13, 0xa4, 0x00]
+        );
+        assert_eq!(alias[0] & 1, 1, "the receive alias is a group address");
     }
 
     #[test]

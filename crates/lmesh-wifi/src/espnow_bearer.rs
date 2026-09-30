@@ -76,7 +76,7 @@ where
 /// ESP-NOW action-frame bearer. The radio monitor owns frame parsing and calls
 /// the returned [`EspNowIngress`]; this adapter owns no packet queue or pool.
 pub struct EspNowBearer<P: PacketPool + 'static> {
-    iface: String,
+    transmitter: crate::radio::RawActionTransmitter,
     shared: Arc<Shared<P>>,
 }
 
@@ -91,7 +91,7 @@ impl<P: PacketPool + 'static> EspNowBearer<P> {
         });
         (
             Self {
-                iface: iface.into(),
+                transmitter: crate::radio::RawActionTransmitter::new(iface.into()),
                 shared: shared.clone(),
             },
             shared,
@@ -108,11 +108,10 @@ where
         peer: PeerL2Address,
         submission: EgressSubmission<P::Buffer>,
     ) -> Result<(), PacketSubmitError<P::Buffer>> {
-        let result = crate::radio::send_raw_action_datagram(
-            &self.iface,
+        let result = self.transmitter.send(
             address_peer(peer),
             submission.packet().bytes(),
-            1,
+            6,
         );
         submission.complete(
             if result.is_ok() {
@@ -141,7 +140,7 @@ where
             suffix_required: 0,
             requires_packet_encryption: true,
             secure_link: false,
-            nominal_bitrate_bps: 1_000_000,
+            nominal_bitrate_bps: 6_000_000,
             local_mac: None,
         }
     }

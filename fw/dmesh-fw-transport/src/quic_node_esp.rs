@@ -400,6 +400,47 @@ pub(crate) fn receive_udp6(path: PeerL2Address, bytes: &[u8]) {
     crate::main_runtime::request_quic_ingress();
 }
 
+/// Admit one already-decoded NOW QUIC datagram through the registered bearer
+/// context. The native action-frame path uses `receive_now_with` to parse
+/// directly into this same pool; this entry point serves ingress adapters that
+/// have already separated the action envelope from its payload.
+pub(crate) fn receive_now_packet(peer: crate::wifi_espnow_esp::EspNowPeer, bytes: &[u8]) -> bool {
+    if !NOW_READY.load(Ordering::Acquire) || bytes.is_empty() {
+        return false;
+    }
+    let context = unsafe {
+        (&*core::ptr::addr_of!(NOW_CONTEXT).cast::<BearerContext<FirmwarePool>>()).clone()
+    };
+    let Some(mut writer) = context.pool().acquire_writer(0, 0) else {
+        return false;
+    };
+    let target = writer.payload_mut();
+    if bytes.len() > target.len() {
+        return false;
+    }
+    target[..bytes.len()].copy_from_slice(bytes);
+    let Some(packet) = writer.commit(bytes.len()) else {
+        return false;
+    };
+    let value = peer
+        .mac
+        .into_iter()
+        .fold(0_u64, |value, octet| (value << 8) | u64::from(octet));
+    let Some(peer_l2_address) = PeerL2Address::new(value.max(1)) else {
+        return false;
+    };
+    context.enqueue_packet(
+        PacketMeta {
+            bearer: context.bearer(),
+            peer_l2_address,
+            received_at_us: unsafe { esp_idf_sys::esp_timer_get_time().max(0) as u64 },
+        },
+        packet,
+    );
+    crate::main_runtime::request_quic_ingress();
+    true
+}
+
 /// Parse a NOW frame directly into the shared QUIC packet pool. The admission
 /// callback may consume sync/discovery records from that same buffer; only an
 /// opaque QUIC datagram is committed and enqueued to the node.
