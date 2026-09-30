@@ -3,9 +3,10 @@
 use std::sync::{Arc, Mutex};
 
 use quic_lite::{
-    BearerContext, BearerInfo, BearerName, ConnectionLimits, EgressSubmission, PacketBearer,
-    PacketEgress, PacketMeta, PacketPool as PacketPoolTrait, PacketSendOutcome, PacketSubmitError,
-    PacketWriter, PeerL2Address, QuicNode, nostd::NoStdRuntime, packet_pool::PacketPool,
+    AssociationLimits, BearerContext, BearerInfo, BearerName, EgressSubmission, NodeLimits,
+    PacketBearer, PacketEgress, PacketMeta, PacketPool as PacketPoolTrait, PacketSendOutcome,
+    PacketSubmitError, PacketWriter, PeerL2Address, QuicNode, nostd::NoStdRuntime,
+    packet_pool::PacketPool,
 };
 
 type Pool = PacketPool<8, { quic_lite::DEFAULT_PACKET_POOL_SLOT_SIZE }>;
@@ -108,10 +109,13 @@ fn copy_into_pool(
 #[test]
 fn slow_queue_consumer_receives_complete_stream() {
     let (client_bearer, client_context, client_sent) = Capture::<Pool>::new("client");
+    let embedded = AssociationLimits::embedded();
     let mut client = NoStdRuntime::new(
         QuicNode::<Pool>::new(None, &CLIENT_POOL),
-        ConnectionLimits::default(),
+        embedded.connection,
     );
+    client.set_limits(NodeLimits::embedded()).unwrap();
+    client.set_default_association_limits(embedded).unwrap();
     let client_bearer_id = client.add_bearer(client_bearer).unwrap();
     let client_address = PacketMeta {
         bearer: client_bearer_id,
@@ -121,8 +125,10 @@ fn slow_queue_consumer_receives_complete_stream() {
     let (server_bearer, server_context, server_sent) = Capture::<Pool>::new("server");
     let mut server = NoStdRuntime::new(
         QuicNode::<Pool>::new(None, &SERVER_POOL),
-        ConnectionLimits::default(),
+        embedded.connection,
     );
+    server.set_limits(NodeLimits::embedded()).unwrap();
+    server.set_default_association_limits(embedded).unwrap();
     let server_bearer_id = server.add_bearer(server_bearer).unwrap();
     let server_address = PacketMeta {
         bearer: server_bearer_id,
@@ -150,7 +156,10 @@ fn slow_queue_consumer_receives_complete_stream() {
     assert!(client.association_is_established(association));
 
     let mut stream = client.open_stream(association).unwrap();
-    let data: Vec<u8> = (0..30_000u32).map(|index| index as u8).collect();
+    // Cross the default 64 KiB initial stream credit several times. This
+    // verifies that a slowly drained no-std stream receives fresh credit
+    // instead of silently stopping at its bootstrap window.
+    let data: Vec<u8> = (0..256 * 1024u32).map(|index| index as u8).collect();
     let mut sent = 0;
     let mut finished = false;
     let mut received = Vec::new();
@@ -167,22 +176,28 @@ fn slow_queue_consumer_receives_complete_stream() {
         if sent == data.len() && !finished {
             finished = client.finish_stream(&mut stream).is_ok();
         }
-        for packet in core::mem::take(&mut *client_sent.lock().unwrap()) {
-            server_context
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .enqueue_packet(
-                    PacketMeta {
-                        received_at_us: now,
-                        ..server_address
-                    },
-                    copy_into_pool(&SERVER_POOL, &packet),
-                );
-            // Errors are the symptom under test; keep driving the node.
-            let _ = server.progress();
+        let client_burst = core::mem::take(&mut *client_sent.lock().unwrap());
+        for burst in client_burst.chunks(2) {
+            for packet in burst {
+                server_context
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .enqueue_packet(
+                        PacketMeta {
+                            received_at_us: now,
+                            ..server_address
+                        },
+                        copy_into_pool(&SERVER_POOL, packet),
+                    );
+            }
+            // Multiple packets can be covered by one callback wake marker.
+            server.progress_all().unwrap();
         }
+        // The event source coalesces these datagrams into one owner wake.
+        // Drain the full burst so a queued MAX_STREAM_DATA update cannot be
+        // stranded behind an earlier ACK-only packet.
         // The application drains its queue only every fourth round.
         if round % 4 == 0 {
             while let Some(chunk) = server.next_stream_chunk() {
@@ -190,20 +205,23 @@ fn slow_queue_consumer_receives_complete_stream() {
             }
         }
         let _ = server.advance_time(now);
-        for packet in core::mem::take(&mut *server_sent.lock().unwrap()) {
-            client_context
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .enqueue_packet(
-                    PacketMeta {
-                        received_at_us: now,
-                        ..client_address
-                    },
-                    copy_into_pool(&CLIENT_POOL, &packet),
-                );
-            let _ = client.progress();
+        let server_burst = core::mem::take(&mut *server_sent.lock().unwrap());
+        for burst in server_burst.chunks(2) {
+            for packet in burst {
+                client_context
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .enqueue_packet(
+                        PacketMeta {
+                            received_at_us: now,
+                            ..client_address
+                        },
+                        copy_into_pool(&CLIENT_POOL, packet),
+                    );
+            }
+            client.progress_all().unwrap();
         }
         let _ = client.advance_time(now);
         if received.len() == data.len() {

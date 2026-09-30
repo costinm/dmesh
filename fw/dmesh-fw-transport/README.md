@@ -153,13 +153,19 @@ end-to-end test.
 
 ### Current Main behavior
 
-Neither `mode=infra` nor `mode=sleepy` starts STA from NVS at boot. A UART
-`transport.start` record starts the shared STA/raw UDP6 bearer from its
-ephemeral SSID; active NAN Service Info uses exactly the same command. The
-initial session deadline is 3 seconds for sleepy mode. A tracked DMesh
-stream keeps it live; after the final tracked stream completes, Main applies a
-200-ms command grace and then stops STA. Ordinary UDP/action packets which do
-not create a tracked stream do not extend the session.
+Main reads the persisted `dmesh:mode` at boot. `mode=active` with a complete
+private STA profile starts associated STA + UDP6 + NAN/NOW; without that
+profile it starts the normal unassociated NAN/NOW radio. `mode=sleepy` starts
+the low-duty NAN/NOW personality and retains a 60-second initial debug window.
+During that window, or after a valid UART wake record, Main defers the next
+sleep decision for 60 seconds. Persisting `mode=active` makes the active
+personality permanent across reboot. STA boot association emits its IPv4
+address on the UART diagnostic channel when DHCP succeeds.
+
+The UART wake record is one PPP-framed `WAKE_MARKER` byte, separate from
+QUIC-lite packets and never admitted to the QUIC packet pool. It asks Main's
+owner task for the 60-second awake grace; it does not itself change NVS or the
+requested radio profile. Use `dmesh-cli SERIAL|DEVICE --wake` to send it.
 
 The implemented NAN wake is an **active subscribe** NAN service descriptor
 whose Service Info bytes are a bounded common CBOR command. It can switch the
@@ -195,8 +201,8 @@ resetting the association, NOW callback, or NAN capture state.
 | --- | --- | --- |
 | `transport.start.ssid`, `sta_bssid`, `sta_channel` | unset | Ephemeral association target, queried from the managed AP owner by Rust e2e and sent over UART. `sta_bssid` and `sta_channel` select the intended AP without an application-owned discovery scan; all three values stay in RAM and never change NVS. A future optional IPv6 field is only needed when the peer is not the BSSID-derived link-local endpoint. |
 | `sta_passphrase` | fixed DMesh key | Optional 8..63-byte WPA2-PSK override for an Android P2P or other protected STA target. It is accepted only in `transport.start`, copied into RAM for the selected epoch, and never written to NVS. Its absence selects the fixed `DIRECT-dmesh`/`untrusted-open-mode` WPA2 key; it never means open authentication or reuse of an old override. WPA2 PMF is capable but not required for Android compatibility. |
-| Main `mode=infra` | n/a | Keeps the infrastructure policy active but does not associate from NVS. |
-| Main `mode=sleepy` | n/a | Keeps STA off in the NAN DW8 sleepy profile. A directed NAN Service Info `transport.start {mode: Nan, nan_dw_interval: 1, now: 1}` wakes it into active NAN+NOW; a later DW8/`now:2` start restores sleepy policy. |
+| Main NVS `mode=active` | active | Uses a complete persisted STA profile at boot when available, while keeping NAN/NOW enabled; otherwise boots unassociated NAN/NOW. |
+| Main NVS `mode=sleepy` | n/a | Starts the NAN DW8 sleepy profile with a 60-second initial awake/debug grace; UART `--wake` requests another grace interval. |
 | `control.transport.start {mode: Sta, ssid: ...}` | n/a | Required ephemeral STA target and full associated STA/raw-UDP6 setup. It replaces the boot setup. |
 | boot default / `control.transport.start {mode: Nan}` | n/a | Unassociated NOW setup. When AP is selected, it starts APSTA on channel 6 using Android's fixed `DIRECT-dmesh`/`untrusted-open-mode` WPA2 credentials; an explicit later Nan start deliberately replaces the current setup. |
 | `now` | `0` | Private action callback: `0` default/on, `1` explicit on, `2` windowed/off. The `mode=Nan`, DW8, `now=2`, `ap=0`, UART-off combination is the sleepy profile; DW1 with `now=1` is the awake NAN+NOW profile. UDP6 remains independent. |
@@ -212,7 +218,7 @@ resetting the association, NOW callback, or NAN capture state.
 | `sta_11b_rates_disabled` | `true` | Pre-start legacy-rate policy; changing it recreates the STA driver and reassociates. |
 | `tx_burst_packets`, `ack_frequency`, `ack_delay_ms` | start defaults | Raw-bearer pacing/ACK controls. A future active-subscribe Service Info CBOR command uses the same fields and validation as UART. |
 | `path_policy` | `0` | QUIC-lite/action path-selection policy; it does not select a Wi-Fi radio mode. |
-| `timeout_ms` | `300000` | Decoded start setting, but it does not replace Main's fixed 3-second sleepy-session deadline or its 200-ms stream grace today. |
+| `timeout_ms` | `300000` | Decoded start setting; sleepy boot's independent 60-second debug grace does not extend a later explicit STA session. |
 
 ### Directed-association timing
 

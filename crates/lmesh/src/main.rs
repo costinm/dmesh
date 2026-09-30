@@ -20,7 +20,8 @@ async fn run() -> Result<()> {
     let mut node = lmesh_wifi::mesh_runtime::HostQuicNode::new(None, &HOST_PACKET_POOL);
     node.add_bearer(bearer)
         .map_err(|error| anyhow::anyhow!("attach lmesh UDP bearer: {error:?}"))?;
-    node.add_bearer(espnow)
+    let now_bearer = node
+        .add_bearer(espnow)
         .map_err(|error| anyhow::anyhow!("attach lmesh ESP-NOW bearer: {error:?}"))?;
     if let Ok(address) = std::env::var("LMESH_BLE_COC") {
         let psm = std::env::var("LMESH_BLE_COC_PSM")
@@ -53,5 +54,5 @@ async fn run() -> Result<()> {
         node.add_bearer(uart)
             .map_err(|error| anyhow::anyhow!("attach lmesh UART bearer: {error:?}"))?;
     }
-    lmesh_wifi::mesh_runtime::run_mesh_service(defaults, node, espnow_ingress).await
+    lmesh_wifi::mesh_runtime::run_mesh_service(defaults, node, now_bearer, espnow_ingress).await
 }

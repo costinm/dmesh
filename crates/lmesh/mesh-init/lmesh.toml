@@ -25,6 +25,9 @@ HOME = "/home/lmesh"
 MESH_LOG_DIR = "/home/lmesh/log"
 MESH_LOG_FILE = "/home/lmesh/log/lmesh.log"
 MESH_TOOLS = "/opt/lmesh/etc/schemas/tools.json"
+# The spawned wpa_supplicant lives in the repo Nix profile; a boot-time
+# mesh-init inherits no useful PATH, so lmesh must receive it explicitly.
+PATH = "/ws/dmesh/target/x86_64-unknown-linux-musl/release:/ws/dmesh/target/nix/profile/bin:/nix/var/nix/profiles/default/bin:/usr/bin:/bin"
 # The binary owns its endpoint defaults: /run/mesh/lmesh/mesh.sock.cbor,
 # localhost HTTP 18981, and normal UDP/QUIC-lite 3336.
 # mesh-init supplies HOME and creates /run/mesh/lmesh before launch.

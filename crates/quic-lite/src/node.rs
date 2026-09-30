@@ -106,7 +106,10 @@ impl AssociationLimits {
     pub const fn embedded() -> Self {
         Self {
             connection: crate::ConnectionLimits::with_receive_profile(32 * 1024, 8 * 1024, 4),
-            history_packets: 8,
+            // Keep receive headroom in the embedded packet pool for inbound
+            // ACK and MAX_STREAM_DATA packets; allowing history to occupy
+            // every packet slot would prevent those packets from releasing it.
+            history_packets: 6,
             max_pending_streams: 4,
             max_queued_chunks_per_stream: 2,
             max_buffered_stream_bytes: 32 * 1024,
@@ -640,6 +643,15 @@ where
         progressed
     }
 
+    /// Whether queued ingress can be processed without generating output for
+    /// a bearer that already has an unsubmitted packet retained.
+    pub(crate) fn can_progress_ingress(&self) -> bool {
+        self.bearers
+            .iter()
+            .filter(|bearer| bearer.state().enabled)
+            .all(|bearer| bearer.can_submit())
+    }
+
     pub(crate) fn submit_egress(
         &mut self,
         bearer_id: BearerId,
@@ -865,7 +877,16 @@ impl<P: PacketPool, const PACKET: usize> QuicNode<P, PACKET> {
             } else {
                 vec![0]
             },
-            next_local_cid: 1,
+            next_local_cid: {
+                #[cfg(feature = "tokio")]
+                {
+                    crate::tokio::initial_local_cid_seed()
+                }
+                #[cfg(not(feature = "tokio"))]
+                {
+                    1
+                }
+            },
             clock_us: 0,
             idle_timeout_us: DEFAULT_IDLE_TIMEOUT_US,
             router: {
@@ -925,7 +946,11 @@ impl<P: PacketPool, const PACKET: usize> QuicNode<P, PACKET> {
                     vec![0]
                 },
             );
-            core::ptr::addr_of_mut!((*node).next_local_cid).write(1);
+            #[cfg(feature = "tokio")]
+            let first_local_cid = crate::tokio::initial_local_cid_seed();
+            #[cfg(not(feature = "tokio"))]
+            let first_local_cid = 1;
+            core::ptr::addr_of_mut!((*node).next_local_cid).write(first_local_cid);
             core::ptr::addr_of_mut!((*node).clock_us).write(0);
             core::ptr::addr_of_mut!((*node).idle_timeout_us).write(DEFAULT_IDLE_TIMEOUT_US);
             let mut router = PacketRouter::new(reset_key);
@@ -2534,6 +2559,18 @@ mod tests {
 
     fn cid(value: u64) -> ConnectionId {
         ConnectionId::new(value).unwrap()
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn separate_host_nodes_use_distinct_local_cid_namespaces() {
+        type TestNode = QuicNode<TestPool, { crate::DEFAULT_MAX_PACKET_SIZE }>;
+        let mut first: TestNode = QuicNode::new(None, &TEST_POOL);
+        let mut second: TestNode = QuicNode::new(None, &TEST_POOL);
+        assert_ne!(
+            first.allocate_local_cid().unwrap(),
+            second.allocate_local_cid().unwrap()
+        );
     }
 
     fn short_packet(destination: ConnectionId, output: &mut [u8]) -> usize {

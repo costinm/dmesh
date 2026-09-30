@@ -13,9 +13,14 @@ use core::{
     task::{Context, Poll},
 };
 use std::{
+    collections::hash_map::RandomState,
     fs::File,
+    hash::BuildHasher,
     io::{self, Write},
-    sync::Mutex,
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -32,6 +37,21 @@ const PACKET_CAPTURE_ENV: &str = "QUIC_LITE_PCAP";
 const LINKTYPE_LINUX_SLL2: u32 = 276;
 const SLL2_HEADER_LEN: usize = 20;
 const ETH_P_QUIC_LITE: u16 = 0x88b5;
+static PROCESS_CID_BASE: OnceLock<u64> = OnceLock::new();
+static NODE_CID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Allocate a host node's first local CID from a process-random namespace.
+/// Firmware without OS entropy keeps its compact local counter; Tokio hosts
+/// create short-lived nodes in separate processes and must not all restart at
+/// CID 1 while a peer still retains their previous associations.
+pub(crate) fn initial_local_cid_seed() -> u64 {
+    let range = crate::ConnectionId::MAX_VALUE;
+    let base = *PROCESS_CID_BASE.get_or_init(|| {
+        RandomState::new().hash_one((SystemTime::now(), std::process::id())) % range
+    });
+    let sequence = NODE_CID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    base.wrapping_add(sequence) % range + 1
+}
 
 enum DriverCommand {
     Wake,

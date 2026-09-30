@@ -56,7 +56,7 @@ pub(crate) fn is_fatal_diagnostic(line: &str) -> bool {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: dmesh-cli SERIAL|DEVICE --reset\n       dmesh-cli SERIAL|DEVICE --watch [--reset] [--interactive] [--baud PHYSICAL_UART_BAUD] [--timeout-secs N]\n       dmesh-cli DEVICE METHOD [--field=value ...]\n       dmesh-cli devices check|backfill [--dry-run]\n       dmesh-cli discover\n       dmesh-cli flash TARGET [--target main|recovery|stage2|MODULE] [--file IMAGE]\n       dmesh-cli SERIAL|DEVICE [--msg TEXT | --direct-hex HEX] [--timeout-secs N]\n       dmesh-cli lmesh METHOD [--field=value ...]\n       dmesh-cli NODE check\n       dmesh-cli udp://HOST:PORT --socket PATH\n       dmesh-cli http://HOST:PORT SERVICE.METHOD [--field=value ...]"
+        "usage: dmesh-cli SERIAL|DEVICE --reset\n       dmesh-cli SERIAL|DEVICE --wake [--baud PHYSICAL_UART_BAUD]\n       dmesh-cli SERIAL|DEVICE --watch [--reset] [--interactive] [--baud PHYSICAL_UART_BAUD] [--timeout-secs N]\n       dmesh-cli DEVICE METHOD [--field=value ...]\n       dmesh-cli SERIAL METHOD [--baud PHYSICAL_UART_BAUD] [--timeout-secs N] [--field=value ...]\n       dmesh-cli devices check|backfill [--dry-run]\n       dmesh-cli discover\n       dmesh-cli flash TARGET [--target main|recovery|stage2|MODULE] [--file IMAGE]\n       dmesh-cli SERIAL|DEVICE [--msg TEXT | --direct-hex HEX] [--timeout-secs N]\n       dmesh-cli lmesh METHOD [--field=value ...]\n       dmesh-cli NODE check\n       dmesh-cli udp://HOST:PORT --socket PATH\n       dmesh-cli http://HOST:PORT SERVICE.METHOD [--field=value ...]"
     );
     std::process::exit(2)
 }
@@ -147,6 +147,39 @@ pub fn run_dmesh_cli_args(args: impl IntoIterator<Item = String>) -> Result<(), 
             arguments[0] = serial.display().to_string();
         }
         return reset_serial(&arguments[0]);
+    }
+    if arguments
+        .get(1)
+        .is_some_and(|argument| argument == "--wake")
+    {
+        let target = arguments.first().cloned().unwrap_or_else(|| usage());
+        let mut baud = None;
+        if !target.starts_with('/') {
+            if target.contains(':') {
+                return Err("--wake requires a serial path or device profile".into());
+            }
+            let profile = load_device(&target)?;
+            let serial = profile
+                .serial_path()?
+                .ok_or_else(|| format!("device {target:?} has no serial_id for --wake"))?;
+            arguments[0] = serial.display().to_string();
+            baud = profile.uart_baud;
+        }
+        if arguments.len() > 2 {
+            if arguments.len() == 4 && arguments[2] == "--baud" {
+                baud = Some(
+                    arguments[3]
+                        .parse::<u32>()
+                        .map_err(|error| error.to_string())?,
+                );
+            } else {
+                return Err("--wake accepts only --baud PHYSICAL_UART_BAUD".into());
+            }
+        }
+        let mut session = DeviceSession::open(&arguments[0], baud)?;
+        session.send_wake()?;
+        println!("dmesh_uart_wake_sent target={} bytes=1", arguments[0]);
+        return Ok(());
     }
     // Watch is explicitly a physical UART operation. A device profile with
     // both serial and static-UDP paths must not silently choose UDP here.
@@ -262,6 +295,11 @@ fn run_check_command(arguments: &[String]) -> Result<(), String> {
         return run_udp_direct_discovery(parse_udp_peer(target.trim_start_matches("udp://"))?);
     }
     if !target.starts_with('/') {
+        if let Some(profile) = resolve_catalog_target(&target)? {
+            let selected = flash_target_from_catalog_profile(&profile)?;
+            let (peer, _) = discover_and_nan_activate(&selected)?;
+            return run_udp_direct_discovery(peer);
+        }
         if let Ok(Some(peer)) = resolve_udp_peer(&target) {
             if explicit_baud.is_some() {
                 return Err("--baud applies only to a UART check".into());
@@ -369,24 +407,8 @@ impl WatchTextFilter {
 /// This intentionally shares the exact bootstrap and request packets used by
 /// the UDP client; only PPP framing and file I/O differ.
 fn run_serial_stream_command(arguments: &[String]) -> Result<(), String> {
-    let mut service_arguments = Vec::new();
-    let mut baud = None;
-    let mut index = 1;
-    while index < arguments.len() {
-        if arguments[index] == "--baud" {
-            index += 1;
-            baud = Some(
-                arguments
-                    .get(index)
-                    .ok_or("missing --baud value")?
-                    .parse::<u32>()
-                    .map_err(|error| error.to_string())?,
-            );
-        } else {
-            service_arguments.push(arguments[index].clone());
-        }
-        index += 1;
-    }
+    let (service_arguments, baud, timeout) =
+        parse_serial_stream_arguments(arguments.get(1..).unwrap_or_default())?;
     let body = encode_stream_argv_with_id(&service_arguments, fresh_request_id())
         .map_err(|error| error.to_string())?;
     let path = arguments.first().ok_or("missing serial path")?;
@@ -398,12 +420,7 @@ fn run_serial_stream_command(arguments: &[String]) -> Result<(), String> {
     }
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
     let response = runtime
-        .block_on(crate::node_client::request_uart(
-            path,
-            baud,
-            &body,
-            Duration::from_secs(3),
-        ))?
+        .block_on(crate::node_client::request_uart(path, baud, &body, timeout))?
         .bytes;
     println!(
         "dmesh_cli_stream_command target={} fin=true bytes={} {}",
@@ -412,6 +429,42 @@ fn run_serial_stream_command(arguments: &[String]) -> Result<(), String> {
         render_device_record(&load_tagged_schema(), &response),
     );
     Ok(())
+}
+
+fn parse_serial_stream_arguments(
+    arguments: &[String],
+) -> Result<(Vec<String>, Option<u32>, Duration), String> {
+    let mut service_arguments = Vec::new();
+    let mut baud = None;
+    let mut timeout = Duration::from_secs(3);
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--baud" => {
+                index += 1;
+                baud = Some(
+                    arguments
+                        .get(index)
+                        .ok_or("missing --baud value")?
+                        .parse::<u32>()
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+            "--timeout-secs" => {
+                index += 1;
+                timeout = Duration::from_secs(
+                    arguments
+                        .get(index)
+                        .ok_or("missing --timeout-secs value")?
+                        .parse::<u64>()
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+            _ => service_arguments.push(arguments[index].clone()),
+        }
+        index += 1;
+    }
+    Ok((service_arguments, baud, timeout))
 }
 
 /// Preserve the catalog's physical-UART contract when a node name resolved to
@@ -717,11 +770,10 @@ pub(crate) fn run_udp_service_client(arguments: &[String]) -> Result<(), String>
         .ok_or("missing schema service; use dmesh-cli DEVICE METHOD [--field=value ...]")?;
     let request = encode_stream_argv_with_id(&arguments[1..], fresh_request_id())
         .map_err(|error| error.to_string())?;
-    let timeout = if dmesh_server::probe::decode_probe_run_record(
+    let probe_request = dmesh_server::probe::decode_probe_run_record(
         dmesh_server::tagged::decode(&request).ok_or("invalid tagged request")?,
-    )
-    .is_some()
-    {
+    );
+    let timeout = if probe_request.is_some() {
         Duration::from_secs(45)
     } else {
         Duration::from_secs(3)
@@ -747,6 +799,23 @@ pub(crate) fn run_udp_service_client(arguments: &[String]) -> Result<(), String>
             ))?
             .bytes
     } else {
+        if let Some((_, probe_request)) = probe_request {
+            let result = runtime.block_on(crate::node_client::probe_udp(
+                udp_bind_for_peer(peer),
+                peer,
+                &request,
+                probe_request,
+                timeout,
+            ))?;
+            println!(
+                "dmesh_cli_probe bearer=udp target={peer} bytes={} elapsed_us={} bits_per_second={} callback_errors={:?}",
+                result.bytes,
+                result.elapsed_us,
+                result.bits_per_second(),
+                result.callback_errors,
+            );
+            return Ok(());
+        }
         runtime
             .block_on(crate::node_client::request_udp(
                 udp_bind_for_peer(peer),
@@ -907,6 +976,9 @@ fn catalog_profile_matches_announce(
         .or_else(|| announce.sta_link_local_v6())
         .map(Ipv6Addr::from);
     profile.ipv6_link_local == address
+        || profile
+            .mac
+            .is_some_and(|mac| address.is_some_and(|address| link_local_matches_mac(address, mac)))
 }
 
 fn flash_target_from_catalog_profile(profile: &DeviceProfile) -> Result<FlashTarget, String> {
@@ -1412,10 +1484,28 @@ pub(crate) fn flash_target_matches_announce(
     announce: &announce::Announce,
     target: &FlashTarget,
 ) -> bool {
-    target
-        .node
-        .as_deref()
-        .is_some_and(|node| hex_encode(announce.device_id()).eq_ignore_ascii_case(node))
+    if let Some(node) = target.node.as_deref() {
+        return hex_encode(announce.device_id()).eq_ignore_ascii_case(node);
+    }
+    target.mac.is_some_and(|mac| {
+        announce
+            .udp_link_local_v6()
+            .or_else(|| announce.sta_link_local_v6())
+            .is_some_and(|address| link_local_matches_mac(Ipv6Addr::from(address), mac))
+    })
+}
+
+fn link_local_matches_mac(address: Ipv6Addr, mac: [u8; 6]) -> bool {
+    let octets = address.octets();
+    octets[..8] == [0xfe, 0x80, 0, 0, 0, 0, 0, 0]
+        && octets[8] == (mac[0] ^ 0x02)
+        && octets[9] == mac[1]
+        && octets[10] == mac[2]
+        && octets[11] == 0xff
+        && octets[12] == 0xfe
+        && octets[13] == mac[3]
+        && octets[14] == mac[4]
+        && octets[15] == mac[5]
 }
 
 pub(crate) fn parse_mac(value: &str) -> Option<[u8; 6]> {
@@ -1743,4 +1833,53 @@ fn exchange_udp_stream_record_with_timeout(
             timeout,
         ))
         .map(|response| response.bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FlashTarget, flash_target_matches_announce, parse_serial_stream_arguments};
+    use std::time::Duration;
+
+    #[test]
+    fn serial_stream_timeout_and_baud_are_not_forwarded_as_service_fields() {
+        let args = [
+            "status".to_owned(),
+            "verbose=true".to_owned(),
+            "--timeout-secs".to_owned(),
+            "10".to_owned(),
+            "--baud".to_owned(),
+            "115200".to_owned(),
+        ];
+        assert_eq!(
+            parse_serial_stream_arguments(&args),
+            Ok((
+                vec!["status".to_owned(), "verbose=true".to_owned()],
+                Some(115_200),
+                Duration::from_secs(10),
+            ))
+        );
+    }
+
+    #[test]
+    fn mac_only_catalog_target_matches_its_discovered_link_local_address() {
+        let mac = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let mut announce = dmesh_server::announce::Announce::discovery([1; 16], 16, 1);
+        announce.set_sta_link_local_v6([
+            0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x00, 0x11, 0x22, 0xff, 0xfe, 0x33, 0x44, 0x55,
+        ]);
+        let target = FlashTarget {
+            description: "node-under-test".into(),
+            node: None,
+            mac: Some(mac),
+            known_peer: None,
+        };
+        assert!(flash_target_matches_announce(&announce, &target));
+        assert!(!flash_target_matches_announce(
+            &announce,
+            &FlashTarget {
+                mac: Some([0x02, 0x11, 0x22, 0x33, 0x44, 0x56]),
+                ..target
+            }
+        ));
+    }
 }

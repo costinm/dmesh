@@ -1028,7 +1028,13 @@ impl RawWifiCounters {
 pub struct RawWifiSnapshot {
     pub epoch: u32,
     pub channel: Option<u8>,
+    /// Whether the current product profile requests infrastructure STA.
+    pub sta_enabled: Option<bool>,
     pub sta_associated: Option<bool>,
+    /// BSSID of the associated infrastructure AP, distinct from `sta_mac`.
+    pub sta_bssid: Option<[u8; 6]>,
+    /// Current infrastructure STA IPv4 address in network octet order.
+    pub sta_ipv4: Option<[u8; 4]>,
     pub promiscuous: Option<bool>,
     pub dw_capturing: Option<bool>,
     /// Configured NAN DW cadence; unlike `dw_capturing`, it remains present
@@ -1172,7 +1178,10 @@ pub fn encode_raw_wifi_snapshot(
         return None;
     }
     let optional = usize::from(snapshot.channel.is_some())
+        + usize::from(snapshot.sta_enabled.is_some())
         + usize::from(snapshot.sta_associated.is_some())
+        + usize::from(snapshot.sta_bssid.is_some())
+        + usize::from(snapshot.sta_ipv4.is_some())
         + usize::from(snapshot.promiscuous.is_some())
         + usize::from(snapshot.dw_capturing.is_some())
         + usize::from(snapshot.nan_dw_interval.is_some())
@@ -1222,9 +1231,21 @@ pub fn encode_raw_wifi_snapshot(
         e.uint(21)?;
         e.uint(u64::from(channel))?;
     }
+    if let Some(value) = snapshot.sta_enabled {
+        e.uint(128)?;
+        e.boolean(value)?;
+    }
     if let Some(value) = snapshot.sta_associated {
         e.uint(22)?;
         e.boolean(value)?;
+    }
+    if let Some(value) = snapshot.sta_bssid {
+        e.uint(129)?;
+        e.bytes_value(&value)?;
+    }
+    if let Some(value) = snapshot.sta_ipv4 {
+        e.uint(130)?;
+        e.bytes_value(&value)?;
     }
     if let Some(value) = snapshot.promiscuous {
         e.uint(23)?;
@@ -1458,7 +1479,24 @@ pub fn decode_raw_wifi_snapshot(data: &[u8]) -> Result<(u64, RawWifiSnapshot), &
                         .map_err(|_| "radio channel")?,
                 )
             }
+            128 => snapshot.sta_enabled = Some(decoder.boolean().ok_or("radio STA enabled")?),
             22 => snapshot.sta_associated = Some(decoder.boolean().ok_or("radio STA")?),
+            129 => {
+                snapshot.sta_bssid = Some(
+                    decoder
+                        .bytes_ref()
+                        .and_then(|v| v.try_into().ok())
+                        .ok_or("radio STA BSSID")?,
+                )
+            }
+            130 => {
+                snapshot.sta_ipv4 = Some(
+                    decoder
+                        .bytes_ref()
+                        .and_then(|v| v.try_into().ok())
+                        .ok_or("radio STA IPv4")?,
+                )
+            }
             23 => snapshot.promiscuous = Some(decoder.boolean().ok_or("radio promiscuous")?),
             24 => snapshot.dw_capturing = Some(decoder.boolean().ok_or("radio DW")?),
             96 => {
@@ -2722,6 +2760,10 @@ mod tests {
         let expected = RawWifiSnapshot {
             epoch: 9,
             channel: Some(6),
+            sta_enabled: Some(true),
+            sta_associated: Some(true),
+            sta_bssid: Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]),
+            sta_ipv4: Some([192, 168, 4, 10]),
             dw_capturing: Some(true),
             sta_mac: Some([0x10, 0, 0, 0, 0, 1]),
             ap_mac: Some([0x10, 0, 0, 0, 0, 2]),

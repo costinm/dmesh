@@ -254,6 +254,36 @@ impl UartPort {
         configure(&self.file, Some(baud))
     }
 
+    /// Send the tiny out-of-band wake record understood by sleepy Main. This
+    /// does not create a QUIC-lite packet or bypass the shared PPP framing.
+    pub fn send_wake_blocking(&mut self) -> io::Result<()> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut encoder = crate::encode_wake()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        let mut bytes = [0u8; 8];
+        while !encoder.is_finished() {
+            let used = encoder.write(&mut bytes);
+            let mut written = 0;
+            while written < used {
+                match self.file.write(&bytes[written..used]) {
+                    Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "UART closed")),
+                    Ok(count) => written += count,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            return Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "UART wake write timed out",
+                            ));
+                        }
+                        wait_fd(&self.file, libc::POLLOUT, Duration::from_millis(100))?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn lines(&self) -> io::Result<ModemLines> {
         let mut bits: libc::c_int = 0;
         if unsafe { libc::ioctl(self.file.as_raw_fd(), libc::TIOCMGET, &mut bits) } < 0 {

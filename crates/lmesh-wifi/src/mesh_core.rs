@@ -2077,6 +2077,7 @@ pub struct LmeshService {
     wifi_service: lmesh_wifi::WifiService,
     radio: lmesh_wifi::RadioService,
     wifi: lmesh_wifi::WifiNetd,
+    now_quic_client: std::sync::Mutex<Option<(quic_lite::tokio::TokioNode, quic_lite::BearerId)>>,
 }
 
 /// Convert the compact DMesh tagged response into the schema-neutral mesh
@@ -2221,6 +2222,50 @@ async fn request_udp_stream_local(peer: SocketAddr, payload: &[u8]) -> Result<Ve
     .context("UDP stream request timed out")?
 }
 
+/// Open a request stream through the running node's registered NOW bearer.
+/// The bearer-local peer address is derived from the immediate radio peer MAC.
+async fn request_now_stream(
+    node: quic_lite::tokio::TokioNode,
+    bearer: quic_lite::BearerId,
+    peer: [u8; 6],
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let association = node
+            .associate(
+                quic_lite::PacketMeta {
+                    bearer,
+                    peer_l2_address: crate::espnow_bearer::peer_address(peer),
+                    received_at_us: 0,
+                },
+                0,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("start ESP-NOW QUIC association: {error:?}"))?;
+        association
+            .wait_established()
+            .await
+            .map_err(|error| anyhow::anyhow!("establish ESP-NOW QUIC association: {error:?}"))?;
+        let mut stream = association
+            .open_stream()
+            .await
+            .map_err(|error| anyhow::anyhow!("open ESP-NOW request stream: {error:?}"))?;
+        stream.write_all(payload).await?;
+        stream.shutdown().await?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        association
+            .finish()
+            .await
+            .map_err(|error| anyhow::anyhow!("finish ESP-NOW association: {error:?}"))?;
+        Result::<Vec<u8>>::Ok(response)
+    })
+    .await
+    .context("ESP-NOW QUIC stream request timed out")?
+}
+
 impl LmeshService {
     pub fn set_espnow_ingress(&self, ingress: Arc<dyn crate::espnow_bearer::EspNowIngress>) {
         self.radio.set_espnow_ingress(ingress);
@@ -2241,7 +2286,20 @@ impl LmeshService {
             wifi_service,
             radio,
             wifi,
+            now_quic_client: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Attach the shared QUIC node's ESP-NOW path for directed MAC routes.
+    pub fn set_now_quic_client(
+        &self,
+        node: quic_lite::tokio::TokioNode,
+        bearer: quic_lite::BearerId,
+    ) {
+        *self
+            .now_quic_client
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((node, bearer));
     }
 
     /// Start the optional lmesh lab AP. lmesh-wifi remains the normal 100-TU
@@ -2437,6 +2495,18 @@ impl LmeshService {
         destination: &str,
         record: &[u8],
     ) -> Result<mesh::tagged::TaggedRecord> {
+        if let Some(peer) = parse_unicast_mac(destination) {
+            self.require_owned_wifi_for_now()?;
+            let (node, bearer) = self
+                .now_quic_client
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .context("unsupported/no_quic_route: ESP-NOW bearer is not attached to the QUIC node")?;
+            let response = request_now_stream(node, bearer, peer, record).await?;
+            return decode_stream_response(&response)
+                .context("decode directed ESP-NOW QUIC tagged response");
+        }
         let peer = self.resolve_udp_peer(destination).await?;
         let response = request_udp_stream(peer, record).await?;
         decode_stream_response(&response).context("decode directed QUIC tagged response")

@@ -129,9 +129,10 @@ pub(crate) fn receive_raw_udp6(
     path: quic_lite::PeerL2Address,
     _peer: crate::wifi_raw_udp6_esp::RawUdp6Peer,
     packet: &[u8],
-    response: &mut [u8; crate::TRANSPORT_MTU],
+    _response: &mut [u8; crate::TRANSPORT_MTU],
 ) -> Option<usize> {
-    receive_connection_frame(path, packet, response)
+    crate::quic_node_esp::receive_udp6(path, packet);
+    None
 }
 pub(crate) fn receive_main_raw_udp6(
     path: quic_lite::PeerL2Address,

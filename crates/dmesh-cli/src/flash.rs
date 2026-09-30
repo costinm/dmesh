@@ -8,10 +8,10 @@
 use crate::client::fresh_request_id;
 use crate::{
     client::{
-        catalog_udp6_peer, catalog_vip6_inventory, direct_discovery_announce,
-        discover_and_nan_activate, ensure_stream_success, exchange_udp_stream_record,
-        firmware_identity, flash_target_matches, flash_target_matches_announce, hex_encode,
-        multicast_discover_peers, parse_mac, run_udp_service_client, submit_nan_wake_to_all,
+        catalog_udp6_peer, direct_discovery_announce, discover_and_nan_activate,
+        ensure_stream_success, exchange_udp_stream_record, firmware_identity, flash_target_matches,
+        flash_target_matches_announce, hex_encode, multicast_discover_peers, parse_mac,
+        run_udp_service_client, submit_nan_wake_to_all,
     },
     device::resolve_catalog_target,
     schema::encode_stream_command_with_id,
@@ -124,28 +124,44 @@ fn resolve_flash_target(value: &str) -> Result<FlashTarget, String> {
             known_peer: None,
         });
     }
-    let host = catalog_vip6_inventory()?
-        .into_iter()
-        .find(|host| host.name.eq_ignore_ascii_case(value))
-        .ok_or_else(|| {
-            format!("unknown flash hostname {value:?}; add vip6 to the shared device catalog")
-        })?;
-    let profile = resolve_catalog_target(value)?
-        .ok_or_else(|| format!("catalog device {value:?} has no VIP6 profile"))?;
+    let profile = resolve_catalog_target(value)?.ok_or_else(|| {
+        format!("unknown flash hostname {value:?}; add vip6 or mac to the shared device catalog")
+    })?;
+    flash_target_from_profile(value, profile)
+}
+
+fn flash_target_from_profile(
+    value: &str,
+    profile: crate::device::DeviceProfile,
+) -> Result<FlashTarget, String> {
+    let name = profile.name.as_deref().unwrap_or(value);
+    if let Some(vip6) = profile.vip6 {
+        return Ok(FlashTarget {
+            description: format!("{name} ({vip6})"),
+            node: Some(hex_encode(&vip6.octets()[8..])),
+            mac: profile.mac,
+            known_peer: catalog_udp6_peer(&profile)?,
+        });
+    }
+    let mac = profile
+        .mac
+        .ok_or_else(|| format!("catalog device {value:?} has neither VIP6 nor MAC identity"))?;
     Ok(FlashTarget {
-        description: format!("{} ({})", host.name, host.vip6),
-        node: Some(host.node),
-        mac: host.mac,
-        known_peer: catalog_udp6_peer(&profile)?,
+        description: format!("{name} (MAC discovery)"),
+        node: None,
+        mac: Some(mac),
+        // MAC-only profiles must discover the current endpoint. In particular,
+        // don't route a flash through an old catalog IPv4 reservation.
+        known_peer: None,
     })
 }
 
 /// Flash one Main image without requiring an operator to stitch together the
 /// discovery, NAN wake, Recovery handoff, and verified-object steps.  The
-/// target is its catalogued VIP6 identity (or a compatibility raw node ID),
-/// with a NAN MAC accepted only as a temporary explicit wake selector. A legacy
-/// generic ESP announce is deliberately refused for writes: it cannot select
-/// a safe CPU artifact.
+/// target is its catalogued VIP6 identity, MAC identity, or a compatibility raw
+/// node ID. A NAN MAC is accepted as a temporary explicit wake selector. A
+/// legacy generic ESP announce is deliberately refused for writes: it cannot
+/// select a safe CPU artifact.
 pub(crate) fn run_automated_flash(arguments: &[String]) -> Result<(), String> {
     let started = Instant::now();
     let result = run_automated_flash_timed(arguments, started);
@@ -573,4 +589,35 @@ fn restore_sleepy_after_flash(
     println!("dmesh_flash_gate sleepy_profile_restored=true peer={peer} unicast_udp_absent=true");
     report_flash_step("sleepy_profile_restore", started, restore_started);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::flash_target_from_profile;
+    use crate::device::DeviceProfile;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn mac_only_flash_target_uses_discovery_not_catalog_ipv4() {
+        let target = flash_target_from_profile(
+            "node-under-test",
+            DeviceProfile {
+                name: Some("node-under-test".into()),
+                static_ipv4: Some(Ipv4Addr::new(192, 0, 2, 44)),
+                vip6: None,
+                ipv6_link_local: None,
+                udp6_iface: None,
+                mac: Some([0x02, 0x11, 0x22, 0x33, 0x44, 0x55]),
+                serial_id: None,
+                uart_baud: None,
+                auth_secret_ref: None,
+                udp_port: 3337,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(target.node, None);
+        assert_eq!(target.mac, Some([0x02, 0x11, 0x22, 0x33, 0x44, 0x55]));
+        assert_eq!(target.known_peer, None);
+    }
 }

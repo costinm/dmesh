@@ -413,6 +413,9 @@ static SERVICE_INFO_DROPPED: AtomicU32 = AtomicU32::new(0);
 // deliberately separate from `SERVICE_INFO_ENQUEUED`: a copied frame proves
 // callback admission, whereas this proves that normal runtime control saw it.
 static SERVICE_INFO_DISPATCHED: AtomicU32 = AtomicU32::new(0);
+static SERVICE_INFO_LOGS_REPORTED: AtomicU32 = AtomicU32::new(0);
+static DEFERRED_SERVICE_INFO: dmesh_server::announce::ServiceInfoHandoff<ACTIVE_PUBLISH_MAX_LEN> =
+    dmesh_server::announce::ServiceInfoHandoff::new();
 static FILTER_PENDING: AtomicBool = AtomicBool::new(false);
 static FILTER_ARMED: AtomicBool = AtomicBool::new(false);
 static FILTER_ARMS: AtomicU32 = AtomicU32::new(0);
@@ -1422,6 +1425,50 @@ pub fn set_service_info_handler(handler: Option<NanServiceInfoHandler>) {
     );
 }
 
+/// Copy one already-classified NAN/NOW Service Info record for Main's event
+/// owner. ESP-IDF invokes action receive on its small Wi-Fi task stack; the
+/// semantic tagged-CBOR/control handler must therefore never run there.
+/// A repeated record can be retried by the next NAN/NOW announcement if this
+/// single callback handoff slot is occupied.
+pub(crate) fn defer_service_info(peer: [u8; 6], payload: &[u8]) -> bool {
+    if !DEFERRED_SERVICE_INFO.try_store(peer, payload) {
+        SERVICE_INFO_DROPPED.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    SERVICE_INFO_ENQUEUED.fetch_add(1, Ordering::Relaxed);
+    crate::main_runtime::request_deadline_recheck();
+    true
+}
+
+/// Drain the callback handoff on Main's single event owner, never the Wi-Fi
+/// driver task. The record is copied to a small local buffer before freeing
+/// the slot, so another callback can proceed while semantic handling runs.
+pub(crate) fn dispatch_deferred_service_info() {
+    let mut peer = [0u8; 6];
+    let mut payload = [0u8; ACTIVE_PUBLISH_MAX_LEN];
+    let Some(len) = DEFERRED_SERVICE_INFO.take(&mut peer, &mut payload) else {
+        return;
+    };
+
+    if SERVICE_INFO_LOGS_REPORTED.fetch_add(1, Ordering::Relaxed) < 2 {
+        crate::commands::send_stats(&[
+            (
+                b"nan SD received peer_le",
+                u64::from_le_bytes([peer[0], peer[1], peer[2], peer[3], peer[4], peer[5], 0, 0]),
+            ),
+            (b"nan SD received bytes", len as u64),
+        ]);
+    }
+    let handler = SERVICE_INFO_HANDLER.load(Ordering::Acquire);
+    if handler != 0 {
+        SERVICE_INFO_DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        let handler: NanServiceInfoHandler = unsafe { core::mem::transmute(handler) };
+        handler(peer, &payload[..len]);
+    } else {
+        SERVICE_INFO_DROPPED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Queue one active-Subscribe SDF for the next local discovery window.
 ///
 /// This is called by the raw-radio control adapter from normal worker
@@ -1659,20 +1706,9 @@ fn dispatch_service_info(item: crate::shared_ingress_esp::IngressPacket, payload
     // it proves the raw callback copied a matching Service Info payload and
     // the deferred worker is about to hand it to Main.  The downstream log
     // then identifies a target mismatch or direct-record rejection.
-    let peer = item.source();
-    crate::commands::send_stats(&[
-        (
-            b"nan SD received peer_le",
-            u64::from_le_bytes([peer[0], peer[1], peer[2], peer[3], peer[4], peer[5], 0, 0]),
-        ),
-        (b"nan SD received bytes", payload.len() as u64),
-    ]);
-    let handler = SERVICE_INFO_HANDLER.load(Ordering::Acquire);
-    if handler != 0 {
-        SERVICE_INFO_DISPATCHED.fetch_add(1, Ordering::Relaxed);
-        let handler: NanServiceInfoHandler = unsafe { core::mem::transmute(handler) };
-        handler(item.source(), payload);
-    }
+    // `shared_ingress_esp` may invoke this adapter from the radio callback;
+    // defer the handler instead of parsing or responding on that stack.
+    let _ = defer_service_info(item.source(), payload);
 }
 
 /// `(armed, successful_arms, errors)` for the private A3/BSSID comparator.
@@ -2727,13 +2763,11 @@ fn receive_nan_action(frame: &[u8]) {
                     let payload = dmesh_rawnan::parse_dmesh_nan_followup(descriptor_payload)
                         .map(|followup| followup.payload)
                         .unwrap_or(descriptor_payload);
-                    if crate::shared_ingress_esp::enqueue(
+                    if !crate::shared_ingress_esp::enqueue(
                         crate::shared_ingress_esp::IngressKind::NanServiceInfo,
                         source,
                         payload,
                     ) {
-                        SERVICE_INFO_ENQUEUED.fetch_add(1, Ordering::Relaxed);
-                    } else {
                         SERVICE_INFO_DROPPED.fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -2785,9 +2819,7 @@ fn receive_nan_action(frame: &[u8]) {
                             &request[..used],
                         )
                     });
-                if queued {
-                    SERVICE_INFO_ENQUEUED.fetch_add(1, Ordering::Relaxed);
-                } else {
+                if !queued {
                     SERVICE_INFO_DROPPED.fetch_add(1, Ordering::Relaxed);
                 }
                 return;
@@ -2806,13 +2838,11 @@ fn receive_nan_action(frame: &[u8]) {
                         .unwrap_or((1, 0));
                     mark_active_subscribe(source, instance, requestor_instance);
                 }
-                if crate::shared_ingress_esp::enqueue(
+                if !crate::shared_ingress_esp::enqueue(
                     crate::shared_ingress_esp::IngressKind::NanServiceInfo,
                     source,
                     payload,
                 ) {
-                    SERVICE_INFO_ENQUEUED.fetch_add(1, Ordering::Relaxed);
-                } else {
                     SERVICE_INFO_DROPPED.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -2857,13 +2887,11 @@ fn receive_nan_action(frame: &[u8]) {
                     // classifies the tagged record and the wake target before
                     // changing a profile; reception alone has no side effect.
                     if let Some(source) = source {
-                        if crate::shared_ingress_esp::enqueue(
+                        if !crate::shared_ingress_esp::enqueue(
                             crate::shared_ingress_esp::IngressKind::NanServiceInfo,
                             source,
                             followup.payload,
                         ) {
-                            SERVICE_INFO_ENQUEUED.fetch_add(1, Ordering::Relaxed);
-                        } else {
                             SERVICE_INFO_DROPPED.fetch_add(1, Ordering::Relaxed);
                         }
                     }

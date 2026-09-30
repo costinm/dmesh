@@ -575,7 +575,12 @@ fn admit_now_payload(source: [u8; 6], payload: &[u8]) {
         return;
     }
     if let Some(sync) = dmesh_rawnan::parse_now_sync_body(payload) {
-        crate::main_runtime::receive_nan_service_info(source, sync.service_info);
+        if crate::wifi_nan_dw_capture_esp::defer_service_info(source, sync.service_info) {
+            RX_ACTIONS.fetch_add(1, Ordering::Relaxed);
+        } else {
+            RX_SHARED_INGRESS_DROPS.fetch_add(1, Ordering::Relaxed);
+            RX_DROPS.fetch_add(1, Ordering::Relaxed);
+        }
         return;
     }
     if dmesh_server::tagged::decode(payload).is_some() {

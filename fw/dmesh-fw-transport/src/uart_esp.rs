@@ -87,6 +87,7 @@ type UartPoolSubmission = EgressSubmission<crate::shared_ingress_esp::SharedPack
 // The bearer accepts only one pool lease at a time. The FreeRTOS queue carries
 // a wake record, never the packet or its ownership-bearing Rust value.
 static UART_POOL_SUBMISSION_STATE: AtomicUsize = AtomicUsize::new(0);
+static UART_POOL_TX_DIAGNOSTICS: AtomicUsize = AtomicUsize::new(0);
 static mut UART_POOL_SUBMISSION: core::mem::MaybeUninit<UartPoolSubmission> =
     core::mem::MaybeUninit::uninit();
 static UART_APB_LOCK: AtomicPtr<esp_idf_sys::esp_pm_lock> = AtomicPtr::new(core::ptr::null_mut());
@@ -872,6 +873,13 @@ fn write_pool_submission_if_ready() -> bool {
         },
         0,
     );
+    if UART_POOL_TX_DIAGNOSTICS.fetch_add(1, Ordering::Relaxed) < 16 {
+        let _ = send_debug_text(if result {
+            b"DMESH UART packet transmit completed"
+        } else {
+            b"DMESH UART packet transmit failed"
+        });
+    }
     notify_egress_ready();
     true
 }

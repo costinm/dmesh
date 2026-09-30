@@ -15,6 +15,139 @@ const MAX_EVENT_RESPONSE_BYTES: usize = 1200;
 pub const MAX_BINARY_EVENT_PAYLOAD_BYTES: usize = 1024;
 pub const LOG_WATCH_MAX_RECORDS: usize = 64;
 
+/// Current Main identity and infrastructure-link state exposed by the
+/// generic `status` stream method. Address values are presentation-ready text
+/// so controllers can display them without knowing firmware byte order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceStatus<'a> {
+    pub uptime_secs: u64,
+    pub sta_enabled: bool,
+    pub sta_associated: bool,
+    pub sta_bssid: &'a [u8],
+    pub sta_ipv4: &'a [u8],
+}
+
+/// Encode a correlated compact Main status response, including current STA
+/// enablement, association, BSSID, and IPv4 state.
+pub fn encode_device_status_response(id: u64, status: DeviceStatus<'_>) -> Option<Vec<u8>> {
+    if !status.sta_bssid.is_ascii() || !status.sta_ipv4.is_ascii() {
+        return None;
+    }
+    let mut result = [0u8; 224];
+    let mut encoder = crate::cbor::Encoder::new(&mut result);
+    encoder.map(7)?;
+    encoder.text_value(b"status")?;
+    encoder.text_value(b"ok")?;
+    encoder.text_value(b"role")?;
+    encoder.text_value(b"main")?;
+    encoder.text_value(b"uptime_secs")?;
+    encoder.uint(status.uptime_secs)?;
+    encoder.text_value(b"sta_enabled")?;
+    encoder.boolean(status.sta_enabled)?;
+    encoder.text_value(b"sta_associated")?;
+    encoder.boolean(status.sta_associated)?;
+    encoder.text_value(b"sta_bssid")?;
+    encoder.text_value(status.sta_bssid)?;
+    encoder.text_value(b"sta_ipv4")?;
+    encoder.text_value(status.sta_ipv4)?;
+    let result_len = encoder.len();
+    drop(encoder);
+
+    let mut response = [0u8; 288];
+    let response_len = crate::tagged::encode_numeric_response(
+        DIAGNOSTIC_COMPONENT,
+        DIAGNOSTIC_STATUS_METHOD,
+        id,
+        &result[..result_len],
+        &mut response,
+    )?;
+    Some(Vec::from(&response[..response_len]))
+}
+
+struct IncompleteRecord<K> {
+    key: K,
+    bytes: Vec<u8>,
+}
+
+/// Reassembles ordered application records split across transport chunks.
+/// Both the per-record and aggregate retained-byte limits are supplied by
+/// the owner so firmware can follow its runtime association limits.
+pub struct OrderedRecordAssembler<K> {
+    incomplete: Vec<IncompleteRecord<K>>,
+    buffered_bytes: usize,
+}
+
+impl<K> OrderedRecordAssembler<K> {
+    pub const fn new() -> Self {
+        Self {
+            incomplete: Vec::new(),
+            buffered_bytes: 0,
+        }
+    }
+
+    pub const fn buffered_bytes(&self) -> usize {
+        self.buffered_bytes
+    }
+}
+
+impl<K: Eq> OrderedRecordAssembler<K> {
+    /// Accept one in-order chunk. A short acceptance of zero means the owner
+    /// must withhold receive credit until retained capacity becomes available.
+    /// A complete record is returned only when its FIN has been observed.
+    pub fn push(
+        &mut self,
+        key: K,
+        offset: u64,
+        fin: bool,
+        chunk: &[u8],
+        max_record_bytes: usize,
+        max_total_bytes: usize,
+    ) -> (usize, Option<(K, Vec<u8>)>) {
+        let existing = self.incomplete.iter().position(|record| record.key == key);
+        let index = if let Some(index) = existing {
+            index
+        } else {
+            if offset != 0
+                || chunk.len() > max_record_bytes
+                || chunk.len() > max_total_bytes.saturating_sub(self.buffered_bytes)
+                || self.incomplete.try_reserve(1).is_err()
+            {
+                return (0, None);
+            }
+            self.incomplete.push(IncompleteRecord {
+                key,
+                bytes: Vec::new(),
+            });
+            self.incomplete.len() - 1
+        };
+
+        let record = &mut self.incomplete[index];
+        if offset != record.bytes.len() as u64
+            || chunk.len() > max_record_bytes.saturating_sub(record.bytes.len())
+            || chunk.len() > max_total_bytes.saturating_sub(self.buffered_bytes)
+            || record.bytes.try_reserve(chunk.len()).is_err()
+        {
+            return (0, None);
+        }
+        record.bytes.extend_from_slice(chunk);
+        self.buffered_bytes += chunk.len();
+        let accepted = chunk.len();
+        if !fin {
+            return (accepted, None);
+        }
+
+        let record = self.incomplete.swap_remove(index);
+        self.buffered_bytes -= record.bytes.len();
+        (accepted, Some((record.key, record.bytes)))
+    }
+}
+
+impl<K: Eq> Default for OrderedRecordAssembler<K> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Common read-only connection diagnostics. These are application handlers,
 /// not QUIC service numbers; every request uses the normal tagged envelope.
 pub const DIAGNOSTIC_COMPONENT: u64 = 9;
@@ -183,7 +316,35 @@ pub fn register_tagged_component(component: u64, handler: TaggedComponentHandler
 /// stream may carry any component and multiple streams may concurrently call
 /// the same component.
 pub fn dispatch_tagged_stream(data: &[u8]) -> Option<Vec<u8>> {
-    dispatch_tagged_record(crate::tagged::decode(data)?)
+    let record = crate::tagged::decode(data)?;
+    if let Some(response) = dispatch_tagged_record(record) {
+        return Some(response);
+    }
+
+    // A complete, correlated request on a stream must not be left open just
+    // because its component is absent or the registered handler declined the
+    // method. In particular this makes adapter/API mismatches observable as a
+    // normal tagged error instead of an application timeout. Malformed,
+    // uncorrelated, and directed records remain unhandled.
+    if record.to.is_some() {
+        return None;
+    }
+    let crate::tagged::Name::Tag(component) = record.component? else {
+        return None;
+    };
+    let crate::tagged::Name::Tag(method) = record.method? else {
+        return None;
+    };
+    let id = record.id?;
+    let mut response = [0u8; 96];
+    let used = crate::tagged::encode_numeric_error(
+        component,
+        method,
+        id,
+        b"unsupported or invalid stream request",
+        &mut response,
+    )?;
+    Some(Vec::from(&response[..used]))
 }
 
 /// Dispatch an already-decoded tagged record from a canonical stream handler.
@@ -203,6 +364,54 @@ pub fn dispatch_tagged_record(record: crate::tagged::Record<'_>) -> Option<Vec<u
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tagged_stream_dispatch_tests {
+    use super::dispatch_tagged_stream;
+
+    #[test]
+    fn unknown_correlated_component_returns_an_error_record() {
+        let mut request = [0u8; 32];
+        let request_len =
+            crate::tagged::encode_numeric_empty_request(u64::MAX - 2, 7, 0x1234, &mut request)
+                .unwrap();
+
+        let response = dispatch_tagged_stream(&request[..request_len]).unwrap();
+        let record = crate::tagged::decode(&response).unwrap();
+        assert_eq!(
+            record.component,
+            Some(crate::tagged::Name::Tag(u64::MAX - 2))
+        );
+        assert_eq!(record.method, Some(crate::tagged::Name::Tag(7)));
+        assert_eq!(record.id, Some(0x1234));
+        let mut error = crate::cbor::Decoder::new(record.error.unwrap());
+        assert_eq!(
+            error.text_ref(),
+            Some(b"unsupported or invalid stream request".as_slice())
+        );
+        assert!(error.is_finished());
+    }
+
+    #[test]
+    fn malformed_and_directed_stream_records_remain_unhandled() {
+        assert_eq!(dispatch_tagged_stream(&[0xff]), None);
+
+        let mut request = [0u8; 64];
+        let mut encoder = crate::cbor::Encoder::new(&mut request);
+        encoder.map(4).unwrap();
+        encoder.uint(1).unwrap();
+        encoder.uint(u64::MAX - 2).unwrap();
+        encoder.uint(2).unwrap();
+        encoder.uint(7).unwrap();
+        encoder.uint(3).unwrap();
+        encoder.uint(0x1234).unwrap();
+        encoder.uint(9).unwrap();
+        encoder.text_value(b"peer").unwrap();
+        let len = encoder.len();
+        drop(encoder);
+        assert_eq!(dispatch_tagged_stream(&request[..len]), None);
+    }
 }
 
 /// Decode `{1: since?, 2: records?}` without allowing unknown or duplicate
@@ -246,6 +455,97 @@ pub fn decode_log_watch_request(data: &[u8]) -> Result<LogWatchRequest, &'static
         return Err("log-watch record count out of range");
     }
     Ok(LogWatchRequest { records })
+}
+
+#[cfg(test)]
+mod record_assembler_tests {
+    use super::OrderedRecordAssembler;
+
+    #[test]
+    fn request_body_and_fin_may_arrive_in_separate_chunks() {
+        let mut assembler = OrderedRecordAssembler::new();
+        assert_eq!(
+            assembler.push(7, 0, false, b"request body", 128, 256),
+            (12, None)
+        );
+        let (accepted, complete) = assembler.push(7, 12, true, b"", 128, 256);
+        assert_eq!(accepted, 0);
+        assert_eq!(complete, Some((7, b"request body".to_vec())));
+        assert_eq!(assembler.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn interleaved_records_keep_independent_offsets_and_contents() {
+        let mut assembler = OrderedRecordAssembler::new();
+        assert_eq!(assembler.push(1, 0, false, b"ab", 16, 16), (2, None));
+        assert_eq!(assembler.push(2, 0, false, b"x", 16, 16), (1, None));
+        assert_eq!(
+            assembler.push(1, 2, true, b"cd", 16, 16),
+            (2, Some((1, b"abcd".to_vec())))
+        );
+        assert_eq!(
+            assembler.push(2, 1, true, b"y", 16, 16),
+            (1, Some((2, b"xy".to_vec())))
+        );
+        assert_eq!(assembler.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn byte_limits_withhold_the_chunk_without_corrupting_prior_data() {
+        let mut assembler = OrderedRecordAssembler::new();
+        assert_eq!(assembler.push(1, 0, false, b"ab", 4, 3), (2, None));
+        assert_eq!(assembler.push(2, 0, false, b"xy", 4, 3), (0, None));
+        assert_eq!(assembler.buffered_bytes(), 2);
+        assert_eq!(
+            assembler.push(1, 2, true, b"", 4, 3),
+            (0, Some((1, b"ab".to_vec())))
+        );
+        assert_eq!(
+            assembler.push(2, 0, true, b"xy", 4, 3),
+            (2, Some((2, b"xy".to_vec())))
+        );
+        assert_eq!(assembler.buffered_bytes(), 0);
+    }
+}
+
+#[cfg(test)]
+mod device_status_tests {
+    #[test]
+    fn correlated_status_contains_current_sta_state_and_addresses() {
+        let response = super::encode_device_status_response(
+            93,
+            super::DeviceStatus {
+                uptime_secs: 17,
+                sta_enabled: true,
+                sta_associated: true,
+                sta_bssid: b"1c:b7:2c:77:1b:f8",
+                sta_ipv4: b"192.0.2.44",
+            },
+        )
+        .unwrap();
+        let envelope = crate::tagged::decode(&response).unwrap();
+        assert_eq!(envelope.component, Some(crate::tagged::Name::Tag(9)));
+        assert_eq!(envelope.method, Some(crate::tagged::Name::Tag(1)));
+        assert_eq!(envelope.id, Some(93));
+
+        let mut result = crate::cbor::Decoder::new(envelope.result.unwrap());
+        assert_eq!(result.head(), Some((5, 7)));
+        assert_eq!(result.text_ref(), Some(b"status".as_slice()));
+        assert_eq!(result.text_ref(), Some(b"ok".as_slice()));
+        assert_eq!(result.text_ref(), Some(b"role".as_slice()));
+        assert_eq!(result.text_ref(), Some(b"main".as_slice()));
+        assert_eq!(result.text_ref(), Some(b"uptime_secs".as_slice()));
+        assert_eq!(result.uint(), Some(17));
+        assert_eq!(result.text_ref(), Some(b"sta_enabled".as_slice()));
+        assert_eq!(result.boolean(), Some(true));
+        assert_eq!(result.text_ref(), Some(b"sta_associated".as_slice()));
+        assert_eq!(result.boolean(), Some(true));
+        assert_eq!(result.text_ref(), Some(b"sta_bssid".as_slice()));
+        assert_eq!(result.text_ref(), Some(b"1c:b7:2c:77:1b:f8".as_slice()));
+        assert_eq!(result.text_ref(), Some(b"sta_ipv4".as_slice()));
+        assert_eq!(result.text_ref(), Some(b"192.0.2.44".as_slice()));
+        assert!(result.is_finished());
+    }
 }
 
 /// Encode a compact `recovery` success response whose payload is a numeric

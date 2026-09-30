@@ -528,6 +528,7 @@ unsafe extern "C" fn sta_event_handler(
             STA_CONNECT_TO_ASSOCIATED_MS.store(now_ms.wrapping_sub(started), Ordering::Release);
         }
         STA_ASSOCIATED_EVENT.store(true, Ordering::Release);
+        log_sta_link(true, event_data);
         notify_sta_lifecycle(true, 0);
     } else if event_id == esp_idf_sys::wifi_event_t_WIFI_EVENT_STA_DISCONNECTED as i32 {
         let reason = if event_data.is_null() {
@@ -537,11 +538,95 @@ unsafe extern "C" fn sta_event_handler(
         };
         STA_ASSOCIATED_EVENT.store(false, Ordering::Release);
         STA_CONNECT_TO_ASSOCIATED_MS.store(0, Ordering::Release);
+        log_sta_link(false, core::ptr::null_mut());
         if reason != WIFI_REASON_STA_LEAVING {
             STA_LAST_DISCONNECT_REASON.store(reason, Ordering::Release);
             notify_sta_lifecycle(false, reason);
         }
     }
+}
+
+unsafe extern "C" fn sta_ip_event_handler(
+    _argument: *mut c_void,
+    _event_base: esp_idf_sys::esp_event_base_t,
+    _event_id: i32,
+    event_data: *mut c_void,
+) {
+    if event_data.is_null() {
+        return;
+    }
+    let event = unsafe { &*event_data.cast::<esp_idf_sys::ip_event_got_ip_t>() };
+    // lwIP stores the IPv4 word in network byte order. `to_ne_bytes` yields
+    // the address octets as they appear on the wire on this little-endian MCU.
+    let octets = event.ip_info.ip.addr.to_ne_bytes();
+    let mut line = [0u8; 48];
+    let mut len = 0usize;
+    for (index, octet) in octets.into_iter().enumerate() {
+        if index != 0 {
+            line[len] = b'.';
+            len += 1;
+        }
+        let mut digits = [0u8; 3];
+        let mut used = 0usize;
+        let mut value = octet;
+        loop {
+            digits[used] = b'0' + value % 10;
+            used += 1;
+            value /= 10;
+            if value == 0 {
+                break;
+            }
+        }
+        for digit in digits[..used].iter().rev() {
+            line[len] = *digit;
+            len += 1;
+        }
+    }
+    log_sta_link(true, core::ptr::null_mut());
+    let mut message = [0u8; 48];
+    let prefix = b"wifi STA IPv4=";
+    message[..prefix.len()].copy_from_slice(prefix);
+    message[prefix.len()..prefix.len() + len].copy_from_slice(&line[..len]);
+    let _ = crate::uart_esp::send_debug_text(&message[..prefix.len() + len]);
+}
+
+/// Write a concise UART diagnostic sideband record for infrastructure STA
+/// lifecycle changes. This is intentionally independent of the QUIC log
+/// service so it remains visible during early boot and service failures.
+fn log_sta_link(associated: bool, event_data: *mut c_void) {
+    let prefix = if associated {
+        b"wifi STA enabled=true associated=true bssid=".as_slice()
+    } else {
+        b"wifi STA enabled=true associated=false bssid=".as_slice()
+    };
+    let mut message = [0u8; 96];
+    message[..prefix.len()].copy_from_slice(prefix);
+    let mut len = prefix.len();
+    let bssid = if !event_data.is_null() && associated {
+        Some(unsafe { (*(event_data.cast::<esp_idf_sys::wifi_event_sta_connected_t>())).bssid })
+    } else if associated {
+        let mut ap = esp_idf_sys::wifi_ap_record_t::default();
+        (unsafe { esp_idf_sys::esp_wifi_sta_get_ap_info(&mut ap) } == esp_idf_sys::ESP_OK)
+            .then_some(ap.bssid)
+    } else {
+        None
+    };
+    if let Some(bssid) = bssid {
+        for (i, byte) in bssid.iter().enumerate() {
+            if i != 0 {
+                message[len] = b':';
+                len += 1;
+            }
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            message[len] = HEX[(byte >> 4) as usize];
+            message[len + 1] = HEX[(byte & 0x0f) as usize];
+            len += 2;
+        }
+    } else {
+        message[len..len + 11].copy_from_slice(b"unavailable");
+        len += 11;
+    }
+    let _ = crate::uart_esp::send_debug_text(&message[..len]);
 }
 
 /// Register a product callback that copies ESP-IDF association transitions to
@@ -587,7 +672,18 @@ unsafe fn register_sta_event_handlers() -> bool {
             core::ptr::null_mut(),
         )
     };
-    if connected == esp_idf_sys::ESP_OK && disconnected == esp_idf_sys::ESP_OK {
+    let ip = unsafe {
+        esp_idf_sys::esp_event_handler_register(
+            esp_idf_sys::IP_EVENT,
+            esp_idf_sys::ip_event_t_IP_EVENT_STA_GOT_IP as i32,
+            Some(sta_ip_event_handler),
+            core::ptr::null_mut(),
+        )
+    };
+    if connected == esp_idf_sys::ESP_OK
+        && disconnected == esp_idf_sys::ESP_OK
+        && ip == esp_idf_sys::ESP_OK
+    {
         STA_EVENT_HANDLER_REGISTERED.store(true, Ordering::Release);
         true
     } else {
@@ -595,8 +691,10 @@ unsafe fn register_sta_event_handlers() -> bool {
             b"wifi STA event registration result=",
             if connected != esp_idf_sys::ESP_OK {
                 connected as u32 as u64
-            } else {
+            } else if disconnected != esp_idf_sys::ESP_OK {
                 disconnected as u32 as u64
+            } else {
+                ip as u32 as u64
             },
         );
         false
@@ -1829,6 +1927,34 @@ pub fn sta_ap_rssi_dbm() -> Option<i8> {
     let mut ap = esp_idf_sys::wifi_ap_record_t::default();
     (unsafe { esp_idf_sys::esp_wifi_sta_get_ap_info(&mut ap) } == esp_idf_sys::ESP_OK)
         .then_some(ap.rssi)
+}
+
+/// Best-effort associated AP BSSID, guarded by the event-driven link state.
+pub fn sta_ap_bssid() -> Option<[u8; 6]> {
+    if !STA_ASSOCIATED_EVENT.load(Ordering::Acquire) {
+        return None;
+    }
+    let mut ap = esp_idf_sys::wifi_ap_record_t::default();
+    (unsafe { esp_idf_sys::esp_wifi_sta_get_ap_info(&mut ap) } == esp_idf_sys::ESP_OK)
+        .then_some(ap.bssid)
+}
+
+/// Current STA IPv4 address, if the ESP netif has a nonzero lease.
+pub fn sta_ipv4() -> Option<[u8; 4]> {
+    if !STA_ASSOCIATED_EVENT.load(Ordering::Acquire) {
+        return None;
+    }
+    let netif = STA_NETIF.load(Ordering::Acquire);
+    if netif.is_null() {
+        return None;
+    }
+    let mut info = esp_idf_sys::esp_netif_ip_info_t::default();
+    if unsafe { esp_idf_sys::esp_netif_get_ip_info(netif, &mut info) } != esp_idf_sys::ESP_OK
+        || info.ip.addr == 0
+    {
+        return None;
+    }
+    Some(info.ip.addr.to_ne_bytes())
 }
 
 /// ESP-IDF's currently applied maximum Wi-Fi TX power in quarter-dBm units.
