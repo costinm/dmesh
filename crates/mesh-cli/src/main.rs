@@ -238,9 +238,20 @@ fn service_mesh_config(service: &str) -> Result<Option<(mesh::config::MeshSectio
 }
 
 fn print_local_help(destination: &str, command: Option<&str>) -> Result<()> {
-    let resolved = service_catalog_resolver()
-        .resolve(destination)
-        .transpose()?
+    let mut resolved = None;
+    let mut lookup_error = None;
+    for component in catalog_components(destination) {
+        match service_catalog_resolver().resolve(&component) {
+            Some(Ok(candidate)) => {
+                resolved = Some(candidate);
+                break;
+            }
+            Some(Err(error)) => lookup_error = Some(error),
+            None => continue,
+        }
+    }
+    let resolved = resolved
+        .ok_or_else(|| lookup_error.unwrap_or_else(|| anyhow::anyhow!("missing catalog")))
         .with_context(|| format!("no installed tools catalog for {destination}"))?;
     let value = resolved.tools.as_ref();
     let tools = value
@@ -282,11 +293,57 @@ fn print_local_help(destination: &str, command: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Logical component candidates for a destination's tools catalog.
+///
+/// Catalog lookup is tied to the logical service/component name, not the
+/// transport, so an installed catalog stays available after transport
+/// resolution. An explicit UDS endpoint maps back to its conventional service
+/// identity: a conventional `mesh.sock*` control socket names the service
+/// after its directory (`/run/mesh/lmesh/mesh.sock.cbor` -> `lmesh`), while a
+/// named endpoint socket `/run/mesh/<namespace>/<endpoint>.sock*` suggests
+/// `<endpoint>.<namespace>` and the method component `<namespace>`. A
+/// destination that is already a bare logical name is its own component; a
+/// raw path itself never is, so it contributes no candidate.
+fn catalog_components(destination: &str) -> Vec<String> {
+    let Some(path) = unix_path(destination) else {
+        return vec![destination.to_owned()];
+    };
+    let mut components = Vec::new();
+    let path = std::path::Path::new(path);
+    if let (Some(parent), Some(file)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
+        && let Some(service) = parent.file_name().and_then(|n| n.to_str())
+    {
+        if file == "mesh.sock" || file.starts_with("mesh.sock.") {
+            components.push(service.to_owned());
+        } else if let Some(endpoint) = file
+            .strip_suffix(".sock.cbor")
+            .or_else(|| file.strip_suffix(".sock"))
+        {
+            components.push(format!("{endpoint}.{service}"));
+            components.push(service.to_owned());
+        }
+    }
+    components
+}
+
+/// Resolve the destination's optional tools catalog.
+///
+/// Derived conventional service names are tried in order; a resolver error is
+/// retained only when no candidate resolves, so an explicit UDS path that maps
+/// to no installed catalog keeps the documented name-based encoding.
 fn catalog(destination: &str) -> Result<Option<Arc<TaggedCatalog>>> {
-    Ok(service_catalog_resolver()
-        .resolve(destination)
-        .transpose()?
-        .map(|resolved| resolved.catalog.clone()))
+    let mut lookup_error = None;
+    for component in catalog_components(destination) {
+        match service_catalog_resolver().resolve(&component) {
+            Some(Ok(resolved)) => return Ok(Some(resolved.catalog.clone())),
+            Some(Err(error)) => lookup_error = Some(error),
+            None => {}
+        }
+    }
+    match lookup_error {
+        Some(error) => Err(error),
+        None => Ok(None),
+    }
 }
 
 async fn rpc_seqpacket(
@@ -774,6 +831,71 @@ mod tests {
             .await
             .unwrap();
         server_task.await.unwrap();
+    }
+
+    #[test]
+    fn explicit_socket_destinations_map_to_conventional_components() {
+        // Conventional control socket: the directory owns the component.
+        assert_eq!(
+            catalog_components("/run/mesh/lmesh/mesh.sock.cbor"),
+            ["lmesh"]
+        );
+        assert_eq!(
+            catalog_components("unix:///run/mesh/lmesh/mesh.sock"),
+            ["lmesh"]
+        );
+        // Named activation socket under a namespace directory.
+        assert_eq!(
+            catalog_components("/run/mesh/example/demo.sock.cbor"),
+            ["demo.example", "example"]
+        );
+        // A bare logical service name is its own component candidate.
+        assert_eq!(catalog_components("demo.example"), ["demo.example"]);
+        // Only conventional socket names map back to components; an arbitrary
+        // UDS path contributes none and keeps the name-based encoding.
+        assert_eq!(
+            catalog_components("/var/run/custom/gateway.socket"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn explicit_socket_catalog_derives_the_service_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = json!({"tools": [{
+            "name": "wifi.interface.list",
+            "x-component-index": 5,
+            "x-method-index": 30
+        }]});
+        let schema_dir = dir.path().join("lmesh");
+        std::fs::create_dir_all(&schema_dir).unwrap();
+        std::fs::write(
+            schema_dir.join("tools.json"),
+            serde_json::to_string(&tools).unwrap(),
+        )
+        .unwrap();
+        // MESH_SCHEMA_DIR is checked before installed package locations.
+        let previous = std::env::var_os("MESH_SCHEMA_DIR");
+        unsafe { std::env::set_var("MESH_SCHEMA_DIR", dir.path()) };
+        let resolved = catalog("/run/mesh/lmesh/mesh.sock.cbor").unwrap();
+        assert!(resolved.is_some());
+        match previous {
+            Some(previous) => unsafe { std::env::set_var("MESH_SCHEMA_DIR", previous) },
+            None => unsafe { std::env::remove_var("MESH_SCHEMA_DIR") },
+        }
+    }
+
+    #[test]
+    fn unconventional_socket_catalog_stays_optional() {
+        let dir = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("MESH_SCHEMA_DIR");
+        unsafe { std::env::set_var("MESH_SCHEMA_DIR", dir.path()) };
+        let resolved = catalog("/var/run/custom/gateway.socket").unwrap();
+        assert!(resolved.is_none());
+        match previous {
+            Some(previous) => unsafe { std::env::set_var("MESH_SCHEMA_DIR", previous) },
+            None => unsafe { std::env::remove_var("MESH_SCHEMA_DIR") },
+        }
     }
 }
 
