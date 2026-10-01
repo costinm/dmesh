@@ -24,7 +24,8 @@ StandardError = "null"
 HOME = "/home/lmesh"
 MESH_LOG_DIR = "/home/lmesh/log"
 MESH_LOG_FILE = "/home/lmesh/log/lmesh.log"
-MESH_TOOLS = "/opt/lmesh/etc/schemas/tools.json"
+# The HTTP named endpoints resolve the lmesh catalog from the shared schema
+# search (see ssh-mesh mesh/src/catalog.rs); no per-service pin is required.
 # The spawned wpa_supplicant lives in the repo Nix profile; a boot-time
 # mesh-init inherits no useful PATH, so lmesh must receive it explicitly.
 PATH = "/ws/dmesh/target/x86_64-unknown-linux-musl/release:/ws/dmesh/target/nix/profile/bin:/nix/var/nix/profiles/default/bin:/usr/bin:/bin"

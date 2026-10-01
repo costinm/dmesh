@@ -748,6 +748,11 @@
       "inputSchema": {
         "type": "object",
         "properties": {
+          "to": {
+            "type": "string",
+            "x-protobuf-index": 15,
+            "x-dmesh-kind": "uri"
+          },
           "bytes": {
             "type": "integer",
             "x-protobuf-index": 1,
@@ -807,6 +812,11 @@
             "type": "integer",
             "x-protobuf-index": 12,
             "x-dmesh-kind": "u32"
+          },
+          "peer": {
+            "type": "string",
+            "x-protobuf-index": 13,
+            "x-dmesh-kind": "uri"
           }
         }
       },

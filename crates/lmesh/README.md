@@ -101,4 +101,13 @@ The HTTP admin endpoint serves upstream ssh-mesh assets by default. Set
 
 The [root API](../../API.md) specifies local and shared portable requests.
 Their method and field tags are listed in the single installed
-[`resources/tools.json`](resources/tools.json) catalog.
+[`resources/tools.json`](resources/tools.json) catalog, which the admin
+gateway serves for discovery: `GET /_m/mesh/services/lmesh/tools?view=all`
+returns every entry, while the default view shows only tools whose
+`x-ui-visibility` is `default` or unset (visibility is presentation metadata;
+masked methods remain callable through the policy-controlled record and
+named-call endpoints). The shared resolver scans `/opt/lmesh/etc/schemas/`,
+`$HOME/opt/lmesh/etc/schemas/`, and `$HOME/etc/schemas/`, loading all `.json`
+files in priority order (ssh-mesh `mesh` crate, `catalog.rs`). Device method
+and field tags come from this catalog; there is no separate firmware schema.
+Run `scripts/generate-lmesh-tools.py` after changing the Linux handler API.
