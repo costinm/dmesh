@@ -9,3 +9,17 @@ plugins {
     alias(libs.plugins.kotlin.compose) apply false
     id("com.google.gms.google-services") version "4.4.4" apply false
 }
+
+val targetBuildBase = providers.environmentVariable("GRADLE_BUILD_DIR")
+    .orElse(providers.environmentVariable("CARGO_TARGET_DIR").map { "$it/android-build" })
+    .orElse("${rootProject.projectDir}/target/android-build")
+
+allprojects {
+    val relativeProjectPath = project.path.replace(':', '/').removePrefix("/")
+    val projectBuildDir = if (relativeProjectPath.isEmpty()) {
+        file("${targetBuildBase.get()}/root")
+    } else {
+        file("${targetBuildBase.get()}/$relativeProjectPath")
+    }
+    layout.buildDirectory.set(projectBuildDir)
+}

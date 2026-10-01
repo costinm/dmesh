@@ -9,15 +9,21 @@ fi
 
 export DMESH_REPO="${DMESH_REPO:-${_dmesh_env_dir}}"
 
-# Keep ordinary checkouts self-contained.  A pre-existing cache location is an
-# explicit operator choice (for example, a persistent build volume), never a
-# side effect of sourcing this file.
 _dmesh_target_base="$DMESH_REPO/target"
 _dmesh_cache_base="${HOME:-/tmp}/.cache/ws/dmesh"
 _dmesh_cargo_target_dir="$DMESH_REPO/target"
+
+# Auto-detect shared VirtioFS / Android FUSE storage mounts (/storage/emulated, /mnt, etc.)
+# and automatically create and redirect build caches/targets to native ext4 filesystem under ~/.cache.
 if [ -d "$_dmesh_cache_base" ]; then
     _dmesh_target_base="$_dmesh_cache_base"
     _dmesh_cargo_target_dir="$_dmesh_cache_base/target"
+elif [[ "$DMESH_REPO" == /storage/* || "$DMESH_REPO" == /mnt/* ]]; then
+    mkdir -p "$_dmesh_cache_base" 2>/dev/null || true
+    if [ -d "$_dmesh_cache_base" ]; then
+        _dmesh_target_base="$_dmesh_cache_base"
+        _dmesh_cargo_target_dir="$_dmesh_cache_base/target"
+    fi
 fi
 mkdir -p "${_dmesh_target_base}" 2>/dev/null || true
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${_dmesh_target_base}/cache}"
@@ -33,6 +39,7 @@ export DMESH_ESP_ROOT="${DMESH_ESP_ROOT_OVERRIDE:-${_dmesh_target_base}/esp32-6.
 export DMESH_BOOT_RECOVERY_SDK_VERSION="v6.0.2"
 export DMESH_BOOT_RECOVERY_ESP_ROOT="${DMESH_BOOT_RECOVERY_ESP_ROOT_OVERRIDE:-${_dmesh_target_base}/esp32-6.0}"
 export CARGO_TARGET_DIR="${DMESH_CARGO_TARGET_DIR:-${_dmesh_cargo_target_dir}}"
+export GRADLE_BUILD_DIR="${GRADLE_BUILD_DIR:-${CARGO_TARGET_DIR}/android-build}"
 export GRADLE_USER_HOME="${GRADLE_USER_HOME:-${_dmesh_target_base}/gradle}"
 export TMPDIR="/tmp"
 export NIX_PROFILE="${DMESH_NIX_PROFILE:-${_dmesh_target_base}/nix/profile}"

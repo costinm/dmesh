@@ -75,7 +75,7 @@ detect_android_env() {
 }
 
 gradle() {
-    "$SCRIPT_DIR/gradlew" "$@"
+    "$SCRIPT_DIR/gradlew" --project-cache-dir="$GRADLE_USER_HOME/project-cache" "$@"
 }
 
 APP_DMESH_PKG="com.github.costinm.dmesh.lm"
@@ -99,6 +99,8 @@ ensure_android_native_libs() {
     fi
 }
 
+DMESH_GRADLE_BUILD_DIR="${GRADLE_BUILD_DIR:-${CARGO_TARGET_DIR:-$SCRIPT_DIR/target}/android-build}"
+
 build_apps() {
     local build_type="${1:-debug}"
     local dmesh_task=":android:app-dmesh:assembleDebug"
@@ -115,7 +117,14 @@ build_apps() {
     fi
 
     ensure_android_native_libs "$build_type"
-    rm -rf         "$SCRIPT_DIR/android/app-dmesh/build/outputs/apk/$build_type"         "$SCRIPT_DIR/android/app-web/build/outputs/apk/$build_type"         "$SCRIPT_DIR/android/app-chat/build/outputs/apk/$build_type"         "$SCRIPT_DIR/target/apk/$build_type"
+    rm -rf \
+        "$DMESH_GRADLE_BUILD_DIR/android/app-dmesh/outputs/apk/$build_type" \
+        "$DMESH_GRADLE_BUILD_DIR/android/app-web/outputs/apk/$build_type" \
+        "$DMESH_GRADLE_BUILD_DIR/android/app-chat/outputs/apk/$build_type" \
+        "$SCRIPT_DIR/android/app-dmesh/build/outputs/apk/$build_type" \
+        "$SCRIPT_DIR/android/app-web/build/outputs/apk/$build_type" \
+        "$SCRIPT_DIR/android/app-chat/build/outputs/apk/$build_type" \
+        "$SCRIPT_DIR/target/apk/$build_type"
     echo ""
     echo "=== Building Android APKs with Gradle ($build_type) ==="
     gradle "$dmesh_task" "$web_task" "$chat_task"
@@ -126,9 +135,9 @@ stage_apks() {
     local out_dir="$SCRIPT_DIR/target/apk/$build_type"
     mkdir -p "$out_dir"
 
-    find "$SCRIPT_DIR/android" \
-        -path "*/build/outputs/apk/$build_type/*.apk" \
-        -type f \
+    find "$DMESH_GRADLE_BUILD_DIR" "$SCRIPT_DIR/android" \
+        -path "*/outputs/apk/$build_type/*.apk" \
+        -type f 2>/dev/null \
         -exec cp -f {} "$out_dir/" \;
 
     echo ""
@@ -247,18 +256,14 @@ wait_for_emulator() {
 
 install_apps() {
     local build_type="${1:-debug}"
-    local dmesh_apk="$SCRIPT_DIR/android/app-dmesh/build/outputs/apk/debug/app-dmesh-debug.apk"
-    local web_apk="$SCRIPT_DIR/android/app-web/build/outputs/apk/debug/app-web-debug.apk"
-    local chat_apk="$SCRIPT_DIR/android/app-chat/build/outputs/apk/debug/app-chat-debug.apk"
-
-    if [ "$build_type" = "release" ]; then
-        dmesh_apk="$SCRIPT_DIR/android/app-dmesh/build/outputs/apk/release/app-dmesh-release.apk"
-        web_apk="$SCRIPT_DIR/android/app-web/build/outputs/apk/release/app-web-release.apk"
-        chat_apk="$SCRIPT_DIR/android/app-chat/build/outputs/apk/release/app-chat-release.apk"
-    elif [ "$build_type" != "debug" ]; then
+    if [ "$build_type" != "debug" ] && [ "$build_type" != "release" ]; then
         echo "Usage: $0 install [debug|release]"
         exit 1
     fi
+
+    local dmesh_apk="$SCRIPT_DIR/target/apk/$build_type/app-dmesh-$build_type.apk"
+    local web_apk="$SCRIPT_DIR/target/apk/$build_type/app-web-$build_type.apk"
+    local chat_apk="$SCRIPT_DIR/target/apk/$build_type/app-chat-$build_type.apk"
 
     local serial index=0 failures=0
     local -a devices
@@ -288,9 +293,9 @@ install_apps() {
 
 install_all_apps() {
     local build_type="${1:-debug}"
-    local dmesh_apk="$SCRIPT_DIR/android/app-dmesh/build/outputs/apk/$build_type/app-dmesh-$build_type.apk"
-    local web_apk="$SCRIPT_DIR/android/app-web/build/outputs/apk/$build_type/app-web-$build_type.apk"
-    local chat_apk="$SCRIPT_DIR/android/app-chat/build/outputs/apk/$build_type/app-chat-$build_type.apk"
+    local dmesh_apk="$SCRIPT_DIR/target/apk/$build_type/app-dmesh-$build_type.apk"
+    local web_apk="$SCRIPT_DIR/target/apk/$build_type/app-web-$build_type.apk"
+    local chat_apk="$SCRIPT_DIR/target/apk/$build_type/app-chat-$build_type.apk"
     local serial index=0 failures=0
     local -a devices
 
@@ -620,9 +625,9 @@ stop_all_nan_sessions() {
 }
 
 prepare_connected_devices() {
-    local dmesh_apk="$SCRIPT_DIR/android/app-dmesh/build/outputs/apk/debug/app-dmesh-debug.apk"
-    local web_apk="$SCRIPT_DIR/android/app-web/build/outputs/apk/debug/app-web-debug.apk"
-    local chat_apk="$SCRIPT_DIR/android/app-chat/build/outputs/apk/debug/app-chat-debug.apk"
+    local dmesh_apk="$SCRIPT_DIR/target/apk/debug/app-dmesh-debug.apk"
+    local web_apk="$SCRIPT_DIR/target/apk/debug/app-web-debug.apk"
+    local chat_apk="$SCRIPT_DIR/target/apk/debug/app-chat-debug.apk"
     local serial
     local -a devices
     mapfile -t devices < <(require_android_devices)

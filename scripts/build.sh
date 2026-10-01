@@ -79,8 +79,16 @@ ensure_rust_toolchain() {
 
 configure_ssh_mesh_override() {
     SSH_MESH_OVERRIDE_ACTIVE=0
-    local override_dir="${DMESH_SSH_MESH_DIR:-}"
     local config="$CARGO_HOME/config.toml"
+    if [ -f "$config" ]; then
+        sed -i '/# BEGIN DMESH SSH_MESH OVERRIDE/,/# END DMESH SSH_MESH OVERRIDE/d' "$config"
+    fi
+
+    if [ "${DMESH_USE_LOCAL_SSH_MESH:-0}" != "1" ]; then
+        return
+    fi
+
+    local override_dir="${DMESH_SSH_MESH_DIR:-}"
 
     if [ -z "$override_dir" ]; then
         for candidate in "$DMESH_REPO/../rust/ssh-mesh" "$DMESH_REPO/../ssh-mesh"; do
@@ -97,9 +105,6 @@ configure_ssh_mesh_override() {
         return
     fi
     mkdir -p "$CARGO_HOME"
-    if [ -f "$config" ]; then
-        sed -i '/# BEGIN DMESH SSH_MESH OVERRIDE/,/# END DMESH SSH_MESH OVERRIDE/d' "$config"
-    fi
     cat >>"$config" <<EOF
 # BEGIN DMESH SSH_MESH OVERRIDE
 [patch."$ssh_mesh_url"]
@@ -211,36 +216,37 @@ musl() {
         -p mesh-tun \
         -p dmeshtui
 
+    local target_dir="${CARGO_TARGET_DIR:-$DMESH_REPO/target}"
     # Keep mesh-init service homes uniform: /home/<service> is provisioned as
     # a symlink to target/home/<service> during development.
     for service in lmesh; do
-        mkdir -p "$DMESH_REPO/target/home/$service/bin"
-        mkdir -p "$DMESH_REPO/target/home/$service/etc/schemas"
+        mkdir -p "$target_dir/home/$service/bin"
+        mkdir -p "$target_dir/home/$service/etc/schemas"
         ln -sfn \
-            "$DMESH_REPO/target/x86_64-unknown-linux-musl/release/$service" \
-            "$DMESH_REPO/target/home/$service/bin/$service"
+            "$target_dir/x86_64-unknown-linux-musl/release/$service" \
+            "$target_dir/home/$service/bin/$service"
         cp "$DMESH_REPO/crates/lmesh/resources/tools.json" \
-            "$DMESH_REPO/target/home/$service/etc/schemas/tools.json"
+            "$target_dir/home/$service/etc/schemas/tools.json"
     done
 
-    # `mesh` and `mesh-init` are owned by ssh-mesh. Let its checked-in build
-    # wrapper retain both artifacts under ssh-mesh/target; DMesh only supplies
-    # the generated lmesh catalog.
-    local ssh_mesh_dir="${DMESH_SSH_MESH_DIR:-}"
-    if [ -z "$ssh_mesh_dir" ]; then
-        for candidate in "$DMESH_REPO/../rust/ssh-mesh" "$DMESH_REPO/../ssh-mesh"; do
-            if [ -x "$candidate/scripts/build.sh" ]; then
-                ssh_mesh_dir="$candidate"
-                break
-            fi
-        done
+    if [ "${DMESH_USE_LOCAL_SSH_MESH:-0}" = "1" ]; then
+        # `mesh` and `mesh-init` are owned by ssh-mesh. Let its checked-in build
+        # wrapper retain both artifacts under ssh-mesh/target; DMesh only supplies
+        # the generated lmesh catalog.
+        local ssh_mesh_dir="${DMESH_SSH_MESH_DIR:-}"
+        if [ -z "$ssh_mesh_dir" ]; then
+            for candidate in "$DMESH_REPO/../rust/ssh-mesh" "$DMESH_REPO/../ssh-mesh"; do
+                if [ -x "$candidate/scripts/build.sh" ]; then
+                    ssh_mesh_dir="$candidate"
+                    break
+                fi
+            done
+        fi
+        if [ -n "$ssh_mesh_dir" ] && [ -x "$ssh_mesh_dir/scripts/build.sh" ]; then
+            "$ssh_mesh_dir/scripts/build.sh" rust mesh-cli
+            "$ssh_mesh_dir/scripts/build.sh" rust mesh-init
+        fi
     fi
-    if [ -z "$ssh_mesh_dir" ] || [ ! -x "$ssh_mesh_dir/scripts/build.sh" ]; then
-        echo "Missing ssh-mesh build source; set DMESH_SSH_MESH_DIR" >&2
-        return 1
-    fi
-    "$ssh_mesh_dir/scripts/build.sh" rust mesh-cli
-    "$ssh_mesh_dir/scripts/build.sh" rust mesh-init
     restore_cargo_lock
     trap - EXIT
 }

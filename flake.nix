@@ -162,7 +162,7 @@
             cargoLock = {
               lockFile = ./Cargo.lock;
               # mesh-api is sourced from the pinned ssh-mesh git revision.
-              outputHashes."mesh-api-0.1.0" = "sha256-5rWzd8kP0CrjXZgaLgVHScsHNY/+lT6RgA8bPN5USk8=";
+              outputHashes."mesh-api-0.1.0" = "sha256-C3eWQxWt+g6jOACLZvyDX0P2MBTQK0DXvigLP/gg/Fs=";
             };
             postPatch = pkgs.lib.optionalString (sshMeshRoot != null) ''
               cat >> Cargo.toml <<'EOF'
