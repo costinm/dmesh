@@ -320,6 +320,24 @@ mod tests {
     }
 
     #[test]
+    fn vendor_reassembled_callback_body_strips_action_and_ie_headers_into_output() {
+        let destination = [1, 2, 3, 4, 5, 6];
+        let source = [6, 5, 4, 3, 2, 1];
+        let payload = [0x40; 700];
+        let frame = build_action_frame(destination, source, [0xff; 6], &payload).unwrap();
+        let action_body = &frame[IEEE80211_HEADER_LEN..];
+        let mut output = [0; 700];
+
+        assert_eq!(
+            parse_action_body_into(action_body, &mut output),
+            Some(payload.len())
+        );
+        assert_eq!(output, payload);
+        assert_eq!(output[0] & 0x40, 0x40, "output begins with the QUIC fixed bit");
+        assert_ne!(output.get(..4), Some(ACTION_PREFIX.as_slice()));
+    }
+
+    #[test]
     fn action_frame_rejects_foreign_and_oversize_data() {
         assert!(
             build_action_frame([0; 6], [1; 6], [0xff; 6], &[0; MAX_ACTION_PAYLOAD + 1]).is_err()
