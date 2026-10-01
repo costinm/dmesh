@@ -713,7 +713,9 @@ mod tests {
     fn link_local_uses_modified_eui64() {
         assert_eq!(
             link_local_from_mac(LOCAL_MAC),
-            [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x16, 0xc1, 0x9f, 0xff, 0xfe, 0xe5, 0x98, 0]
+            [
+                0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x16, 0xc1, 0x9f, 0xff, 0xfe, 0xe5, 0x98, 0
+            ]
         );
     }
 

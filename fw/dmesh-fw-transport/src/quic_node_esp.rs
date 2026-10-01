@@ -11,7 +11,7 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use quic_lite::{
     BearerContext, BearerInfo, BearerName, EgressSubmission, OwnedPacket, PacketBearer,
     PacketEgress, PacketMeta, PacketPool as _, PacketSendOutcome, PacketSubmitError, PacketWriter,
-    PeerL2Address, QuicNodeEgressError, QuicStream,
+    PeerL2Address, QuicAssociation, QuicNodeEgressError, QuicStream,
     nostd::NoStdRuntime,
     packet_pool::{PacketPool, PoolBufferLease},
 };
@@ -63,6 +63,19 @@ struct PendingProbeResponse {
     chunk_size: usize,
 }
 static mut PENDING_PROBE_RESPONSE: Option<PendingProbeResponse> = None;
+struct PendingPeerProbe {
+    caller: QuicStream,
+    id: u64,
+    request: dmesh_server::probe::ProbeServiceRequest,
+    started_at_us: u64,
+    association: Option<QuicAssociation>,
+    stream: Option<QuicStream>,
+    request_wire: [u8; dmesh_server::probe::PROBE_RUN_REQUEST_MAX],
+    request_len: usize,
+    request_offset: usize,
+    receiver: dmesh_server::probe::ProbeReceiver,
+}
+static mut PENDING_PEER_PROBE: Option<PendingPeerProbe> = None;
 const PROBE_CHUNK_SIZE: usize = quic_lite::DEFAULT_MAX_STREAM_PAYLOAD;
 static mut INCOMING_REQUESTS: dmesh_server::services::OrderedRecordAssembler<QuicStream> =
     dmesh_server::services::OrderedRecordAssembler::new();
@@ -110,15 +123,30 @@ pub(crate) fn queue_now_control_response(
         drop(packet);
         return false;
     }
-    crate::main_runtime::request_quic_ingress();
+    if crate::wifi_espnow_esp::now_tx_retry_delay_ms().is_none() {
+        crate::main_runtime::request_quic_ingress();
+    }
     true
 }
 
-pub(crate) fn take_pending_now_control_response(
-) -> Option<(crate::wifi_espnow_esp::EspNowPeer, FirmwarePacket)> {
+pub(crate) fn take_pending_now_control_response()
+-> Option<(crate::wifi_espnow_esp::EspNowPeer, FirmwarePacket)> {
     PENDING_NOW_CONTROL_TX
         .try_pop()
         .map(|(peer, packet)| (crate::wifi_espnow_esp::EspNowPeer { mac: peer }, packet))
+}
+
+/// Return an unsubmitted control/discovery packet to the same shared pool
+/// lease queue after transient ESP-IDF send pressure.
+pub(crate) fn requeue_pending_now_control_response(
+    peer: crate::wifi_espnow_esp::EspNowPeer,
+    packet: FirmwarePacket,
+) -> bool {
+    if let Err((_peer, packet)) = PENDING_NOW_CONTROL_TX.try_push(peer.mac, packet) {
+        drop(packet);
+        return false;
+    }
+    true
 }
 
 pub(crate) fn now_control_response_pending() -> Option<bool> {
@@ -236,7 +264,7 @@ impl PacketEgress<<FirmwarePool as quic_lite::PacketPool>::Buffer> for NowBearer
         peer: PeerL2Address,
         submission: EgressSubmission<<FirmwarePool as quic_lite::PacketPool>::Buffer>,
     ) -> Result<(), PacketSubmitError<<FirmwarePool as quic_lite::PacketPool>::Buffer>> {
-        let sent = crate::wifi_espnow_esp::transmit_from_worker(
+        let result = crate::wifi_espnow_esp::try_transmit_from_worker(
             crate::wifi_espnow_esp::EspNowPeer {
                 mac: peer.value().to_be_bytes()[2..]
                     .try_into()
@@ -244,16 +272,21 @@ impl PacketEgress<<FirmwarePool as quic_lite::PacketPool>::Buffer> for NowBearer
             },
             submission.packet().bytes(),
         );
-        submission.complete(
-            if sent {
-                PacketSendOutcome::Sent
-            } else {
-                PacketSendOutcome::Failed
-            },
-            0,
-        );
-        crate::main_runtime::request_quic_ingress();
-        Ok(())
+        match result {
+            crate::wifi_espnow_esp::NowTransmitResult::Accepted => {
+                submission.complete(PacketSendOutcome::Sent, 0);
+                crate::main_runtime::request_quic_ingress();
+                Ok(())
+            }
+            crate::wifi_espnow_esp::NowTransmitResult::Busy => {
+                Err(PacketSubmitError::WouldBlock(submission))
+            }
+            crate::wifi_espnow_esp::NowTransmitResult::Failed => {
+                submission.complete(PacketSendOutcome::Failed, 0);
+                crate::main_runtime::request_quic_ingress();
+                Ok(())
+            }
+        }
     }
 }
 
@@ -285,11 +318,7 @@ impl PacketBearer<FirmwarePool> for NowBearer {
 unsafe fn runtime() -> &'static mut FirmwareRuntime {
     if !READY.load(Ordering::Acquire) {
         let embedded = quic_lite::AssociationLimits::embedded();
-        let mut value = FirmwareRuntime::try_new_boxed(
-            crate::main_runtime::stateless_reset_key(),
-            &POOL,
-            embedded.connection,
-        )
+        let mut value = FirmwareRuntime::try_new_boxed(&POOL, embedded.connection)
         .expect("firmware QUIC runtime allocation succeeds");
         value
             .set_limits(quic_lite::NodeLimits::embedded())
@@ -310,6 +339,27 @@ unsafe fn runtime() -> &'static mut FirmwareRuntime {
         READY.store(true, Ordering::Release);
     }
     &mut **core::ptr::addr_of_mut!(RUNTIME)
+}
+
+pub(crate) fn connection_delay_ms() -> Option<u32> {
+    if !READY.load(Ordering::Acquire) {
+        return None;
+    }
+    let now_us = unsafe { esp_idf_sys::esp_timer_get_time().max(0) as u64 };
+    let deadline = unsafe { runtime() }.next_deadline()?;
+    let delay_us = deadline.saturating_sub(now_us);
+    Some(delay_us.div_ceil(1_000).min(u64::from(u32::MAX)) as u32)
+}
+
+pub(crate) fn schedule_connection_timer() {
+    if !READY.load(Ordering::Acquire) {
+        return;
+    }
+    let now_us = unsafe { esp_idf_sys::esp_timer_get_time().max(0) as u64 };
+    if unsafe { runtime() }.advance_time(now_us).unwrap_or(false) {
+        crate::main_runtime::request_quic_ingress();
+    }
+    crate::main_runtime::request_connection_deadline_recheck();
 }
 
 /// Pool assigned to UART by its registered bearer context.
@@ -496,6 +546,7 @@ where
 /// wake that owner.
 pub(crate) fn progress() {
     let runtime = unsafe { runtime() };
+    progress_directed_probe(runtime);
     if runtime.take_ingress_drops() != 0 {
         let _ = crate::uart_esp::send_debug_text(b"DMESH QUIC ingress queue packet dropped");
     }
@@ -523,6 +574,84 @@ pub(crate) fn progress() {
     loop {
         let mut received_response = None;
         let processed = match runtime.progress_with_stream(|stream, offset, fin, bytes| {
+            let peer_probe_stream = unsafe {
+                PENDING_PEER_PROBE.as_ref().is_some_and(|pending| {
+                    pending
+                        .stream
+                        .as_ref()
+                        .is_some_and(|outbound| outbound.same_stream(&stream))
+                })
+            };
+            if peer_probe_stream {
+                let received = unsafe {
+                    PENDING_PEER_PROBE
+                        .as_mut()
+                        .expect("probe stream checked above")
+                        .receiver
+                        .receive(offset, fin, bytes)
+                };
+                match received {
+                    Ok(accepted) => {
+                        let _ =
+                            crate::uart_esp::send_debug_text(b"DMESH directed probe RX accepted");
+                        if unsafe {
+                            PENDING_PEER_PROBE
+                                .as_ref()
+                                .is_some_and(|pending| pending.receiver.is_complete())
+                        } {
+                            let _ = crate::uart_esp::send_debug_text(
+                                b"DMESH directed probe RX complete",
+                            );
+                            finish_peer_probe(true);
+                        }
+                        return Ok(accepted);
+                    }
+                    Err(error) => {
+                        if matches!(error, quic_lite::probe::ProbeError::InvalidPayload) {
+                            report_probe_value(
+                                b"DMESH directed probe RX bytes before reject=",
+                                unsafe {
+                                    PENDING_PEER_PROBE
+                                        .as_ref()
+                                        .map_or(0, |pending| pending.receiver.bytes())
+                                },
+                            );
+                            report_probe_value(
+                                b"DMESH directed probe RX data length=",
+                                bytes.len() as u64,
+                            );
+                            if let Some(sequence) = bytes
+                                .get(..4)
+                                .and_then(|prefix| <[u8; 4]>::try_from(prefix).ok())
+                            {
+                                report_probe_value(
+                                    b"DMESH directed probe RX sequence=",
+                                    u64::from(u32::from_be_bytes(sequence)),
+                                );
+                            }
+                            if let Some(first_data) = bytes.get(4) {
+                                report_probe_value(
+                                    b"DMESH directed probe RX first data byte=",
+                                    u64::from(*first_data),
+                                );
+                            }
+                        }
+                        crate::uart_esp::send_debug_text(match error {
+                            quic_lite::probe::ProbeError::UnexpectedRange => {
+                                b"DMESH directed probe RX range rejected"
+                            }
+                            quic_lite::probe::ProbeError::InvalidPayload => {
+                                b"DMESH directed probe RX data rejected"
+                            }
+                            quic_lite::probe::ProbeError::UnexpectedStream => {
+                                b"DMESH directed probe RX stream rejected"
+                            }
+                        });
+                        finish_peer_probe(false);
+                        return Ok(bytes.len());
+                    }
+                }
+            }
             let (accepted, complete) = unsafe {
                 INCOMING_REQUESTS.push(
                     stream,
@@ -570,6 +699,9 @@ pub(crate) fn progress() {
                         QuicNodeEgressError::Transport(quic_lite::Error::StreamLimit) => {
                             b"stream-limit"
                         }
+                        QuicNodeEgressError::Transport(quic_lite::Error::PathLimit) => {
+                            b"path-limit"
+                        }
                         QuicNodeEgressError::Transport(quic_lite::Error::PacketNumberExhausted) => {
                             b"packet-number-exhausted"
                         }
@@ -595,6 +727,11 @@ pub(crate) fn progress() {
                         QuicNodeEgressError::BearerBusy => b"bearer-busy",
                         QuicNodeEgressError::StreamEventsFull => b"stream-events-full",
                         QuicNodeEgressError::AssociationTimedOut => b"association-timeout",
+                        QuicNodeEgressError::CircuitBusy => b"circuit-busy",
+                        QuicNodeEgressError::PathSetupAttemptsExhausted => {
+                            b"path-attempts-exhausted"
+                        }
+                        QuicNodeEgressError::SetupRejected(_) => b"setup-rejected",
                         QuicNodeEgressError::RelayUnavailable => b"relay-unavailable",
                     };
                     let _ = crate::uart_esp::send_debug_text(detail);
@@ -649,12 +786,65 @@ pub(crate) fn progress() {
         }
         progress_probe_response(runtime);
     }
+    crate::main_runtime::request_connection_deadline_recheck();
+}
+
+/// Report NOW driver capacity after a prior zero-byte WouldBlock. Main calls
+/// this from its one-shot retry deadline before advancing the QUIC owner.
+pub(crate) fn now_send_ready() {
+    if !NOW_READY.load(Ordering::Acquire) {
+        return;
+    }
+    let context = unsafe {
+        (&*core::ptr::addr_of!(NOW_CONTEXT).cast::<BearerContext<FirmwarePool>>()).clone()
+    };
+    context.send_ready();
 }
 
 fn dispatch_complete_request(stream: QuicStream, request: &[u8]) -> Option<(QuicStream, Vec<u8>)> {
     if let Some(record) = dmesh_server::tagged::decode(request) {
-        if let Some((_, probe_request)) = dmesh_server::probe::decode_probe_run_record(record) {
-            if unsafe { PENDING_PROBE_RESPONSE.is_none() } {
+        if let Some((id, probe_request)) = dmesh_server::probe::decode_probe_run_record(record) {
+            if probe_request.peer.is_some() {
+                if unsafe { PENDING_PEER_PROBE.is_none() && PENDING_RESPONSE.is_none() }
+                    && NOW_READY.load(Ordering::Acquire)
+                    && probe_request
+                        .peer
+                        .is_some_and(|destination| destination.espnow_mac().is_some())
+                {
+                    let outbound = dmesh_server::probe::ProbeServiceRequest::new(
+                        probe_request.bytes,
+                        probe_request.packet_size,
+                    );
+                    let mut request_wire = [0; dmesh_server::probe::PROBE_RUN_REQUEST_MAX];
+                    let Some(request_len) = dmesh_server::probe::encode_probe_run_request(
+                        outbound,
+                        id,
+                        &mut request_wire,
+                    ) else {
+                        return Some(directed_probe_error(stream, id, probe_request));
+                    };
+                    let pending = PendingPeerProbe {
+                        caller: stream,
+                        id,
+                        request: probe_request,
+                        started_at_us: unsafe { esp_idf_sys::esp_timer_get_time().max(0) as u64 },
+                        association: None,
+                        stream: None,
+                        request_wire,
+                        request_len,
+                        request_offset: 0,
+                        receiver: dmesh_server::probe::ProbeReceiver::new(2),
+                    };
+                    unsafe { PENDING_PEER_PROBE = Some(pending) };
+                    let _ = crate::uart_esp::send_debug_text(b"DMESH directed probe queued");
+                    crate::main_runtime::request_quic_ingress();
+                    crate::main_runtime::request_connection_deadline_recheck();
+                    return None;
+                }
+                return Some(directed_probe_error(stream, id, probe_request));
+            }
+            let response_available = unsafe { PENDING_PROBE_RESPONSE.is_none() };
+            if response_available {
                 if let Some((sender, chunk_size)) = pending_probe(stream.id(), probe_request) {
                     PROBE_PROGRESS_REPORTED.store(0, Ordering::Release);
                     PROBE_WINDOW_BLOCK_REPORTED.store(false, Ordering::Release);
@@ -670,10 +860,14 @@ fn dispatch_complete_request(stream: QuicStream, request: &[u8]) -> Option<(Quic
                     crate::main_runtime::request_quic_ingress();
                     return None;
                 }
+                let _ = crate::uart_esp::send_debug_text(b"DMESH QUIC probe request rejected");
+            } else {
+                let _ = crate::uart_esp::send_debug_text(b"DMESH QUIC probe responder busy");
             }
         }
     }
 
+    let _ = crate::uart_esp::send_debug_text(b"DMESH QUIC tagged request fallback");
     let response = dmesh_server::services::dispatch_tagged_stream(request);
     if response.is_some() {
         let _ = crate::uart_esp::send_debug_text(b"DMESH QUIC service dispatch matched");
@@ -681,6 +875,138 @@ fn dispatch_complete_request(stream: QuicStream, request: &[u8]) -> Option<(Quic
         let _ = crate::uart_esp::send_debug_text(b"DMESH QUIC service dispatch unmatched");
     }
     response.map(|response| (stream, response))
+}
+
+fn directed_probe_error(
+    stream: QuicStream,
+    id: u64,
+    request: dmesh_server::probe::ProbeServiceRequest,
+) -> (QuicStream, Vec<u8>) {
+    let mut response = alloc::vec![0u8; 256];
+    let len =
+        dmesh_server::probe::encode_probe_result_response(id, request, false, 0, 0, &mut response)
+            .unwrap_or(0);
+    response.truncate(len);
+    (stream, response)
+}
+
+/// Run one device-originated NOW probe from Main's single QUIC owner.
+fn progress_directed_probe(runtime: &mut FirmwareRuntime) {
+    let Some(pending) = (unsafe { PENDING_PEER_PROBE.as_mut() }) else {
+        return;
+    };
+    let now_us = unsafe { esp_idf_sys::esp_timer_get_time().max(0) as u64 };
+    if now_us.saturating_sub(pending.started_at_us) > 30_000_000 {
+        crate::uart_esp::send_debug_text(b"DMESH directed probe timed out");
+        finish_peer_probe(false);
+        return;
+    }
+    if pending.association.is_none() {
+        let context = unsafe {
+            (&*core::ptr::addr_of!(NOW_CONTEXT).cast::<BearerContext<FirmwarePool>>()).clone()
+        };
+        let Some(peer) = pending
+            .request
+            .peer
+            .and_then(|destination| destination.espnow_mac())
+        else {
+            crate::uart_esp::send_debug_text(b"DMESH directed probe peer invalid");
+            finish_peer_probe(false);
+            return;
+        };
+        let peer_value = peer
+            .into_iter()
+            .fold(0_u64, |value, octet| (value << 8) | u64::from(octet));
+        let Some(peer_l2_address) = PeerL2Address::new(peer_value) else {
+            crate::uart_esp::send_debug_text(b"DMESH directed probe peer address invalid");
+            finish_peer_probe(false);
+            return;
+        };
+        let meta = PacketMeta {
+            bearer: context.bearer(),
+            peer_l2_address,
+            received_at_us: now_us,
+        };
+        match runtime.associate(meta, now_us) {
+            Ok(association) => {
+                pending.association = Some(association);
+                let _ =
+                    crate::uart_esp::send_debug_text(b"DMESH NOW peer probe association started");
+                crate::main_runtime::request_connection_deadline_recheck();
+            }
+            Err(_) => {
+                crate::uart_esp::send_debug_text(b"DMESH directed probe association rejected");
+                finish_peer_probe(false)
+            }
+        }
+        return;
+    }
+    let association = pending.association.expect("association checked above");
+    if !runtime.association_is_established(association) {
+        return;
+    }
+    if pending.stream.is_none() {
+        match runtime.open_stream(association) {
+            Ok(stream) => pending.stream = Some(stream),
+            Err(_) => {
+                crate::uart_esp::send_debug_text(b"DMESH directed probe stream open failed");
+                finish_peer_probe(false);
+                return;
+            }
+        }
+    }
+    let stream = pending.stream.as_mut().expect("stream initialized above");
+    let result = if pending.request_offset < pending.request_len {
+        runtime.write_stream_and_finish(
+            stream,
+            &pending.request_wire[pending.request_offset..pending.request_len],
+        )
+    } else {
+        return;
+    };
+    match result {
+        Ok(written) => {
+            pending.request_offset += written;
+            if pending.request_offset < pending.request_len {
+                crate::main_runtime::request_quic_ingress();
+            } else {
+                let _ = crate::uart_esp::send_debug_text(b"DMESH directed probe request sent");
+            }
+        }
+        Err(error) if error.is_retryable() => {}
+        Err(_) => {
+            crate::uart_esp::send_debug_text(b"DMESH directed probe request write failed");
+            finish_peer_probe(false);
+        }
+    }
+}
+
+fn finish_peer_probe(ok: bool) {
+    let Some(pending) = (unsafe { PENDING_PEER_PROBE.take() }) else {
+        return;
+    };
+    let received = pending.receiver.bytes();
+    let _ = crate::uart_esp::send_debug_text(if ok {
+        b"DMESH directed probe finish ok"
+    } else {
+        b"DMESH directed probe finish error"
+    });
+    let elapsed = (unsafe { esp_idf_sys::esp_timer_get_time().max(0) as u64 })
+        .saturating_sub(pending.started_at_us);
+    let mut response = alloc::vec![0u8; 256];
+    let len = dmesh_server::probe::encode_probe_result_response(
+        pending.id,
+        pending.request,
+        ok && pending.receiver.is_complete() && received == pending.request.bytes,
+        received,
+        elapsed,
+        &mut response,
+    )
+    .unwrap_or(0);
+    response.truncate(len);
+    unsafe { PENDING_RESPONSE = Some((pending.caller, response, 0)) };
+    crate::main_runtime::request_quic_ingress();
+    crate::main_runtime::request_connection_deadline_recheck();
 }
 
 fn pending_probe(
@@ -699,7 +1025,7 @@ fn pending_probe(
         return None;
     }
     let plan = dmesh_server::probe::ProbeServicePlan::from_request(
-        request,
+        request.workload(),
         quic_lite::DEFAULT_MAX_STREAM_PAYLOAD,
     );
     Some((
@@ -717,9 +1043,16 @@ fn progress_probe_response(runtime: &mut FirmwareRuntime) {
         return;
     };
     let mut bytes = [0u8; PROBE_CHUNK_SIZE];
-    let Ok(window) = runtime.stream_send_window(&pending.stream) else {
-        unsafe { PENDING_PROBE_RESPONSE = Some(pending) };
-        return;
+    let window = match runtime.stream_send_window(&pending.stream) {
+        Ok(window) => window,
+        Err(error) if error.is_retryable() => {
+            unsafe { PENDING_PROBE_RESPONSE = Some(pending) };
+            return;
+        }
+        Err(_) => {
+            let _ = crate::uart_esp::send_debug_text(b"DMESH QUIC probe stream window failed");
+            return;
+        }
     };
     let Some(chunk) = pending
         .sender
@@ -865,6 +1198,9 @@ fn write_response(
                     QuicNodeEgressError::BearerBusy => b"bearer-busy",
                     QuicNodeEgressError::StreamEventsFull => b"stream-events-full",
                     QuicNodeEgressError::AssociationTimedOut => b"association-timeout",
+                    QuicNodeEgressError::CircuitBusy => b"circuit-busy",
+                    QuicNodeEgressError::PathSetupAttemptsExhausted => b"path-attempts-exhausted",
+                    QuicNodeEgressError::SetupRejected(_) => b"setup-rejected",
                     QuicNodeEgressError::RelayUnavailable => b"relay-unavailable",
                     QuicNodeEgressError::Transport(_) => b"transport",
                 };

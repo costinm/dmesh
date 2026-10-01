@@ -344,38 +344,6 @@ pub fn install_pairing(name: &str, root_public_key: &[u8], secret: &[u8]) -> boo
     result
 }
 
-/// Derive the quic-lite stateless-reset branch from Main's provisioned device
-/// secret. The raw `sec:key` material remains in NVS: callers receive only a
-/// derived, bearer-neutral key and must never log or serialize it. This is the
-/// DMesh PSP-style key-schedule boundary; future packet-protection branches
-/// use different labels in quic-lite.
-pub(crate) fn stateless_reset_key() -> Option<quic_lite::StatelessResetKey> {
-    let _ = unsafe { nvs_flash_init() };
-    let mut handle = 0_u32;
-    if unsafe { nvs_open(b"sec\0".as_ptr().cast(), NVS_READONLY, &mut handle) } != 0 {
-        return None;
-    }
-    // `sec:key` is provisioned as bounded binary material. Keep the raw value
-    // on this stack only long enough to derive the reset branch.
-    let mut secret = [0u8; dmesh_server::announce::MAX_PUBLIC_KEY];
-    let mut length = secret.len();
-    let loaded = unsafe {
-        nvs_get_blob(
-            handle,
-            SHARED_SECRET_NVS_KEY.as_ptr().cast(),
-            secret.as_mut_ptr().cast(),
-            &mut length,
-        ) == 0
-    };
-    unsafe { nvs_close(handle) };
-    if !loaded || length > secret.len() {
-        return None;
-    }
-    let key = quic_lite::StatelessResetKey::from_device_secret(&secret[..length]).ok();
-    secret.fill(0);
-    key
-}
-
 pub(crate) fn setting_keys() -> &'static [&'static [u8]] {
     &SETTINGS_KEYS
 }
@@ -639,6 +607,11 @@ pub(crate) fn is_sleepy_profile(profile: &crate::TransportProfile) -> bool {
         && matches!(profile.nan_dw_interval, 1 | 8 | 16)
         && profile.now == 2
         && profile.ap == 0
+        // Sleep is reserved for a NAN-only radio personality. An explicitly
+        // provisioned STA or enabled UART is another usable path and must
+        // keep Main awake for ordinary QUIC diagnostics and control.
+        && profile.ssid_len == 0
+        && profile.uart == dmesh_server::firmware_profile::UART_OFF
 }
 
 /// Physical light sleep is part of every explicit sleepy profile. USB-JTAG
@@ -917,6 +890,14 @@ pub(crate) fn service_radio_deadline(services: u8) {
         crate::wifi_nan_dw_capture_esp::dispatch_deferred_service_info();
     }
     if services & DEADLINE_QUIC_INGRESS != 0 {
+        let retry_due = crate::wifi_espnow_esp::take_now_tx_retry_if_due();
+        if retry_due {
+            // Give pool-backed connectionless discovery/control the first
+            // retry opportunity. It must not be starved behind a QUIC packet
+            // that was held after the same temporary driver refusal.
+            crate::wifi_espnow_esp::dispatch_pending_control_response();
+            crate::quic_node_esp::now_send_ready();
+        }
         crate::quic_node_esp::progress();
         crate::wifi_espnow_esp::dispatch_pending_control_response();
     }
@@ -2113,6 +2094,7 @@ fn next_deadline(sleep_deadline_ms: Option<u64>) -> Option<(u8, u32)> {
     let nan_delay = crate::wifi_nan_dw_capture_esp::next_service_delay_ms();
     let roc_delay = crate::wifi_nonpromisc_probe_esp::next_service_delay_ms();
     let connection_delay = crate::core_runtime::connection_delay_ms();
+    let now_tx_retry_delay = crate::wifi_espnow_esp::now_tx_retry_delay_ms();
     let now_ms = (unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) as u64) / 1_000;
     let sleep_delay = sleep_deadline_ms
         .map(|deadline| deadline.saturating_sub(now_ms).min(u64::from(u32::MAX)) as u32);
@@ -2120,6 +2102,7 @@ fn next_deadline(sleep_deadline_ms: Option<u64>) -> Option<(u8, u32)> {
         .into_iter()
         .chain(roc_delay)
         .chain(connection_delay)
+        .chain(now_tx_retry_delay)
         .chain(sleep_delay)
         .min()
     else {
@@ -2134,6 +2117,11 @@ fn next_deadline(sleep_deadline_ms: Option<u64>) -> Option<(u8, u32)> {
     }
     if connection_delay == Some(delay_ms) {
         services |= DEADLINE_CONNECTION;
+    }
+    if now_tx_retry_delay == Some(delay_ms) {
+        // Reuse the queued QUIC-owner turn: it emits send_ready before
+        // progressing the node, so a WouldBlock lease is retried unchanged.
+        services |= DEADLINE_QUIC_INGRESS;
     }
     if sleep_delay == Some(delay_ms) {
         services |= DEADLINE_SLEEP_POLICY;
@@ -2818,6 +2806,8 @@ fn encode_telemetry_response_record(
             &mut result,
         )?,
         t::NOW_METRICS_METHOD => {
+            let (now_tx_attempted, now_tx_accepted, now_tx_failed, now_tx_busy) =
+                crate::wifi_espnow_esp::now_tx_metrics();
             let (last_roc_body_prefix, last_roc_body_len) =
                 crate::wifi_espnow_esp::last_roc_action_body();
             let (
@@ -2831,15 +2821,19 @@ fn encode_telemetry_response_record(
                 &[
                     t::Metric {
                         id: t::now_metric::TX_ATTEMPTED,
-                        value: u64::from(counters.tx_attempted),
+                        value: u64::from(now_tx_attempted),
                     },
                     t::Metric {
                         id: t::now_metric::TX_ACCEPTED,
-                        value: u64::from(counters.tx_driver_accepted),
+                        value: u64::from(now_tx_accepted),
                     },
                     t::Metric {
                         id: t::now_metric::TX_FAILED,
-                        value: u64::from(counters.tx_driver_failed),
+                        value: u64::from(now_tx_failed),
+                    },
+                    t::Metric {
+                        id: t::now_metric::TX_BUSY,
+                        value: u64::from(now_tx_busy),
                     },
                     t::Metric {
                         id: t::now_metric::RX_DISPATCHED,
@@ -3389,12 +3383,10 @@ impl MainCoordinator {
             dmesh_server::main_runtime_state::MainEffect::None
         };
         if work.profile_changed {
-            // Automatic CPU idle sleep is independent of the explicit DW
-            // boundary. Peripheral PM locks (for example UART or an active
-            // Wi-Fi window) decide whether a particular idle interval can
-            // actually sleep; a profile change must not silently disable the
-            // policy for the next idle interval.
-            let _ = crate::power_esp::configure(true);
+            // Only the explicit NAN-only sleepy profile enables automatic
+            // CPU idle light sleep. Active profiles stay responsive even if
+            // their radios momentarily have no peripheral PM lock.
+            let _ = crate::power_esp::configure(is_sleepy_profile(&work.profile));
             if is_sleepy_profile(&work.profile) {
                 // Arm a single deadline after the radio transition settles.
                 // Without this, a volatile DW8 request has no subsequent
@@ -3491,31 +3483,32 @@ pub(crate) fn run_main_service(service: MainRuntimeService) {
     // In its absence Main retains the ordinary NAN/NOW startup and accepts a
     // later volatile transport.start command.
     let boot_power_policy = crate::main_runtime::boot_power_policy_from_nvs();
-    let sleepy_boot = service.role == 1 && boot_power_policy.sleepy;
+    // A provisioned STA profile is an alternate always-reachable bearer, so
+    // it must not be hidden by a stale sleepy power setting. `sleepy` is only
+    // meaningful for the unassociated NAN-only boot personality.
+    let mut boot_sta_profile = crate::TransportProfile::new();
+    let has_provisioned_sta =
+        service.role == 1 && crate::sta_profile_esp::load(&mut boot_sta_profile);
+    let sleepy_boot = service.role == 1 && boot_power_policy.sleepy && !has_provisioned_sta;
     // Automatic CPU idle sleep is selected before the Wi-Fi owner starts.
     // It is not the explicit DW physical-sleep policy: active peripherals
     // retain their own PM locks and prevent entry where needed.
-    let _ = crate::power_esp::configure(true);
+    let _ = crate::power_esp::configure(sleepy_boot);
     unsafe { esp_idf_sys::esp_rom_printf(b"DMESH main: power\n\0".as_ptr().cast()) };
     crate::profile_store::with_profile(|params| {
         params.command_mode = service.role == 2 || !sleepy_boot;
         if sleepy_boot {
-            // A sleepy boot must retain its complete private STA profile even
-            // though it deliberately starts NAN+NOW instead of associating.
-            // `nan.wakeup` later requests `mode=sta` without carrying an SSID
-            // or PSK over NAN; without this load the target correctly rejects
-            // that request as an unspecified STA, making a sleepy device
-            // impossible to recover remotely.
-            let has_provisioned_sta = crate::sta_profile_esp::load(params);
-            crate::commands::send_stat(b"sleepy STA profile loaded=", has_provisioned_sta as u64);
+            // This branch is selected only when no complete STA profile was
+            // provisioned; sleepy boot is therefore strictly NAN-only.
             params.requested_transport = Some(dmesh_server::control::TransportKind::Nan);
             params.nan_dw_interval = 8;
             params.now = 2;
             params.ap = 0;
-            // UART is an explicit profile choice, not a sleepy-boot or
-            // light-sleep prerequisite.  Preserve the configured/default
-            // value so a DW8 node remains diagnosable unless its operator
-            // explicitly selected `uart=off`.
+            // Sleepy mode is reserved for NAN-only operation. Keep the
+            // physical UART disabled as well; active mode retains UART by
+            // default, and runtime policy independently rejects sleep while
+            // any other bearer is enabled.
+            params.uart = dmesh_server::firmware_profile::UART_OFF;
         } else if service.role == 1 && !crate::main_runtime::apply_sta_profile_from_nvs(params) {
             // Main's active default is NAN+NOW only. An AP is an explicit
             // transport.start personality, not an unconditional boot side
@@ -3541,6 +3534,56 @@ pub(crate) fn run_main_service(service: MainRuntimeService) {
             params.ap = 0;
         }
     });
+    // Register the complete application surface before starting shared UART
+    // ingress. `start_shared_l2` can deliver the first QUIC request as soon as
+    // its reader is live; registering afterward leaves a startup window where
+    // a valid tagged request (notably log-watch) has no component handler.
+    // The same registry is used by UART, UDP6, and NOW-backed QUIC streams.
+    assert!(dmesh_server::services::register_tagged_component(
+        dmesh_server::services::DIAGNOSTIC_COMPONENT,
+        crate::main_runtime::receive_tagged_diagnostics,
+    ));
+    assert!(dmesh_server::services::register_tagged_component(
+        dmesh_server::services::FIRMWARE_COMPONENT,
+        crate::firmware_identity::receive_tagged_identity,
+    ));
+    assert!(dmesh_server::services::register_tagged_component(
+        dmesh_server::verified_object::OBJECT_COMPONENT,
+        crate::flash::receive_tagged_flash,
+    ));
+    assert!(dmesh_server::services::register_tagged_component(
+        dmesh_server::control::CONTROL_COMPONENT,
+        crate::main_runtime::receive_tagged_control,
+    ));
+    // `discovery.nodes` is the bounded production inventory read used by a
+    // relay controller to select its next hop. The compact direct form is
+    // retained for UART/NAN/NOW diagnostics only; normal administration uses
+    // this correlated QUIC-stream handler.
+    assert!(dmesh_server::services::register_tagged_component(
+        dmesh_server::announce::ANNOUNCE_COMPONENT,
+        crate::main_runtime::receive_tagged_discovery,
+    ));
+    assert!(dmesh_server::services::register_tagged_component(
+        dmesh_server::telemetry::TELEMETRY_COMPONENT,
+        crate::main_runtime::receive_tagged_telemetry,
+    ));
+    assert!(dmesh_server::services::register_tagged_component(
+        dmesh_server::raw_wifi::RAW_WIFI_COMPONENT,
+        crate::main_runtime::receive_tagged_raw_wifi,
+    ));
+    assert!(dmesh_server::services::register_tagged_component(
+        crate::main_runtime::RUNTIME_COMPONENT,
+        crate::main_runtime::receive_tagged_snapshot,
+    ));
+    assert!(dmesh_server::services::register_tagged_component(
+        crate::main_runtime::POWER_COMPONENT,
+        crate::main_runtime::receive_tagged_power_snapshot,
+    ));
+    assert!(dmesh_server::services::register_tagged_component(
+        crate::main_runtime::MEMORY_COMPONENT,
+        crate::main_runtime::receive_tagged_memory_snapshot,
+    ));
+
     if service.role == 1 && !sleepy_boot {
         // The coordinator blocks for an ingress or timer event after setup.
         // Therefore the active boot profile must arm the physical UART before
@@ -3561,53 +3604,6 @@ pub(crate) fn run_main_service(service: MainRuntimeService) {
     // egress budget without a periodic poll or a private bulk queue.
     crate::uart_esp::set_egress_notify(Some(crate::core_runtime::schedule_uart_egress_ready));
     unsafe { esp_idf_sys::esp_rom_printf(b"DMESH main: uart-start\n\0".as_ptr().cast()) };
-    // Register once before any bearer accepts traffic. The handler table is
-    // fixed-size and shared by UDP6/QUIC and NOW action adapters; no per-bearer
-    // command implementation or queue is created here.
-    let _ = dmesh_server::services::register_tagged_component(
-        dmesh_server::services::DIAGNOSTIC_COMPONENT,
-        crate::main_runtime::receive_tagged_diagnostics,
-    );
-    let _ = dmesh_server::services::register_tagged_component(
-        dmesh_server::services::FIRMWARE_COMPONENT,
-        crate::firmware_identity::receive_tagged_identity,
-    );
-    let _ = dmesh_server::services::register_tagged_component(
-        dmesh_server::verified_object::OBJECT_COMPONENT,
-        crate::flash::receive_tagged_flash,
-    );
-    let _ = dmesh_server::services::register_tagged_component(
-        dmesh_server::control::CONTROL_COMPONENT,
-        crate::main_runtime::receive_tagged_control,
-    );
-    // `discovery.nodes` is the bounded production inventory read used by a
-    // relay controller to select its next hop.  The compact direct form is
-    // retained for UART/NAN/NOW diagnostics only; normal administration uses
-    // this correlated QUIC-stream handler.
-    let _ = dmesh_server::services::register_tagged_component(
-        dmesh_server::announce::ANNOUNCE_COMPONENT,
-        crate::main_runtime::receive_tagged_discovery,
-    );
-    let _ = dmesh_server::services::register_tagged_component(
-        dmesh_server::telemetry::TELEMETRY_COMPONENT,
-        crate::main_runtime::receive_tagged_telemetry,
-    );
-    let _ = dmesh_server::services::register_tagged_component(
-        dmesh_server::raw_wifi::RAW_WIFI_COMPONENT,
-        crate::main_runtime::receive_tagged_raw_wifi,
-    );
-    let _ = dmesh_server::services::register_tagged_component(
-        crate::main_runtime::RUNTIME_COMPONENT,
-        crate::main_runtime::receive_tagged_snapshot,
-    );
-    let _ = dmesh_server::services::register_tagged_component(
-        crate::main_runtime::POWER_COMPONENT,
-        crate::main_runtime::receive_tagged_power_snapshot,
-    );
-    let _ = dmesh_server::services::register_tagged_component(
-        crate::main_runtime::MEMORY_COMPONENT,
-        crate::main_runtime::receive_tagged_memory_snapshot,
-    );
     crate::wifi_nan_dw_capture_esp::set_service_info_handler(Some(
         crate::main_runtime::receive_nan_service_info,
     ));
@@ -4023,16 +4019,67 @@ pub(crate) fn receive_tagged_diagnostics(
     let dmesh_server::tagged::Name::Tag(method) = record.method? else {
         return None;
     };
-    if method != dmesh_server::services::DIAGNOSTIC_STATUS_METHOD {
-        let mut response = [0u8; 96];
-        let used = dmesh_server::tagged::encode_numeric_error(
+    if method == dmesh_server::services::DIAGNOSTIC_SERVICES_METHOD {
+        if record.to.is_some() || record.params.is_some() || record.data.is_some() {
+            return diagnostic_error(method, id, b"invalid services request");
+        }
+        let catalog = dmesh_server::services::encode_tagged_service_catalog();
+        let mut response = alloc::vec![0u8; catalog.len().saturating_add(64)];
+        let response_len = dmesh_server::tagged::encode_numeric_response(
             dmesh_server::services::DIAGNOSTIC_COMPONENT,
             method,
             id,
-            b"unsupported diagnostic method",
+            &catalog,
             &mut response,
         )?;
-        return Some(alloc::vec::Vec::from(&response[..used]));
+        response.truncate(response_len);
+        return Some(response);
+    }
+    if method == dmesh_server::services::DIAGNOSTIC_LOG_WATCH_METHOD {
+        if record.to.is_some() || record.params.is_some() || record.data.is_some() {
+            return diagnostic_error(method, id, b"invalid log-watch request");
+        }
+        let Some((since, records)) =
+            dmesh_server::services::decode_diagnostic_fields(record.fields)
+        else {
+            return diagnostic_error(method, id, b"invalid log-watch fields");
+        };
+        let since = since.unwrap_or(0);
+        let limit = records.unwrap_or(16) as usize;
+        if !(1..=dmesh_server::services::LOG_WATCH_MAX_RECORDS).contains(&limit) {
+            return diagnostic_error(method, id, b"log record count out of range");
+        }
+        let (cursor, lines) =
+            crate::log_history::read(since, limit.min(crate::log_history::CAPACITY));
+        let mut result = alloc::vec![0u8; 6_400];
+        let mut encoder = dmesh_server::cbor::Encoder::new(&mut result);
+        encoder.map(2)?;
+        encoder.text_value(b"cursor")?;
+        encoder.uint(cursor)?;
+        encoder.text_value(b"records")?;
+        encoder.array(lines.len() as u64)?;
+        for (sequence, line) in lines {
+            encoder.map(2)?;
+            encoder.text_value(b"sequence")?;
+            encoder.uint(sequence)?;
+            encoder.text_value(b"line")?;
+            encoder.text_value(&line)?;
+        }
+        let result_len = encoder.len();
+        drop(encoder);
+        let mut response = alloc::vec![0u8; result_len.saturating_add(64)];
+        let response_len = dmesh_server::tagged::encode_numeric_response(
+            dmesh_server::services::DIAGNOSTIC_COMPONENT,
+            method,
+            id,
+            &result[..result_len],
+            &mut response,
+        )?;
+        response.truncate(response_len);
+        return Some(response);
+    }
+    if method != dmesh_server::services::DIAGNOSTIC_STATUS_METHOD {
+        return diagnostic_error(method, id, b"unsupported diagnostic method");
     }
 
     let sta_enabled = wants_sta(&crate::profile_store::snapshot());
@@ -4081,6 +4128,18 @@ pub(crate) fn receive_tagged_diagnostics(
         unsafe { esp_idf_sys::vTaskDelay(1) };
     }
     Some(response)
+}
+
+fn diagnostic_error(method: u64, id: u64, message: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+    let mut response = [0u8; 128];
+    let used = dmesh_server::tagged::encode_numeric_error(
+        dmesh_server::services::DIAGNOSTIC_COMPONENT,
+        method,
+        id,
+        message,
+        &mut response,
+    )?;
+    Some(alloc::vec::Vec::from(&response[..used]))
 }
 
 /// Serve a correlated, bounded runtime snapshot over any tagged bearer.

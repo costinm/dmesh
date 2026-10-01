@@ -30,6 +30,9 @@ pub mod core_runtime;
 pub mod crypto_esp;
 mod firmware_identity;
 pub mod flash;
+/// Main-only retained firmware log lines used by the remote `log-watch`
+/// diagnostic stream.
+pub mod log_history;
 /// Main-specific policy entry point. The implementation is intentionally
 /// separate from the shared engine so Main can evolve without making the
 /// frozen Recovery lane link or execute its policy.

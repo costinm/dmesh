@@ -103,9 +103,11 @@ pub(crate) fn connection_tx_burst_packets() -> usize {
     1
 }
 pub(crate) fn connection_delay_ms() -> Option<u32> {
-    None
+    crate::quic_node_esp::connection_delay_ms()
 }
-pub(crate) fn schedule_connection_timer() {}
+pub(crate) fn schedule_connection_timer() {
+    crate::quic_node_esp::schedule_connection_timer();
+}
 pub(crate) fn schedule_uart_egress_ready() {
     // Send completion returns the retained pool lease and may unblock a stream
     // write which lost the race with an ACK. Wake the sole QUIC owner so it
@@ -207,6 +209,7 @@ pub(crate) fn receive_main_espnow(
             crate::quic_node_esp::receive_now_packet(peer, packet);
             None
         }
+        dmesh_server::raw_wifi::EspNowPayloadClass::Unrecognized => None,
     }
 }
 pub(crate) fn poll_espnow(
@@ -217,6 +220,5 @@ pub(crate) fn poll_espnow(
         .mac
         .into_iter()
         .fold(0_u64, |value, octet| (value << 8) | u64::from(octet));
-    quic_lite::PeerL2Address::new(value.max(1))
-        .and_then(|path| poll_connection(path, response))
+    quic_lite::PeerL2Address::new(value.max(1)).and_then(|path| poll_connection(path, response))
 }

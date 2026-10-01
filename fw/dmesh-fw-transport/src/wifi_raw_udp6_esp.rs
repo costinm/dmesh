@@ -6,13 +6,13 @@
 
 use core::{
     ffi::c_void,
-    sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering},
 };
 
 use crate::raw_udp6::{
-    encode_neighbor_advertisement, encode_station_ipv6_data_frame, encode_station_udp6_data_frame,
-    encode_udp6, link_local_from_mac, parse_neighbor_solicitation, parse_udp6,
-    parse_udp6_for_destination, Error,
+    Error, encode_neighbor_advertisement, encode_station_ipv6_data_frame,
+    encode_station_udp6_data_frame, encode_udp6, link_local_from_mac, parse_neighbor_solicitation,
+    parse_udp6, parse_udp6_for_destination,
 };
 
 pub const RAW_UDP6_PORT: u16 = 3339;

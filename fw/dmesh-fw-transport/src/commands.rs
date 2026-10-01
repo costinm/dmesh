@@ -509,8 +509,8 @@ impl ProfileControlError {
 
 #[cfg(test)]
 mod command_tests {
-    use super::{apply_control_record, apply_control_record_result, ControlApplyResult};
-    use crate::{state::direct_record_generation_changed_from, TransportProfile};
+    use super::{ControlApplyResult, apply_control_record, apply_control_record_result};
+    use crate::{TransportProfile, state::direct_record_generation_changed_from};
 
     #[test]
     fn direct_record_arrival_during_worker_is_not_missed() {

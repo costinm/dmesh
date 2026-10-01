@@ -5,7 +5,7 @@
 //! call sites while each radio is converted to `PacketBearer`.
 
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use quic_lite::{packet_pool::PoolBufferLease, OwnedPacket};
+use quic_lite::{OwnedPacket, packet_pool::PoolBufferLease};
 
 pub const FRAME_CAPACITY: usize = crate::TRANSPORT_MTU + 96;
 pub const ESP_CALLBACK_PACKET_SLOTS: usize = 8;

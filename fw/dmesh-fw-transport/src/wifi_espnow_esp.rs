@@ -106,6 +106,15 @@ static ACTION_PARSE_BUSY: AtomicBool = AtomicBool::new(false);
 const DUPLICATE_ACTION_WINDOW_MS: u32 = 20;
 static TX_ACTIONS: AtomicU32 = AtomicU32::new(0);
 static TX_FAILURES: AtomicU32 = AtomicU32::new(0);
+// NOW-only submit-path metrics. The generic TX_ACTIONS/TX_FAILURES counters
+// also include NAN/public action traffic and local queue/preflight failures,
+// so they are not suitable for telemetry.now_metrics.
+static NOW_TX_ATTEMPTED: AtomicU32 = AtomicU32::new(0);
+static NOW_TX_ACCEPTED: AtomicU32 = AtomicU32::new(0);
+static NOW_TX_FAILED: AtomicU32 = AtomicU32::new(0);
+static NOW_TX_BUSY: AtomicU32 = AtomicU32::new(0);
+static NOW_TX_RETRY_PENDING: AtomicBool = AtomicBool::new(false);
+static NOW_TX_RETRY_AT_MS: AtomicU32 = AtomicU32::new(0);
 static TX_LAST_ERROR: AtomicI32 = AtomicI32::new(0);
 static TX_DURATION_TOTAL_US: AtomicU32 = AtomicU32::new(0);
 static TX_DURATION_MAX_US: AtomicU32 = AtomicU32::new(0);
@@ -176,6 +185,55 @@ pub fn stats() -> (u32, u32, u32, u32) {
     )
 }
 
+/// NOW-only action submission counts: calls to the serialized NOW sender,
+/// ESP-IDF accepted submissions, and calls that failed before acceptance.
+pub fn now_tx_metrics() -> (u32, u32, u32, u32) {
+    (
+        NOW_TX_ATTEMPTED.load(Ordering::Relaxed),
+        NOW_TX_ACCEPTED.load(Ordering::Relaxed),
+        NOW_TX_FAILED.load(Ordering::Relaxed),
+        NOW_TX_BUSY.load(Ordering::Relaxed),
+    )
+}
+
+pub(crate) fn now_tx_retry_delay_ms() -> Option<u32> {
+    if !NOW_TX_RETRY_PENDING.load(Ordering::Acquire) {
+        return None;
+    }
+    let deadline = NOW_TX_RETRY_AT_MS.load(Ordering::Acquire);
+    let now = (unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) as u64 / 1_000) as u32;
+    let remaining = deadline.wrapping_sub(now);
+    if remaining > i32::MAX as u32 {
+        // The owner may reach this calculation just after the deadline. Keep
+        // the retry pending and schedule an immediate owner turn rather than
+        // clearing the only readiness notification.
+        Some(1)
+    } else {
+        Some(remaining.max(1))
+    }
+}
+
+pub(crate) fn take_now_tx_retry_if_due() -> bool {
+    if !NOW_TX_RETRY_PENDING.load(Ordering::Acquire) {
+        return false;
+    }
+    let deadline = NOW_TX_RETRY_AT_MS.load(Ordering::Acquire);
+    let now = (unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) as u64 / 1_000) as u32;
+    if now.wrapping_sub(deadline) > i32::MAX as u32 {
+        return false;
+    }
+    NOW_TX_RETRY_PENDING
+        .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NowTransmitResult {
+    Accepted,
+    Busy,
+    Failed,
+}
+
 /// Bounded framing evidence for the ROC action callback.  It deliberately
 /// exposes only a four-byte prefix and length, never an application record.
 pub fn last_roc_action_body() -> (u32, u32) {
@@ -231,6 +289,10 @@ pub fn reset_stats() {
     RX_SELF_ECHOES.store(0, Ordering::Release);
     TX_ACTIONS.store(0, Ordering::Release);
     TX_FAILURES.store(0, Ordering::Release);
+    NOW_TX_ATTEMPTED.store(0, Ordering::Release);
+    NOW_TX_ACCEPTED.store(0, Ordering::Release);
+    NOW_TX_FAILED.store(0, Ordering::Release);
+    NOW_TX_BUSY.store(0, Ordering::Release);
     TX_LAST_ERROR.store(0, Ordering::Release);
     TX_DURATION_TOTAL_US.store(0, Ordering::Release);
     TX_DURATION_MAX_US.store(0, Ordering::Release);
@@ -351,11 +413,11 @@ pub fn stop_action_ingress() {
 /// `ieee80211_recv_action_register(127, 0, ...)` has the callback ABI
 /// The private C6 action dispatcher has two call forms. Its vendor-reassembled
 /// path uses `(context, length, payload)`. Generic STA/AP action ingress uses
-/// `(interface, ieee80211_header, body_start, body_end)`. Both forms have
-/// already checked category/OUI/vendor IEs and supplied the complete NOW body,
-/// so this is deliberately an ABI adaptation, not a raw 802.11 frame parser.
-/// Parse or copy the bounded body exactly once, directly into the shared QUIC
-/// packet pool; none of the private input pointers outlive this callback.
+/// `(interface, ieee80211_header, body_start, body_end)`. The first form still
+/// supplies the category/action/OUI and vendor-IE bytes (the reassembly only
+/// joins IEs); both forms therefore use the same portable body parser to strip
+/// framing and write the QUIC datagram directly into the shared packet pool.
+/// This is deliberately an ABI adaptation, not a raw 802.11 frame parser.
 pub(crate) fn receive_registered_action_payload(
     peer_context: *mut core::ffi::c_void,
     second: usize,
@@ -413,15 +475,13 @@ pub(crate) fn receive_registered_action_payload(
         .fold(0u32, |value, byte| (value << 8) | u32::from(*byte));
     LAST_REGISTERED_BODY_PREFIX.store(prefix, Ordering::Relaxed);
     if vendor_reassembled {
-        // The vendor helper already concatenated the bodies. Copy once into
-        // the shared QUIC packet pool; classification and handling then use
-        // that same buffer.
+        // The callback has reassembled the vendor IEs, not removed the
+        // action/vendor envelope. Parse that envelope into the pool just like
+        // the generic action-body path; copying `body` verbatim would enqueue
+        // `7f 18 fe 34 ...` as if those framing bytes were a QUIC header.
         receive_now_with(|output| {
-            if len > output.len() {
-                return None;
-            }
-            output[..len].copy_from_slice(body);
-            Some((source, len))
+            dmesh_rawnan::espnow::parse_action_body_into(body, output)
+                .map(|used| (source, used))
         });
         return;
     }
@@ -567,6 +627,11 @@ fn admit_now_payload(source: [u8; 6], payload: &[u8]) -> bool {
             false
         }
         dmesh_server::raw_wifi::EspNowPayloadClass::QuicDatagram => true,
+        dmesh_server::raw_wifi::EspNowPayloadClass::Unrecognized => {
+            RX_INVALID_DROPS.fetch_add(1, Ordering::Relaxed);
+            RX_DROPS.fetch_add(1, Ordering::Relaxed);
+            false
+        }
     }
 }
 
@@ -642,8 +707,13 @@ pub(crate) fn dispatch_ingress(item: crate::shared_ingress_esp::IngressPacket, p
             TX_FAILURES.fetch_add(1, Ordering::Relaxed);
         } else {
             let packet = &response[..used];
-            if !transmit_from_worker(peer, packet) {
-                TX_FAILURES.fetch_add(1, Ordering::Relaxed);
+            match try_transmit_from_worker(peer, packet) {
+                NowTransmitResult::Accepted | NowTransmitResult::Failed => {}
+                NowTransmitResult::Busy => {
+                    if !crate::quic_node_esp::queue_now_control_response(peer, packet) {
+                        TX_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
             }
         }
     }
@@ -684,10 +754,15 @@ pub(crate) fn dispatch_pending_control_response() {
         return;
     }
     let _ = crate::wifi_nan_dw_capture_esp::request_permissive_capture(600);
-    if !transmit_from_worker(peer, packet.bytes()) {
-        TX_FAILURES.fetch_add(1, Ordering::Relaxed);
+    match try_transmit_from_worker(peer, packet.bytes()) {
+        NowTransmitResult::Accepted | NowTransmitResult::Failed => drop(packet),
+        NowTransmitResult::Busy => {
+            if !crate::quic_node_esp::requeue_pending_now_control_response(peer, packet) {
+                TX_FAILURES.fetch_add(1, Ordering::Relaxed);
+            }
+            return;
+        }
     }
-    drop(packet);
     if crate::quic_node_esp::now_control_response_pending() == Some(true) {
         crate::main_runtime::request_quic_ingress();
     }
@@ -698,14 +773,27 @@ pub(crate) fn dispatch_pending_control_response() {
 /// QUIC packet egress and deferred control replies call this only from Main's
 /// serialized event owner, retaining one radio submit owner and avoiding an
 /// extra queue turn inside the short C6 action reply window.
-pub(crate) fn transmit_from_worker(peer: EspNowPeer, payload: &[u8]) -> bool {
-    transmit_submitted(peer, payload, NOW_ACTION_TX_SERVER_WAIT_MS)
+pub(crate) fn try_transmit_from_worker(peer: EspNowPeer, payload: &[u8]) -> NowTransmitResult {
+    NOW_TX_ATTEMPTED.fetch_add(1, Ordering::Relaxed);
+    let result = transmit_submitted(peer, payload, NOW_ACTION_TX_SERVER_WAIT_MS);
+    match result {
+        NowTransmitResult::Accepted => {
+            NOW_TX_ACCEPTED.fetch_add(1, Ordering::Relaxed);
+        }
+        NowTransmitResult::Busy => {
+            NOW_TX_BUSY.fetch_add(1, Ordering::Relaxed);
+        }
+        NowTransmitResult::Failed => {
+            NOW_TX_FAILED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    result
 }
 
 /// Perform ESP-IDF action submission after common egress serialization, so the
 /// static action request is never concurrently initialized by independent
 /// client deadlines, connectionless callbacks, or server responses.
-fn transmit_submitted(peer: EspNowPeer, payload: &[u8], wait_time_ms: u32) -> bool {
+fn transmit_submitted(peer: EspNowPeer, payload: &[u8], wait_time_ms: u32) -> NowTransmitResult {
     // Normal NOW-like traffic is deliberately independent of NAN discovery
     // windows.  The common NAN policy enables promiscuous *receive* only for
     // the bounded DW capture; constraining data TX to that window both
@@ -722,7 +810,7 @@ fn transmit_submitted(peer: EspNowPeer, payload: &[u8], wait_time_ms: u32) -> bo
     };
     let Some(buffers) = action_buffers() else {
         TX_FAILURES.fetch_add(1, Ordering::Relaxed);
-        return false;
+        return NowTransmitResult::Failed;
     };
     let frame = unsafe { &mut (*buffers).tx_frame };
     // Auto normally means the STA identity, but an AP-only epoch has no
@@ -747,7 +835,7 @@ fn transmit_submitted(peer: EspNowPeer, payload: &[u8], wait_time_ms: u32) -> bo
         // handled by its scheduled capture path instead.
         dmesh_server::raw_wifi::RawWifiInterface::Nan => {
             TX_FAILURES.fetch_add(1, Ordering::Relaxed);
-            return false;
+            return NowTransmitResult::Failed;
         }
     };
     let local = crate::wifi_esp::interface_mac(interface).unwrap_or_else(|| unsafe { LOCAL_MAC });
@@ -757,7 +845,8 @@ fn transmit_submitted(peer: EspNowPeer, payload: &[u8], wait_time_ms: u32) -> bo
     let Ok(frame_len) =
         dmesh_rawnan::espnow::encode_action_frame(frame, destination, local, [0xff; 6], payload)
     else {
-        return false;
+        TX_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return NowTransmitResult::Failed;
     };
     let action = &frame[24..frame_len];
     // The bearer has no independent egress queue, but it does have a local
@@ -772,7 +861,7 @@ fn transmit_submitted(peer: EspNowPeer, payload: &[u8], wait_time_ms: u32) -> bo
         request.request.type_ = esp_idf_sys::wifi_action_tx_t_WIFI_OFFCHAN_TX_REQ;
         let Some((channel, secondary)) = crate::wifi_esp::current_channel() else {
             TX_FAILURES.fetch_add(1, Ordering::Relaxed);
-            return false;
+            return NowTransmitResult::Failed;
         };
         request.request.channel = channel;
         request.request.sec_channel = secondary;
@@ -794,11 +883,18 @@ fn transmit_submitted(peer: EspNowPeer, payload: &[u8], wait_time_ms: u32) -> bo
     if sent == esp_idf_sys::ESP_OK {
         TX_LAST_ERROR.store(0, Ordering::Relaxed);
         TX_ACTIONS.fetch_add(1, Ordering::Relaxed);
-        true
+        NowTransmitResult::Accepted
+    } else if sent == esp_idf_sys::ESP_ERR_NO_MEM {
+        TX_LAST_ERROR.store(sent, Ordering::Relaxed);
+        TX_FAILURES.fetch_add(1, Ordering::Relaxed);
+        let now_ms = (unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) as u64 / 1_000) as u32;
+        NOW_TX_RETRY_AT_MS.store(now_ms.wrapping_add(10), Ordering::Release);
+        NOW_TX_RETRY_PENDING.store(true, Ordering::Release);
+        NowTransmitResult::Busy
     } else {
         TX_LAST_ERROR.store(sent, Ordering::Relaxed);
         TX_FAILURES.fetch_add(1, Ordering::Relaxed);
-        false
+        NowTransmitResult::Failed
     }
 }
 
@@ -806,11 +902,20 @@ fn transmit_submitted(peer: EspNowPeer, payload: &[u8], wait_time_ms: u32) -> bo
 /// recognizes the tagged discovery schema before handing opaque packets to the
 /// registered QUIC bearer.
 pub fn broadcast_discovery(record: &[u8]) -> bool {
-    dmesh_server::announce::decode_announce(record).is_some()
-        // Main runtime calls announcements from its serialized owner. The
-        // shared ingress TX hook is intentionally absent: submit directly
-        // through the NOW action lane rather than silently dropping them.
-        && transmit_from_worker(EspNowPeer { mac: [0xff; 6] }, record)
+    if dmesh_server::announce::decode_announce(record).is_none() {
+        return false;
+    }
+    // Main runtime calls announcements from its serialized owner. The
+    // shared ingress TX hook is intentionally absent: submit directly
+    // through the NOW action lane. The borrowed record is never returned as
+    // a pool lease; only a transient busy result copies it into the shared
+    // pool so the owner can retry it later.
+    let peer = EspNowPeer { mac: [0xff; 6] };
+    match try_transmit_from_worker(peer, record) {
+        NowTransmitResult::Accepted => true,
+        NowTransmitResult::Busy => crate::quic_node_esp::queue_now_control_response(peer, record),
+        NowTransmitResult::Failed => false,
+    }
 }
 
 /// Send a pre-built public action body through the same ESP-IDF action-TX

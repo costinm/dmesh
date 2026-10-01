@@ -805,6 +805,7 @@ pub unsafe extern "C" fn dmesh_uart_log_line(bytes: *const u8, len: usize) -> i3
         return -1;
     }
     let line = core::slice::from_raw_parts(bytes, len);
+    crate::log_history::push(line);
     i32::from(send_debug_text(line))
 }
 
