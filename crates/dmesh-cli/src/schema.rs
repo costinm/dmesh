@@ -41,6 +41,29 @@ fn decode_tagged_reply(schema: &TaggedSchema, payload: &[u8]) -> Result<Value> {
     if let Some(method) = wire.method {
         record.method = device_name(method)?;
     }
+    // The device-directed probe result uses a response-specific field map;
+    // its numeric tags intentionally do not mirror the request tags. The
+    // shared presentation catalog currently describes only input fields, so
+    // project these five stable result fields before generic rendering can
+    // mislabel (for example) `status` as `bytes`.
+    if wire.component == Some(dmesh_server::tagged::Name::Tag(
+        dmesh_server::probe::PROBE_COMPONENT,
+    )) && wire.method == Some(dmesh_server::tagged::Name::Tag(dmesh_server::probe::PROBE_RUN))
+    {
+        if let Some(result) = record.result.as_mut().and_then(Value::as_object_mut) {
+            for (tag, name) in [
+                ("1", "status"),
+                ("2", "peer"),
+                ("3", "requested_bytes"),
+                ("4", "received_bytes"),
+                ("5", "elapsed_us"),
+            ] {
+                if let Some(value) = result.remove(tag) {
+                    result.insert(name.to_owned(), value);
+                }
+            }
+        }
+    }
     Ok(schema.to_jsonl(&record))
 }
 
@@ -62,15 +85,13 @@ pub fn render_device_record(schema: &TaggedSchema, payload: &[u8]) -> String {
     if payload.is_empty() {
         return "kind=empty".to_owned();
     }
-    if bytes_are_text(payload) {
-        return format!(
-            "kind=text text={}",
-            serde_json::to_string(&text_preview(payload)).expect("string JSON")
-        );
-    }
     match decode_tagged_reply(schema, payload) {
         Ok(decoded) if decoded.get("error").is_none() => cbor_log_fields(&decoded),
         Ok(decoded) => format!("kind=cbor_error value={decoded}"),
+        Err(_) if bytes_are_text(payload) => format!(
+            "kind=text text={}",
+            serde_json::to_string(&text_preview(payload)).expect("string JSON")
+        ),
         Err(_) => format!(
             "kind=raw bytes={} hex={}",
             payload.len(),
@@ -149,7 +170,13 @@ fn encode_schema_fields_with_id(
     id: u64,
     direct: bool,
 ) -> Result<Vec<u8>> {
-    let entry = schema.validate_fields(method, fields)?;
+    let mut request_fields = fields.clone();
+    let probe_client = if method == "probe" {
+        request_fields.remove("to")
+    } else {
+        None
+    };
+    let entry = schema.validate_fields(method, &request_fields)?;
     if direct && (method != "transport.set" || entry.component != NameOrTag::Tag(1)) {
         anyhow::bail!("{method} is stream-only; only transport.set has a direct encoding");
     }
@@ -208,7 +235,14 @@ fn encode_schema_fields_with_id(
             .context("radio.tx request")?;
         return Ok(wire[..used].to_vec());
     }
-    let mut record = schema.record_from_value(method, &Value::Object(fields.clone()))?;
+    let mut record = schema.record_from_value(method, &Value::Object(request_fields))?;
+    if let Some(probe_client) = probe_client {
+        let uri = probe_client
+            .as_str()
+            .and_then(dmesh_server::probe::ProbeDestination::parse)
+            .ok_or_else(|| anyhow::anyhow!("invalid probe destination URI in to"))?;
+        record.to = Some(Value::String(uri.as_str().to_owned()));
+    }
     record.id = Some(Value::from(id));
     mesh::cbor::encode_record(&record)
 }
@@ -258,6 +292,41 @@ mod tests {
             ),
             "radio.count=2 radio.status=ok"
         );
+    }
+
+    #[test]
+    fn mostly_ascii_diagnostic_cbor_is_decoded_before_text_fallback() {
+        let schema = load_tagged_schema();
+        let mut result = [0u8; 320];
+        let mut encoder = dmesh_server::cbor::Encoder::new(&mut result);
+        encoder.map(2).unwrap();
+        encoder.text_value(b"cursor").unwrap();
+        encoder.uint(8).unwrap();
+        encoder.text_value(b"records").unwrap();
+        encoder.array(1).unwrap();
+        encoder.map(2).unwrap();
+        encoder.text_value(b"sequence").unwrap();
+        encoder.uint(8).unwrap();
+        encoder.text_value(b"line").unwrap();
+        encoder
+            .text_value(b"wifi: remote diagnostic line with mostly printable ASCII")
+            .unwrap();
+        let result_len = encoder.len();
+        drop(encoder);
+
+        let mut wire = [0u8; 400];
+        let used = dmesh_server::tagged::encode_numeric_response(
+            dmesh_server::services::DIAGNOSTIC_COMPONENT,
+            dmesh_server::services::DIAGNOSTIC_LOG_WATCH_METHOD,
+            8,
+            &result[..result_len],
+            &mut wire,
+        )
+        .unwrap();
+        let rendered = render_device_record(&schema, &wire[..used]);
+        assert!(!rendered.contains("kind=text"), "{rendered}");
+        assert!(rendered.contains("log-watch"), "{rendered}");
+        assert!(rendered.contains("remote diagnostic line"), "{rendered}");
     }
     use super::{
         encode_direct_command, encode_direct_command_with_id, encode_stream_argv_with_id,
@@ -439,6 +508,54 @@ mod tests {
             dmesh_server::probe::decode_probe_run_record(record),
             Some((44, dmesh_server::probe::ProbeServiceRequest::new(4096, 512)))
         );
+        let directed = encode_stream_command_with_id(
+            "probe to=mesh://fc00::a4 bytes=256 packet_size=128 peer=espnow://02:11:22:33:44:55",
+            45,
+        )
+        .expect("device-directed probe remains the probe method");
+        let record = dmesh_server::tagged::decode(&directed).expect("tagged probe request");
+        assert_eq!(
+            record.to,
+            Some(dmesh_server::tagged::Name::Text(b"mesh://fc00::a4")),
+            "wire={directed:02x?}"
+        );
+        let (id, request) =
+            dmesh_server::probe::decode_probe_run_record(record).expect("directed probe fields");
+        assert_eq!(id, 45);
+        assert_eq!(
+            request
+                .peer
+                .and_then(|destination| destination.espnow_mac()),
+            Some([0x02, 0x11, 0x22, 0x33, 0x44, 0x55])
+        );
+    }
+
+    #[test]
+    fn directed_probe_result_uses_response_field_names() {
+        let mut request = dmesh_server::probe::ProbeServiceRequest::new(128, 128);
+        request.peer = Some(
+            dmesh_server::probe::ProbeDestination::parse("espnow://02:11:22:33:44:55")
+                .unwrap(),
+        );
+        let mut response = [0u8; 256];
+        let used = dmesh_server::probe::encode_probe_result_response(
+            46,
+            request,
+            true,
+            128,
+            9_876,
+            &mut response,
+        )
+        .unwrap();
+        let rendered = render_device_record(&load_tagged_schema(), &response[..used]);
+        assert!(rendered.contains("result.status=ok"), "{rendered}");
+        assert!(
+            rendered.contains("result.peer=espnow://02:11:22:33:44:55"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("result.requested_bytes=128"), "{rendered}");
+        assert!(rendered.contains("result.received_bytes=128"), "{rendered}");
+        assert!(rendered.contains("result.elapsed_us=9876"), "{rendered}");
     }
 
     #[test]

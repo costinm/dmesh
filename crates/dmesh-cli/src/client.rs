@@ -770,14 +770,10 @@ pub(crate) fn run_udp_service_client(arguments: &[String]) -> Result<(), String>
         .ok_or("missing schema service; use dmesh-cli DEVICE METHOD [--field=value ...]")?;
     let request = encode_stream_argv_with_id(&arguments[1..], fresh_request_id())
         .map_err(|error| error.to_string())?;
+    let timeout = stream_request_timeout(&request)?;
     let probe_request = dmesh_server::probe::decode_probe_run_record(
         dmesh_server::tagged::decode(&request).ok_or("invalid tagged request")?,
     );
-    let timeout = if probe_request.is_some() {
-        Duration::from_secs(45)
-    } else {
-        Duration::from_secs(3)
-    };
     let started = Instant::now();
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
     let response = if command == "object.flash" {
@@ -799,7 +795,9 @@ pub(crate) fn run_udp_service_client(arguments: &[String]) -> Result<(), String>
             ))?
             .bytes
     } else {
-        if let Some((_, probe_request)) = probe_request {
+        if let Some((_, probe_request)) =
+            probe_request.filter(|(_, request)| request.peer.is_none())
+        {
             let result = runtime.block_on(crate::node_client::probe_udp(
                 udp_bind_for_peer(peer),
                 peer,
@@ -835,6 +833,16 @@ pub(crate) fn run_udp_service_client(arguments: &[String]) -> Result<(), String>
         render_device_record(&load_tagged_schema(), &response),
     );
     Ok(())
+}
+
+fn stream_request_timeout(request: &[u8]) -> Result<Duration, String> {
+    let record = dmesh_server::tagged::decode(request).ok_or("invalid tagged request")?;
+    let long_running = dmesh_server::probe::decode_probe_run_record(record).is_some();
+    Ok(if long_running {
+        Duration::from_secs(45)
+    } else {
+        Duration::from_secs(3)
+    })
 }
 
 /// Remove the CLI-only object source selector before schema encoding.  A
@@ -1837,7 +1845,10 @@ fn exchange_udp_stream_record_with_timeout(
 
 #[cfg(test)]
 mod tests {
-    use super::{FlashTarget, flash_target_matches_announce, parse_serial_stream_arguments};
+    use super::{
+        FlashTarget, flash_target_matches_announce, parse_serial_stream_arguments,
+        stream_request_timeout,
+    };
     use std::time::Duration;
 
     #[test]

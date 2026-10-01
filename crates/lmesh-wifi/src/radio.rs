@@ -117,9 +117,9 @@ fn action_path_id(peer: [u8; 6]) -> quic_lite::PeerL2Address {
 /// Discovery/status records are raw tagged CBOR on ESP-NOW. Every other
 /// action payload is an opaque QUIC packet for the ESP-NOW bearer.
 fn action_payload_is_discovery(packet: &[u8]) -> bool {
-    matches!(
+    !matches!(
         dmesh_server::raw_wifi::classify_espnow_payload(packet),
-        dmesh_server::raw_wifi::EspNowPayloadClass::TaggedControl
+        dmesh_server::raw_wifi::EspNowPayloadClass::QuicDatagram
     )
 }
 
@@ -1646,10 +1646,13 @@ impl RadioService {
         })
     }
 
-    /// Linux's current socket adapter does not yet export a stable raw-UDP6
-    /// counter set. An empty map expresses unavailable optional facts.
+    /// Linux currently exposes one stable local-link counter: unmatched
+    /// discovery datagrams (stale peers still emitting the retired
+    /// QUIC direct-packet announce envelope).
     pub fn udp6_metrics(&self) -> Value {
-        json!({})
+        json!({
+            "announce_parse_errors": crate::mesh_core::announce_parse_errors(),
+        })
     }
 
     /// Project the existing common `WifiLinkMetrics` station records without
@@ -2008,6 +2011,11 @@ impl RadioService {
         if wait_ms != 0 {
             std::thread::sleep(Duration::from_millis(wait_ms));
         }
+        // One bounded response. The retained history can hold many observed
+        // discovery events across a long DW window (each carrying a full
+        // announce projection), so cap the inline events and keep the full
+        // stream on the history surface; an unbounded result overflows the
+        // 64 KiB seqpacket record limit.
         let fresh = self
             .history
             .lock()
@@ -2022,7 +2030,9 @@ impl RadioService {
             })
             .map(|event| event.value.clone())
             .collect::<Vec<_>>();
-        result["fresh_events"] = json!(fresh);
+        let fresh_len = fresh.len();
+        result["fresh_events"] = json!(fresh.into_iter().rev().take(8).collect::<Vec<_>>());
+        result["fresh_events_dropped"] = json!(fresh_len.saturating_sub(8));
         result["inventory"] = self.rawnan_status(Some(iface.clone()))["discovered_devices"].clone();
         self.record("announce.discovery", result.clone());
         result
@@ -2396,6 +2406,85 @@ impl RadioService {
             .cloned()
             .collect::<Vec<_>>();
         json!({ "events": events })
+    }
+
+    /// Bounded, oldest-last diagnostic history for the shared component-9
+    /// event/log-watch surface. `since_ms` filters by retained event time;
+    /// the returned cursor is the newest retained timestamp so a client can
+    /// resume from `since=cursor`.
+    pub fn diagnostic_events(&self, since_ms: Option<u64>, limit: Option<usize>) -> Value {
+        let limit = limit
+            .unwrap_or(16)
+            .clamp(1, dmesh_server::services::LOG_WATCH_MAX_RECORDS);
+        let since_ms = since_ms.unwrap_or(0);
+        let history = self
+            .history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let selected: Vec<&RadioEvent> = history
+            .iter()
+            .filter(|event| event.ts_millis >= u128::from(since_ms))
+            .collect();
+        let start = selected.len().saturating_sub(limit);
+        let slice = &selected[start..];
+        let cursor = slice
+            .last()
+            .map(|event| u64::try_from(event.ts_millis).unwrap_or(u64::MAX))
+            .unwrap_or(since_ms);
+        let events = slice
+            .iter()
+            .map(|event| {
+                json!({
+                    "ts_millis": u64::try_from(event.ts_millis).unwrap_or(u64::MAX),
+                    "key": event.key,
+                    "source": event.source,
+                    "value": event.value,
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({ "cursor": cursor, "events": events })
+    }
+
+    /// Reset the process-local capture counters. QUIC-lite and discovery
+    /// counters keep their own lifetime; this covers the raw-monitor ledger
+    /// exposed through `radio.snapshot`.
+    pub fn reset_capture_counters(&self) -> Value {
+        *host_capture_counters()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = HostCaptureCounters::default();
+        json!({ "ok": true })
+    }
+
+    /// Map the host capture ledger into the shared `radio.snapshot`
+    /// vocabulary. Fields the Linux adapter cannot observe are omitted
+    /// rather than synthesized as zero.
+    pub fn radio_snapshot(&self) -> Value {
+        let raw = self.wifi_raw_metrics(None);
+        let capture = raw.get("capture").cloned().unwrap_or(Value::Null);
+        let mut snapshot = serde_json::Map::new();
+        snapshot.insert("epoch".to_owned(), Value::from(0));
+        snapshot.insert(
+            "applied_channel".to_owned(),
+            Value::from(raw_wifi_channel(None)),
+        );
+        for (shared, source) in [
+            ("rx_driver_dispatch", "dispatch"),
+            ("rx_parser_accepted", "rx"),
+            ("rx_dropped", "dispatch_errors"),
+        ] {
+            if let Some(value) = raw.get(source).cloned() {
+                snapshot.insert(shared.to_owned(), value);
+            }
+        }
+        if let Some(value) = capture.get("nan_beacons").cloned() {
+            snapshot.insert("nan_beacons".to_owned(), value);
+        }
+        if let Some(value) = capture.get("nan_rx").cloned() {
+            snapshot.insert("nan_sdfs".to_owned(), value);
+        }
+        snapshot.insert("tx_attempted".to_owned(), raw["monitor_frames"].clone());
+        snapshot.insert("capture".to_owned(), capture);
+        Value::Object(snapshot)
     }
 
     /// Return the configured local, remote, and future adapter inventory.
@@ -7501,7 +7590,7 @@ impl MonitorTxSocket {
                 self.fd,
                 packet.as_ptr() as *const libc::c_void,
                 packet.len(),
-                0,
+                libc::MSG_DONTWAIT,
             )
         };
         if written < 0 {
@@ -9856,10 +9945,12 @@ impl RawActionTransmitter {
         peer: [u8; 6],
         payload: &[u8],
         tx_rate_mbps: u8,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), RawActionSubmitError> {
         if self.socket.is_none() {
             let monitor_iface = monitor_iface_name(&self.iface);
-            self.socket = Some(MonitorTxSocket::open(&monitor_iface)?);
+            self.socket = Some(
+                MonitorTxSocket::open(&monitor_iface).map_err(RawActionSubmitError::Failed)?,
+            );
         }
         let result = send_raw_action_datagram_on_socket(
             &self.iface,
@@ -9868,11 +9959,28 @@ impl RawActionTransmitter {
             payload,
             tx_rate_mbps,
         );
-        if result.is_err() {
-            self.socket.take();
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) if raw_action_error_is_would_block(&error) => {
+                Err(RawActionSubmitError::WouldBlock)
+            }
+            Err(error) => {
+                self.socket.take();
+                Err(RawActionSubmitError::Failed(error))
+            }
         }
-        result
     }
+}
+
+pub(crate) enum RawActionSubmitError {
+    WouldBlock,
+    Failed(anyhow::Error),
+}
+
+fn raw_action_error_is_would_block(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
 }
 
 /// Send using a caller-owned AF_PACKET socket.  The receive loop sends both
@@ -10405,7 +10513,7 @@ fn monitor_receive_loop(
                             // short-header QUIC packets pass this direct decoder.
                             return false;
                         }
-                        true
+                        admission == dmesh_server::raw_wifi::EspNowPayloadClass::QuicDatagram
                             },
                         );
                         continue;
@@ -12994,6 +13102,20 @@ mod tests {
     use p256::ecdsa::signature::Signer;
 
     #[test]
+    fn raw_action_submit_classifies_only_nonblocking_socket_pressure_as_retryable() {
+        let would_block = anyhow::Error::new(std::io::Error::from(
+            std::io::ErrorKind::WouldBlock,
+        ))
+        .context("failed to send monitor frame");
+        let disconnected = anyhow::Error::new(std::io::Error::from(
+            std::io::ErrorKind::NotConnected,
+        ))
+        .context("failed to send monitor frame");
+        assert!(raw_action_error_is_would_block(&would_block));
+        assert!(!raw_action_error_is_would_block(&disconnected));
+    }
+
+    #[test]
     fn now_metrics_exclude_host_reflections_from_peer_action_count() {
         let directory = tempfile::tempdir().unwrap();
         let service = RadioService::from_environment_with_discovery_log(
@@ -13049,10 +13171,7 @@ mod tests {
         );
         assert_eq!(peer[0] & 1, 0, "the announced peer address is unicast");
         let alias = raw_action_response_address_with_alias_override(peer, true);
-        assert_eq!(
-            alias,
-            [0x21, 0x6e, 0xf1, 0x13, 0xa4, 0x00]
-        );
+        assert_eq!(alias, [0x21, 0x6e, 0xf1, 0x13, 0xa4, 0x00]);
         assert_eq!(alias[0] & 1, 1, "the receive alias is a group address");
     }
 

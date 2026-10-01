@@ -135,10 +135,11 @@ admission, and an application response.
 
 The [single lmesh tools catalog](../lmesh/resources/tools.json) carries local and
 device methods with their CBOR tags and field types. dmesh-cli discovers it in
-the same per-service layout as mesh-cli: `MESH_SCHEMA_DIR/lmesh/tools.json`,
-`$HOME/opt/lmesh/etc/schemas/tools.json`, or
-`/opt/lmesh/etc/schemas/tools.json`. The repository `env.sh` selects the source
-catalog; the packaged CLI selects its installed catalog. The shared device
+the same per-service layout as mesh-cli: all `.json` files under
+`MESH_SCHEMA_DIR/lmesh/`, then `/opt/lmesh/etc/schemas/`,
+`$HOME/opt/lmesh/etc/schemas/`, and `$HOME/etc/schemas/`. The repository
+`env.sh` selects the source catalog; the packaged CLI selects its installed
+catalog. The shared device
 control contract is specified in [root API](../../API.md).
 The firmware transport [README](../../fw/dmesh-fw-transport/README.md) records
 implementation and radio policy, not a second API schema.

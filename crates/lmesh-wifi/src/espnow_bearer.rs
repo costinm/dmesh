@@ -108,20 +108,23 @@ where
         peer: PeerL2Address,
         submission: EgressSubmission<P::Buffer>,
     ) -> Result<(), PacketSubmitError<P::Buffer>> {
-        let result = self.transmitter.send(
-            address_peer(peer),
-            submission.packet().bytes(),
-            6,
-        );
-        submission.complete(
-            if result.is_ok() {
-                PacketSendOutcome::Sent
-            } else {
-                PacketSendOutcome::Failed
-            },
-            0,
-        );
-        Ok(())
+        match self
+            .transmitter
+            .send(address_peer(peer), submission.packet().bytes(), 6)
+        {
+            Ok(()) => {
+                submission.complete(PacketSendOutcome::Sent, 0);
+                Ok(())
+            }
+            Err(crate::radio::RawActionSubmitError::WouldBlock) => {
+                Err(PacketSubmitError::WouldBlock(submission))
+            }
+            Err(crate::radio::RawActionSubmitError::Failed(error)) => {
+                tracing::warn!(peer = ?address_peer(peer), %error, "lmesh_espnow_submit_failed");
+                submission.complete(PacketSendOutcome::Failed, 0);
+                Ok(())
+            }
+        }
     }
 }
 
@@ -195,7 +198,7 @@ mod tests {
             dmesh_rawnan::espnow::build_action_frame([0xff; 6], source, [0xff; 6], &control)
                 .unwrap();
         let (bearer, ingress) = EspNowBearer::<TestPool>::new("not-opened-by-receive-test");
-        let mut node: quic_lite::QuicNode<TestPool> = quic_lite::QuicNode::new(None, &POOL);
+        let mut node: quic_lite::QuicNode<TestPool> = quic_lite::QuicNode::new(&POOL);
         node.add_bearer(bearer).unwrap();
 
         let available_before_control = POOL.available();

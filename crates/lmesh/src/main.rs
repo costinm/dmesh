@@ -17,7 +17,7 @@ async fn run() -> Result<()> {
     let wifi_iface = std::env::var("LMESH_WIFI_IFACE").unwrap_or_else(|_| "wlan1".to_owned());
     let (espnow, espnow_ingress) =
         lmesh_wifi::espnow_bearer::EspNowBearer::<HostPacketPool>::new(wifi_iface);
-    let mut node = lmesh_wifi::mesh_runtime::HostQuicNode::new(None, &HOST_PACKET_POOL);
+    let mut node = lmesh_wifi::mesh_runtime::HostQuicNode::new(&HOST_PACKET_POOL);
     node.add_bearer(bearer)
         .map_err(|error| anyhow::anyhow!("attach lmesh UDP bearer: {error:?}"))?;
     let now_bearer = node

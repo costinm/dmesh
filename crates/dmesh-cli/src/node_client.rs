@@ -111,7 +111,7 @@ pub(crate) async fn request_udp(
         let peer_l2_address = bearer_impl
             .register_peer(peer)
             .map_err(|error| format!("register UDP peer: {error:?}"))?;
-        let mut node = Node::new(None, &UDP_POOL);
+        let mut node = Node::new(&UDP_POOL);
         node.set_limits(quic_lite::NodeLimits::host())
             .expect("host QUIC node limits are valid");
         node.set_default_association_limits(quic_lite::AssociationLimits::host())
@@ -162,7 +162,7 @@ pub(crate) async fn probe_udp(
         let peer_l2_address = bearer_impl
             .register_peer(peer)
             .map_err(|error| format!("register UDP peer: {error:?}"))?;
-        let mut node = Node::new(None, &UDP_POOL);
+        let mut node = Node::new(&UDP_POOL);
         node.set_limits(quic_lite::NodeLimits::host())
             .expect("host QUIC node limits are valid");
         node.set_default_association_limits(quic_lite::AssociationLimits::host())
@@ -218,8 +218,10 @@ async fn exchange_probe(
         .await
         .map_err(|error| format!("finish UDP probe request: {error}"))?;
 
-    let plan =
-        quic_lite::probe::ProbePlan::from_request(request, quic_lite::DEFAULT_MAX_STREAM_PAYLOAD);
+    let plan = quic_lite::probe::ProbePlan::from_request(
+        request.workload(),
+        quic_lite::DEFAULT_MAX_STREAM_PAYLOAD,
+    );
     let mut receiver = quic_lite::probe::ProbeReceiver::new(2);
     let started = std::time::Instant::now();
     if let Some(delay) = request.initial_consume_delay_ms.filter(|delay| *delay != 0) {
@@ -295,7 +297,7 @@ pub(crate) async fn flash_udp(
         let peer_l2_address = bearer_impl
             .register_peer(peer)
             .map_err(|error| format!("register UDP peer: {error:?}"))?;
-        let mut node = Node::new(None, &UDP_POOL);
+        let mut node = Node::new(&UDP_POOL);
         node.set_limits(quic_lite::NodeLimits::host())
             .expect("host QUIC node limits are valid");
         node.set_default_association_limits(quic_lite::AssociationLimits::host())
@@ -361,7 +363,7 @@ pub(crate) async fn request_uart(
         }
     });
     let future = async {
-        let mut node = Node::new(None, &UART_POOL);
+        let mut node = Node::new(&UART_POOL);
         node.set_limits(quic_lite::NodeLimits::host())
             .expect("host QUIC node limits are valid");
         node.set_default_association_limits(quic_lite::AssociationLimits::host())
@@ -430,7 +432,7 @@ mod tests {
             runtime.block_on(async move {
                 let bearer =
                     quic_lite::bearer_udp::TokioUdpBearer::<8>::from_std(server_socket).unwrap();
-                let mut node = TestNode::new(None, &SERVER_POOL);
+                let mut node = TestNode::new(&SERVER_POOL);
                 node.set_limits(NodeLimits::host()).unwrap();
                 node.set_default_association_limits(AssociationLimits::host())
                     .unwrap();
@@ -483,7 +485,7 @@ mod tests {
             runtime.block_on(async move {
                 let bearer =
                     quic_lite::bearer_udp::TokioUdpBearer::<8>::from_std(server_socket).unwrap();
-                let mut node = TestNode::new(None, &SERVER_POOL);
+                let mut node = TestNode::new(&SERVER_POOL);
                 node.set_limits(NodeLimits::host()).unwrap();
                 node.set_default_association_limits(AssociationLimits::host())
                     .unwrap();
@@ -550,7 +552,7 @@ mod tests {
             runtime.block_on(async move {
                 let bearer =
                     quic_lite::bearer_udp::TokioUdpBearer::<8>::from_std(server_socket).unwrap();
-                let mut node = TestNode::new(None, &SERVER_POOL);
+                let mut node = TestNode::new(&SERVER_POOL);
                 node.set_limits(NodeLimits::host()).unwrap();
                 node.set_default_association_limits(AssociationLimits::host())
                     .unwrap();
@@ -569,7 +571,7 @@ mod tests {
                     let (_, request) =
                         dmesh_server::probe::decode_probe_run_record(record).unwrap();
                     let plan = quic_lite::probe::ProbePlan::from_request(
-                        request,
+                        request.workload(),
                         quic_lite::DEFAULT_MAX_STREAM_PAYLOAD,
                     );
                     let mut sender = quic_lite::probe::ProbeSender::new(

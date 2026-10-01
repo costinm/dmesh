@@ -27,15 +27,42 @@ use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, RwLock, oneshot};
 
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{debug, error, info, instrument, trace, warn};
 
 const STABLE_WIFI_UDP_PORT: u16 = 3336;
 const RAW_UDP6_PORT: u16 = 3339;
+
+/// Datagrams on the discovery socket that matched neither the common
+/// tagged-CBOR announce nor the legacy JSON envelope. Old firmware and
+/// Android peers still emit the retired QUIC direct-packet envelope, so this
+/// counts steady background traffic; the raw payload is only visible at
+/// trace level.
+static ANNOUNCE_PARSE_ERRORS: AtomicU64 = AtomicU64::new(0);
+static NEXT_ROUTED_PROBE_ID: AtomicU64 = AtomicU64::new(1);
+static SERVICE_STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Record the service start instant once the control plane is up.
+pub(crate) fn note_service_started() {
+    let _ = SERVICE_STARTED.set(std::time::Instant::now());
+}
+
+/// Whole seconds since the service owner started.
+pub(crate) fn service_uptime_secs() -> u64 {
+    SERVICE_STARTED
+        .get()
+        .map(|started| started.elapsed().as_secs())
+        .unwrap_or(0)
+}
+
+/// Total unmatched discovery datagrams since process start.
+pub fn announce_parse_errors() -> u64 {
+    ANNOUNCE_PARSE_ERRORS.load(Ordering::Relaxed)
+}
 
 /// A decoded common announce delivered by a local-link bearer. The callback
 /// takes semantic data, never a UDP buffer, so another local owner can merge
@@ -642,6 +669,19 @@ fn parse_unicast_mac(value: &str) -> Option<[u8; 6]> {
     (parts.next().is_none() && mac != [0; 6] && mac[0] & 1 == 0).then_some(mac)
 }
 
+fn parse_now_destination(value: &str) -> Option<[u8; 6]> {
+    dmesh_server::probe::ProbeDestination::parse(value)
+        .and_then(|destination| destination.espnow_mac())
+        // Preserve the existing direct-MAC command form while callers move
+        // to the shared URI destination syntax.
+        .or_else(|| parse_unicast_mac(value))
+}
+
+fn mesh_discovery_key(value: &str) -> Option<String> {
+    let destination = dmesh_server::probe::ProbeDestination::parse(value)?;
+    (destination.scheme() == "mesh").then(|| destination.target().to_owned())
+}
+
 fn common_discovery_status(radio: &lmesh_wifi::RadioService) -> serde_json::Value {
     let devices = radio
         .radio_devices()
@@ -1162,7 +1202,10 @@ impl LocalDiscovery {
                     }
                 }
                 Err(e) => {
-                    warn!("Failed to parse announcement from {}: {}", addr, e);
+                    ANNOUNCE_PARSE_ERRORS.fetch_add(1, Ordering::Relaxed);
+                    trace!(sender = %addr, error = %e, bytes = data.len(),
+                        hex = %base64_url_encode(data),
+                        "announce_parse_error");
                 }
             }
         }
@@ -2142,7 +2185,11 @@ fn decode_stream_response(response: &[u8]) -> Result<mesh::tagged::TaggedRecord>
 /// Execute one UDP request with the public node/stream API. The UDP bearer
 /// owns its socket and peer table; application code only supplies the peer
 /// selected from discovery and the stream payload.
-async fn request_udp_stream(peer: SocketAddr, payload: &[u8]) -> Result<Vec<u8>> {
+async fn request_udp_stream(
+    peer: SocketAddr,
+    payload: &[u8],
+    timeout: Duration,
+) -> Result<Vec<u8>> {
     let payload = payload.to_vec();
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
@@ -2152,13 +2199,19 @@ async fn request_udp_stream(peer: SocketAddr, payload: &[u8]) -> Result<Vec<u8>>
                 .enable_all()
                 .build()
                 .map_err(anyhow::Error::from)
-                .and_then(|runtime| runtime.block_on(request_udp_stream_local(peer, &payload)));
+                .and_then(|runtime| {
+                    runtime.block_on(request_udp_stream_local(peer, &payload, timeout))
+                });
             let _ = result_tx.send(result);
         })?;
     result_rx.await.context("UDP QUIC client stopped")?
 }
 
-async fn request_udp_stream_local(peer: SocketAddr, payload: &[u8]) -> Result<Vec<u8>> {
+async fn request_udp_stream_local(
+    peer: SocketAddr,
+    payload: &[u8],
+    timeout: Duration,
+) -> Result<Vec<u8>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     type Pool = quic_lite::packet_pool::PacketPool<8, { quic_lite::DEFAULT_PACKET_POOL_SLOT_SIZE }>;
@@ -2172,7 +2225,7 @@ async fn request_udp_stream_local(peer: SocketAddr, payload: &[u8]) -> Result<Ve
     let peer_l2_address = bearer_impl
         .register_peer(peer)
         .map_err(|error| anyhow::anyhow!("register UDP peer: {error:?}"))?;
-    let mut node = Node::new(None, &POOL);
+    let mut node = Node::new(&POOL);
     node.set_limits(quic_lite::NodeLimits::host())
         .expect("host QUIC node limits are valid");
     node.set_default_association_limits(quic_lite::AssociationLimits::host())
@@ -2212,7 +2265,7 @@ async fn request_udp_stream_local(peer: SocketAddr, payload: &[u8]) -> Result<Ve
             .map_err(|error| anyhow::anyhow!("finish UDP association: {error:?}"))?;
         Result::<Vec<u8>>::Ok(response)
     };
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    tokio::time::timeout(timeout, async {
         tokio::select! {
             result = driver.run() => Err(anyhow::anyhow!("UDP QUIC driver stopped: {result:?}")),
             result = exchange => result,
@@ -2229,10 +2282,11 @@ async fn request_now_stream(
     bearer: quic_lite::BearerId,
     peer: [u8; 6],
     payload: &[u8],
+    timeout: Duration,
 ) -> Result<Vec<u8>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    tokio::time::timeout(timeout, async {
         let association = node
             .associate(
                 quic_lite::PacketMeta {
@@ -2300,6 +2354,98 @@ impl LmeshService {
             .now_quic_client
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((node, bearer));
+    }
+
+    async fn run_routed_probe(
+        &self,
+        destination: &str,
+        bytes: Option<u64>,
+        packet_size: Option<u16>,
+        parallel_streams: Option<u8>,
+        initial_consume_delay_ms: Option<u32>,
+        consume_delay_ms: Option<u32>,
+        timeout_ms: Option<u64>,
+    ) -> Result<serde_json::Value> {
+        let mut request = dmesh_server::probe::ProbeServiceRequest::new(
+            bytes.unwrap_or(64 * 1024),
+            packet_size.unwrap_or(1024),
+        );
+        request.parallel_streams = parallel_streams;
+        request.initial_consume_delay_ms = initial_consume_delay_ms;
+        request.consume_delay_ms = consume_delay_ms;
+        let id = NEXT_ROUTED_PROBE_ID.fetch_add(1, Ordering::Relaxed).max(1);
+        let mut wire = [0; dmesh_server::probe::PROBE_RUN_REQUEST_MAX];
+        let used = dmesh_server::probe::encode_probe_run_request(request, id, &mut wire)
+            .context("encode routed QUIC probe request")?;
+        let timeout = Duration::from_millis(timeout_ms.unwrap_or(30_000).max(1));
+        let started = std::time::Instant::now();
+        let response = self
+            .request_probe_stream(destination, &wire[..used], timeout)
+            .await?;
+        if let Some(record) = dmesh_server::tagged::decode(&response)
+            && record.error.is_some()
+        {
+            anyhow::bail!("remote QUIC probe request was rejected");
+        }
+        let plan = quic_lite::probe::ProbePlan::from_request(
+            request.workload(),
+            quic_lite::DEFAULT_MAX_STREAM_PAYLOAD,
+        );
+        let expected = request.bytes.min(quic_lite::probe::MAX_BYTES);
+        let mut receiver = quic_lite::probe::ProbeReceiver::new(2);
+        let mut offset = 0u64;
+        for chunk in response.chunks(plan.packet_size.max(4)) {
+            let next = offset.saturating_add(chunk.len() as u64);
+            receiver
+                .receive(offset, next == expected, chunk)
+                .map_err(|error| anyhow::anyhow!("invalid QUIC probe response: {error:?}"))?;
+            offset = next;
+        }
+        if !receiver.is_complete() || receiver.bytes() != expected {
+            anyhow::bail!(
+                "QUIC probe response ended after {} of {expected} bytes",
+                receiver.bytes()
+            );
+        }
+        let elapsed_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        let result = quic_lite::probe::ProbeResult {
+            bytes: receiver.bytes(),
+            normal_bytes: receiver.bytes(),
+            high_bytes: 0,
+            low_bytes: 0,
+            elapsed_us,
+            callback_errors: *receiver.callback_errors(),
+        };
+        Ok(serde_json::json!({
+            "status": "ok",
+            "bytes": result.bytes,
+            "normal_bytes": result.normal_bytes,
+            "high_bytes": result.high_bytes,
+            "low_bytes": result.low_bytes,
+            "elapsed_us": result.elapsed_us,
+            "callback_errors": result.callback_errors,
+        }))
+    }
+
+    async fn request_probe_stream(
+        &self,
+        destination: &str,
+        request: &[u8],
+        timeout: Duration,
+    ) -> Result<Vec<u8>> {
+        if let Some(peer) = parse_now_destination(destination) {
+            self.require_owned_wifi_for_now()?;
+            let (node, bearer) = self
+                .now_quic_client
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .context("ESP-NOW bearer is not attached to the QUIC node")?;
+            request_now_stream(node, bearer, peer, request, timeout).await
+        } else {
+            let peer = self.resolve_udp_peer(destination).await?;
+            request_udp_stream(peer, request, timeout).await
+        }
     }
 
     /// Start the optional lmesh lab AP. lmesh-wifi remains the normal 100-TU
@@ -2421,6 +2567,8 @@ impl LmeshService {
         if let Some(peer) = explicit_udp_endpoint(destination)? {
             return require_live_udp6_scope(peer);
         }
+        let discovery_key = mesh_discovery_key(destination);
+        let destination = discovery_key.as_deref().unwrap_or(destination);
         let node = if let Some(node) = self.discovery.get_node(destination).await {
             node
         } else if let Some(peer) =
@@ -2495,7 +2643,17 @@ impl LmeshService {
         destination: &str,
         record: &[u8],
     ) -> Result<mesh::tagged::TaggedRecord> {
-        if let Some(peer) = parse_unicast_mac(destination) {
+        self.forward_tagged_record_with_timeout(destination, record, Duration::from_secs(10))
+            .await
+    }
+
+    async fn forward_tagged_record_with_timeout(
+        &self,
+        destination: &str,
+        record: &[u8],
+        timeout: Duration,
+    ) -> Result<mesh::tagged::TaggedRecord> {
+        if let Some(peer) = parse_now_destination(destination) {
             self.require_owned_wifi_for_now()?;
             let (node, bearer) = self
                 .now_quic_client
@@ -2505,12 +2663,12 @@ impl LmeshService {
                 .context(
                     "unsupported/no_quic_route: ESP-NOW bearer is not attached to the QUIC node",
                 )?;
-            let response = request_now_stream(node, bearer, peer, record).await?;
+            let response = request_now_stream(node, bearer, peer, record, timeout).await?;
             return decode_stream_response(&response)
                 .context("decode directed ESP-NOW QUIC tagged response");
         }
         let peer = self.resolve_udp_peer(destination).await?;
-        let response = request_udp_stream(peer, record).await?;
+        let response = request_udp_stream(peer, record, timeout).await?;
         decode_stream_response(&response).context("decode directed QUIC tagged response")
     }
 
@@ -2558,16 +2716,28 @@ impl LmeshService {
                 }
             }
             Request::Probe {
-                to: _,
-                bytes: _,
-                packet_size: _,
-                parallel_streams: _,
-                initial_consume_delay_ms: _,
-                consume_delay_ms: _,
-                timeout_ms: _,
-            } => mesh::protocol::Response::err(
-                "probe requires the main QuicNode request/response stream path",
-            ),
+                to,
+                bytes,
+                packet_size,
+                parallel_streams,
+                initial_consume_delay_ms,
+                consume_delay_ms,
+                timeout_ms,
+            } => match self
+                .run_routed_probe(
+                    &to,
+                    bytes,
+                    packet_size,
+                    parallel_streams,
+                    initial_consume_delay_ms,
+                    consume_delay_ms,
+                    timeout_ms,
+                )
+                .await
+            {
+                Ok(value) => mesh::protocol::Response::ok_with_data(value),
+                Err(error) => mesh::protocol::Response::err(error.to_string()),
+            },
             Request::Send {
                 radio,
                 destination,
@@ -2829,6 +2999,183 @@ impl LmeshService {
             ),
         }
     }
+
+    /// Host status for the shared connection-diagnostic surface. The radio
+    /// compatibility block keeps its established shape; the host identity
+    /// fields mirror the firmware `status` vocabulary.
+    pub fn host_status(&self) -> mesh::protocol::Response {
+        let mut status = self
+            .radio
+            .status()
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        status.insert("status".to_owned(), serde_json::json!("ok"));
+        status.insert("role".to_owned(), serde_json::json!("host"));
+        status.insert("service".to_owned(), serde_json::json!("lmesh"));
+        status.insert(
+            "version".to_owned(),
+            serde_json::json!(env!("CARGO_PKG_VERSION")),
+        );
+        status.insert(
+            "uptime_secs".to_owned(),
+            serde_json::json!(service_uptime_secs()),
+        );
+        mesh::protocol::Response::ok_with_data(serde_json::Value::Object(status))
+    }
+
+    /// Combined transport counters for the shared `metrics` method.
+    pub fn host_metrics(&self) -> mesh::protocol::Response {
+        mesh::protocol::Response::ok_with_data(serde_json::json!({
+            "now": self.radio.now_metrics(None),
+            "nan": self.radio.nan_metrics(None),
+            "udp6": self.radio.udp6_metrics(),
+            "wifi_link": self.radio.wifi_link_metrics(None),
+        }))
+    }
+
+    /// Shared component-9 event history: `{cursor, events}` with the same
+    /// bounded retention as `messages.history`.
+    pub fn host_events(
+        &self,
+        since_ms: Option<u64>,
+        records: Option<u64>,
+    ) -> mesh::protocol::Response {
+        mesh::protocol::Response::ok_with_data(
+            self.radio.diagnostic_events(since_ms, records.map(|value| value as usize)),
+        )
+    }
+
+    /// Shared component-9 log-watch: the same bounded history rendered as
+    /// `{cursor, records: [{sequence, line}]}` with the firmware shape.
+    pub fn host_log_watch(
+        &self,
+        since_ms: Option<u64>,
+        records: Option<u64>,
+    ) -> mesh::protocol::Response {
+        let events = self
+            .radio
+            .diagnostic_events(since_ms, records.map(|value| value as usize));
+        let rendered = events["events"]
+            .as_array()
+            .map(|events| {
+                events
+                    .iter()
+                    .map(|event| {
+                        serde_json::json!({
+                            "sequence": event["ts_millis"],
+                            "line": format!(
+                                "{} {} {}",
+                                event["ts_millis"],
+                                event["key"].as_str().unwrap_or("?"),
+                                event["value"]
+                            ),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        mesh::protocol::Response::ok_with_data(serde_json::json!({
+            "cursor": events["cursor"],
+            "records": rendered,
+        }))
+    }
+
+    /// Local undirected `radio.tx`: transmit the decoded 802.11 frame on an
+    /// owned interface. Directed `to` requests are forwarded before this.
+    pub fn host_radio_tx_local(
+        &self,
+        iface: Option<String>,
+        channel: u8,
+        frame: &[u8],
+        rate_mbps: Option<u8>,
+    ) -> mesh::protocol::Response {
+        let frame_hex = frame
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        mesh::protocol::Response::ok_with_data(self.radio.wifi_raw_send_frame(
+            iface,
+            Some(channel),
+            Some("monitor".to_owned()),
+            frame_hex,
+            rate_mbps,
+        ))
+    }
+
+    /// Apply the shared radio-lab control fields the Linux adapter supports;
+    /// firmware-only driver dimensions are reported as `not_owned`.
+    pub fn host_radio_control(&self, fields: &serde_json::Value) -> mesh::protocol::Response {
+        let mut applied = serde_json::Map::new();
+        let mut not_owned = Vec::<String>::new();
+        if let Some(channel) = fields.get("channel").and_then(serde_json::Value::as_u64) {
+            let Ok(channel) = u8::try_from(channel) else {
+                return mesh::protocol::Response::err(format!("invalid channel {channel}"));
+            };
+            let result = self.radio.wifi_interface_set_channel(None, channel);
+            applied.insert("channel".to_owned(), result);
+        }
+        if let Some(rate) = fields.get("rate").and_then(serde_json::Value::as_u64) {
+            // The wire enum is 0=Auto then 6..54 Mbps in ascending order.
+            let profile = match rate {
+                0 => Some("auto".to_owned()),
+                3 => Some("12".to_owned()),
+                5 => Some("24".to_owned()),
+                _ => None,
+            };
+            match profile {
+                Some(profile) => {
+                    let disable_11b = fields
+                        .get("disable_11b")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(rate != 0);
+                    let result = self.radio.wifi_rate_profile(None, profile, disable_11b);
+                    applied.insert("rate".to_owned(), result);
+                }
+                None => not_owned.push("rate".to_owned()),
+            }
+        } else if let Some(disable_11b) = fields.get("disable_11b").and_then(serde_json::Value::as_bool)
+        {
+            let result = self.radio.wifi_rate_profile(None, "auto".to_owned(), disable_11b);
+            applied.insert("disable_11b".to_owned(), result);
+        }
+        for (name, present) in [
+            ("interface", fields.get("interface").is_some()),
+            ("sta_state", fields.get("sta_state").is_some()),
+            ("promiscuous", fields.get("promiscuous").is_some()),
+            ("dw_policy", fields.get("dw_policy").is_some()),
+            ("rx_filter", fields.get("rx_filter").is_some()),
+            ("ap_mode", fields.get("ap_mode").is_some()),
+            ("mac_ack", fields.get("mac_ack").is_some()),
+        ] {
+            if present {
+                not_owned.push(name.to_owned());
+            }
+        }
+        mesh::protocol::Response::ok_with_data(serde_json::json!({
+            "ok": true,
+            "applied": applied,
+            "not_owned": not_owned,
+        }))
+    }
+
+    /// Host radio-lab snapshot in the shared counter vocabulary.
+    pub fn host_radio_snapshot(&self) -> mesh::protocol::Response {
+        mesh::protocol::Response::ok_with_data(self.radio.radio_snapshot())
+    }
+
+    /// Reset the host capture ledger for the shared radio-lab surface.
+    pub fn host_radio_reset_counters(&self) -> mesh::protocol::Response {
+        mesh::protocol::Response::ok_with_data(self.radio.reset_capture_counters())
+    }
+
+    /// Directed NAN pairing wake to one observed peer MAC.
+    pub fn host_pair_wakeup(&self, to: &str) -> mesh::protocol::Response {
+        match self.radio.nan_pair_wakeup(to.to_owned()) {
+            Ok(value) => mesh::protocol::Response::ok_with_data(value),
+            Err(error) => mesh::protocol::Response::err(error.to_string()),
+        }
+    }
 }
 
 /// Encode bytes as base64url (RFC 4648)
@@ -2955,6 +3302,22 @@ mod tests {
                 ..
             } if to == "02:00:00:00:00:44"
         ));
+    }
+
+    #[test]
+    fn now_route_accepts_shared_espnow_uri_and_legacy_mac() {
+        let peer = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+        assert_eq!(
+            parse_now_destination("espnow://02:11:22:33:44:55"),
+            Some(peer)
+        );
+        assert_eq!(parse_now_destination("02:11:22:33:44:55"), Some(peer));
+        assert_eq!(parse_now_destination("espnow://ff:ff:ff:ff:ff:ff"), None);
+        assert_eq!(
+            mesh_discovery_key("mesh://fc00::a4"),
+            Some("fc00::a4".into())
+        );
+        assert_eq!(mesh_discovery_key("espnow://02:11:22:33:44:55"), None);
     }
 
     #[test]

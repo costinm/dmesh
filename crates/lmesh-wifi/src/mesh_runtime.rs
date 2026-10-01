@@ -21,6 +21,16 @@ const DEFAULT_ANNOUNCE_INTERVAL_SECS: u64 = 5 * 60;
 const ANNOUNCE_INTERVAL_ENV: &str = "LMESH_ANNOUNCE_INTERVAL_SECS";
 const RAW_WIFI_CHANNEL_ENV: &str = "LMESH_RAW_WIFI_CHANNEL";
 
+fn quic_driver_exit_error(
+    result: Result<Result<(), quic_lite::QuicNodeEgressError>, tokio::task::JoinError>,
+) -> anyhow::Error {
+    match result {
+        Ok(Ok(())) => anyhow::anyhow!("lmesh QUIC node driver exited unexpectedly"),
+        Ok(Err(error)) => anyhow::anyhow!("lmesh QUIC node driver failed: {error:?}"),
+        Err(error) => anyhow::anyhow!("lmesh QUIC node driver task failed: {error}"),
+    }
+}
+
 /// Process-local endpoints for a Linux mesh service.
 ///
 /// These are code defaults, deliberately selected by each binary rather than
@@ -90,14 +100,17 @@ async fn run_server(
     now_bearer: quic_lite::BearerId,
     espnow_ingress: Arc<dyn crate::espnow_bearer::EspNowIngress>,
 ) -> Result<()> {
+    crate::mesh_core::note_service_started();
     let (node, driver) = quic_lite::tokio::TokioNodeDriver::new(
         node,
         quic_lite::AssociationLimits::host().connection,
     );
-    tokio::task::spawn_local(async move {
-        if let Err(error) = driver.run().await {
-            warn!(?error, "lmesh_quic_driver_stopped");
-        }
+    // Keep the driver task handle so the service cannot remain "healthy" with
+    // a closed QUIC stream receiver. In particular, if the driver exits or
+    // panics, let mesh-init restart the whole service (and its radio/bearers)
+    // instead of spinning in the accept loop and logging BrokenPipe forever.
+    let mut quic_driver = tokio::task::spawn_local(async move {
+        driver.run().await
     });
     let mut discovery = LocalDiscovery::new(None).await?;
     // The shared LAN label is local configuration only. The wire announce
@@ -276,7 +289,14 @@ async fn run_server(
         }
     });
     loop {
-        let stream = listener.accept().await.context("lmesh CBOR accept")?;
+        let stream = tokio::select! {
+            result = &mut quic_driver => {
+                let error = quic_driver_exit_error(result);
+                error!(%error, "lmesh_quic_driver_stopped");
+                return Err(error);
+            }
+            result = listener.accept() => result.context("lmesh CBOR accept")?,
+        };
         let service = service.clone();
         tokio::spawn(async move {
             if let Err(error) = handle_seqpacket_connection(stream, service).await {
@@ -403,7 +423,11 @@ impl dmesh_server::stream_service::RecordHandler for LmeshRecordHandler {
     ) -> Pin<Box<dyn Future<Output = std::io::Result<Vec<u8>>> + 'a>> {
         Box::pin(async move {
             let record = mesh::cbor::decode_record(&request).map_err(std::io::Error::other)?;
-            if is_connection_diagnostic(&record) {
+            // A constrained QUIC peer may only read numeric-tagged envelopes.
+            // Anything outside the reviewed catalog receives the shared
+            // numeric error instead of a host-shaped response it cannot
+            // decode.
+            if numeric_stream_fallback(&record) {
                 return dmesh_server::services::dispatch_tagged_stream(&request).ok_or_else(|| {
                     std::io::Error::new(
                         std::io::ErrorKind::Unsupported,
@@ -425,21 +449,34 @@ impl dmesh_server::stream_service::RecordHandler for LmeshRecordHandler {
     }
 }
 
-fn is_connection_diagnostic(record: &mesh::tagged::TaggedRecord) -> bool {
-    let (mesh::tagged::NameOrTag::Tag(component), mesh::tagged::NameOrTag::Tag(method)) =
+/// True when a numeric-tagged request is outside the reviewed catalog, so a
+/// constrained QUIC peer must receive the shared numeric-tagged error
+/// instead of a name-keyed host response.
+fn numeric_stream_fallback(record: &mesh::tagged::TaggedRecord) -> bool {
+    let (mesh::tagged::NameOrTag::Tag(_), mesh::tagged::NameOrTag::Tag(_)) =
         (&record.component, &record.method)
     else {
         return false;
     };
-    *component == dmesh_server::services::DIAGNOSTIC_COMPONENT as u32
-        && matches!(
-            *method as u64,
-            dmesh_server::services::DIAGNOSTIC_STATUS_METHOD
-                | dmesh_server::services::DIAGNOSTIC_SERVICES_METHOD
-                | dmesh_server::services::DIAGNOSTIC_METRICS_METHOD
-                | dmesh_server::services::DIAGNOSTIC_EVENTS_METHOD
-                | dmesh_server::services::DIAGNOSTIC_LOG_WATCH_METHOD
-        )
+    record.to.is_none()
+        && record.id.is_some()
+        && CONTROL_CATALOG.method_name(record).is_none()
+}
+
+/// The diagnostic component belongs to the QUIC connection service rather
+/// than the lmesh radio/application request adapter. Keep its stable numeric
+/// methods recognizable even if a presentation catalog is temporarily stale.
+fn is_connection_diagnostic(record: &mesh::tagged::TaggedRecord) -> bool {
+    matches!(
+        (&record.component, &record.method),
+        (
+            mesh::tagged::NameOrTag::Tag(component),
+            mesh::tagged::NameOrTag::Tag(method)
+        ) if u64::from(*component) == dmesh_server::services::DIAGNOSTIC_COMPONENT
+            && (dmesh_server::services::DIAGNOSTIC_STATUS_METHOD
+                ..=dmesh_server::services::DIAGNOSTIC_LOG_WATCH_METHOD)
+                .contains(&u64::from(*method))
+    )
 }
 
 #[async_trait::async_trait]
@@ -455,9 +492,14 @@ impl mesh::wire::TaggedRecordHandler for LmeshCborHandler {
             .id
             .clone()
             .context("tagged-CBOR request missing id")?;
-        let response = match decode_lmesh_tagged_request(&record) {
-            Ok(request) => self.service.handle_request(request).await,
-            Err(error) => mesh::protocol::Response::err(format!("invalid request: {error}")),
+        let response = if let Some(response) = host_component_response(&self.service, &record).await
+        {
+            response
+        } else {
+            match decode_lmesh_tagged_request(&record) {
+                Ok(request) => self.service.handle_request(request).await,
+                Err(error) => mesh::protocol::Response::err(format!("invalid request: {error}")),
+            }
         };
         let response = if response.success {
             mesh::wire::response_ok(id, response.data.unwrap_or(serde_json::Value::Null))
@@ -567,6 +609,366 @@ fn record_keeps_to_as_local_argument(record: &mesh::tagged::TaggedRecord) -> boo
     )
 }
 
+/// Serve the shared numeric-tagged components that the local JSON `Request`
+/// surface does not model. One dispatch backs the UDS control socket, QUIC
+/// streams, and the HTTP/REST gateway, so every catalogued method has the
+/// same handler on every path.
+async fn host_component_response(
+    service: &crate::mesh_core::LmeshService,
+    record: &mesh::tagged::TaggedRecord,
+) -> Option<mesh::protocol::Response> {
+    use mesh::tagged::NameOrTag;
+
+    let (NameOrTag::Tag(component), NameOrTag::Tag(method)) = (&record.component, &record.method)
+    else {
+        return None;
+    };
+    let (component, method) = (u64::from(*component), u64::from(*method));
+    // The reviewed-surface gate: an unnumbered or unknown method never gains
+    // a host handler here and falls through to the JSON request adapter.
+    if CONTROL_CATALOG.method_name(record).is_none() && !is_connection_diagnostic(record) {
+        return None;
+    }
+    let fields = CONTROL_CATALOG.to_jsonl(record);
+    let field_u64 = |name: &str| {
+        fields
+            .get(name)
+            .and_then(serde_json::Value::as_u64)
+    };
+    let response = match (
+        component,
+        method,
+    ) {
+        // Connection diagnostics (status/services/metrics/events/log-watch).
+        (
+            dmesh_server::services::DIAGNOSTIC_COMPONENT,
+            dmesh_server::services::DIAGNOSTIC_STATUS_METHOD,
+        ) => service.host_status(),
+        (
+            dmesh_server::services::DIAGNOSTIC_COMPONENT,
+            dmesh_server::services::DIAGNOSTIC_SERVICES_METHOD,
+        ) => host_services_response(),
+        (
+            dmesh_server::services::DIAGNOSTIC_COMPONENT,
+            dmesh_server::services::DIAGNOSTIC_METRICS_METHOD,
+        ) => service.host_metrics(),
+        (
+            dmesh_server::services::DIAGNOSTIC_COMPONENT,
+            dmesh_server::services::DIAGNOSTIC_EVENTS_METHOD,
+        ) => service.host_events(
+            field_u64("since"),
+            Some(field_u64("records").unwrap_or(64)),
+        ),
+        (
+            dmesh_server::services::DIAGNOSTIC_COMPONENT,
+            dmesh_server::services::DIAGNOSTIC_LOG_WATCH_METHOD,
+        ) => service.host_log_watch(
+            field_u64("since"),
+            Some(field_u64("records").unwrap_or(16)),
+        ),
+        // Common control-plane settings, backed by the shared settings store.
+        (
+            dmesh_server::control::CONTROL_COMPONENT,
+            dmesh_server::control::SETTINGS_GET,
+        ) => host_settings_get(fields.get("key").and_then(serde_json::Value::as_str)),
+        (
+            dmesh_server::control::CONTROL_COMPONENT,
+            dmesh_server::control::SETTINGS_SET,
+        ) => host_settings_set(
+            fields.get("key").and_then(serde_json::Value::as_str),
+            fields.get("value").and_then(serde_json::Value::as_str),
+        ),
+        (
+            dmesh_server::control::CONTROL_COMPONENT,
+            dmesh_server::control::SETTINGS_LIST,
+        ) => host_settings_list(),
+        // Raw-radio laboratory surface.
+        (
+            dmesh_server::raw_wifi::RAW_WIFI_COMPONENT,
+            dmesh_server::raw_wifi::RAW_WIFI_METHOD_TX,
+        ) => host_radio_tx(service, record, &fields),
+        (
+            dmesh_server::raw_wifi::RAW_WIFI_COMPONENT,
+            dmesh_server::raw_wifi::RAW_WIFI_METHOD_CONTROL,
+        ) => service.host_radio_control(&fields),
+        (
+            dmesh_server::raw_wifi::RAW_WIFI_COMPONENT,
+            dmesh_server::raw_wifi::RAW_WIFI_METHOD_SNAPSHOT,
+        ) => service.host_radio_snapshot(),
+        (
+            dmesh_server::raw_wifi::RAW_WIFI_COMPONENT,
+            dmesh_server::raw_wifi::RAW_WIFI_METHOD_RESET_COUNTERS,
+        ) => service.host_radio_reset_counters(),
+        // Directed pairing wake.
+        (
+            dmesh_server::announce::ANNOUNCE_COMPONENT,
+            dmesh_server::announce::ANNOUNCE_NAN_PAIR_WAKEUP,
+        ) => match fields.get("to").and_then(serde_json::Value::as_str) {
+            Some(to) => service.host_pair_wakeup(to),
+            None => mesh::protocol::Response::err("nan.pair_wakeup requires to"),
+        },
+        // Connection policy belongs to a routed QUIC association; the local
+        // control plane reports that it does not apply one here.
+        (
+            dmesh_server::connection::CONNECTION_COMPONENT,
+            dmesh_server::connection::CONNECTION_CONFIGURE,
+        ) => mesh::protocol::Response::err(
+            "connection.configure requires a routed QUIC connection",
+        ),
+        // Optional battery/power snapshot.
+        (
+            dmesh_server::telemetry::TELEMETRY_COMPONENT,
+            dmesh_server::telemetry::BATTERY_METHOD,
+        ) => mesh::protocol::Response::ok_with_data(serde_json::json!({
+            "available": false,
+            "note": "Linux host exposes no battery telemetry integration",
+        })),
+        // Runtime snapshot and lifecycle.
+        (
+            dmesh_server::services::RUNTIME_SNAPSHOT_COMPONENT,
+            dmesh_server::services::RUNTIME_SNAPSHOT_METHOD,
+        ) => host_runtime_snapshot(),
+        (
+            dmesh_server::services::RUNTIME_SNAPSHOT_COMPONENT,
+            dmesh_server::services::RUNTIME_RESET_METHOD,
+        ) => mesh::protocol::Response::err(
+            "runtime reset is a device-only operation",
+        ),
+        (dmesh_server::services::POWER_SNAPSHOT_COMPONENT, _) => {
+            host_power_snapshot()
+        }
+        (dmesh_server::services::MEMORY_SNAPSHOT_COMPONENT, _) => {
+            host_memory_snapshot()
+        }
+        // Linux BLE is a startup-selected CoC bearer; the scan/advertising
+        // state machine is a device-side adapter.
+        (
+            dmesh_server::services::BLE_COMPONENT,
+            dmesh_server::services::BLE_STATUS_METHOD,
+        ) => host_ble_status(),
+        (dmesh_server::services::BLE_COMPONENT, _) => mesh::protocol::Response::err(
+            "Linux BLE runs only as the startup-selected LMESH_BLE_COC bearer; \
+             scan/advertising/connect need a device-side adapter",
+        ),
+        // Host firmware/service identity.
+        (
+            dmesh_server::services::FIRMWARE_COMPONENT,
+            dmesh_server::services::FIRMWARE_IDENTITY_METHOD,
+        ) => host_firmware_identity(),
+        // Device-only operations. The host control plane never boots a
+        // module or writes flash; direct callers to a device instead.
+        (dmesh_server::services::BOOT_COMPONENT, _) => mesh::protocol::Response::err(
+            "boot.recovery is a device-only operation",
+        ),
+        (dmesh_server::services::MODULE_COMPONENT, _) => mesh::protocol::Response::err(
+            "module control is a device-only operation",
+        ),
+        (dmesh_server::verified_object::OBJECT_COMPONENT, _) => {
+            mesh::protocol::Response::err(
+                "object.flash runs on the target device; the host only serves \
+                 object bytes for a remote flash",
+            )
+        }
+        _ => return None,
+    };
+    Some(response)
+}
+
+/// The built-in tagged service catalog as a correlated result value.
+fn host_services_response() -> mesh::protocol::Response {
+    match mesh::cbor::decode_value_bytes(&dmesh_server::services::encode_tagged_service_catalog()) {
+        Ok(services) => mesh::protocol::Response::ok_with_data(services),
+        Err(error) => mesh::protocol::Response::err(format!("service catalog: {error}")),
+    }
+}
+
+/// The host settings file: an explicit path wins over the service home.
+fn host_settings_store(
+) -> Result<dmesh_server::settings::FileSettings, String> {
+    let path = std::env::var_os("DMESH_SETTINGS_FILE")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|home| std::path::PathBuf::from(home).join("etc/settings.conf"))
+        })
+        .ok_or_else(|| "no settings file: set DMESH_SETTINGS_FILE".to_owned())?;
+    Ok(dmesh_server::settings::FileSettings::new(path, "linux"))
+}
+
+fn host_settings_get(key: Option<&str>) -> mesh::protocol::Response {
+    let Some(key) = key else {
+        return mesh::protocol::Response::err("settings.get requires key=<name>");
+    };
+    match host_settings_store() {
+        Ok(mut store) => {
+            let handler = dmesh_server::settings::SettingsHandler::new(&mut store);
+            match handler.get(key) {
+                Ok(value) => mesh::protocol::Response::ok_with_data(
+                    serde_json::json!({"key": key, "value": value}),
+                ),
+                Err(error) => mesh::protocol::Response::err(error),
+            }
+        }
+        Err(error) => mesh::protocol::Response::err(error),
+    }
+}
+
+fn host_settings_set(key: Option<&str>, value: Option<&str>) -> mesh::protocol::Response {
+    let (Some(key), Some(value)) = (key, value) else {
+        return mesh::protocol::Response::err("settings.set requires key=<name> value=<text>");
+    };
+    match host_settings_store() {
+        Ok(mut store) => {
+            let mut handler = dmesh_server::settings::SettingsHandler::new(&mut store);
+            match handler.set(key, value) {
+                Ok(()) => mesh::protocol::Response::ok_with_data(
+                    serde_json::json!({"key": key, "set": true}),
+                ),
+                Err(error) => mesh::protocol::Response::err(error),
+            }
+        }
+        Err(error) => mesh::protocol::Response::err(error),
+    }
+}
+
+fn host_settings_list() -> mesh::protocol::Response {
+    match host_settings_store() {
+        Ok(mut store) => {
+            let handler = dmesh_server::settings::SettingsHandler::new(&mut store);
+            match handler.list() {
+                Ok(entries) => mesh::protocol::Response::ok_with_data(serde_json::json!({
+                    "entries": entries
+                        .into_iter()
+                        .map(|(key, value)| serde_json::json!({"key": key, "value": value}))
+                        .collect::<Vec<_>>(),
+                })),
+                Err(error) => mesh::protocol::Response::err(error),
+            }
+        }
+        Err(error) => mesh::protocol::Response::err(error),
+    }
+}
+
+/// Decode and transmit one undirected `radio.tx` request locally. Directed
+/// `to` requests are forwarded before this handler runs.
+fn host_radio_tx(
+    service: &crate::mesh_core::LmeshService,
+    record: &mesh::tagged::TaggedRecord,
+    fields: &serde_json::Value,
+) -> mesh::protocol::Response {
+    let Some(frame) = fields
+        .get("frame")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|frame| hex_decode_bytes(frame))
+    else {
+        return mesh::protocol::Response::err("radio.tx requires frame=<hex>");
+    };
+    let channel = fields
+        .get("channel")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|channel| u8::try_from(channel).ok())
+        .filter(|channel| (1..=13).contains(channel))
+        .unwrap_or(6);
+    let rate_mbps = fields
+        .get("rate")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(raw_wifi_rate_mbps);
+    let iface = raw_wifi_interface(fields.get("interface").cloned());
+    let _ = record;
+    service.host_radio_tx_local(iface, channel, &frame, rate_mbps)
+}
+
+/// Map the shared raw-rate enum onto a physical Mbps value. `0` is Auto.
+fn raw_wifi_rate_mbps(rate: u64) -> Option<u8> {
+    match rate {
+        1 => Some(6),
+        2 => Some(9),
+        3 => Some(12),
+        4 => Some(18),
+        5 => Some(24),
+        6 => Some(36),
+        7 => Some(48),
+        8 => Some(54),
+        _ => None,
+    }
+}
+
+/// Map the shared raw interface enum onto an owned Linux interface name.
+/// `Auto` and `Sta` select the default owned interface; dedicated AP/NAN
+/// VIF selection is a firmware adapter concept.
+fn raw_wifi_interface(interface: Option<serde_json::Value>) -> Option<String> {
+    match interface {
+        Some(serde_json::Value::Number(number)) if number.as_u64() == Some(2) => {
+            Some("ap".to_owned())
+        }
+        _ => None,
+    }
+}
+
+fn hex_decode_bytes(value: &str) -> Option<Vec<u8>> {
+    let value = value.trim().trim_start_matches("hex:");
+    (0..value.len() / 2)
+        .map(|index| {
+            u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()
+        })
+        .collect()
+}
+
+/// Bounded host runtime snapshot for the shared runtime component.
+fn host_runtime_snapshot() -> mesh::protocol::Response {
+    mesh::protocol::Response::ok_with_data(serde_json::json!({
+        "role": "host",
+        "service": "lmesh",
+        "version": env!("CARGO_PKG_VERSION"),
+        "uptime_secs": crate::mesh_core::service_uptime_secs(),
+        "udp_port": LMESH_DEFAULTS.udp_port,
+        "http_port": LMESH_DEFAULTS.http_port,
+        "announce_interval_secs": announce_interval().as_secs(),
+    }))
+}
+
+/// A Linux host has no battery/power management telemetry. The response is a
+/// proper correlated result so controllers treat the platform as unavailable
+/// instead of timing out.
+fn host_power_snapshot() -> mesh::protocol::Response {
+    mesh::protocol::Response::ok_with_data(serde_json::json!({
+        "available": false,
+        "battery": {"available": false},
+        "note": "Linux host exposes no power management telemetry",
+    }))
+}
+
+/// Linux cannot observe the firmware heap/packet-pool vocabulary; the
+/// response stays a proper correlated result with that fact explicit.
+fn host_memory_snapshot() -> mesh::protocol::Response {
+    mesh::protocol::Response::ok_with_data(serde_json::json!({
+        "available": false,
+        "note": "Linux host exposes no allocator packet-pool telemetry",
+    }))
+}
+
+/// Linux BLE exists only as the startup-selected CoC bearer.
+fn host_ble_status() -> mesh::protocol::Response {
+    mesh::protocol::Response::ok_with_data(serde_json::json!({
+        "ok": true,
+        "ready": false,
+        "advertising": false,
+        "connected": false,
+        "coc_connected": false,
+        "note": "Linux BLE runs only as the LMESH_BLE_COC bearer selected at startup",
+    }))
+}
+
+/// Host service identity for the shared firmware-identity surface.
+fn host_firmware_identity() -> mesh::protocol::Response {
+    mesh::protocol::Response::ok_with_data(serde_json::json!({
+        "name": "lmesh",
+        "version": env!("CARGO_PKG_VERSION"),
+        "role": "host",
+        "uptime_secs": crate::mesh_core::service_uptime_secs(),
+    }))
+}
+
 fn decode_lmesh_tagged_request(
     record: &mesh::tagged::TaggedRecord,
 ) -> Result<crate::mesh_core::Request> {
@@ -629,6 +1031,20 @@ fn decode_lmesh_tagged_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quic_driver_clean_exit_is_reported_as_unexpected() {
+        let error = quic_driver_exit_error(Ok(Ok(())));
+        assert!(error.to_string().contains("exited unexpectedly"));
+    }
+
+    #[test]
+    fn quic_driver_error_is_preserved_for_service_supervision() {
+        let error = quic_driver_exit_error(Ok(Err(
+            quic_lite::QuicNodeEgressError::AssociationTimedOut,
+        )));
+        assert!(error.to_string().contains("AssociationTimedOut"));
+    }
 
     #[test]
     fn shared_method_names_keep_linux_fields() {
@@ -902,7 +1318,9 @@ mod tests {
     }
 
     #[test]
-    fn connection_diagnostics_bypass_the_lmesh_application_adapter() {
+    fn catalogued_diagnostics_route_to_the_host_adapter() {
+        // Every shared diagnostic method is inside the reviewed catalog, so
+        // the stream adapter serves it through the unified host handler.
         for method in [
             dmesh_server::services::DIAGNOSTIC_STATUS_METHOD,
             dmesh_server::services::DIAGNOSTIC_SERVICES_METHOD,
@@ -910,7 +1328,7 @@ mod tests {
             dmesh_server::services::DIAGNOSTIC_EVENTS_METHOD,
             dmesh_server::services::DIAGNOSTIC_LOG_WATCH_METHOD,
         ] {
-            assert!(is_connection_diagnostic(&mesh::tagged::TaggedRecord {
+            assert!(!numeric_stream_fallback(&mesh::tagged::TaggedRecord {
                 component: mesh::tagged::NameOrTag::Tag(
                     dmesh_server::services::DIAGNOSTIC_COMPONENT as u32,
                 ),
@@ -919,9 +1337,11 @@ mod tests {
                 ..Default::default()
             }));
         }
-        assert!(!is_connection_diagnostic(&mesh::tagged::TaggedRecord {
+        // A numeric request outside the reviewed catalog keeps the shared
+        // numeric error path for constrained QUIC peers.
+        assert!(numeric_stream_fallback(&mesh::tagged::TaggedRecord {
             component: mesh::tagged::NameOrTag::Tag(7),
-            method: mesh::tagged::NameOrTag::Tag(3),
+            method: mesh::tagged::NameOrTag::Tag(99),
             id: Some(serde_json::json!(7)),
             ..Default::default()
         }));
