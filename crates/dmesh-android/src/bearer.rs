@@ -136,7 +136,7 @@ impl BearerRuntime {
                     .build()
                     .expect("create Android QUIC driver runtime");
                 driver_runtime.block_on(async move {
-                    let mut raw_node = Node::new(None, &PACKET_POOL);
+                    let mut raw_node = Node::new(&PACKET_POOL);
                     raw_node
                         .set_limits(quic_lite::NodeLimits::host())
                         .expect("Android QUIC node limits are valid");
@@ -381,11 +381,41 @@ async fn serve_android_stream(mut stream: quic_lite::tokio::TokioStream) {
         log::warn!("Android QUIC request read failed: {error}");
         return;
     }
+    // Android-specific handlers first, then the shared component surface, and
+    // finally the common numeric error so an unknown correlated request from
+    // a constrained peer is never left without a correlated reply.
     let response = crate::mesh_jni::android_discovery_active_response(&request)
         .or_else(|| crate::mesh_jni::android_nan_wakeup_response(&request))
         .or_else(|| crate::mesh_jni::android_battery_response(&request))
         .or_else(|| crate::mesh_jni::android_telemetry_response(&request))
-        .or_else(|| crate::mesh_jni::android_discovery_nodes_response(&request));
+        .or_else(|| crate::mesh_jni::android_discovery_nodes_response(&request))
+        .or_else(|| crate::mesh_jni::android_diag_status_response(&request))
+        .or_else(|| crate::mesh_jni::android_services_response(&request))
+        .or_else(|| crate::mesh_jni::android_diag_metrics_response(&request))
+        .or_else(|| crate::mesh_jni::android_diag_events_response(&request, false))
+        .or_else(|| crate::mesh_jni::android_diag_events_response(&request, true))
+        .or_else(|| crate::mesh_jni::android_ble_component_response(&request))
+        .or_else(|| crate::mesh_jni::android_identity_response(&request))
+        .or_else(|| {
+            crate::mesh_jni::android_snapshot_response(
+                &request,
+                dmesh_server::services::RUNTIME_SNAPSHOT_COMPONENT,
+            )
+        })
+        .or_else(|| {
+            crate::mesh_jni::android_snapshot_response(
+                &request,
+                dmesh_server::services::POWER_SNAPSHOT_COMPONENT,
+            )
+        })
+        .or_else(|| {
+            crate::mesh_jni::android_snapshot_response(
+                &request,
+                dmesh_server::services::MEMORY_SNAPSHOT_COMPONENT,
+            )
+        })
+        .or_else(|| crate::mesh_jni::android_device_only_response(&request))
+        .or_else(|| dmesh_server::services::dispatch_tagged_stream(&request));
     if let Some(response) = response
         && let Err(error) = stream.write_all(&response).await
     {

@@ -11,7 +11,8 @@
 
 pub use crate::probe_service::{
     PROBE_COMPONENT, PROBE_MAX_BYTES, PROBE_MAX_NORMAL_STREAMS, PROBE_RUN, PROBE_RUN_REQUEST_MAX,
-    ProbeServicePlan, ProbeServiceRequest, decode_probe_run_record, encode_probe_run_request,
+    ProbeDestination, ProbeServicePlan, ProbeServiceRequest, decode_probe_run_record,
+    encode_probe_result_response, encode_probe_run_request,
 };
 pub use crate::probe_stream::{ProbeReceiver, ProbeRun, ProbeSender};
 

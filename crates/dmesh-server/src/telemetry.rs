@@ -25,9 +25,15 @@ pub const TELEMETRY_RESPONSE_MAX_BYTES: usize = 512;
 pub const MAX_METRICS: usize = 48;
 
 pub mod now_metric {
+    /// Calls made to the serialized NOW action sender.
     pub const TX_ATTEMPTED: u16 = 1;
+    /// NOW requests accepted by ESP-IDF. This is local submission evidence,
+    /// not evidence that a peer received the frame.
     pub const TX_ACCEPTED: u16 = 2;
+    /// NOW sender calls rejected before ESP-IDF accepted the frame.
     pub const TX_FAILED: u16 = 3;
+    /// NOW submit calls refused for temporary ESP-IDF memory pressure.
+    pub const TX_BUSY: u16 = 18;
     pub const RX_DISPATCHED: u16 = 4;
     pub const RX_ACCEPTED: u16 = 5;
     pub const RX_REJECTED: u16 = 6;
@@ -422,7 +428,24 @@ mod tests {
 
     #[test]
     fn metric_ids_are_unique_and_bounded() {
-        let metrics = [Metric { id: 1, value: 2 }, Metric { id: 3, value: 5 }];
+        let metrics = [
+            Metric {
+                id: now_metric::TX_ATTEMPTED,
+                value: 8,
+            },
+            Metric {
+                id: now_metric::TX_ACCEPTED,
+                value: 6,
+            },
+            Metric {
+                id: now_metric::TX_FAILED,
+                value: 1,
+            },
+            Metric {
+                id: now_metric::TX_BUSY,
+                value: 1,
+            },
+        ];
         let mut wire = [0; TELEMETRY_RESPONSE_MAX_BYTES];
         assert!(encode_metrics(&metrics, &mut wire).is_some());
         assert!(encode_metrics(&[metrics[0], metrics[0]], &mut wire).is_none());

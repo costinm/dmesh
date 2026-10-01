@@ -58,17 +58,32 @@ pub enum EspNowPayloadClass {
     NowSync,
     TaggedControl,
     QuicDatagram,
+    Unrecognized,
 }
 
-/// Classify one already-framed ESP-NOW payload before it enters QUIC. Kept in
-/// the portable server crate so Linux and ESP adapters apply the same rule.
+/// QUIC's packet fixed bit. ESP-NOW adapters use it as the fast path for
+/// opaque datagrams; the one DMesh control payload whose prefix overlaps it
+/// (NOW sync) is recognized by its complete magic/version header first.
+const ESP_NOW_QUIC_FIXED_BIT: u8 = 0x40;
+
+/// Classify one already-framed ESP-NOW payload before it enters QUIC. The
+/// fixed bit is the common-case split: QUIC packets bypass CBOR decoding,
+/// while discovery/control records are decoded only when that bit is clear.
+/// Kept portable so Linux and ESP adapters apply the same admission rule.
 pub fn classify_espnow_payload(payload: &[u8]) -> EspNowPayloadClass {
-    if dmesh_rawnan::parse_now_sync_body(payload).is_some() {
+    if payload.first() == Some(&ESP_NOW_QUIC_FIXED_BIT)
+        && dmesh_rawnan::parse_now_sync_body(payload).is_some()
+    {
         EspNowPayloadClass::NowSync
+    } else if payload
+        .first()
+        .is_some_and(|first| first & ESP_NOW_QUIC_FIXED_BIT != 0)
+    {
+        EspNowPayloadClass::QuicDatagram
     } else if decode(payload).is_some() {
         EspNowPayloadClass::TaggedControl
     } else {
-        EspNowPayloadClass::QuicDatagram
+        EspNowPayloadClass::Unrecognized
     }
 }
 
@@ -2361,16 +2376,25 @@ mod tests {
     fn espnow_admission_separates_sync_control_and_opaque_quic() {
         let sync = dmesh_rawnan::build_now_sync_body([1; 6], [2; 6], 3, 512, 0, &[]).unwrap();
         let tagged_control = [0xa3, 1, 6, 2, 1, 3, 1];
-        let quic_datagram = [0x40, 0x01, 0x02, 0x03];
+        // Both long- and short-header-like first bytes with the fixed bit set
+        // must dispatch QUIC before attempting a CBOR decode. The contents are
+        // intentionally not a valid CBOR control record.
+        let quic_datagrams = [[0x40, 0xff, 0xff, 0xff], [0xc0, 0xff, 0xff, 0xff]];
 
         assert_eq!(classify_espnow_payload(&sync), EspNowPayloadClass::NowSync);
         assert_eq!(
             classify_espnow_payload(&tagged_control),
             EspNowPayloadClass::TaggedControl
         );
+        for packet in quic_datagrams {
+            assert_eq!(
+                classify_espnow_payload(&packet),
+                EspNowPayloadClass::QuicDatagram
+            );
+        }
         assert_eq!(
-            classify_espnow_payload(&quic_datagram),
-            EspNowPayloadClass::QuicDatagram
+            classify_espnow_payload(&[0x20, 0xff]),
+            EspNowPayloadClass::Unrecognized
         );
     }
 

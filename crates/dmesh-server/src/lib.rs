@@ -34,6 +34,8 @@ pub mod main_runtime_state;
 /// Small no-std network-address helpers used by bearer adapters. This module
 /// has no socket runtime or ESP-IDF dependency.
 pub mod net;
+/// Discovery-driven circuit selection and device-local relay reputation.
+pub mod path_builder;
 /// Common, bearer-independent platform power and memory observation contract.
 /// Android, Linux, and ESP adapters report facts; server policy consumes this
 /// state without depending on framework callback types.

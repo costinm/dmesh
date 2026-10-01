@@ -373,6 +373,378 @@ pub(crate) fn android_telemetry_response(request: &[u8]) -> Option<Vec<u8>> {
     Some(response[..size].to_vec())
 }
 
+/// Android QUIC-stream uptime. The mesh owner records its start so shared
+/// component responses can report bounded runtime facts without Java.
+#[cfg(target_os = "android")]
+static ANDROID_STARTED: OnceLock<std::time::Instant> = OnceLock::new();
+
+#[cfg(target_os = "android")]
+pub(crate) fn android_note_started() {
+    let _ = ANDROID_STARTED.set(std::time::Instant::now());
+}
+
+#[cfg(target_os = "android")]
+fn android_uptime_secs() -> u64 {
+    ANDROID_STARTED
+        .get()
+        .map(|started| started.elapsed().as_secs())
+        .unwrap_or(0)
+}
+
+/// Shared numeric-correlated response for one documented method whose result
+/// already exists as JSON.
+#[cfg(target_os = "android")]
+fn android_json_response(
+    request: &[u8],
+    component: u64,
+    method: u64,
+    result: &Value,
+) -> Option<Vec<u8>> {
+    let record = dmesh_server::tagged::decode(request)?;
+    let id = record.id?;
+    let mut encoded = [0u8; 1400];
+    let used = dmesh_server::cbor::encode_json_value(result, &mut encoded)?;
+    let mut response = [0u8; 1500];
+    let size = dmesh_server::tagged::encode_numeric_response(
+        component,
+        method,
+        id,
+        &encoded[..used],
+        &mut response,
+    )?;
+    Some(response[..size].to_vec())
+}
+
+/// Shared numeric-correlated error for a documented method the Android host
+/// role deliberately does not implement.
+#[cfg(target_os = "android")]
+fn android_numeric_error(request: &[u8], message: &[u8]) -> Option<Vec<u8>> {
+    let record = dmesh_server::tagged::decode(request)?;
+    let component = match record.component? {
+        dmesh_server::tagged::Name::Tag(value) => u64::from(value),
+        _ => return None,
+    };
+    let method = match record.method? {
+        dmesh_server::tagged::Name::Tag(value) => u64::from(value),
+        _ => return None,
+    };
+    let id = record.id?;
+    let mut response = [0u8; 160];
+    let size = dmesh_server::tagged::encode_numeric_error(
+        component,
+        method,
+        id,
+        message,
+        &mut response,
+    )?;
+    Some(response[..size].to_vec())
+}
+
+/// Shared component-9 `status`: bounded connection diagnostics with the
+/// firmware result shape. Android reports its framework-observed link facts
+/// conservatively: fields without a retained observation stay unavailable.
+#[cfg(target_os = "android")]
+pub(crate) fn android_diag_status_response(request: &[u8]) -> Option<Vec<u8>> {
+    let record = dmesh_server::tagged::decode(request)?;
+    let dmesh_server::tagged::Name::Tag(component) = record.component? else {
+        return None;
+    };
+    let dmesh_server::tagged::Name::Tag(method) = record.method? else {
+        return None;
+    };
+    if u64::from(component) != dmesh_server::services::DIAGNOSTIC_COMPONENT
+        || u64::from(method) != dmesh_server::services::DIAGNOSTIC_STATUS_METHOD
+    {
+        return None;
+    }
+    dmesh_server::services::encode_device_status_response(
+        record.id?,
+        dmesh_server::services::DeviceStatus {
+            uptime_secs: android_uptime_secs(),
+            sta_enabled: false,
+            sta_associated: false,
+            sta_bssid: b"unavailable",
+            sta_ipv4: b"unavailable",
+        },
+    )
+}
+
+/// Shared component-9 `services`: the built-in tagged service catalog.
+#[cfg(target_os = "android")]
+pub(crate) fn android_services_response(request: &[u8]) -> Option<Vec<u8>> {
+    let record = dmesh_server::tagged::decode(request)?;
+    let dmesh_server::tagged::Name::Tag(component) = record.component? else {
+        return None;
+    };
+    let dmesh_server::tagged::Name::Tag(method) = record.method? else {
+        return None;
+    };
+    if u64::from(component) != dmesh_server::services::DIAGNOSTIC_COMPONENT
+        || u64::from(method) != dmesh_server::services::DIAGNOSTIC_SERVICES_METHOD
+    {
+        return None;
+    }
+    let id = record.id?;
+    let catalog = dmesh_server::services::encode_tagged_service_catalog();
+    let mut response = [0u8; 512];
+    let size = dmesh_server::tagged::encode_numeric_response(
+        dmesh_server::services::DIAGNOSTIC_COMPONENT,
+        method,
+        id,
+        &catalog,
+        &mut response,
+    )?;
+    Some(response[..size].to_vec())
+}
+
+/// Shared component-9 `metrics`: Android's framework callbacks retain
+/// history rather than the firmware scalar contract, so the shared metric
+/// map stays empty and history remains the authoritative observation source.
+#[cfg(target_os = "android")]
+pub(crate) fn android_diag_metrics_response(request: &[u8]) -> Option<Vec<u8>> {
+    use dmesh_server::telemetry::{self, Metric};
+
+    let record = dmesh_server::tagged::decode(request)?;
+    let dmesh_server::tagged::Name::Tag(component) = record.component? else {
+        return None;
+    };
+    let dmesh_server::tagged::Name::Tag(method) = record.method? else {
+        return None;
+    };
+    if u64::from(component) != dmesh_server::services::DIAGNOSTIC_COMPONENT
+        || u64::from(method) != dmesh_server::services::DIAGNOSTIC_METRICS_METHOD
+    {
+        return None;
+    }
+    let mut result = [0u8; 128];
+    let used = telemetry::encode_metrics(&[] as &[Metric], &mut result)?;
+    let mut response = [0u8; 160];
+    let size = dmesh_server::tagged::encode_numeric_response(
+        dmesh_server::services::DIAGNOSTIC_COMPONENT,
+        method,
+        record.id?,
+        &result[..used],
+        &mut response,
+    )?;
+    Some(response[..size].to_vec())
+}
+
+/// Shared component-9 `events` and `log-watch`, projected from the retained
+/// Android observation history.
+#[cfg(target_os = "android")]
+pub(crate) fn android_diag_events_response(
+    request: &[u8],
+    log_watch: bool,
+) -> Option<Vec<u8>> {
+    let record = dmesh_server::tagged::decode(request)?;
+    let dmesh_server::tagged::Name::Tag(component) = record.component? else {
+        return None;
+    };
+    let dmesh_server::tagged::Name::Tag(method) = record.method? else {
+        return None;
+    };
+    let expected_method = if log_watch {
+        dmesh_server::services::DIAGNOSTIC_LOG_WATCH_METHOD
+    } else {
+        dmesh_server::services::DIAGNOSTIC_EVENTS_METHOD
+    };
+    if u64::from(component) != dmesh_server::services::DIAGNOSTIC_COMPONENT
+        || u64::from(method) != expected_method
+    {
+        return None;
+    }
+    let fields = dmesh_server::services::decode_diagnostic_fields(record.fields)?;
+    let (since, records) = fields;
+    let history = android_radio_history(
+        records,
+        since,
+        None,
+    );
+    if !log_watch {
+        return android_json_response(
+            request,
+            dmesh_server::services::DIAGNOSTIC_COMPONENT,
+            method,
+            &history,
+        );
+    }
+    let cursor = history
+        .get("events")
+        .and_then(Value::as_array)
+        .and_then(|events| events.first())
+        .and_then(|event| event.get("last_seen_ms"))
+        .and_then(Value::as_u64)
+        .unwrap_or(since.unwrap_or(0));
+    let rendered = history
+        .get("events")
+        .and_then(Value::as_array)
+        .map(|events| {
+            events
+                .iter()
+                .map(|event| {
+                    serde_json::json!({
+                        "sequence": event.get("last_seen_ms"),
+                        "line": serde_json::to_string(event).unwrap_or_default(),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    android_json_response(
+        request,
+        dmesh_server::services::DIAGNOSTIC_COMPONENT,
+        method,
+        &serde_json::json!({"cursor": cursor, "records": rendered}),
+    )
+}
+
+/// Shared component-12 host identity for the Android adapter.
+#[cfg(target_os = "android")]
+pub(crate) fn android_identity_response(request: &[u8]) -> Option<Vec<u8>> {
+    android_json_response(
+        request,
+        dmesh_server::services::FIRMWARE_COMPONENT,
+        dmesh_server::services::FIRMWARE_IDENTITY_METHOD,
+        &serde_json::json!({
+            "name": "dmesh",
+            "version": env!("CARGO_PKG_VERSION"),
+            "role": "android",
+            "uptime_secs": android_uptime_secs(),
+        }),
+    )
+}
+
+/// Shared runtime/power/memory snapshots. Android reports its retained
+/// battery observation through the shared power state; allocator and
+/// packet-pool facts remain device-side.
+#[cfg(target_os = "android")]
+pub(crate) fn android_snapshot_response(request: &[u8], component: u64) -> Option<Vec<u8>> {
+    let result = match component {
+        dmesh_server::services::RUNTIME_SNAPSHOT_COMPONENT => serde_json::json!({
+            "role": "android",
+            "version": env!("CARGO_PKG_VERSION"),
+            "uptime_secs": android_uptime_secs(),
+        }),
+        dmesh_server::services::POWER_SNAPSHOT_COMPONENT => {
+            let state = power_state().lock().ok()?.battery;
+            serde_json::json!({
+                "battery": dmesh_server::power::battery_json_status(state),
+            })
+        }
+        dmesh_server::services::MEMORY_SNAPSHOT_COMPONENT => serde_json::json!({
+            "available": false,
+            "note": "Android exposes no allocator packet-pool telemetry",
+        }),
+        _ => return None,
+    };
+    android_json_response(request, component, 1, &result)
+}
+
+/// Shared BLE component surface for the Android stream path. The framework
+/// adapter keeps its own command names; the numeric surface projects them.
+#[cfg(target_os = "android")]
+pub(crate) fn android_ble_component_response(request: &[u8]) -> Option<Vec<u8>> {
+    let record = dmesh_server::tagged::decode(request)?;
+    let dmesh_server::tagged::Name::Tag(component) = record.component? else {
+        return None;
+    };
+    let dmesh_server::tagged::Name::Tag(method) = record.method? else {
+        return None;
+    };
+    if u64::from(component) != dmesh_server::services::BLE_COMPONENT {
+        return None;
+    }
+    let method = u64::from(method);
+    let fields = record.fields;
+    let field_uint = |tag: u64| -> Option<u64> {
+        let fields = fields?;
+        let mut decoder = dmesh_server::cbor::Decoder::new(fields);
+        let (major, count) = decoder.head()?;
+        if major != 5 {
+            return None;
+        }
+        for _ in 0..count {
+            let key = decoder.uint()?;
+            if key == tag {
+                return decoder.uint_or_text();
+            }
+            decoder.skip()?;
+        }
+        None
+    };
+    let value: anyhow::Result<Value> = match method {
+        dmesh_server::services::BLE_SCAN_METHOD => {
+            android_ble_command("ble.scan", &json!({}))
+                .context("Android BLE callback is unavailable")
+        }
+        dmesh_server::services::BLE_STATUS_METHOD => {
+            android_ble_command("ble.status", &json!({}))
+                .context("Android BLE callback is unavailable")
+        }
+        dmesh_server::services::BLE_SCAN_STOP_METHOD => {
+            android_ble_command("ble.scan_stop", &json!({}))
+                .context("Android BLE callback is unavailable")
+        }
+        dmesh_server::services::BLE_CONNECT_METHOD => {
+            if field_uint(2).is_none() {
+                Err(anyhow::anyhow!("ble.connect requires addr"))
+            } else {
+                // The framework callback owns the real address decoding; the
+                // numeric surface forwards the decoded shared fields.
+                android_ble_command(
+                    "ble.connect",
+                    &json!({
+                        "addr": field_uint(2),
+                        "addr_type": field_uint(3),
+                        "psm": field_uint(4),
+                    }),
+                )
+                .context("Android BLE callback is unavailable")
+            }
+        }
+        dmesh_server::services::BLE_START_METHOD
+        | dmesh_server::services::BLE_STOP_METHOD
+        | dmesh_server::services::BLE_COC_SEND_METHOD => Err(anyhow::anyhow!(
+            "BLE start/stop/coc.send are device-side operations"
+        )),
+        _ => return None,
+    };
+    android_json_response(
+        request,
+        dmesh_server::services::BLE_COMPONENT,
+        method,
+        &match value {
+            Ok(value) => value,
+            Err(error) => return android_numeric_error(request, error.to_string().as_bytes()),
+        },
+    )
+}
+
+/// Device-only lifecycle operations on the Android host role.
+#[cfg(target_os = "android")]
+pub(crate) fn android_device_only_response(request: &[u8]) -> Option<Vec<u8>> {
+    let record = dmesh_server::tagged::decode(request)?;
+    let dmesh_server::tagged::Name::Tag(component) = record.component? else {
+        return None;
+    };
+    match u64::from(component) {
+        dmesh_server::services::BOOT_COMPONENT => {
+            android_numeric_error(request, b"boot.recovery is a device-only operation")
+        }
+        dmesh_server::services::MODULE_COMPONENT => {
+            android_numeric_error(request, b"module control is a device-only operation")
+        }
+        dmesh_server::verified_object::OBJECT_COMPONENT => android_numeric_error(
+            request,
+            b"object.flash runs on the target device",
+        ),
+        dmesh_server::services::RUNTIME_SNAPSHOT_COMPONENT => {
+            android_numeric_error(request, b"runtime reset is a device-only operation")
+        }
+        _ => None,
+    }
+}
+
 fn update_local_networks(payload: &[u8]) -> anyhow::Result<usize> {
     let snapshot = dmesh_server::local_networks::decode_snapshot(payload)
         .ok_or_else(|| anyhow::anyhow!("invalid local-networks CBOR snapshot"))?;

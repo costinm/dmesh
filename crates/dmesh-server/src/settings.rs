@@ -119,7 +119,7 @@ impl FileSettings {
 /// mode-0600 binary file in their private data directory, typically named
 /// `device-secret.bin` beside `settings.conf`. Provisioning owns creation;
 /// a missing file simply leaves reset detection on the normal PTO fallback.
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", feature = "stateless-reset"))]
 pub fn stateless_reset_key_from_private_file(
     path: impl AsRef<std::path::Path>,
 ) -> Result<Option<quic_lite::StatelessResetKey>, String> {
@@ -180,7 +180,7 @@ pub fn write_private_device_secret_file(
 /// platform-specific credential store. An explicit private secret path wins;
 /// otherwise a configured common settings file supplies only the directory,
 /// never the secret itself.
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", feature = "stateless-reset"))]
 pub fn stateless_reset_key_from_environment() -> Result<Option<quic_lite::StatelessResetKey>, String>
 {
     let path = if let Some(path) = std::env::var_os("DMESH_DEVICE_SECRET_FILE") {

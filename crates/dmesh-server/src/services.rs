@@ -163,6 +163,25 @@ pub const BOOT_RECOVERY_METHOD: u64 = 1;
 /// Read-only identity of the currently executing firmware image.
 pub const FIRMWARE_COMPONENT: u64 = 12;
 pub const FIRMWARE_IDENTITY_METHOD: u64 = 1;
+/// Host/device runtime snapshot and reset component. Firmware defines the
+/// scalar vocabulary in its runtime state; the component identity is shared.
+pub const RUNTIME_SNAPSHOT_COMPONENT: u64 = 101;
+pub const RUNTIME_SNAPSHOT_METHOD: u64 = 1;
+pub const RUNTIME_RESET_METHOD: u64 = 2;
+pub const POWER_SNAPSHOT_COMPONENT: u64 = 102;
+pub const MEMORY_SNAPSHOT_COMPONENT: u64 = 103;
+/// BLE adapter component shared by the ESP firmware adapter and host
+/// services that expose the same catalog surface.
+pub const BLE_COMPONENT: u64 = 104;
+pub const BLE_START_METHOD: u64 = 80;
+pub const BLE_STOP_METHOD: u64 = 81;
+pub const BLE_SCAN_METHOD: u64 = 82;
+pub const BLE_STATUS_METHOD: u64 = 83;
+pub const BLE_SCAN_STOP_METHOD: u64 = 84;
+pub const BLE_CONNECT_METHOD: u64 = 85;
+pub const BLE_COC_SEND_METHOD: u64 = 86;
+/// Loadable-firmware-module control component.
+pub const MODULE_COMPONENT: u64 = 1000;
 
 const BUILTIN_TAGGED_SERVICES: &[(u64, u64, &[u8])] = &[
     (DIAGNOSTIC_COMPONENT, DIAGNOSTIC_STATUS_METHOD, b"status"),
@@ -272,7 +291,10 @@ pub fn encode_tagged_service_catalog() -> Vec<u8> {
 /// remains unaware of them.
 pub type TaggedComponentHandler = fn(crate::tagged::Record<'_>) -> Option<Vec<u8>>;
 
-const TAGGED_COMPONENT_CAPACITY: usize = 16;
+// Main registers its built-in handlers alongside optional module, BLE, and
+// provisioning handlers. Keep headroom so a newly added built-in does not
+// silently disappear when the fixed table fills.
+const TAGGED_COMPONENT_CAPACITY: usize = 24;
 // Each slot is published handler-first, component-second. A reader that sees
 // the component with Acquire ordering therefore sees the matching function.
 // Components use small numeric IDs today (1000+) and fit `usize` on every
@@ -416,7 +438,7 @@ mod tagged_stream_dispatch_tests {
 
 /// Decode `{1: since?, 2: records?}` without allowing unknown or duplicate
 /// fields. An omitted fields map is the same as an empty map.
-fn diagnostic_fields(fields: Option<&[u8]>) -> Option<(Option<u64>, Option<u64>)> {
+pub fn decode_diagnostic_fields(fields: Option<&[u8]>) -> Option<(Option<u64>, Option<u64>)> {
     let Some(fields) = fields else {
         return Some((None, None));
     };

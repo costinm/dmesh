@@ -115,6 +115,8 @@ pub fn start_mesh(
 
     let mesh_services = ssh_mesh::mesh_rest::MeshServiceRegistry::default();
     #[cfg(target_os = "android")]
+    crate::mesh_jni::android_note_started();
+    #[cfg(target_os = "android")]
     crate::mesh_jni::register_ble_service(&mesh_services);
     #[cfg(target_os = "android")]
     crate::mesh_jni::register_companion_service(&mesh_services);

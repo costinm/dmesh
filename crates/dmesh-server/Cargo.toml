@@ -34,6 +34,7 @@ std = [
 ]
 mesh-session = ["std", "dep:mesh"]
 http = ["mesh-session", "dep:axum", "dep:ssh-mesh", "dep:async-trait"]
+stateless-reset = ["quic-lite/stateless-reset"]
 
 [dev-dependencies]
 tempfile = "3"
