@@ -34,10 +34,13 @@ pub(crate) struct ServerStreamConnection<const PACKET: usize = { crate::DEFAULT_
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ServerStreamConfig {
-    /// Heap-backed retransmission records allocated for this association.
+    /// Retained stream-range slots allocated for this association.
     /// Zero selects one packet for compatibility callers which do not yet
     /// provide an admission-time memory policy.
     pub history_packets: usize,
+    /// Per-transmission metadata records allocated for this association.
+    /// Zero selects twice the retained-range count for compatibility callers.
+    pub transmission_records: usize,
     pub max_pending_streams: usize,
     pub max_stream_bytes: usize,
 }
@@ -46,6 +49,7 @@ impl Default for ServerStreamConfig {
     fn default() -> Self {
         Self {
             history_packets: 0,
+            transmission_records: 0,
             // CallbackStreams retains only live ordered-delivery state. The
             // endpoint is the single source for completed and retired stream
             // IDs, so keep this live limit in lockstep with EndpointState.
@@ -56,6 +60,26 @@ impl Default for ServerStreamConfig {
 }
 
 impl<const PACKET: usize> ServerStreamConnection<PACKET> {
+    pub(crate) fn path_state(&self) -> &crate::PathState {
+        &self.mux.endpoint.paths[0]
+    }
+
+    pub(crate) fn path_state_mut(&mut self) -> &mut crate::PathState {
+        &mut self.mux.endpoint.paths[0]
+    }
+
+    pub(crate) fn path_state_at(&self, path_id: usize) -> Option<&crate::PathState> {
+        self.mux.endpoint.path_state(path_id)
+    }
+
+    pub(crate) fn path_state_at_mut(&mut self, path_id: usize) -> Option<&mut crate::PathState> {
+        self.mux.endpoint.path_state_mut(path_id)
+    }
+
+    pub(crate) fn pending_control_path(&self) -> Option<usize> {
+        self.mux.endpoint.pending_control_path()
+    }
+
     pub(crate) fn set_runtime_limits(
         &mut self,
         limits: crate::AssociationLimits,
@@ -66,6 +90,16 @@ impl<const PACKET: usize> ServerStreamConnection<PACKET> {
         self.mux
             .endpoint
             .set_history_capacity(limits.history_packets)?;
+        self.mux
+            .endpoint
+            .set_transmission_capacity(limits.transmission_records)?;
+        self.mux
+            .endpoint
+            .set_duplication_budget_capacity(limits.duplication_budget_bytes as u64);
+        self.mux
+            .endpoint
+            .set_path_estimator_config(limits.path_estimator)?;
+        self.mux.endpoint.set_pacing_config(limits.pacing)?;
         self.mux
             .set_delivery_limits(limits.max_pending_streams, limits.max_buffered_stream_bytes);
         Ok(())
@@ -89,6 +123,12 @@ impl<const PACKET: usize> ServerStreamConnection<PACKET> {
             crate::callback::retention_for_receive_window(local_limits, config.max_stream_bytes),
             history_packets,
         );
+        mux.endpoint
+            .set_transmission_capacity(if config.transmission_records == 0 {
+                history_packets.saturating_mul(2)
+            } else {
+                config.transmission_records
+            })?;
         Self::finish_open(&mut mux, bootstrap_header.packet_number, open, server_cid)?;
         Ok(Self {
             mux,
@@ -263,6 +303,19 @@ impl<const PACKET: usize> ServerStreamConnection<PACKET> {
         self.mux.receive_stream_events(packet, on_stream)
     }
 
+    pub(crate) fn receive_stream_events_on_path<F>(
+        &mut self,
+        packet: &[u8],
+        ingress_path: usize,
+        on_stream: F,
+    ) -> Result<(), crate::mux::StreamDeliveryError>
+    where
+        F: FnMut(u64, u64, bool, &[u8]) -> Result<usize, crate::Error>,
+    {
+        self.mux
+            .receive_stream_events_on_path(packet, ingress_path, on_stream)
+    }
+
     pub(crate) fn resume_stream_events<F>(
         &mut self,
         stream_id: u64,
@@ -287,13 +340,33 @@ impl<const PACKET: usize> ServerStreamConnection<PACKET> {
         fin: bool,
         out: &mut [u8],
     ) -> Result<usize, crate::Error> {
+        self.encode_stream_payload_at_on_path(0, stream_id, offset, data, fin, out)
+    }
+
+    pub(crate) fn encode_stream_payload_at_on_path(
+        &mut self,
+        path_id: usize,
+        stream_id: u64,
+        offset: u64,
+        data: &[u8],
+        fin: bool,
+        out: &mut [u8],
+    ) -> Result<usize, crate::Error> {
         self.mux
-            .encode_response_at(stream_id, offset, data, fin, out)
+            .encode_response_at_on_path(path_id, stream_id, offset, data, fin, out)
             .map(|(used, _)| used)
     }
 
     pub(crate) fn poll_transmit(&mut self, out: &mut [u8]) -> Result<Option<usize>, crate::Error> {
         self.mux.endpoint.poll_transmit(out)
+    }
+
+    pub(crate) fn poll_transmit_on_path(
+        &mut self,
+        path_id: usize,
+        out: &mut [u8],
+    ) -> Result<Option<usize>, crate::Error> {
+        self.mux.endpoint.poll_transmit_on_path(path_id, out)
     }
 
     /// Association-owned clock used for ACK and PTO calculations.
@@ -362,22 +435,26 @@ impl<const PACKET: usize> ServerStreamConnection<PACKET> {
     /// The caller supplies policy values, never the endpoint, so UART, UDP,
     /// NOW, and NAN adapters cannot alter packet framing or ledger state.
     ///
-    /// `history_packets` bounds this endpoint's own retransmission ledger. It
-    /// is deliberately not advertised as a peer packet credit: an outbound
-    /// ledger size says nothing about how many inbound packets the
-    /// application can consume. Receive backpressure is expressed by the
-    /// ordinary connection and stream byte credit returned after consumption.
+    /// `history_packets` bounds retained stream ranges and
+    /// `transmission_records` bounds packet-copy metadata. Neither is
+    /// advertised as peer packet credit: local storage limits say nothing
+    /// about how many inbound packets the application can consume. Receive
+    /// backpressure uses the ordinary connection and stream byte credit.
     pub(crate) fn configure_transport(
         &mut self,
         history_packets: usize,
+        transmission_records: usize,
         initial_window_bytes: u64,
         ack_frequency: u8,
         ack_delay: u64,
     ) -> Result<(), crate::Error> {
         self.mux.endpoint.set_history_capacity(history_packets)?;
-        self.mux.endpoint.congestion.congestion_window = initial_window_bytes;
+        self.mux
+            .endpoint
+            .set_transmission_capacity(transmission_records)?;
+        self.mux.endpoint.paths[0].congestion.congestion_window = initial_window_bytes;
         // Start at the configured initial window and grow in slow start.
-        self.mux.endpoint.congestion.slow_start_threshold = u64::MAX;
+        self.mux.endpoint.paths[0].congestion.slow_start_threshold = u64::MAX;
         self.mux
             .endpoint
             .set_ack_policy(ack_frequency, ack_delay.saturating_mul(1_000));
@@ -389,8 +466,8 @@ impl<const PACKET: usize> ServerStreamConnection<PACKET> {
     pub(crate) fn transport_ack_state(&self) -> (Option<u32>, u64, u64) {
         (
             self.mux.endpoint.largest_acked_by_peer(),
-            self.mux.endpoint.congestion.bytes_in_flight,
-            self.mux.endpoint.congestion.congestion_window,
+            self.mux.endpoint.paths[0].congestion.bytes_in_flight,
+            self.mux.endpoint.paths[0].congestion.congestion_window,
         )
     }
 
@@ -423,6 +500,12 @@ impl<const PACKET: usize> ServerStreamConnection<PACKET> {
 pub(crate) enum ServerPacket {
     /// A custom-version Initial OPEN that may create or replay an association.
     Initial(crate::BootstrapOpen),
+    /// A connectionless path-open request routed by its physical ingress hop
+    /// until the relay stack has installed CID forwarding state.
+    PathOpen,
+    /// A connectionless path-open response returning over the physical
+    /// previous hop retained by setup transaction state.
+    PathOpenAck,
     /// A custom-version Initial OPEN_ACK for an association initiated by this
     /// listener.  A shared listener routes it by the client CID in the long
     /// header; the receiving association alone validates its payload and
@@ -442,10 +525,23 @@ pub(crate) fn classify_server_packet(packet: &[u8]) -> Result<ServerPacket, crat
         return Ok(ServerPacket::Initial(open));
     }
     if let Ok((long, _, _)) = crate::decode_long_packet(packet) {
-        if long.packet_type == crate::LONG_PACKET_INITIAL {
-            if let Some(destination) = long.dcid {
-                return Ok(ServerPacket::BootstrapAck { destination });
+        match long.packet_type {
+            crate::LONG_PACKET_INITIAL => {
+                if let Some(destination) = long.dcid {
+                    return Ok(ServerPacket::BootstrapAck { destination });
+                }
             }
+            crate::LONG_PACKET_PATH_OPEN
+                if crate::relay::decode_setup_request_packet(packet).is_ok() =>
+            {
+                return Ok(ServerPacket::PathOpen);
+            }
+            crate::LONG_PACKET_PATH_OPEN_ACK
+                if crate::relay::decode_setup_reply_packet(packet).is_ok() =>
+            {
+                return Ok(ServerPacket::PathOpenAck);
+            }
+            _ => {}
         }
         return Err(crate::Error::Invalid);
     }
@@ -470,6 +566,10 @@ pub(crate) struct ClientConnection<const PACKET: usize> {
     started: bool,
     open_packet_number: u32,
     history_packets: usize,
+    transmission_records: usize,
+    duplication_budget_capacity: u64,
+    path_estimator_config: crate::PathEstimatorConfig,
+    pacing_config: crate::PacingConfig,
 }
 
 impl<const PACKET: usize> ClientConnection<PACKET> {
@@ -481,13 +581,14 @@ impl<const PACKET: usize> ClientConnection<PACKET> {
         local_cid: crate::ConnectionId,
         local_limits: crate::ConnectionLimits,
     ) -> Self {
-        Self::with_limits_and_history(local_cid, local_limits, 1)
+        Self::with_limits_and_history(local_cid, local_limits, 1, 2)
     }
 
     pub(crate) const fn with_limits_and_history(
         local_cid: crate::ConnectionId,
         local_limits: crate::ConnectionLimits,
         history_packets: usize,
+        transmission_records: usize,
     ) -> Self {
         Self {
             local_cid,
@@ -500,6 +601,10 @@ impl<const PACKET: usize> ClientConnection<PACKET> {
             started: false,
             open_packet_number: 0,
             history_packets,
+            transmission_records,
+            duplication_budget_capacity: 0,
+            path_estimator_config: crate::PathEstimatorConfig::default_config(),
+            pacing_config: crate::PacingConfig::host(),
         }
     }
 
@@ -552,11 +657,20 @@ impl<const PACKET: usize> ClientConnection<PACKET> {
         self.endpoint.is_some()
     }
 
-    pub(crate) fn accepts(&self, input: &[u8]) -> bool {
-        crate::ShortHeader::decode(input).is_ok_and(|(header, _)| header.dcid == self.local_cid)
-            || (self.started
+    pub(crate) fn accepts(&self, input: &[u8], path_id: usize) -> bool {
+        if let Some(endpoint) = self.endpoint.as_ref() {
+            return crate::ShortHeader::decode(input).is_ok_and(|(header, _)| {
+                endpoint.local_connection_id_on_path(path_id) == Some(header.dcid)
+            }) || (path_id == 0
                 && crate::decode_bootstrap_open_ack_packet_with_limits(input, self.local_cid)
-                    .is_ok())
+                    .is_ok());
+        }
+        path_id == 0
+            && (crate::ShortHeader::decode(input)
+                .is_ok_and(|(header, _)| header.dcid == self.local_cid)
+                || (self.started
+                    && crate::decode_bootstrap_open_ack_packet_with_limits(input, self.local_cid)
+                        .is_ok()))
     }
 
     pub(crate) fn start(&mut self, output: &mut [u8; PACKET]) -> Result<usize, crate::Error> {
@@ -621,6 +735,14 @@ impl<const PACKET: usize> ClientConnection<PACKET> {
             PACKET as u64,
             self.history_packets,
         );
+        endpoint.set_transmission_capacity(if self.transmission_records == 0 {
+            self.history_packets.saturating_mul(2)
+        } else {
+            self.transmission_records
+        })?;
+        endpoint.set_duplication_budget_capacity(self.duplication_budget_capacity);
+        endpoint.set_path_estimator_config(self.path_estimator_config)?;
+        endpoint.set_pacing_config(self.pacing_config)?;
         endpoint.set_time(now_us);
         endpoint.install_connection_ids(self.local_cid, ack.server_receive_cid)?;
         endpoint.set_initial_peer_credit(ack.max_data, ack.max_stream_data)?;
@@ -655,6 +777,14 @@ impl<const PACKET: usize> ClientConnection<PACKET> {
             PACKET as u64,
             self.history_packets,
         );
+        endpoint.set_transmission_capacity(if self.transmission_records == 0 {
+            self.history_packets.saturating_mul(2)
+        } else {
+            self.transmission_records
+        })?;
+        endpoint.set_duplication_budget_capacity(self.duplication_budget_capacity);
+        endpoint.set_path_estimator_config(self.path_estimator_config)?;
+        endpoint.set_pacing_config(self.pacing_config)?;
         endpoint.set_time(now_us);
         endpoint.install_connection_ids(self.local_cid, self.local_cid)?;
         endpoint.continue_packet_numbers_from(self.open_packet_number.saturating_add(1))?;
@@ -681,6 +811,41 @@ impl<const PACKET: usize> ClientConnection<PACKET> {
         self.endpoint.as_mut().ok_or(crate::Error::Invalid)
     }
 
+    pub(crate) fn set_duplication_budget_capacity(&mut self, capacity: u64) {
+        self.duplication_budget_capacity = capacity;
+        if let Some(endpoint) = self.endpoint.as_mut() {
+            endpoint.set_duplication_budget_capacity(capacity);
+        }
+    }
+
+    pub(crate) fn set_path_estimator_config(
+        &mut self,
+        config: crate::PathEstimatorConfig,
+    ) -> Result<(), crate::Error> {
+        if !config.is_valid() {
+            return Err(crate::Error::Invalid);
+        }
+        self.path_estimator_config = config;
+        if let Some(endpoint) = self.endpoint.as_mut() {
+            endpoint.set_path_estimator_config(config)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_pacing_config(
+        &mut self,
+        config: crate::PacingConfig,
+    ) -> Result<(), crate::Error> {
+        if !config.is_valid() {
+            return Err(crate::Error::Invalid);
+        }
+        self.pacing_config = config;
+        if let Some(endpoint) = self.endpoint.as_mut() {
+            endpoint.set_pacing_config(config)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn poll_transmit(
         &mut self,
         output: &mut [u8; PACKET],
@@ -688,6 +853,16 @@ impl<const PACKET: usize> ClientConnection<PACKET> {
         self.endpoint
             .as_mut()
             .map_or(Ok(None), |endpoint| endpoint.poll_transmit(output))
+    }
+
+    pub(crate) fn poll_transmit_on_path(
+        &mut self,
+        path_id: usize,
+        output: &mut [u8; PACKET],
+    ) -> Result<Option<usize>, crate::Error> {
+        self.endpoint.as_mut().map_or(Ok(None), |endpoint| {
+            endpoint.poll_transmit_on_path(path_id, output)
+        })
     }
 
     pub(crate) fn poll_transmit_at(
@@ -773,13 +948,37 @@ pub(crate) struct AssociationStreamPayload<'a> {
 }
 
 impl<const PACKET: usize> ClientAssociation<PACKET> {
+    pub(crate) fn set_duplication_budget_capacity(&mut self, capacity: u64) {
+        self.connection.set_duplication_budget_capacity(capacity);
+    }
+
+    pub(crate) fn set_path_estimator_config(
+        &mut self,
+        config: crate::PathEstimatorConfig,
+    ) -> Result<(), crate::Error> {
+        self.connection.set_path_estimator_config(config)
+    }
+
+    pub(crate) fn set_pacing_config(
+        &mut self,
+        config: crate::PacingConfig,
+    ) -> Result<(), crate::Error> {
+        self.connection.set_pacing_config(config)
+    }
+
     pub(crate) fn set_runtime_limits(
         &mut self,
         limits: crate::AssociationLimits,
     ) -> Result<(), crate::Error> {
+        self.connection
+            .set_path_estimator_config(limits.path_estimator)?;
+        self.connection.set_pacing_config(limits.pacing)?;
         let endpoint = self.connection_mut().endpoint_mut()?;
         endpoint.set_receive_growth_limits(limits.connection)?;
-        endpoint.set_history_capacity(limits.history_packets)
+        endpoint.set_history_capacity(limits.history_packets)?;
+        endpoint.set_transmission_capacity(limits.transmission_records)?;
+        endpoint.set_duplication_budget_capacity(limits.duplication_budget_bytes as u64);
+        Ok(())
     }
     pub(crate) fn new(local_cid: crate::ConnectionId) -> Self {
         Self::with_limits(local_cid, crate::ConnectionLimits::default())
@@ -799,12 +998,14 @@ impl<const PACKET: usize> ClientAssociation<PACKET> {
         local_cid: crate::ConnectionId,
         local_limits: crate::ConnectionLimits,
         history_packets: usize,
+        transmission_records: usize,
     ) -> Self {
         Self {
             connection: ClientConnection::with_limits_and_history(
                 local_cid,
                 local_limits,
                 history_packets,
+                transmission_records,
             ),
             next_client_bidi_stream_id: crate::FIRST_CLIENT_BIDI_STREAM_ID,
         }
@@ -922,14 +1123,36 @@ impl<const PACKET: usize> ClientAssociation<PACKET> {
         fin: bool,
         output: &mut [u8; PACKET],
     ) -> Result<usize, crate::Error> {
+        self.encode_stream_payload_at_on_path(0, stream_id, offset, data, fin, output)
+    }
+
+    pub(crate) fn encode_stream_payload_at_on_path(
+        &mut self,
+        path_id: usize,
+        stream_id: u64,
+        offset: u64,
+        data: &[u8],
+        fin: bool,
+        output: &mut [u8; PACKET],
+    ) -> Result<usize, crate::Error> {
         let connection = self.connection_mut();
-        let destination = connection
+        let fallback_destination = connection
             .peer_cid()
             .unwrap_or_else(|| connection.local_cid());
         let endpoint = connection.endpoint_mut()?;
+        let destination = endpoint
+            .peer_connection_id_on_path(path_id)
+            .unwrap_or(fallback_destination);
         endpoint.open_send_stream(stream_id, crate::INITIAL_MAX_STREAM_DATA)?;
-        let (used, _) =
-            endpoint.encode_stream_packet(destination, stream_id, offset, fin, data, output)?;
+        let (used, _) = endpoint.encode_stream_packet_on_path(
+            path_id,
+            destination,
+            stream_id,
+            offset,
+            fin,
+            data,
+            output,
+        )?;
         Ok(used)
     }
 
@@ -939,6 +1162,15 @@ impl<const PACKET: usize> ClientAssociation<PACKET> {
     pub(crate) fn receive_stream_payload_packet<'a>(
         &mut self,
         meta: PacketMeta,
+        input: &'a [u8],
+    ) -> Result<Option<AssociationStreamPayload<'a>>, crate::Error> {
+        self.receive_stream_payload_packet_on_path(meta, 0, input)
+    }
+
+    pub(crate) fn receive_stream_payload_packet_on_path<'a>(
+        &mut self,
+        meta: PacketMeta,
+        path_id: usize,
         input: &'a [u8],
     ) -> Result<Option<AssociationStreamPayload<'a>>, crate::Error> {
         let completed_stream = self.connection().endpoint().and_then(|endpoint| {
@@ -957,15 +1189,18 @@ impl<const PACKET: usize> ClientAssociation<PACKET> {
             }
             None
         });
-        let payload = self.receive_packet(meta, input, |connection| {
-            let packet = connection.endpoint_mut()?.receive_packet(input)?;
-            Ok(match packet {
-                crate::TransportFrame::Control => None,
-                crate::TransportFrame::Stream { frame, .. } => {
-                    Some((frame.id, frame.offset, frame.fin, frame.data))
-                }
-            })
-        })?;
+        let payload =
+            self.receive_packet_on_path(meta, input, path_id, |connection, path_id| {
+                let packet = connection
+                    .endpoint_mut()?
+                    .receive_packet_on_path(input, path_id)?;
+                Ok(match packet {
+                    crate::TransportFrame::Control => None,
+                    crate::TransportFrame::Stream { frame, .. } => {
+                        Some((frame.id, frame.offset, frame.fin, frame.data))
+                    }
+                })
+            })?;
         let Some((stream_id, offset, fin, data)) = payload else {
             return Ok(None);
         };
@@ -1062,14 +1297,24 @@ impl<const PACKET: usize> ClientAssociation<PACKET> {
         input: &[u8],
         receive: impl FnOnce(&mut ClientConnection<PACKET>) -> Result<R, crate::Error>,
     ) -> Result<R, crate::Error> {
-        if !self.connection().accepts(input) {
+        self.receive_packet_on_path(meta, input, 0, |connection, _| receive(connection))
+    }
+
+    pub(crate) fn receive_packet_on_path<R>(
+        &mut self,
+        meta: PacketMeta,
+        input: &[u8],
+        path_id: usize,
+        receive: impl FnOnce(&mut ClientConnection<PACKET>, usize) -> Result<R, crate::Error>,
+    ) -> Result<R, crate::Error> {
+        if !self.connection().accepts(input, path_id) {
             if self.connection().is_peer_stateless_reset(input) {
                 return Err(crate::Error::PeerRestarted);
             }
             return Err(crate::Error::WrongConnectionId);
         }
         let _ = meta;
-        receive(&mut self.connection)
+        receive(&mut self.connection, path_id)
     }
 }
 
@@ -1135,10 +1380,13 @@ mod tests {
         };
         server.set_runtime_limits(limits).unwrap();
         assert_eq!(server.mux.delivery_limits(), (3, 1234));
-        server.configure_transport(8, 6_000, 2, 25).unwrap();
-        assert_eq!(server.mux.endpoint.congestion.congestion_window, 6_000);
+        server.configure_transport(8, 16, 6_000, 2, 25).unwrap();
         assert_eq!(
-            server.mux.endpoint.congestion.slow_start_threshold,
+            server.mux.endpoint.paths[0].congestion.congestion_window,
+            6_000
+        );
+        assert_eq!(
+            server.mux.endpoint.paths[0].congestion.slow_start_threshold,
             u64::MAX
         );
     }

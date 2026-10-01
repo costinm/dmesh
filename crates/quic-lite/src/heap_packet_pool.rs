@@ -463,6 +463,21 @@ impl<const MAX_SLOTS: usize, const MTU: usize> AsRef<[u8]> for HeapPacketLease<'
     }
 }
 
+impl<const MAX_SLOTS: usize, const MTU: usize> crate::PacketBuffer
+    for HeapPacketLease<'_, MAX_SLOTS, MTU>
+{
+    fn as_mut_unique(&mut self) -> Option<&mut [u8]> {
+        if self.pool.references[self.slot as usize].load(Ordering::Acquire) != 1 {
+            return None;
+        }
+        let pointer = self.pool.buffers[self.slot as usize].load(Ordering::Acquire);
+        if pointer.is_null() {
+            return None;
+        }
+        Some(unsafe { core::slice::from_raw_parts_mut(pointer, MTU) })
+    }
+}
+
 impl<const MAX_SLOTS: usize, const MTU: usize> core::fmt::Debug
     for HeapPacketLease<'_, MAX_SLOTS, MTU>
 {
@@ -584,5 +599,26 @@ mod tests {
         CONTENDED.lock.store(false, Ordering::Release);
         assert!(CONTENDED.acquire_writer_reserving(0, 0).is_some());
         CONTENDED.resize(0).unwrap();
+    }
+
+    #[test]
+    fn packet_buffer_mutation_requires_a_unique_heap_lease() {
+        static MUTABLE: HeapPacketPool<2, 32> = HeapPacketPool::new();
+        MUTABLE.resize(1).unwrap();
+        let packet = MUTABLE
+            .build_packet(0, 0, |output| -> Result<usize, ()> {
+                output[..3].copy_from_slice(&[1, 2, 3]);
+                Ok(3)
+            })
+            .unwrap();
+        let (buffer, range) = packet.into_parts();
+        let shared = buffer.clone();
+        let mut packet = OwnedPacket::new(buffer, range).unwrap();
+        assert!(packet.bytes_mut_unique().is_none());
+        drop(shared);
+        packet.bytes_mut_unique().unwrap()[0] = 9;
+        assert_eq!(packet.bytes(), &[9, 2, 3]);
+        drop(packet);
+        MUTABLE.resize(0).unwrap();
     }
 }

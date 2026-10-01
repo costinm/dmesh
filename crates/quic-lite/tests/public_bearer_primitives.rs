@@ -6,6 +6,8 @@
 //! would fail to compile and expose an unintended dependency before a platform
 //! bearer copies it.
 
+#[cfg(feature = "stateless-reset")]
+use quic_lite::StatelessResetKey;
 use quic_lite::bearer_framed::{
     FramedPacketError, LENGTH_HEADER_BYTES, MAX_FRAMED_PACKET_BYTES, decode_packet_length,
     encode_packet_length,
@@ -16,7 +18,7 @@ use quic_lite::heap_packet_pool::{
 use quic_lite::packet_pool::PacketPool as FixedPacketPool;
 use quic_lite::{
     BearerId, BearerName, ConnectionLimits, OwnedPacket, PacketBuildError, PacketPool,
-    PeerL2Address, QuicNode, StatelessResetKey,
+    PeerL2Address, QuicNode,
 };
 
 #[test]
@@ -95,12 +97,13 @@ fn compact_bearer_identifiers_reject_reserved_or_invalid_values() {
 fn common_node_reports_its_owned_pool_capacity() {
     static POOL: FixedPacketPool<3, { quic_lite::DEFAULT_PACKET_POOL_SLOT_SIZE }> =
         FixedPacketPool::new();
-    let node = QuicNode::<_>::new(None, &POOL);
+    let node = QuicNode::<_>::new(&POOL);
     assert_eq!(node.packet_capacity(), 3);
     assert_eq!(node.available_packets(), 3);
 }
 
 #[test]
+#[cfg(feature = "stateless-reset")]
 fn public_connection_limits_and_reset_key_validate_application_input() {
     let profile = ConnectionLimits::with_receive_profile(4096, 1024, 3);
     assert_eq!(profile.max_data, 4096);

@@ -36,13 +36,14 @@ DMESH_SSH_MESH_DIR="$PWD/no-ssh-mesh-override" \
 
 ### Managed service control
 
-Use the `mesh` CLI for `mesh-init` service control:
+Use the `mesh` CLI for `mesh-init` service control. The RPC component is
+`mesh-init` and the service argument is `name=value`:
 
 ```sh
-mesh mesh-init status [SERVICE]
-mesh mesh-init start SERVICE
-mesh mesh-init stop SERVICE
-mesh mesh-init reload
+mesh mesh-init mesh-init status [name=SERVICE]
+mesh mesh-init mesh-init start name=SERVICE
+mesh mesh-init mesh-init stop name=SERVICE
+mesh mesh-init mesh-init reload
 ```
 
 ```sh
@@ -170,11 +171,48 @@ on the configured HTTP port and dispatches directly to the
 Rust handler registry: it does not use the retired JSONL Java bridge or a
 host-style `/mesh/run/mesh/...` UDS path.
 
-Registered Android HTTP services include `ble`, `wifi`, `transport`, `usb`,
-and `history`. `dmesh-cli http://... SERVICE.METHOD` sends a tagged record
-through their shared handler boundary. QUIC-lite on port `3336` exposes the
-portable discovery and telemetry methods, including `telemetry.battery`.
-Framework callbacks and JNI diagnostics are not separate HTTP commands.
+### Finding the supported HTTP API
+
+The gateway is its own discovery surface; two read-only GETs enumerate
+everything a service answers (ssh-mesh `mesh_rest`):
+
+```sh
+# Every registered service: name, backend, encoding, catalog component.
+curl -sS 'http://127.0.0.1:18480/_m/mesh/services'
+
+# Every method of one service with descriptions and field tags.
+# view=all includes masked and legacy methods; the default view shows
+# only operator-facing entries (x-ui-visibility default or unspecified).
+curl -sS 'http://127.0.0.1:18480/_m/mesh/services/wifi/tools?view=all'
+```
+
+Method and field tags are formally specified in the root `API.md`. The
+installed catalogs it generates (`crates/lmesh/resources/tools.json` for
+Linux `lmesh`, `crates/dmesh-server/platform/tools.json` for the shared
+platform services) are checked against `API.md` in `scripts/build.sh`, so a
+catalog GET and the documentation cannot drift apart silently. Over
+QUIC/UART/SSH stream transports the tagged equivalent of the service list is
+component 9, method 2 (`dmesh-cli DEVICE services`).
+
+Commands then go through one of two POST routes:
+`/_m/mesh/services/<svc>/records` (a tagged record; numeric tags need no
+catalog) or `/_m/mesh/services/<svc>/call/<METHOD>` (named, resolved through
+the service catalog). `dmesh-cli http://... SERVICE.METHOD` uses the records
+route.
+
+Registered Android HTTP services are `ble`, `companion`, `history`, `status`,
+`transport`, `usb`, and `wifi`. The Linux `lmesh` admin endpoint (localhost
+port 18981) registers a single `lmesh` service backed by its UDS; numeric
+tagged records dispatch there without provisioning, while the named
+convenience endpoints (`/tools`, `/call/<method>`, name-based records)
+resolve through the shared catalog search: `/opt/lmesh/etc/schemas/`,
+`$HOME/opt/lmesh/etc/schemas/`, and `$HOME/etc/schemas/`. The mesh-init
+template no longer pins `MESH_TOOLS`; a host without an installed catalog can
+place one under `$HOME/etc/schemas/` for its service user.
+
+QUIC-lite on port `3336` exposes the portable discovery and telemetry
+methods, including `telemetry.battery`. Framework callbacks and JNI
+diagnostics are not separate HTTP commands.
 
 If a defensive UDS fallback is ever needed on Android, JNI configures mesh paths
 under the app files tree:

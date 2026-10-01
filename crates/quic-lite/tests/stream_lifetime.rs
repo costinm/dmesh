@@ -34,8 +34,8 @@ async fn association_serves_more_streams_than_delivery_slots() {
         BearerName::new("client").unwrap(),
         BearerName::new("server").unwrap(),
     );
-    let mut client = Node::new(None, &CLIENT_POOL);
-    let mut server = Node::new(None, &SERVER_POOL);
+    let mut client = Node::new(&CLIENT_POOL);
+    let mut server = Node::new(&SERVER_POOL);
     let bearer = client.add_bearer(client_bearer).unwrap();
     server.add_bearer(server_bearer).unwrap();
     let (client, client_driver) = TokioNodeDriver::new(client, ConnectionLimits::default());
@@ -104,8 +104,8 @@ async fn unread_stream_does_not_block_accepting_another_stream() {
         BearerName::new("client").unwrap(),
         BearerName::new("server").unwrap(),
     );
-    let mut client = Node::new(None, &CLIENT_POOL);
-    let mut server = Node::new(None, &SERVER_POOL);
+    let mut client = Node::new(&CLIENT_POOL);
+    let mut server = Node::new(&SERVER_POOL);
     let bearer = client.add_bearer(client_bearer).unwrap();
     server.add_bearer(server_bearer).unwrap();
     let (client, client_driver) = TokioNodeDriver::new(client, ConnectionLimits::default());
@@ -193,8 +193,8 @@ async fn slow_reader_with_small_window_receives_complete_stream() {
         BearerName::new("client").unwrap(),
         BearerName::new("server").unwrap(),
     );
-    let mut client = Node::new(None, &CLIENT_POOL);
-    let mut server = Node::new(None, &SERVER_POOL);
+    let mut client = Node::new(&CLIENT_POOL);
+    let mut server = Node::new(&SERVER_POOL);
     let bearer = client.add_bearer(client_bearer).unwrap();
     server.add_bearer(server_bearer).unwrap();
     let (client, client_driver) = TokioNodeDriver::new(client, ConnectionLimits::default());

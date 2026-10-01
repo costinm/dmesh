@@ -8,10 +8,15 @@ publish = false
 default = []
 std = []
 tokio = ["std", "dep:libc", "dep:tokio"]
+packet-protection = ["dep:aes-gcm", "dep:hkdf", "dep:sha2", "dep:zeroize"]
+stateless-reset = ["dep:hmac", "dep:sha2"]
 
 [dependencies]
-hmac = { version = "0.13", default-features = false }
-sha2 = { version = "0.11", default-features = false }
+hmac = { version = "0.13", default-features = false, optional = true }
+sha2 = { version = "0.11", default-features = false, optional = true }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes"], optional = true }
+hkdf = { version = "0.13", default-features = false, optional = true }
+zeroize = { version = "1.8", default-features = false, optional = true }
 spin = { version = "0.10", default-features = false, features = ["mutex", "spin_mutex"] }
 smallvec = { version = "1", default-features = false }
 libc = { version = "0.2", optional = true }

@@ -110,10 +110,7 @@ fn copy_into_pool(
 fn slow_queue_consumer_receives_complete_stream() {
     let (client_bearer, client_context, client_sent) = Capture::<Pool>::new("client");
     let embedded = AssociationLimits::embedded();
-    let mut client = NoStdRuntime::new(
-        QuicNode::<Pool>::new(None, &CLIENT_POOL),
-        embedded.connection,
-    );
+    let mut client = NoStdRuntime::new(QuicNode::<Pool>::new(&CLIENT_POOL), embedded.connection);
     client.set_limits(NodeLimits::embedded()).unwrap();
     client.set_default_association_limits(embedded).unwrap();
     let client_bearer_id = client.add_bearer(client_bearer).unwrap();
@@ -123,10 +120,7 @@ fn slow_queue_consumer_receives_complete_stream() {
         received_at_us: 1,
     };
     let (server_bearer, server_context, server_sent) = Capture::<Pool>::new("server");
-    let mut server = NoStdRuntime::new(
-        QuicNode::<Pool>::new(None, &SERVER_POOL),
-        embedded.connection,
-    );
+    let mut server = NoStdRuntime::new(QuicNode::<Pool>::new(&SERVER_POOL), embedded.connection);
     server.set_limits(NodeLimits::embedded()).unwrap();
     server.set_default_association_limits(embedded).unwrap();
     let server_bearer_id = server.add_bearer(server_bearer).unwrap();

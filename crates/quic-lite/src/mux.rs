@@ -188,6 +188,18 @@ impl<const P: usize> StreamMux<P> {
     where
         F: FnMut(u64, u64, bool, &[u8]) -> Result<usize, Error>,
     {
+        self.receive_stream_events_on_path(input, 0, on_stream)
+    }
+
+    pub(crate) fn receive_stream_events_on_path<F>(
+        &mut self,
+        input: &[u8],
+        ingress_path: usize,
+        mut on_stream: F,
+    ) -> Result<(), StreamDeliveryError>
+    where
+        F: FnMut(u64, u64, bool, &[u8]) -> Result<usize, Error>,
+    {
         let (_header, header_len) =
             crate::ShortHeader::decode_with_expected(input, self.endpoint.expected_packet_number())
                 .map_err(StreamDeliveryError::Packet)?;
@@ -213,7 +225,7 @@ impl<const P: usize> StreamMux<P> {
         }
         if !has_stream {
             self.endpoint
-                .receive_packet(input)
+                .receive_packet_on_path(input, ingress_path)
                 .map_err(StreamDeliveryError::Packet)?;
             return Ok(());
         }
@@ -263,7 +275,7 @@ impl<const P: usize> StreamMux<P> {
             }
         }
         self.endpoint
-            .receive_packet(input)
+            .receive_packet_on_path(input, ingress_path)
             .map_err(StreamDeliveryError::Packet)?;
 
         let mut offset = header_len;
@@ -346,6 +358,18 @@ impl<const P: usize> StreamMux<P> {
         fin: bool,
         out: &mut [u8],
     ) -> Result<(usize, u32), Error> {
+        self.encode_response_at_on_path(0, stream_id, offset, data, fin, out)
+    }
+
+    pub(crate) fn encode_response_at_on_path(
+        &mut self,
+        path_id: usize,
+        stream_id: u64,
+        offset: u64,
+        data: &[u8],
+        fin: bool,
+        out: &mut [u8],
+    ) -> Result<(usize, u32), Error> {
         if self
             .endpoint
             .open_send_stream(stream_id, crate::INITIAL_MAX_STREAM_DATA)
@@ -355,9 +379,9 @@ impl<const P: usize> StreamMux<P> {
         }
         let peer = self
             .endpoint
-            .peer_connection_id()
+            .peer_connection_id_on_path(path_id)
             .ok_or(Error::WrongConnectionId)?;
         self.endpoint
-            .encode_stream_packet(peer, stream_id, offset, fin, data, out)
+            .encode_stream_packet_on_path(path_id, peer, stream_id, offset, fin, data, out)
     }
 }

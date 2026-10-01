@@ -732,7 +732,6 @@ pub(crate) fn progress() {
                             b"path-attempts-exhausted"
                         }
                         QuicNodeEgressError::SetupRejected(_) => b"setup-rejected",
-                        QuicNodeEgressError::RelayUnavailable => b"relay-unavailable",
                     };
                     let _ = crate::uart_esp::send_debug_text(detail);
                 }
@@ -1201,7 +1200,6 @@ fn write_response(
                     QuicNodeEgressError::CircuitBusy => b"circuit-busy",
                     QuicNodeEgressError::PathSetupAttemptsExhausted => b"path-attempts-exhausted",
                     QuicNodeEgressError::SetupRejected(_) => b"setup-rejected",
-                    QuicNodeEgressError::RelayUnavailable => b"relay-unavailable",
                     QuicNodeEgressError::Transport(_) => b"transport",
                 };
                 let _ = crate::uart_esp::send_debug_text(b"DMESH QUIC response write failed");

@@ -72,11 +72,10 @@ the DCID in caller-supplied output storage and sends the unchanged packet
 number and body to an adapter-owned next-hop handle. It does not parse CBOR or
 QUIC frames, and it does not rely on source address, bearer, or ingress peer.
 
-The forwarding machinery is currently protocol-internal. Neither public
-runtime exposes relay-rule registration or a next-hop adapter yet. If an
-internally installed rule is reached through a runtime, it reports
-`RelayUnavailable`; applications must not treat relay forwarding as an
-implemented public feature.
+The forwarding machinery is available to the node runtimes once circuit setup
+installs a forwarding rule. Runtimes submit the rewritten packet to the
+rule's registered next-hop bearer and address. Forwarding policy, leases, and
+quotas are enforced by the node's relay router.
 
 ## Differences from QUIC
 

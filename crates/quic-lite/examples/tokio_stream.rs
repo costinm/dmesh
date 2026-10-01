@@ -23,8 +23,8 @@ async fn main() {
         BearerName::new("client").unwrap(),
         BearerName::new("server").unwrap(),
     );
-    let mut client = Node::new(None, &CLIENT_POOL);
-    let mut server = Node::new(None, &SERVER_POOL);
+    let mut client = Node::new(&CLIENT_POOL);
+    let mut server = Node::new(&SERVER_POOL);
     let bearer = client.add_bearer(client_bearer).unwrap();
     server.add_bearer(server_bearer).unwrap();
 

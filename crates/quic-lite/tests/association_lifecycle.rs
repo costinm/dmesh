@@ -51,6 +51,21 @@ async fn process_peer_close(node: &mut OneAssociationNode) {
     );
 }
 
+fn next_terminal_event(node: &mut OneAssociationNode) -> Option<AssociationEvent> {
+    loop {
+        let event = node.next_association_event()?;
+        if matches!(
+            event,
+            AssociationEvent::Closed { .. }
+                | AssociationEvent::Reset { .. }
+                | AssociationEvent::IdleTimeout { .. }
+                | AssociationEvent::SetupTimeout { .. }
+        ) {
+            return Some(event);
+        }
+    }
+}
+
 #[tokio::test]
 async fn waiting_for_one_handshake_retains_stream_data_from_another_association() {
     static CLIENT_POOL: Pool = Pool::new();
@@ -65,9 +80,9 @@ async fn waiting_for_one_handshake_retains_stream_data_from_another_association(
         BearerName::new("waiting-client-b").unwrap(),
         BearerName::new("waiting-server-b").unwrap(),
     );
-    let mut client = TwoAssociationNode::new(None, &CLIENT_POOL);
-    let mut server_a = OneAssociationNode::new(None, &SERVER_A_POOL);
-    let mut server_b = OneAssociationNode::new(None, &SERVER_B_POOL);
+    let mut client = TwoAssociationNode::new(&CLIENT_POOL);
+    let mut server_a = OneAssociationNode::new(&SERVER_A_POOL);
+    let mut server_b = OneAssociationNode::new(&SERVER_B_POOL);
     let client_a_bearer = client.add_bearer(client_a_bearer).unwrap();
     let client_b_bearer = client.add_bearer(client_b_bearer).unwrap();
     server_a.add_bearer(server_a_bearer).unwrap();
@@ -153,9 +168,9 @@ async fn finished_tokio_operation_retires_routes_and_one_slot_accepts_an_indepen
         BearerName::new("client-b").unwrap(),
         BearerName::new("server-b").unwrap(),
     );
-    let mut client_a = OneAssociationNode::new(None, &CLIENT_A_POOL);
-    let mut client_b = OneAssociationNode::new(None, &CLIENT_B_POOL);
-    let mut server = OneAssociationNode::new(None, &SERVER_POOL);
+    let mut client_a = OneAssociationNode::new(&CLIENT_A_POOL);
+    let mut client_b = OneAssociationNode::new(&CLIENT_B_POOL);
+    let mut server = OneAssociationNode::new(&SERVER_POOL);
     let client_a_bearer = client_a.add_bearer(client_a_bearer).unwrap();
     let client_b_bearer = client_b.add_bearer(client_b_bearer).unwrap();
     server.add_bearer(server_a_bearer).unwrap();
@@ -180,7 +195,7 @@ async fn finished_tokio_operation_retires_routes_and_one_slot_accepts_an_indepen
     process_peer_close(&mut server).await;
     assert_eq!(server.association_count(), 0);
     assert!(matches!(
-        server.next_association_event(),
+        next_terminal_event(&mut server),
         Some(AssociationEvent::Closed { code: 0, .. })
     ));
 
@@ -203,7 +218,7 @@ async fn finished_tokio_operation_retires_routes_and_one_slot_accepts_an_indepen
     process_peer_close(&mut server).await;
     assert_eq!(server.association_count(), 0);
     assert!(matches!(
-        server.next_association_event(),
+        next_terminal_event(&mut server),
         Some(AssociationEvent::Closed { code: 0, .. })
     ));
 }
@@ -216,8 +231,8 @@ async fn abrupt_disappearance_is_retired_at_the_enforced_idle_deadline() {
         BearerName::new("idle-client").unwrap(),
         BearerName::new("idle-server").unwrap(),
     );
-    let mut client = OneAssociationNode::new(None, &CLIENT_POOL);
-    let mut server = OneAssociationNode::new(None, &SERVER_POOL);
+    let mut client = OneAssociationNode::new(&CLIENT_POOL);
+    let mut server = OneAssociationNode::new(&SERVER_POOL);
     let client_bearer = client.add_bearer(client_bearer).unwrap();
     server.add_bearer(server_bearer).unwrap();
     server.set_idle_timeout_us(1_000);
@@ -252,7 +267,7 @@ async fn abrupt_disappearance_is_retired_at_the_enforced_idle_deadline() {
     process_peer_close(&mut server).await;
     assert_eq!(server.association_count(), 0);
     assert!(matches!(
-        server.next_association_event(),
+        next_terminal_event(&mut server),
         Some(AssociationEvent::IdleTimeout { .. })
     ));
 }

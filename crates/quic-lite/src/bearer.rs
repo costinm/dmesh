@@ -104,13 +104,34 @@ use core::{fmt, ops::Range};
 /// it moves through ingress, connection processing, egress, and completion.
 pub trait PacketWriter: Sized {
     /// Pool-owned lease produced after a successful commit.
-    type Buffer: AsRef<[u8]>;
+    type Buffer: PacketBuffer;
 
     /// Writable packet region after the requested bearer headroom.
     fn payload_mut(&mut self) -> &mut [u8];
 
     /// Commit exactly `len` initialized bytes into a packet lease.
     fn commit(self, len: usize) -> Option<OwnedPacket<Self::Buffer>>;
+}
+
+/// Pool-owned packet storage with optional mutation when its lease is unique.
+///
+/// Packet protection authenticates and decrypts in place after ingress has
+/// selected the destination endpoint. Shared leases remain immutable; a
+/// buffer implementation returns `None` unless this owner has exclusive
+/// access to its backing bytes.
+pub trait PacketBuffer: AsRef<[u8]> {
+    /// Borrow the complete backing storage mutably if no other lease can read
+    /// or write it. The returned slice includes any bearer prefix and suffix.
+    fn as_mut_unique(&mut self) -> Option<&mut [u8]>;
+}
+
+impl<T> PacketBuffer for T
+where
+    T: AsRef<[u8]> + AsMut<[u8]>,
+{
+    fn as_mut_unique(&mut self) -> Option<&mut [u8]> {
+        Some(self.as_mut())
+    }
 }
 
 /// Node-owned source of packet leases shared by every ingress and egress bearer.
@@ -124,7 +145,7 @@ pub trait PacketWriter: Sized {
 /// replies or other higher-priority output.
 pub trait PacketPool {
     /// Lease retained from construction through physical send completion.
-    type Buffer: AsRef<[u8]>;
+    type Buffer: PacketBuffer;
     /// Exclusive writer used to initialize one lease without an extra copy.
     type Writer: PacketWriter<Buffer = Self::Buffer>;
 
@@ -451,8 +472,12 @@ pub(crate) trait PacketEgressEvents<B>: Send + Sync {
 pub enum PacketSendOutcome {
     /// The complete packet reached the physical transport.
     Sent,
-    /// The transport failed after accepting ownership.
+    /// The transport definitely did not submit the packet after accepting the
+    /// lease. QUIC can retire flight and schedule reliable repair immediately.
     Failed,
+    /// The send result is ambiguous; the packet may have reached the peer.
+    /// QUIC keeps it in flight until normal ACK/loss recovery resolves it.
+    Indeterminate,
 }
 
 /// Ownership-bearing physical-send completion delivered to the QUIC owner.
@@ -461,6 +486,7 @@ pub(crate) struct PacketSendCompletion<B> {
     pub packet: OwnedPacket<B>,
     pub outcome: PacketSendOutcome,
     pub elapsed_us: u64,
+    pub acceptance: Option<PacketAcceptance>,
 }
 
 /// Single-use completion callback paired with one submitted packet.
@@ -470,6 +496,7 @@ pub(crate) struct PacketSendCompletion<B> {
 pub struct PacketCompletionToken<B> {
     bearer: BearerId,
     events: Arc<dyn PacketEgressEvents<B>>,
+    acceptance: Option<PacketAcceptance>,
 }
 
 impl<B> fmt::Debug for PacketCompletionToken<B> {
@@ -489,6 +516,7 @@ impl<B> PacketCompletionToken<B> {
             packet,
             outcome,
             elapsed_us,
+            acceptance: self.acceptance,
         });
     }
 }
@@ -517,7 +545,11 @@ impl<B: AsRef<[u8]>> EgressSubmission<B> {
     ) -> Self {
         Self {
             packet,
-            completion: PacketCompletionToken { bearer, events },
+            completion: PacketCompletionToken {
+                bearer,
+                events,
+                acceptance: None,
+            },
         }
     }
 
@@ -626,6 +658,17 @@ impl<B: AsRef<[u8]>> OwnedPacket<B> {
     }
 }
 
+impl<B: PacketBuffer> OwnedPacket<B> {
+    /// Borrow the packet bytes mutably only when this lease uniquely owns its
+    /// backing storage. Relays and shared retained packets therefore cannot
+    /// be changed by endpoint packet protection.
+    pub fn bytes_mut_unique(&mut self) -> Option<&mut [u8]> {
+        let range = self.range.clone();
+        let bytes = self.buffer.as_mut_unique()?;
+        bytes.get_mut(range)
+    }
+}
+
 impl<B: AsRef<[u8]>> AsRef<[u8]> for OwnedPacket<B> {
     fn as_ref(&self) -> &[u8] {
         self.bytes()
@@ -634,9 +677,10 @@ impl<B: AsRef<[u8]>> AsRef<[u8]> for OwnedPacket<B> {
 
 /// A bearer temporarily rejected a packet without taking ownership of it.
 ///
-/// Terminal physical failures happen only after ownership transfers and are
-/// reported through [`PacketSendOutcome::Failed`], which returns the lease by
-/// the same completion path as a successful send.
+/// Terminal physical outcomes happen only after ownership transfers and return
+/// the lease by the same completion path. A definite
+/// [`PacketSendOutcome::Failed`] retires QUIC flight;
+/// [`PacketSendOutcome::Indeterminate`] leaves delivery to ACK/loss recovery.
 #[derive(Debug)]
 pub enum PacketSubmitError<B: AsRef<[u8]>> {
     /// The sender is temporarily full and consumed no bytes.
@@ -779,6 +823,12 @@ where
 /// impose scheduling policy or reject a submission itself. QUIC selects among
 /// bearers using the reported state; the callback remains authoritative and
 /// returns `WouldBlock` without changing a packet when it cannot accept it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PacketAcceptance {
+    pub association: crate::node::QuicAssociation,
+    pub packet_number: u32,
+}
+
 pub(crate) struct RegisteredBearer<B: AsRef<[u8]>> {
     id: BearerId,
     info: BearerInfo,
@@ -786,7 +836,7 @@ pub(crate) struct RegisteredBearer<B: AsRef<[u8]>> {
     stats: BearerStats,
     egress: Box<dyn PacketEgress<B>>,
     events: Arc<dyn PacketEgressEvents<B>>,
-    pending: Option<(PeerL2Address, EgressSubmission<B>)>,
+    pending: Option<(PeerL2Address, EgressSubmission<B>, Option<PacketAcceptance>)>,
 }
 
 impl<B: AsRef<[u8]>> RegisteredBearer<B> {
@@ -816,6 +866,10 @@ impl<B: AsRef<[u8]>> RegisteredBearer<B> {
         self.is_ready() && self.pending.is_none()
     }
 
+    pub(crate) fn has_pending_submission(&self) -> bool {
+        self.pending.is_some()
+    }
+
     /// Enable or disable this bearer without disturbing the QUIC owner.
     ///
     /// The scheduler excludes a disabled bearer from new work. The registry
@@ -841,29 +895,32 @@ impl<B: AsRef<[u8]>> RegisteredBearer<B> {
         &mut self,
         peer_l2_address: PeerL2Address,
         packet: OwnedPacket<B>,
-    ) {
+        acceptance: Option<PacketAcceptance>,
+    ) -> bool {
         assert!(
             self.pending.is_none(),
             "node submitted past a blocked bearer"
         );
-        match self.submit(peer_l2_address, packet) {
-            Ok(()) => {}
+        match self.submit(peer_l2_address, packet, acceptance) {
+            Ok(()) => true,
             Err(PacketSubmitError::WouldBlock(submission)) => {
-                self.pending = Some((peer_l2_address, submission));
+                self.pending = Some((peer_l2_address, submission, acceptance));
+                false
             }
         }
     }
 
-    pub(crate) fn retry_pending(&mut self) {
-        let Some((peer_l2_address, submission)) = self.pending.take() else {
+    pub(crate) fn retry_pending(&mut self) -> Option<PacketAcceptance> {
+        let Some((peer_l2_address, submission, acceptance)) = self.pending.take() else {
             self.send_ready();
-            return;
+            return None;
         };
         self.send_ready();
         match self.retry(peer_l2_address, submission) {
-            Ok(()) => {}
+            Ok(()) => acceptance,
             Err(PacketSubmitError::WouldBlock(submission)) => {
-                self.pending = Some((peer_l2_address, submission));
+                self.pending = Some((peer_l2_address, submission, acceptance));
+                None
             }
         }
     }
@@ -899,12 +956,14 @@ impl<B: AsRef<[u8]>> RegisteredBearer<B> {
         &mut self,
         peer_l2_address: PeerL2Address,
         packet: OwnedPacket<B>,
+        acceptance: Option<PacketAcceptance>,
     ) -> Result<(), PacketSubmitError<B>> {
         let submission = EgressSubmission {
             packet,
             completion: PacketCompletionToken {
                 bearer: self.id,
                 events: self.events.clone(),
+                acceptance,
             },
         };
         self.retry(peer_l2_address, submission)
@@ -1236,7 +1295,19 @@ pub(crate) mod tokio {
 mod tests {
     use super::*;
     use alloc::rc::Rc;
+    use alloc::vec;
     use core::cell::Cell;
+
+    #[test]
+    fn owned_packet_mutation_respects_packet_range() {
+        let mut packet = OwnedPacket::new(vec![1, 2, 3, 4, 5], 1..4).unwrap();
+        packet
+            .bytes_mut_unique()
+            .unwrap()
+            .copy_from_slice(&[7, 8, 9]);
+        assert_eq!(packet.bytes(), &[7, 8, 9]);
+        assert_eq!(packet.into_buffer(), [1, 7, 8, 9, 5]);
+    }
 
     #[test]
     fn rejected_submit_returns_the_same_owned_buffer() {
@@ -1295,6 +1366,7 @@ mod tests {
             .submit(
                 PeerL2Address::new(7).unwrap(),
                 OwnedPacket::new([0, 1, 2, 3, 4, 5, 6, 7], 3..5).unwrap(),
+                None,
             )
             .unwrap();
         assert_eq!(calls.get(), 1);

@@ -64,6 +64,49 @@ enum DriverCommand {
         now_us: u64,
         reply: oneshot::Sender<Result<QuicAssociation, QuicNodeEgressError>>,
     },
+    AssociateRelayed {
+        meta: crate::PacketMeta,
+        destination_vip: Option<u64>,
+        hops: Vec<crate::RelayHop>,
+        return_hints: crate::NearbyRelayHints,
+        now_us: u64,
+        reply: oneshot::Sender<Result<QuicAssociation, QuicNodeEgressError>>,
+    },
+    AddRelayedCircuit {
+        association: QuicAssociation,
+        meta: crate::PacketMeta,
+        hops: Vec<crate::RelayHop>,
+        now_us: u64,
+        reply: oneshot::Sender<Result<crate::CircuitId, QuicNodeEgressError>>,
+    },
+    AddDirectCircuit {
+        association: QuicAssociation,
+        next_hop: crate::CircuitNextHop,
+        now_us: u64,
+        reply: oneshot::Sender<Result<crate::CircuitId, QuicNodeEgressError>>,
+    },
+    RetryDirectCircuit {
+        circuit: crate::CircuitId,
+        reply: oneshot::Sender<Result<(), QuicNodeEgressError>>,
+    },
+    SuspendCircuit {
+        circuit: crate::CircuitId,
+        reply: oneshot::Sender<Result<(), QuicNodeEgressError>>,
+    },
+    ResumeCircuit {
+        circuit: crate::CircuitId,
+        next_hop: crate::CircuitNextHop,
+        now_us: u64,
+        reply: oneshot::Sender<Result<(), QuicNodeEgressError>>,
+    },
+    CloseCircuit {
+        circuit: crate::CircuitId,
+        reply: oneshot::Sender<Result<(), QuicNodeEgressError>>,
+    },
+    Circuits {
+        association: QuicAssociation,
+        reply: oneshot::Sender<Result<Vec<crate::CircuitInfo>, QuicNodeEgressError>>,
+    },
     WaitEstablished {
         association: QuicAssociation,
         reply: oneshot::Sender<Result<(), QuicNodeEgressError>>,
@@ -164,6 +207,54 @@ impl TokioNode {
             association,
         })
     }
+
+    /// Create an association through a client-selected layered relay circuit.
+    pub async fn associate_relayed(
+        &self,
+        meta: crate::PacketMeta,
+        destination_vip: Option<u64>,
+        hops: Vec<crate::RelayHop>,
+        now_us: u64,
+    ) -> Result<TokioAssociation, QuicNodeEgressError> {
+        self.associate_relayed_with_return_hints(
+            meta,
+            destination_vip,
+            hops,
+            crate::NearbyRelayHints::EMPTY,
+            now_us,
+        )
+        .await
+    }
+
+    /// Create a relayed association and offer nearby relays for a peer-built
+    /// return circuit.
+    pub async fn associate_relayed_with_return_hints(
+        &self,
+        meta: crate::PacketMeta,
+        destination_vip: Option<u64>,
+        hops: Vec<crate::RelayHop>,
+        return_hints: crate::NearbyRelayHints,
+        now_us: u64,
+    ) -> Result<TokioAssociation, QuicNodeEgressError> {
+        let (reply, receive) = oneshot::channel();
+        self.commands
+            .send(DriverCommand::AssociateRelayed {
+                meta,
+                destination_vip,
+                hops,
+                return_hints,
+                now_us,
+                reply,
+            })
+            .map_err(|_| QuicNodeEgressError::AssociationTimedOut)?;
+        let association = receive
+            .await
+            .map_err(|_| QuicNodeEgressError::AssociationTimedOut)??;
+        Ok(TokioAssociation {
+            node: self.clone(),
+            association,
+        })
+    }
 }
 
 impl TokioAssociation {
@@ -173,6 +264,146 @@ impl TokioAssociation {
         self.node
             .commands
             .send(DriverCommand::WaitEstablished {
+                association: self.association,
+                reply,
+            })
+            .map_err(|_| QuicNodeEgressError::AssociationTimedOut)?;
+        receive
+            .await
+            .map_err(|_| QuicNodeEgressError::AssociationTimedOut)?
+    }
+
+    /// Add a directly reachable circuit using a registered bearer.
+    pub async fn add_direct_circuit(
+        &self,
+        next_hop: crate::CircuitNextHop,
+        now_us: u64,
+    ) -> Result<crate::CircuitId, QuicNodeEgressError> {
+        let (reply, receive) = oneshot::channel();
+        self.node
+            .commands
+            .send(DriverCommand::AddDirectCircuit {
+                association: self.association,
+                next_hop,
+                now_us,
+                reply,
+            })
+            .map_err(|_| QuicNodeEgressError::AssociationTimedOut)?;
+        receive
+            .await
+            .map_err(|_| QuicNodeEgressError::AssociationTimedOut)?
+    }
+
+    /// Add a client-selected layered relay circuit to this association.
+    pub async fn add_relayed_circuit(
+        &self,
+        first_hop: crate::PacketMeta,
+        hops: Vec<crate::RelayHop>,
+        now_us: u64,
+    ) -> Result<crate::CircuitId, QuicNodeEgressError> {
+        let (reply, receive) = oneshot::channel();
+        self.node
+            .commands
+            .send(DriverCommand::AddRelayedCircuit {
+                association: self.association,
+                meta: first_hop,
+                hops,
+                now_us,
+                reply,
+            })
+            .map_err(|_| QuicNodeEgressError::AssociationTimedOut)?;
+        receive
+            .await
+            .map_err(|_| QuicNodeEgressError::AssociationTimedOut)?
+    }
+
+    /// Retry a direct circuit join that is still opening.
+    pub async fn retry_direct_circuit(
+        &self,
+        circuit: crate::CircuitId,
+    ) -> Result<(), QuicNodeEgressError> {
+        if circuit.association() != self.association {
+            return Err(QuicNodeEgressError::Transport(crate::Error::Invalid));
+        }
+        let (reply, receive) = oneshot::channel();
+        self.node
+            .commands
+            .send(DriverCommand::RetryDirectCircuit { circuit, reply })
+            .map_err(|_| QuicNodeEgressError::AssociationTimedOut)?;
+        receive
+            .await
+            .map_err(|_| QuicNodeEgressError::AssociationTimedOut)?
+    }
+
+    /// Mark a circuit unavailable after its neighbour-down notification.
+    pub async fn suspend_circuit(
+        &self,
+        circuit: crate::CircuitId,
+    ) -> Result<(), QuicNodeEgressError> {
+        if circuit.association() != self.association {
+            return Err(QuicNodeEgressError::Transport(crate::Error::Invalid));
+        }
+        let (reply, receive) = oneshot::channel();
+        self.node
+            .commands
+            .send(DriverCommand::SuspendCircuit { circuit, reply })
+            .map_err(|_| QuicNodeEgressError::AssociationTimedOut)?;
+        receive
+            .await
+            .map_err(|_| QuicNodeEgressError::AssociationTimedOut)?
+    }
+
+    /// Probe a suspended circuit through its newly available next hop.
+    pub async fn resume_circuit(
+        &self,
+        circuit: crate::CircuitId,
+        next_hop: crate::CircuitNextHop,
+        now_us: u64,
+    ) -> Result<(), QuicNodeEgressError> {
+        if circuit.association() != self.association {
+            return Err(QuicNodeEgressError::Transport(crate::Error::Invalid));
+        }
+        let (reply, receive) = oneshot::channel();
+        self.node
+            .commands
+            .send(DriverCommand::ResumeCircuit {
+                circuit,
+                next_hop,
+                now_us,
+                reply,
+            })
+            .map_err(|_| QuicNodeEgressError::AssociationTimedOut)?;
+        receive
+            .await
+            .map_err(|_| QuicNodeEgressError::AssociationTimedOut)?
+    }
+
+    /// Close an idle circuit after PATH_STATUS abandon has been acknowledged.
+    /// The first call queues the status and returns `CircuitBusy`; retry after
+    /// the peer's ACK arrives.
+    pub async fn close_circuit(
+        &self,
+        circuit: crate::CircuitId,
+    ) -> Result<(), QuicNodeEgressError> {
+        if circuit.association() != self.association {
+            return Err(QuicNodeEgressError::Transport(crate::Error::Invalid));
+        }
+        let (reply, receive) = oneshot::channel();
+        self.node
+            .commands
+            .send(DriverCommand::CloseCircuit { circuit, reply })
+            .map_err(|_| QuicNodeEgressError::AssociationTimedOut)?;
+        receive
+            .await
+            .map_err(|_| QuicNodeEgressError::AssociationTimedOut)?
+    }
+
+    /// Return read-only telemetry for this association's direct circuits.
+    pub async fn circuits(&self) -> Result<Vec<crate::CircuitInfo>, QuicNodeEgressError> {
+        let (reply, receive) = oneshot::channel();
+        self.node
+            .commands
+            .send(DriverCommand::Circuits {
                 association: self.association,
                 reply,
             })
@@ -214,6 +445,15 @@ impl TokioAssociation {
 }
 
 impl TokioStream {
+    /// Mark this stream as latency-sensitive control traffic. Accepted data
+    /// packets may be duplicated over an alternate circuit when budget allows.
+    pub fn set_priority(&mut self, priority: bool) {
+        self.stream
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .set_priority(priority);
+    }
+
     /// Receive the next ordered application chunk.
     pub async fn read_chunk(&mut self) -> Option<(u64, bool, Vec<u8>)> {
         let chunk = self
@@ -515,12 +755,27 @@ where
                 continue;
             }
             let association = match event {
-                crate::AssociationEvent::Closed { association, .. }
+                crate::AssociationEvent::CircuitOpened { association, .. }
+                | crate::AssociationEvent::CircuitStatusChanged { association, .. }
+                | crate::AssociationEvent::CircuitClosed { association, .. }
+                | crate::AssociationEvent::Closed { association, .. }
                 | crate::AssociationEvent::Reset { association }
                 | crate::AssociationEvent::IdleTimeout { association }
-                | crate::AssociationEvent::SetupTimeout { association } => association,
+                | crate::AssociationEvent::SetupTimeout { association }
+                | crate::AssociationEvent::SetupRejected { association, .. }
+                | crate::AssociationEvent::PeerReturnPathHints { association, .. } => association,
                 crate::AssociationEvent::EventsDropped { .. } => unreachable!(),
             };
+            if matches!(
+                event,
+                crate::AssociationEvent::CircuitOpened { .. }
+                    | crate::AssociationEvent::CircuitStatusChanged { .. }
+                    | crate::AssociationEvent::CircuitClosed { .. }
+                    | crate::AssociationEvent::PeerReturnPathHints { .. }
+            ) {
+                let _ = self.event_sender.send(event);
+                continue;
+            }
             if matches!(event, crate::AssociationEvent::Closed { .. }) {
                 if !self.closing_associations.contains(&association) {
                     self.closing_associations.push(association);
@@ -539,11 +794,24 @@ where
             self.node
                 .deferred_streams
                 .retain(|(owner, _)| *owner != association);
-            if matches!(event, crate::AssociationEvent::SetupTimeout { .. }) {
+            if matches!(
+                event,
+                crate::AssociationEvent::SetupTimeout { .. }
+                    | crate::AssociationEvent::SetupRejected { .. }
+            ) {
                 let mut pending = Vec::new();
                 for (waiting, reply) in self.establishment_waiters.drain(..) {
                     if waiting == association {
-                        let _ = reply.send(Err(QuicNodeEgressError::AssociationTimedOut));
+                        let result = match event {
+                            crate::AssociationEvent::SetupTimeout { .. } => {
+                                QuicNodeEgressError::AssociationTimedOut
+                            }
+                            crate::AssociationEvent::SetupRejected { code, .. } => {
+                                QuicNodeEgressError::SetupRejected(code)
+                            }
+                            _ => unreachable!(),
+                        };
+                        let _ = reply.send(Err(result));
                     } else {
                         pending.push((waiting, reply));
                     }
@@ -566,6 +834,62 @@ where
                 reply,
             } => {
                 let _ = reply.send(self.node.associate(meta, now_us));
+            }
+            DriverCommand::AssociateRelayed {
+                meta,
+                destination_vip,
+                hops,
+                return_hints,
+                now_us,
+                reply,
+            } => {
+                let _ = reply.send(self.node.associate_relayed_with_return_hints(
+                    meta,
+                    destination_vip,
+                    &hops,
+                    return_hints,
+                    now_us,
+                ));
+            }
+            DriverCommand::AddRelayedCircuit {
+                association,
+                meta,
+                hops,
+                now_us,
+                reply,
+            } => {
+                let _ = reply.send(
+                    self.node
+                        .join_relayed_path(association, meta, &hops, now_us),
+                );
+            }
+            DriverCommand::AddDirectCircuit {
+                association,
+                next_hop,
+                now_us,
+                reply,
+            } => {
+                let _ = reply.send(self.node.add_direct_circuit(association, next_hop, now_us));
+            }
+            DriverCommand::RetryDirectCircuit { circuit, reply } => {
+                let _ = reply.send(self.node.retry_direct_circuit(circuit));
+            }
+            DriverCommand::SuspendCircuit { circuit, reply } => {
+                let _ = reply.send(self.node.suspend_circuit(circuit));
+            }
+            DriverCommand::ResumeCircuit {
+                circuit,
+                next_hop,
+                now_us,
+                reply,
+            } => {
+                let _ = reply.send(self.node.resume_circuit(circuit, next_hop, now_us));
+            }
+            DriverCommand::CloseCircuit { circuit, reply } => {
+                let _ = reply.send(self.node.close_circuit(circuit));
+            }
+            DriverCommand::Circuits { association, reply } => {
+                let _ = reply.send(Ok(self.node.circuits_vec(association)));
             }
             DriverCommand::WaitEstablished { association, reply } => {
                 if self.node.association_is_established(association) {
@@ -1084,14 +1408,19 @@ where
             })?;
         match ingress {
             crate::node::NodeIngress::Initial { response, .. }
+            | crate::node::NodeIngress::SetupReply { response }
+            | crate::node::NodeIngress::SetupAccepted { response, .. }
             | crate::node::NodeIngress::StatelessReset { response } => {
                 self.submit_unassociated_packet(response)?;
+            }
+            crate::node::NodeIngress::PathControl { response, .. } => {
+                self.submit_node_packet(response)?;
             }
             crate::node::NodeIngress::Association { association, .. } => {
                 self.submit_or_defer_control(association.association())?;
             }
-            crate::node::NodeIngress::Forward { .. } => {
-                return Err(QuicNodeEgressError::RelayUnavailable);
+            crate::node::NodeIngress::Forward { next_hop, packet } => {
+                self.submit_egress(next_hop.bearer, next_hop.peer_l2_address, packet)?;
             }
             _ => {}
         }
@@ -1178,7 +1507,9 @@ where
                         Some(crate::node::NodeTimer::BootstrapTimedOut { .. }) => {
                             return Err(QuicNodeEgressError::AssociationTimedOut);
                         }
-                        Some(crate::node::NodeTimer::IdleTimedOut { .. }) | None => {}
+                        Some(crate::node::NodeTimer::IdleTimedOut { .. })
+                        | Some(crate::node::NodeTimer::CircuitSetupTimedOut { .. })
+                        | None => {}
                     }
                 }
             }
@@ -1301,10 +1632,11 @@ mod tests {
     #[test]
     fn per_stream_chunk_limit_does_not_scale_with_node_size() {
         static POOL: Pool = Pool::new();
-        let mut node = Node::new(None, &POOL);
+        let mut node = Node::new(&POOL);
         node.set_limits(crate::NodeLimits {
             max_associations: 1_000_000,
             max_routes: 1_000_000,
+            ..crate::NodeLimits::host()
         })
         .unwrap();
         assert_eq!(
@@ -1314,16 +1646,421 @@ mod tests {
     }
 
     #[test]
+    fn relayed_association_starts_with_replayable_layered_path_open() {
+        static POOL: Pool = Pool::new();
+        let mut node = Node::new(&POOL);
+        let bearer = FakePacketBearer::<Pool>::new(BearerName::new("relay-origin").unwrap());
+        let sent = bearer.sent_packets();
+        let bearer = node.add_bearer(bearer).unwrap();
+        let address = PacketMeta {
+            bearer,
+            peer_l2_address: PeerL2Address::new(9).unwrap(),
+            received_at_us: 100,
+        };
+        let hop = crate::RelayHop::new(2, &[1, 2, 3], 5_000_000, 128).unwrap();
+        let association = node
+            .associate_relayed(address, Some(0x1020), &[hop], 100)
+            .unwrap();
+        let first = sent.lock().unwrap()[0].clone();
+        let request = crate::relay::decode_setup_request_packet(&first).unwrap();
+        assert_eq!(request.transaction_id, 1);
+        assert_eq!(request.destination_vip, Some(0x1020));
+        assert_eq!(request.blocks.count(), 2);
+        assert_eq!(
+            request.current_hop_instruction().unwrap(),
+            crate::relay::SetupHopInstruction {
+                address_kind: 2,
+                address_len: 3,
+                address: [1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                lease_us: 5_000_000,
+                packet_quota: 128,
+            }
+        );
+
+        let Some(crate::node::NodeTimer::Egress(retry)) = node
+            .timer_expired(100 + crate::node::DEFAULT_INITIAL_PTO_US)
+            .unwrap()
+        else {
+            panic!("relay setup should retry on its bootstrap deadline");
+        };
+        assert_eq!(retry.association, association);
+        assert_eq!(retry.packet.bytes(), first);
+        drop(retry);
+
+        let client_cid = node.receive_cid(association).unwrap();
+        let endpoint_cid = crate::ConnectionId::new(0x902).unwrap();
+        let mut bootstrap_ack = [0u8; crate::DEFAULT_MAX_PACKET_SIZE];
+        let ack_len = crate::encode_bootstrap_open_ack_packet(
+            client_cid,
+            endpoint_cid,
+            0,
+            &mut bootstrap_ack,
+        )
+        .unwrap();
+        let mut relay_cids = crate::relay::SetupRelayCids::empty();
+        relay_cids
+            .prepend(crate::ConnectionId::new(0x901).unwrap())
+            .unwrap();
+        let reply = crate::relay::SetupReply {
+            transaction_id: request.transaction_id,
+            circuit: request.circuit,
+            result: crate::relay::SetupResult::Accepted {
+                endpoint_cid,
+                lease_us: 5_000_000,
+            },
+            bootstrap_ack: Some(
+                crate::relay::SetupBootstrapAck::from_slice(&bootstrap_ack[..ack_len]).unwrap(),
+            ),
+            relay_cids,
+        };
+        let mut reply_bytes = [0u8; crate::DEFAULT_MAX_PACKET_SIZE];
+        let reply_len = reply.encode_packet(&mut reply_bytes).unwrap();
+        let mut writer = POOL.acquire_writer(0).unwrap();
+        writer.payload_mut()[..reply_len].copy_from_slice(&reply_bytes[..reply_len]);
+        let ingress_lease = writer.commit(reply_len).unwrap();
+        let ingress_packet = match crate::OwnedPacket::new(ingress_lease, 0..reply_len) {
+            Ok(packet) => packet,
+            Err(_) => panic!("valid pooled packet range should be accepted"),
+        };
+        let ingress =
+            match node.receive_packet(address, ingress_packet, |_| None, |_, _, _, _, _| Ok(0)) {
+                Ok(ingress) => ingress,
+                Err(_) => panic!("valid PATH_OPEN_ACK should not reject its packet lease"),
+            };
+        assert!(matches!(
+            ingress,
+            crate::node::NodeIngress::Association {
+                association: crate::node::AssociationIngress::Client(opened),
+                ..
+            } if opened == association
+        ));
+        let mut circuits = [crate::CircuitInfo::default(); 1];
+        assert_eq!(node.circuits(association, &mut circuits), 1);
+        assert_eq!(circuits[0].status, crate::CircuitStatus::Active);
+        assert_eq!(
+            circuits[0].first_hop.peer_l2_address,
+            address.peer_l2_address
+        );
+    }
+
+    #[test]
+    fn create_through_three_relays_then_join_a_second_three_relay_chain() {
+        use crate::node::InitialAdmission;
+        use crate::node::NodeIngress;
+        use crate::{CircuitNextHop, RelayHop};
+
+        type MultiPool = PacketPool<32, { crate::DEFAULT_PACKET_POOL_SLOT_SIZE }>;
+        type RelayNode = QuicNode<MultiPool>;
+        type TestPacket = [u8; crate::DEFAULT_MAX_PACKET_SIZE];
+        static CLIENT_POOL: MultiPool = MultiPool::new();
+        static R1_POOL: MultiPool = MultiPool::new();
+        static R2_POOL: MultiPool = MultiPool::new();
+        static R3_POOL: MultiPool = MultiPool::new();
+        static R4_POOL: MultiPool = MultiPool::new();
+        static R5_POOL: MultiPool = MultiPool::new();
+        static R6_POOL: MultiPool = MultiPool::new();
+        static ENDPOINT_POOL: MultiPool = MultiPool::new();
+
+        let packet = |bytes: &[u8]| {
+            let mut storage = [0u8; crate::DEFAULT_MAX_PACKET_SIZE];
+            storage[..bytes.len()].copy_from_slice(bytes);
+            crate::OwnedPacket::<TestPacket>::new(storage, 0..bytes.len()).unwrap()
+        };
+        let admission = || {
+            Some(InitialAdmission {
+                local_limits: crate::ConnectionLimits::default(),
+            })
+        };
+        let on_stream = |_, _, _, _, bytes: &[u8]| Ok(bytes.len());
+        macro_rules! forward {
+            ($relay:expr, $meta:expr, $packet:expr) => {{
+                match $relay
+                    .receive_packet($meta, $packet, |_| admission(), on_stream)
+                    .unwrap()
+                {
+                    NodeIngress::Forward { packet, .. } => packet,
+                    _ => panic!("relay must forward the next setup block"),
+                }
+            }};
+        }
+        macro_rules! reply {
+            ($relay:expr, $meta:expr, $packet:expr) => {{
+                match $relay
+                    .receive_packet($meta, $packet, |_| None, on_stream)
+                    .unwrap()
+                {
+                    NodeIngress::SetupReply { response } => response.packet,
+                    NodeIngress::NonQuic { error, .. } => {
+                        panic!("{} rejected the setup reply: {error:?}", stringify!($relay));
+                    }
+                    _ => panic!("{} must return the setup reply", stringify!($relay)),
+                }
+            }};
+        }
+
+        let bearer_impl = FakePacketBearer::<MultiPool>::new(BearerName::new("mp-client").unwrap());
+        let sent = bearer_impl.sent_packets();
+        let node = RelayNode::new(&CLIENT_POOL);
+        let mut client = TokioNodeDriver::new(node, crate::ConnectionLimits::default()).1;
+        let bearer = client.node.add_bearer(bearer_impl).unwrap();
+        let create_meta = PacketMeta {
+            bearer,
+            peer_l2_address: PeerL2Address::new(11).unwrap(),
+            received_at_us: 10,
+        };
+
+        let links1 = [
+            CircuitNextHop {
+                bearer: BearerId::new(2).unwrap(),
+                peer_l2_address: PeerL2Address::new(22).unwrap(),
+            },
+            CircuitNextHop {
+                bearer: BearerId::new(3).unwrap(),
+                peer_l2_address: PeerL2Address::new(33).unwrap(),
+            },
+            CircuitNextHop {
+                bearer: BearerId::new(4).unwrap(),
+                peer_l2_address: PeerL2Address::new(44).unwrap(),
+            },
+        ];
+        let links2 = [
+            CircuitNextHop {
+                bearer: BearerId::new(5).unwrap(),
+                peer_l2_address: PeerL2Address::new(55).unwrap(),
+            },
+            CircuitNextHop {
+                bearer: BearerId::new(6).unwrap(),
+                peer_l2_address: PeerL2Address::new(66).unwrap(),
+            },
+            CircuitNextHop {
+                bearer: BearerId::new(7).unwrap(),
+                peer_l2_address: PeerL2Address::new(77).unwrap(),
+            },
+        ];
+        let mut r1 = RelayNode::new(&R1_POOL);
+        let mut r2 = RelayNode::new(&R2_POOL);
+        let mut r3 = RelayNode::new(&R3_POOL);
+        let mut r4 = RelayNode::new(&R4_POOL);
+        let mut r5 = RelayNode::new(&R5_POOL);
+        let mut r6 = RelayNode::new(&R6_POOL);
+        let mut endpoint = RelayNode::new(&ENDPOINT_POOL);
+        r1.set_path_open_resolver(move |kind, addr| {
+            (kind == 2 && addr == [2]).then_some(links1[0])
+        });
+        r2.set_path_open_resolver(move |kind, addr| {
+            (kind == 2 && addr == [3]).then_some(links1[1])
+        });
+        r3.set_path_open_resolver(move |kind, addr| {
+            (kind == 3 && addr == [4]).then_some(links1[2])
+        });
+        r4.set_path_open_resolver(move |kind, addr| {
+            (kind == 2 && addr == [5]).then_some(links2[0])
+        });
+        r5.set_path_open_resolver(move |kind, addr| {
+            (kind == 2 && addr == [6]).then_some(links2[1])
+        });
+        r6.set_path_open_resolver(move |kind, addr| {
+            (kind == 3 && addr == [7]).then_some(links2[2])
+        });
+
+        let hops1 = [
+            RelayHop::new(2, &[2], 60_000_000, 4096).unwrap(),
+            RelayHop::new(2, &[3], 50_000_000, 4096).unwrap(),
+            RelayHop::new(3, &[4], 40_000_000, 4096).unwrap(),
+        ];
+        let association = client
+            .node
+            .associate_relayed(create_meta, Some(0x0102_0304_0506_0708), &hops1, 10)
+            .unwrap();
+        let create_bytes = sent.lock().unwrap()[0].clone();
+        let p12 = forward!(r1, create_meta, packet(&create_bytes));
+        let meta12 = PacketMeta {
+            bearer: links1[0].bearer,
+            peer_l2_address: links1[0].peer_l2_address,
+            received_at_us: 20,
+        };
+        let p23 = forward!(r2, meta12, p12);
+        let meta23 = PacketMeta {
+            bearer: links1[1].bearer,
+            peer_l2_address: links1[1].peer_l2_address,
+            received_at_us: 30,
+        };
+        let p3e = forward!(r3, meta23, p23);
+        let created = endpoint
+            .receive_packet(
+                PacketMeta {
+                    bearer: links1[2].bearer,
+                    peer_l2_address: links1[2].peer_l2_address,
+                    received_at_us: 40,
+                },
+                p3e,
+                |_| admission(),
+                on_stream,
+            )
+            .unwrap();
+        let NodeIngress::SetupAccepted {
+            response: endpoint_reply,
+            ..
+        } = created
+        else {
+            panic!("the endpoint admits Create through three relays");
+        };
+        let p3r = reply!(
+            r3,
+            PacketMeta {
+                bearer: links1[2].bearer,
+                peer_l2_address: links1[2].peer_l2_address,
+                received_at_us: 50,
+            },
+            endpoint_reply.packet
+        );
+        let p2r = reply!(
+            r2,
+            PacketMeta {
+                received_at_us: 60,
+                ..meta23
+            },
+            p3r
+        );
+        let p1r = reply!(
+            r1,
+            PacketMeta {
+                received_at_us: 70,
+                ..meta12
+            },
+            p2r
+        );
+        let create_reply = crate::relay::decode_setup_reply_packet(p1r.bytes()).unwrap();
+        assert!(matches!(
+            create_reply.result,
+            crate::relay::SetupResult::Accepted { .. }
+        ));
+        assert_eq!(create_reply.relay_cids.count(), 3);
+        client
+            .node
+            .receive_packet(
+                PacketMeta {
+                    received_at_us: 70,
+                    ..create_meta
+                },
+                p1r,
+                |_| None,
+                on_stream,
+            )
+            .unwrap();
+        assert_eq!(client.node.association_count(), 1);
+        assert_eq!(endpoint.association_count(), 1);
+        assert!(client.node.association_is_established(association));
+
+        let join_meta = PacketMeta {
+            peer_l2_address: PeerL2Address::new(12).unwrap(),
+            received_at_us: 100,
+            ..create_meta
+        };
+        let hops2 = [
+            RelayHop::new(2, &[5], 60_000_000, 4096).unwrap(),
+            RelayHop::new(2, &[6], 50_000_000, 4096).unwrap(),
+            RelayHop::new(3, &[7], 40_000_000, 4096).unwrap(),
+        ];
+        let join_circuit = client
+            .node
+            .join_relayed_path(association, join_meta, &hops2, 100)
+            .unwrap();
+        let join_bytes = sent.lock().unwrap()[1].clone();
+        let p45 = forward!(r4, join_meta, packet(&join_bytes));
+        let meta45 = PacketMeta {
+            bearer: links2[0].bearer,
+            peer_l2_address: links2[0].peer_l2_address,
+            received_at_us: 110,
+        };
+        let p56 = forward!(r5, meta45, p45);
+        let meta56 = PacketMeta {
+            bearer: links2[1].bearer,
+            peer_l2_address: links2[1].peer_l2_address,
+            received_at_us: 120,
+        };
+        let p6e = forward!(r6, meta56, p56);
+        let joined = endpoint
+            .receive_packet(
+                PacketMeta {
+                    bearer: links2[2].bearer,
+                    peer_l2_address: links2[2].peer_l2_address,
+                    received_at_us: 130,
+                },
+                p6e,
+                |_| None,
+                on_stream,
+            )
+            .unwrap();
+        let NodeIngress::SetupReply {
+            response: join_endpoint_reply,
+        } = joined
+        else {
+            panic!("the existing endpoint accepts the second chain JOIN");
+        };
+        let p6r = reply!(
+            r6,
+            PacketMeta {
+                bearer: links2[2].bearer,
+                peer_l2_address: links2[2].peer_l2_address,
+                received_at_us: 140,
+            },
+            join_endpoint_reply.packet
+        );
+        let p5r = reply!(
+            r5,
+            PacketMeta {
+                received_at_us: 150,
+                ..meta56
+            },
+            p6r
+        );
+        let p4r = reply!(
+            r4,
+            PacketMeta {
+                received_at_us: 160,
+                ..meta45
+            },
+            p5r
+        );
+        let join_reply = crate::relay::decode_setup_reply_packet(p4r.bytes()).unwrap();
+        assert!(matches!(
+            join_reply.result,
+            crate::relay::SetupResult::Accepted { .. }
+        ));
+        assert_eq!(join_reply.relay_cids.count(), 3);
+        client
+            .node
+            .receive_packet(
+                PacketMeta {
+                    received_at_us: 160,
+                    ..join_meta
+                },
+                p4r,
+                |_| None,
+                on_stream,
+            )
+            .unwrap();
+        assert_eq!(client.node.association_count(), 1);
+        assert_eq!(endpoint.association_count(), 1);
+        let mut circuits = [crate::CircuitInfo::default(); crate::MAX_PATH_STATES];
+        assert_eq!(client.node.circuits(association, &mut circuits), 2);
+        assert_eq!(circuits[1].id, join_circuit);
+        assert_eq!(circuits[1].status, crate::CircuitStatus::Probing);
+    }
+
+    #[test]
     fn committed_packet_batch_is_retained_and_ingress_continues_at_the_queue_limit() {
         static POOL: Pool = Pool::new();
         let (bearer, _peer) = FakePacketBearer::<Pool>::pair(
             BearerName::new("batch-node").unwrap(),
             BearerName::new("batch-peer").unwrap(),
         );
-        let mut node = Node::new(None, &POOL);
+        let mut node = Node::new(&POOL);
         node.set_limits(crate::NodeLimits {
             max_associations: 1,
             max_routes: 1,
+            ..crate::NodeLimits::host()
         })
         .unwrap();
         node.set_default_association_limits(crate::AssociationLimits {
@@ -1407,6 +2144,12 @@ where
     P: PacketPool + 'static,
     P::Buffer: Send,
 {
+    /// Mark this stream as latency-sensitive control traffic. Accepted data
+    /// packets may be duplicated over an alternate circuit when budget allows.
+    pub fn set_priority(&mut self, priority: bool) {
+        self.stream.set_priority(priority);
+    }
+
     fn new(
         node: &'a mut QuicNode<P, PACKET>,
         stream: QuicStream,
@@ -1490,6 +2233,7 @@ where
                 let _ = association;
                 Poll::Ready(Ok(()))
             }
+            Ok(Some(crate::node::NodeTimer::CircuitSetupTimedOut { .. })) => Poll::Ready(Ok(())),
             Ok(None) => {
                 context.waker().wake_by_ref();
                 Poll::Pending

@@ -17,8 +17,8 @@ async fn owned_handles_exchange_two_concurrent_streams() {
         BearerName::new("driver-client").unwrap(),
         BearerName::new("driver-server").unwrap(),
     );
-    let mut client_node = Node::new(None, &CLIENT_POOL);
-    let mut server_node = Node::new(None, &SERVER_POOL);
+    let mut client_node = Node::new(&CLIENT_POOL);
+    let mut server_node = Node::new(&SERVER_POOL);
     let client_bearer = client_node.add_bearer(client_bearer).unwrap();
     server_node.add_bearer(server_bearer).unwrap();
     let (client, client_driver) = TokioNodeDriver::new(client_node, ConnectionLimits::default());
@@ -105,8 +105,8 @@ async fn one_association_reuses_stream_capacity_past_initial_limit() {
         BearerName::new("reuse-client").unwrap(),
         BearerName::new("reuse-server").unwrap(),
     );
-    let mut client_node = Node::new(None, &CLIENT_POOL);
-    let mut server_node = Node::new(None, &SERVER_POOL);
+    let mut client_node = Node::new(&CLIENT_POOL);
+    let mut server_node = Node::new(&SERVER_POOL);
     let client_bearer = client_node.add_bearer(client_bearer).unwrap();
     server_node.add_bearer(server_bearer).unwrap();
     let (client, client_driver) = TokioNodeDriver::new(client_node, ConnectionLimits::default());

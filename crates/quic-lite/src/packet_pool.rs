@@ -133,6 +133,16 @@ impl<const SLOTS: usize, const MTU: usize> AsRef<[u8]> for PoolBufferLease<'_, S
     }
 }
 
+impl<const SLOTS: usize, const MTU: usize> crate::PacketBuffer for PoolBufferLease<'_, SLOTS, MTU> {
+    fn as_mut_unique(&mut self) -> Option<&mut [u8]> {
+        let index = self.lease.slot.index();
+        if self.lease.pool.references[index].load(Ordering::Acquire) != 1 {
+            return None;
+        }
+        Some(unsafe { &mut (*self.lease.pool.packets.get())[index] })
+    }
+}
+
 /// Exclusive construction access to one slot in a `QuicNode` packet pool.
 ///
 /// A producer reserves bearer headroom, serializes directly into

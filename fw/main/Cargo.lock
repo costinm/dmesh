@@ -706,7 +706,6 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "mesh-api"
 version = "0.1.0"
-source = "git+https://github.com/costinm/ssh-mesh#5fbdaeeae73e2dde842069c6ab50a4853cd65cc2"
 
 [[package]]
 name = "minimal-lexical"
@@ -1401,3 +1400,11 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+
+[[patch.unused]]
+name = "mesh"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "ssh-mesh"
+version = "0.1.0"

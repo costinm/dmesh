@@ -106,7 +106,7 @@ fn copy_into_pool(
 #[test]
 fn synchronous_driver_receives_and_replies_to_stream_shaped_message() {
     let (client_bearer, client_context, client_sent) = Capture::<Pool>::new("client-uart");
-    let client = QuicNode::<Pool>::new(None, &CLIENT_POOL);
+    let client = QuicNode::<Pool>::new(&CLIENT_POOL);
     let mut client = NoStdRuntime::new(client, ConnectionLimits::default());
     let client_bearer_id = client.add_bearer(client_bearer).unwrap();
     let client_address = PacketMeta {
@@ -115,7 +115,7 @@ fn synchronous_driver_receives_and_replies_to_stream_shaped_message() {
         received_at_us: 1,
     };
     let (server_bearer, server_context, server_sent) = Capture::<Pool>::new("server-uart");
-    let server = QuicNode::<Pool>::new(None, &SERVER_POOL);
+    let server = QuicNode::<Pool>::new(&SERVER_POOL);
     let mut server = NoStdRuntime::new(server, ConnectionLimits::default());
     let server_bearer_id = server.add_bearer(server_bearer).unwrap();
     let server_address = PacketMeta {

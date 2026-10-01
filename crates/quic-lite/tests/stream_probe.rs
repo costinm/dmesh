@@ -174,8 +174,8 @@ async fn fake_bearer_uses_the_same_stream_probe_as_tcp() {
         BearerName::new("probe-client").unwrap(),
         BearerName::new("probe-server").unwrap(),
     );
-    let mut client_node = ProbeNode::new(None, &CLIENT_POOL);
-    let mut server_node = ProbeNode::new(None, &SERVER_POOL);
+    let mut client_node = ProbeNode::new(&CLIENT_POOL);
+    let mut server_node = ProbeNode::new(&SERVER_POOL);
     let client_bearer = client_node.add_bearer(client_bearer).unwrap();
     server_node.add_bearer(server_bearer).unwrap();
 
@@ -201,8 +201,8 @@ async fn framed_bearer_uses_the_same_stream_probe_as_tcp() {
     let accept = listener.accept();
     let (client, server) = tokio::join!(connect, accept);
 
-    let mut client_node = ProbeNode::new(None, &CLIENT_POOL);
-    let mut server_node = ProbeNode::new(None, &SERVER_POOL);
+    let mut client_node = ProbeNode::new(&CLIENT_POOL);
+    let mut server_node = ProbeNode::new(&SERVER_POOL);
     let client_bearer = client_node
         .add_bearer(TokioFramedBearer::<ProbePool>::from_tcp(
             client.unwrap(),
@@ -246,8 +246,8 @@ async fn udp_bearer_uses_the_same_stream_probe_as_tcp() {
     let server_peer = client_bearer.register_peer(server_address).unwrap();
     server_bearer.register_peer(client_address).unwrap();
 
-    let mut client_node = ProbeNode::new(None, &CLIENT_POOL);
-    let mut server_node = ProbeNode::new(None, &SERVER_POOL);
+    let mut client_node = ProbeNode::new(&CLIENT_POOL);
+    let mut server_node = ProbeNode::new(&SERVER_POOL);
     let client_bearer = client_node.add_bearer(client_bearer).unwrap();
     server_node.add_bearer(server_bearer).unwrap();
 
@@ -272,8 +272,8 @@ async fn tokio_stream_retransmits_after_receiver_pool_drop() {
         BearerName::new("loss-client").unwrap(),
         BearerName::new("loss-server").unwrap(),
     );
-    let mut client_node = ProbeNode::new(None, &CLIENT_POOL);
-    let mut server_node = ProbeNode::new(None, &SERVER_POOL);
+    let mut client_node = ProbeNode::new(&CLIENT_POOL);
+    let mut server_node = ProbeNode::new(&SERVER_POOL);
     let client_bearer = client_node.add_bearer(client_bearer).unwrap();
     server_node.add_bearer(server_bearer).unwrap();
     let association = client_node

@@ -78,7 +78,7 @@ impl PacketBearer<Pool> for AttachFailure {
 
 #[test]
 fn node_owns_the_complete_bearer() {
-    let mut node = Node::new(None, &CLIENT_POOL);
+    let mut node = Node::new(&CLIENT_POOL);
     let name = BearerName::new("owned0").unwrap();
     assert_eq!(
         node.add_bearer(FakePacketBearer::<Pool>::new(name))
@@ -93,7 +93,7 @@ fn node_owns_the_complete_bearer() {
 
 #[test]
 fn node_rejects_bearers_below_the_common_packet_size_before_attachment() {
-    let mut node = Node::new(None, &CLIENT_POOL);
+    let mut node = Node::new(&CLIENT_POOL);
     let name = BearerName::new("small-mtu").unwrap();
     assert_eq!(
         node.add_bearer(UndersizedBearer(FakePacketBearer::<Pool>::new(name))),
@@ -111,7 +111,7 @@ fn node_rejects_bearers_below_the_common_packet_size_before_attachment() {
 
 #[test]
 fn removed_bearer_ids_are_retired_and_names_can_be_reused() {
-    let mut node = Node::new(None, &CLIENT_POOL);
+    let mut node = Node::new(&CLIENT_POOL);
     let name = BearerName::new("replaceable").unwrap();
     let first = node
         .add_bearer(FakePacketBearer::<Pool>::new(name))
@@ -128,13 +128,13 @@ fn removed_bearer_ids_are_retired_and_names_can_be_reused() {
 
 #[test]
 fn bearer_attachment_and_registry_capacity_errors_are_public_and_distinct() {
-    let mut failed = Node::new(None, &CLIENT_POOL);
+    let mut failed = Node::new(&CLIENT_POOL);
     assert_eq!(
         failed.add_bearer(AttachFailure),
         Err(AddBearerError::Attach("attach rejected"))
     );
 
-    let mut full = Node::new(None, &CLIENT_POOL);
+    let mut full = Node::new(&CLIENT_POOL);
     for index in 0..8 {
         let name = format!("full-{index}");
         full.add_bearer(FakePacketBearer::<Pool>::new(
@@ -153,11 +153,12 @@ fn bearer_attachment_and_registry_capacity_errors_are_public_and_distinct() {
 #[test]
 fn node_reports_association_and_route_capacity_without_exposing_tables() {
     static ASSOCIATION_POOL: Pool = Pool::new();
-    let mut association_full = QuicNode::<Pool>::new(None, &ASSOCIATION_POOL);
+    let mut association_full = QuicNode::<Pool>::new(&ASSOCIATION_POOL);
     association_full
         .set_limits(quic_lite::NodeLimits {
             max_associations: 1,
             max_routes: 1,
+            ..quic_lite::NodeLimits::host()
         })
         .unwrap();
     let bearer = association_full
@@ -180,11 +181,12 @@ fn node_reports_association_and_route_capacity_without_exposing_tables() {
     assert_eq!(association_full.association_count(), 1);
 
     static ROUTE_POOL: Pool = Pool::new();
-    let mut route_full = QuicNode::<Pool>::new(None, &ROUTE_POOL);
+    let mut route_full = QuicNode::<Pool>::new(&ROUTE_POOL);
     route_full
         .set_limits(quic_lite::NodeLimits {
             max_associations: 2,
             max_routes: 1,
+            ..quic_lite::NodeLimits::host()
         })
         .unwrap();
     let bearer = route_full
@@ -218,7 +220,7 @@ fn node_reports_association_and_route_capacity_without_exposing_tables() {
 
 #[test]
 fn public_node_creates_and_owns_client_association_state() {
-    let mut node = Node::new(None, &CLIENT_POOL);
+    let mut node = Node::new(&CLIENT_POOL);
     let bearer_impl = FakePacketBearer::<Pool>::new(BearerName::new("capture0").unwrap());
     let sent = bearer_impl.sent_packets();
     let bearer = node.add_bearer(bearer_impl).unwrap();
@@ -243,7 +245,7 @@ async fn framed_tcp_is_one_complete_node_bearer() {
     let accept = listener.accept();
     let (client, server) = tokio::join!(connect, accept);
 
-    let mut client_node = Node::new(None, &CLIENT_POOL);
+    let mut client_node = Node::new(&CLIENT_POOL);
     let client_bearer = TokioFramedBearer::<Pool>::from_tcp(
         client.unwrap(),
         BearerName::new("tcp-client").unwrap(),
@@ -251,7 +253,7 @@ async fn framed_tcp_is_one_complete_node_bearer() {
     let client_bearer = client_node.add_bearer(client_bearer).unwrap();
 
     static SERVER_POOL: Pool = Pool::new();
-    let mut server_node = Node::new(None, &SERVER_POOL);
+    let mut server_node = Node::new(&SERVER_POOL);
     let server_bearer = TokioFramedBearer::<Pool>::from_tcp(
         server.unwrap().0,
         BearerName::new("tcp-server").unwrap(),
@@ -314,7 +316,7 @@ async fn framed_bearer_connects_through_its_public_tcp_initializer() {
         TokioFramedBearer::<Pool>::connect_tcp(address, BearerName::new("tcp-connect").unwrap());
     let accept = listener.accept();
     let (bearer, accepted) = tokio::join!(connect, accept);
-    let mut node = Node::new(None, &CLIENT_POOL);
+    let mut node = Node::new(&CLIENT_POOL);
     assert!(node.add_bearer(bearer.unwrap()).is_ok());
     drop(accepted.unwrap());
 }
@@ -327,8 +329,8 @@ async fn paired_fake_establishes_and_delivers_multi_packet_fin_through_public_ap
         BearerName::new("fake-a").unwrap(),
         BearerName::new("fake-b").unwrap(),
     );
-    let mut client = Node::new(None, &FIRST_POOL);
-    let mut server = Node::new(None, &SECOND_POOL);
+    let mut client = Node::new(&FIRST_POOL);
+    let mut server = Node::new(&SECOND_POOL);
     let client_bearer = client.add_bearer(first_bearer).unwrap();
     server.add_bearer(second_bearer).unwrap();
 
@@ -383,8 +385,8 @@ async fn small_pool_handles_multiple_associations_and_streams_without_cross_deli
         BearerName::new("stress-a").unwrap(),
         BearerName::new("stress-b").unwrap(),
     );
-    let mut client = Node::new(None, &FIRST_POOL);
-    let mut server = Node::new(None, &SECOND_POOL);
+    let mut client = Node::new(&FIRST_POOL);
+    let mut server = Node::new(&SECOND_POOL);
     let client_bearer = client.add_bearer(first_bearer).unwrap();
     server.add_bearer(second_bearer).unwrap();
     let address = PacketMeta {
@@ -489,8 +491,8 @@ async fn udp_establishes_and_delivers_multi_packet_fin_through_public_api() {
     let server_peer = client_bearer.register_peer(server_address).unwrap();
     server_bearer.register_peer(client_address).unwrap();
 
-    let mut client = Node::new(None, &UDP_CLIENT_POOL);
-    let mut server = Node::new(None, &UDP_SERVER_POOL);
+    let mut client = Node::new(&UDP_CLIENT_POOL);
+    let mut server = Node::new(&UDP_SERVER_POOL);
     let client_bearer = client.add_bearer(client_bearer).unwrap();
     server.add_bearer(server_bearer).unwrap();
     let client_association = client
