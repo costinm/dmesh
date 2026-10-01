@@ -1,0 +1,27 @@
+# Example: Routing ssh-mesh HTTP Admin & CLI to lmesh UDS
+#
+# Place this file in one of the mesh-init candidate directories:
+#   - $MESH_SERVICE_DIR/lmesh.toml
+#   - /home/system/etc/mesh-init/lmesh.toml  (root / system mode)
+#   - $HOME/etc/mesh-init/lmesh.toml         (user mode)
+#
+# Schemas:
+# The `mesh` CLI and `ssh-mesh` HTTP translation discover tools/schemas via:
+#   1. $MESH_SCHEMA_DIR/lmesh/tools.json
+#   2. $HOME/opt/lmesh/etc/schemas/tools.json
+#   3. /opt/lmesh/etc/schemas/tools.json
+#
+# When lmesh runs, it exposes its tagged-CBOR seqpacket UDS control socket at:
+#   /run/mesh/lmesh/mesh.sock.cbor
+#
+# All HTTP endpoints, SSH server/client, and JSON-to-CBOR translation remain in
+# ssh-mesh, while lmesh runs separately with elevated network/radio privileges.
+
+[Service]
+ExecStart = "/opt/lmesh/bin/lmesh"
+User = "root"
+Group = "root"
+
+[Mesh]
+Address = "unix:///run/mesh/lmesh/mesh.sock.cbor"
+DestinationFormat = "cbor"

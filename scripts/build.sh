@@ -10,6 +10,8 @@ cd "${REPO_ROOT}"
 # shellcheck disable=SC1091
 source "${REPO_ROOT}/env.sh"
 
+TARGET_DIR="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
+
 export CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc
 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc 
 
@@ -105,7 +107,7 @@ find_busybox() {
 }
 
 default_nix_profile() {
-    printf '%s\n' "$PWD/target/nix/profile"
+    printf '%s\n' "$TARGET_DIR/nix/profile"
 }
 
 resolve_nix_profile() {
@@ -257,15 +259,15 @@ stage_opt_tree() {
 
 stage_examples() {
     local src="${1:-}"
-    local root="${2:-$PWD/target/dist}"
+    local root="${2:-$TARGET_DIR/dist}"
     local opt="$root/opt"
     local busybox
 
     if [ -z "$src" ]; then
-        if [ -d "target/x86_64-unknown-linux-musl/release" ]; then
-            src="target/x86_64-unknown-linux-musl/release"
+        if [ -d "$TARGET_DIR/x86_64-unknown-linux-musl/release" ]; then
+            src="$TARGET_DIR/x86_64-unknown-linux-musl/release"
         else
-            src="target/debug"
+            src="$TARGET_DIR/debug"
         fi
     fi
 
@@ -290,8 +292,8 @@ stage_examples() {
 }
 
 stage_example_tree() {
-    local root="${1:-$PWD/target/examples}"
-    local opt="${2:-$PWD/target/dist/opt}"
+    local root="${1:-$TARGET_DIR/examples}"
+    local opt="${2:-$TARGET_DIR/dist/opt}"
 
     if [ ! -d "docs/examples" ]; then
         echo "Missing docs/examples source tree" >&2
@@ -330,17 +332,17 @@ rust() {
 }
 
 deploy_examples() {
-    local src="${1:-target/x86_64-unknown-linux-musl/release}"
-    local root="${2:-$PWD/target/dist}"
+    local src="${1:-$TARGET_DIR/x86_64-unknown-linux-musl/release}"
+    local root="${2:-$TARGET_DIR/dist}"
 
     stage_examples "$src" "$root"
-    stage_example_tree "$PWD/target/examples" "$root/opt"
+    stage_example_tree "$TARGET_DIR/examples" "$root/opt"
 }
 
 default() {
     rust
-    dist "$PWD/target/dist" "target/x86_64-unknown-linux-musl/release"
-    stage_example_tree "$PWD/target/examples" "$PWD/target/dist/opt"
+    dist "$TARGET_DIR/dist" "$TARGET_DIR/x86_64-unknown-linux-musl/release"
+    stage_example_tree "$TARGET_DIR/examples" "$TARGET_DIR/dist/opt"
 }
 
 setup() {
@@ -391,8 +393,8 @@ push() {
 }
 
 dist() {
-    local dest="${1:-$PWD/target/dist}"
-    local release_dir="${2:-target/x86_64-unknown-linux-musl/release}"
+    local dest="${1:-$TARGET_DIR/dist}"
+    local release_dir="${2:-$TARGET_DIR/x86_64-unknown-linux-musl/release}"
     local busybox
 
     if [ ! -x "$release_dir/ssh-mesh" ]; then
@@ -413,7 +415,7 @@ dist() {
 
 install() {
     local dest="${1:-/opt/ssh-mesh}"
-    local release_dir="target/x86_64-unknown-linux-musl/release"
+    local release_dir="$TARGET_DIR/x86_64-unknown-linux-musl/release"
     
     mkdir -p "$dest/bin"
 
@@ -431,7 +433,7 @@ install() {
 
 # Build aarch64 release binaries into a separate dist directory.
 arm_release() {
-    local dest="${1:-target/dist-aarch64}"
+    local dest="${1:-$TARGET_DIR/dist-aarch64}"
     mkdir -p "$dest/bin" "$dest/lib/arm64-v8a"
 
     echo "Building aarch64 release (musl) for runtime crates..."
@@ -439,8 +441,8 @@ arm_release() {
 
     echo "Copying aarch64 binaries..."
     for bin in $BIN_TARGETS; do
-        if [ -f "target/aarch64-unknown-linux-musl/release/$bin" ]; then
-            cp "target/aarch64-unknown-linux-musl/release/$bin" "$dest/bin/"
+        if [ -f "$TARGET_DIR/aarch64-unknown-linux-musl/release/$bin" ]; then
+            cp "$TARGET_DIR/aarch64-unknown-linux-musl/release/$bin" "$dest/bin/"
         fi
     done
 
@@ -463,10 +465,10 @@ build() {
     rust
 
     echo "=== 2. Creating dist artifacts ==="
-    dist "$PWD/target/dist" "target/x86_64-unknown-linux-musl/release"
+    dist "$TARGET_DIR/dist" "$TARGET_DIR/x86_64-unknown-linux-musl/release"
 
     echo "=== 3. Refreshing example tree ==="
-    stage_example_tree "$PWD/target/examples" "$PWD/target/dist/opt"
+    stage_example_tree "$TARGET_DIR/examples" "$TARGET_DIR/dist/opt"
 }
 
 test_cmd() {
@@ -482,31 +484,31 @@ test_cmd() {
     case "$name" in
         examples)
             build
-            export PATH="$PWD/target/dist/opt/ssh-mesh/bin:$PWD/target/dist/opt/busybox/bin:${PATH:-}"
+            export PATH="$TARGET_DIR/dist/opt/ssh-mesh/bin:$TARGET_DIR/dist/opt/busybox/bin:${PATH:-}"
             tests/test_examples.sh
             ;;
         ssh_mesh_activation)
             rust
-            stage_examples "target/x86_64-unknown-linux-musl/release" "$PWD/target/dist"
-            export PATH="$PWD/target/dist/opt/ssh-mesh/bin:$PWD/target/dist/opt/busybox/bin:${PATH:-}"
+            stage_examples "$TARGET_DIR/x86_64-unknown-linux-musl/release" "$TARGET_DIR/dist"
+            export PATH="$TARGET_DIR/dist/opt/ssh-mesh/bin:$TARGET_DIR/dist/opt/busybox/bin:${PATH:-}"
             tests/test_ssh_mesh_activation.sh
             ;;
         trace)
             rust
-            stage_examples "target/x86_64-unknown-linux-musl/release" "$PWD/target/dist"
-            export PATH="$PWD/target/dist/opt/ssh-mesh/bin:$PWD/target/dist/opt/busybox/bin:${PATH:-}"
+            stage_examples "$TARGET_DIR/x86_64-unknown-linux-musl/release" "$TARGET_DIR/dist"
+            export PATH="$TARGET_DIR/dist/opt/ssh-mesh/bin:$TARGET_DIR/dist/opt/busybox/bin:${PATH:-}"
             tests/test_trace.sh "$@"
             ;;
         cert_terminal_mesh_init)
             rust
-            stage_examples "target/x86_64-unknown-linux-musl/release" "$PWD/target/dist"
-            export PATH="$PWD/target/dist/opt/ssh-mesh/bin:$PWD/target/dist/opt/busybox/bin:${PATH:-}"
+            stage_examples "$TARGET_DIR/x86_64-unknown-linux-musl/release" "$TARGET_DIR/dist"
+            export PATH="$TARGET_DIR/dist/opt/ssh-mesh/bin:$TARGET_DIR/dist/opt/busybox/bin:${PATH:-}"
             python3 tests/test_cert_terminal_mesh_init.py "$@"
             ;;
         docker)
             rust
-            stage_examples "target/x86_64-unknown-linux-musl/release" "$PWD/target/dist"
-            export PATH="$PWD/target/dist/opt/ssh-mesh/bin:$PWD/target/dist/opt/busybox/bin:${PATH:-}"
+            stage_examples "$TARGET_DIR/x86_64-unknown-linux-musl/release" "$TARGET_DIR/dist"
+            export PATH="$TARGET_DIR/dist/opt/ssh-mesh/bin:$TARGET_DIR/dist/opt/busybox/bin:${PATH:-}"
             tests/test_docker.sh "$@"
             ;;
         *)

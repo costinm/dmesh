@@ -103,7 +103,7 @@ pub fn load_json<T: DeserializeOwned>(embedded: Option<&str>) -> Result<Vec<T>> 
 
 pub fn configured_files() -> Vec<PathBuf> {
     let mut files = Vec::new();
-    let value = std::env::var("MESH_SCHEMA_FILES").or_else(|_| std::env::var("LMESH_SCHEMA_FILES"));
+    let value = std::env::var("MESH_SCHEMA_FILES");
     if let Ok(value) = value {
         files.extend(
             value
@@ -113,8 +113,7 @@ pub fn configured_files() -> Vec<PathBuf> {
         );
     }
     let dir = std::env::var("MESH_SCHEMA_DIR")
-        .or_else(|_| std::env::var("LMESH_SCHEMA_DIR"))
-        .unwrap_or_else(|_| "/etc/dmesh/lmesh/schemas".to_owned());
+        .unwrap_or_else(|_| "/etc/mesh/schemas".to_owned());
     if let Ok(entries) = fs::read_dir(dir) {
         files.extend(
             entries

@@ -126,6 +126,7 @@
         build-deps = pkgs.symlinkJoin {
           name = "ssh-mesh-build-deps";
           paths = with pkgs; [
+            stdenv.cc
             musl-toolchain
             rustToolchain
             pkg-config
