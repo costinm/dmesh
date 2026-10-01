@@ -14,7 +14,7 @@
 // That works on host/esp32 - if Androids are present they can start a NAN cluster.
 // Using only NOW action frames is simplest - no deps on the beacon/management frames in NAN.
 
-use alloc::alloc::{alloc_zeroed, dealloc, Layout};
+use alloc::alloc::{Layout, alloc_zeroed, dealloc};
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -124,7 +124,7 @@ struct ActionTxRequest {
 }
 
 /// NAN/NOW scratch is needed only while the action bearer is installed. Keep
-/// its four MTU-sized buffers out of firmware BSS so reduced images which link
+/// its three fixed buffers out of firmware BSS so reduced images which link
 /// shared flash code do not permanently reserve them. The allocation is made
 /// once before callbacks are registered and retained across radio restarts;
 /// callbacks and packet turns never allocate.
@@ -132,7 +132,6 @@ struct ActionTxRequest {
 struct ActionBuffers {
     response: [u8; quic_lite::DEFAULT_MAX_PACKET_SIZE],
     tx_frame: [u8; FRAME_CAPACITY],
-    rx_payload: [u8; quic_lite::DEFAULT_MAX_PACKET_SIZE],
     action_tx_request: ActionTxRequest,
 }
 
@@ -333,16 +332,6 @@ pub fn install_action_ingress(local_mac: [u8; 6], handler: EspNowHandler) -> boo
         return false;
     }
     HANDLER.store(handler as usize, Ordering::Release);
-    // All NOW ingress and egress share one worker.  Main's one-shot client
-    // timer and the packet worker can both produce actions; queuing egress
-    // here prevents them from concurrently rewriting ACTION_TX_REQUEST while
-    // retaining the same bounded packet-pool backpressure as UDP6 and UART.
-    if !crate::shared_ingress_esp::start(
-        crate::shared_ingress_esp::IngressKind::EspNowTx,
-        dispatch_egress,
-    ) {
-        return false;
-    }
     unsafe {
         LOCAL_MAC = local_mac;
     }
@@ -354,10 +343,6 @@ pub fn install_action_ingress(local_mac: [u8; 6], handler: EspNowHandler) -> boo
 /// ingress-pool stop remain with `wifi_esp`, the sole Wi-Fi owner.
 pub fn stop_action_ingress() {
     HANDLER.store(0, Ordering::Release);
-    // The matching radio epoch owns the egress submitter too. A queued
-    // datagram can still be released by the common worker, but it must not
-    // call ESP-IDF after NOW has been stopped.
-    crate::shared_ingress_esp::stop(crate::shared_ingress_esp::IngressKind::EspNowTx);
     STARTED.store(false, Ordering::Release);
 }
 
@@ -369,8 +354,8 @@ pub fn stop_action_ingress() {
 /// `(interface, ieee80211_header, body_start, body_end)`. Both forms have
 /// already checked category/OUI/vendor IEs and supplied the complete NOW body,
 /// so this is deliberately an ABI adaptation, not a raw 802.11 frame parser.
-/// Copy only the source MAC and bounded body into common ingress; none of the
-/// private input pointers outlive this callback.
+/// Parse or copy the bounded body exactly once, directly into the shared QUIC
+/// packet pool; none of the private input pointers outlive this callback.
 pub(crate) fn receive_registered_action_payload(
     peer_context: *mut core::ffi::c_void,
     second: usize,
@@ -428,26 +413,22 @@ pub(crate) fn receive_registered_action_payload(
         .fold(0u32, |value, byte| (value << 8) | u32::from(*byte));
     LAST_REGISTERED_BODY_PREFIX.store(prefix, Ordering::Relaxed);
     if vendor_reassembled {
-        // The vendor helper already concatenated the bodies into the complete
-        // QUIC-lite datagram. Do not parse radio framing a second time.
-        admit_now_payload(source, body);
+        // The vendor helper already concatenated the bodies. Copy once into
+        // the shared QUIC packet pool; classification and handling then use
+        // that same buffer.
+        receive_now_with(|output| {
+            if len > output.len() {
+                return None;
+            }
+            output[..len].copy_from_slice(body);
+            Some((source, len))
+        });
         return;
     }
-    // Generic STA/AP action ingress still includes the normal vendor action
-    // prefix and IEs. Strip only that radio framing before handing the
-    // complete opaque QUIC-lite datagram to the common dispatcher.
-    let Some(buffers) = action_buffers() else {
-        RX_DROPS.fetch_add(1, Ordering::Relaxed);
-        return;
-    };
-    let output = unsafe { &mut (*buffers).rx_payload };
-    match dmesh_rawnan::espnow::parse_action_body_into(body, output) {
-        Some(used) => admit_now_payload(source, &output[..used]),
-        None => {
-            RX_PARSE_DROPS.fetch_add(1, Ordering::Relaxed);
-            RX_DROPS.fetch_add(1, Ordering::Relaxed);
-        }
-    }
+    // Parse generic STA/AP action framing directly into the packet pool.
+    receive_now_with(|output| {
+        dmesh_rawnan::espnow::parse_action_body_into(body, output).map(|used| (source, used))
+    });
 }
 
 /// ESP-IDF's action-transmit request may receive a co-channel response during
@@ -491,29 +472,31 @@ fn receive_action_parts(header: *mut u8, payload: *mut u8, len: usize) {
         ACTION_PARSE_BUSY.store(false, Ordering::Release);
         return;
     };
-    let Some(buffers) = action_buffers() else {
-        RX_DROPS.fetch_add(1, Ordering::Relaxed);
-        ACTION_PARSE_BUSY.store(false, Ordering::Release);
-        return;
-    };
-    let output = unsafe { &mut (*buffers).rx_payload };
     RX_MANAGEMENT.fetch_add(1, Ordering::Relaxed);
     RX_ACTION_FRAMES.fetch_add(1, Ordering::Relaxed);
-    match dmesh_rawnan::espnow::parse_action_body_into(payload, output) {
-        Some(used) => admit_now_payload(source, &output[..used]),
-        None if payload.starts_with(&dmesh_rawnan::espnow::ACTION_PREFIX) && payload.len() > 8 => {
-            // The C6 ROC callback may validate and remove the vendor IEs
-            // before invoking its response hook, while retaining the eight
-            // byte action header.  In that ABI variant the suffix is already
-            // the complete bounded QUIC datagram.  The connection/direct
-            // dispatcher still validates it; this branch only removes the
-            // native framing that the driver has already consumed.
-            admit_now_payload(source, &payload[8..]);
+    receive_now_with(|output| {
+        match dmesh_rawnan::espnow::parse_action_body_into(payload, output) {
+            Some(used) => Some((source, used)),
+            None if payload.starts_with(&dmesh_rawnan::espnow::ACTION_PREFIX)
+                && payload.len() > 8 =>
+            {
+                // The C6 ROC callback may validate and remove the vendor IEs
+                // before invoking its response hook, while retaining the eight
+                // byte action header.  In that ABI variant the suffix is already
+                // the complete bounded QUIC datagram.  The connection/direct
+                // dispatcher still validates it; this branch only removes the
+                // native framing that the driver has already consumed.
+                let packet = &payload[8..];
+                if packet.len() > output.len() {
+                    None
+                } else {
+                    output[..packet.len()].copy_from_slice(packet);
+                    Some((source, packet.len()))
+                }
+            }
+            None => None,
         }
-        None => {
-            RX_PARSE_DROPS.fetch_add(1, Ordering::Relaxed);
-        }
-    }
+    });
     ACTION_PARSE_BUSY.store(false, Ordering::Release);
 }
 
@@ -544,51 +527,69 @@ pub fn receive_action_frame(frame: &[u8]) {
     ACTION_PARSE_BUSY.store(false, Ordering::Release);
 }
 
-/// Parse one action while [`ACTION_PARSE_BUSY`] owns the shared scratch.
-/// Callers above are the only callback adapters and release the guard after
-/// the parser has copied the accepted payload into `shared_ingress_esp`.
+/// Parse one action while [`ACTION_PARSE_BUSY`] owns the receive turn. The
+/// parser writes directly into a node-pool packet lease.
 fn receive_action_frame_unlocked(frame: &[u8]) {
-    let Some(buffers) = action_buffers() else {
-        RX_DROPS.fetch_add(1, Ordering::Relaxed);
-        return;
-    };
-    let output = unsafe { &mut (*buffers).rx_payload };
-    let Some((source, used)) = dmesh_rawnan::espnow::parse_action_frame_into(frame, output) else {
-        RX_PARSE_DROPS.fetch_add(1, Ordering::Relaxed);
-        return;
-    };
-    admit_now_payload(source, &output[..used]);
+    receive_now_with(|output| dmesh_rawnan::espnow::parse_action_frame_into(frame, output));
 }
 
 /// Apply the common post-framing admission policy.  Every callback variant
 /// has supplied one complete bounded QUIC datagram and its immutable source
 /// path fact by this point.
-fn admit_now_payload(source: [u8; 6], payload: &[u8]) {
+fn admit_now_payload(source: [u8; 6], payload: &[u8]) -> bool {
     // ESP-IDF exposes a locally transmitted action to private receive paths.
     // It is not ingress and must not consume a device-wide packet slot.
     if crate::wifi_radio_control_esp::is_local_action_source(source) {
         RX_SELF_ECHOES.fetch_add(1, Ordering::Relaxed);
-        return;
+        return false;
     }
     if recently_seen_action(source, payload) {
         RX_DUPLICATE_ACTIONS.fetch_add(1, Ordering::Relaxed);
-        return;
+        return false;
     }
-    if let Some(sync) = dmesh_rawnan::parse_now_sync_body(payload) {
-        crate::main_runtime::receive_nan_service_info(source, sync.service_info);
-        return;
+    match dmesh_server::raw_wifi::classify_espnow_payload(payload) {
+        dmesh_server::raw_wifi::EspNowPayloadClass::NowSync => {
+            let Some(sync) = dmesh_rawnan::parse_now_sync_body(payload) else {
+                return false;
+            };
+            if crate::wifi_nan_dw_capture_esp::defer_service_info(source, sync.service_info) {
+                RX_ACTIONS.fetch_add(1, Ordering::Relaxed);
+            } else {
+                RX_SHARED_INGRESS_DROPS.fetch_add(1, Ordering::Relaxed);
+                RX_DROPS.fetch_add(1, Ordering::Relaxed);
+            }
+            false
+        }
+        dmesh_server::raw_wifi::EspNowPayloadClass::TaggedControl => {
+            let _ = crate::main_runtime::receive_connectionless_request(payload, |response| {
+                let _ = transmit(EspNowPeer { mac: source }, response);
+            });
+            false
+        }
+        dmesh_server::raw_wifi::EspNowPayloadClass::QuicDatagram => true,
     }
-    if dmesh_server::tagged::decode(payload).is_some() {
-        let _ = crate::main_runtime::receive_connectionless_request(payload, |response| {
-            let _ = transmit(EspNowPeer { mac: source }, response);
-        });
-        return;
-    }
-    if !crate::wifi_esp::enqueue_now_payload(source, payload) {
-        RX_SHARED_INGRESS_DROPS.fetch_add(1, Ordering::Relaxed);
-        RX_DROPS.fetch_add(1, Ordering::Relaxed);
-    } else {
-        RX_ACTIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+fn receive_now_with<F>(parse: F)
+where
+    F: FnOnce(&mut [u8]) -> Option<([u8; 6], usize)>,
+{
+    let result = crate::quic_node_esp::receive_now_with(parse, |peer, payload| {
+        admit_now_payload(peer.mac, payload)
+    });
+    match result {
+        Ok(true) => {
+            RX_ACTIONS.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(false) => {}
+        Err(crate::quic_node_esp::NowReceiveError::InvalidFrame) => {
+            RX_PARSE_DROPS.fetch_add(1, Ordering::Relaxed);
+            RX_DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(_) => {
+            RX_SHARED_INGRESS_DROPS.fetch_add(1, Ordering::Relaxed);
+            RX_DROPS.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -648,54 +649,62 @@ pub(crate) fn dispatch_ingress(item: crate::shared_ingress_esp::IngressPacket, p
     }
 }
 
-/// Submit one queued NOW datagram from the sole common packet worker.
-///
-/// This is called once per [`IngressKind::EspNowTx`] queue item, not from a
-/// periodic service tick.  The sender owns no packet history: QUIC-lite keeps
-/// retransmission state and re-enqueues only a due complete datagram.
-pub(crate) fn dispatch_egress(item: crate::shared_ingress_esp::IngressPacket, payload: &[u8]) {
-    // A packet-at-a-time raw association sends one stream frame, then waits
-    // for the peer's ACK before the next frame may leave the QUIC-lite
-    // ledger.  Keep the existing NAN capture owner available for that reply
-    // flight.  This is an egress-triggered, bounded 600 ms lease renewal—not
-    // a periodic poll—and it is a no-op when NAN capture is not the active
-    // radio personality.
-    let _ = crate::wifi_nan_dw_capture_esp::request_permissive_capture(600);
-    if !transmit_submitted(
-        EspNowPeer { mac: item.source() },
-        payload,
-        NOW_ACTION_TX_SERVER_WAIT_MS,
-    ) {
-        TX_FAILURES.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
 /// Send one complete QUIC-lite datagram through the same driver action lane
 /// used by the shared Recovery/Main bearer. Main-local raw 802.11 injection
 /// remains available for explicit radio experiments, but must not be used by
 /// the bearer: it bypasses this driver's action receive/reply integration.
 pub fn transmit(peer: EspNowPeer, payload: &[u8]) -> bool {
-    // Do not call the ESP-IDF action API from the Main timer owner or an RX
-    // reply path directly.  Both producers share one static flexible-array
-    // request below; the shared worker is the single submit owner and uses
-    // the same bounded pool as UART and UDP6.
-    crate::shared_ingress_esp::enqueue_espnow_tx(peer.mac, payload)
+    // Wi-Fi receive callbacks cannot submit ESP-IDF actions. Retain the reply
+    // in the shared QUIC packet pool and let Main's serialized owner send it;
+    // the packet is not parsed or otherwise passed through QUIC.
+    if !STARTED.load(Ordering::Acquire) {
+        TX_FAILURES.fetch_add(1, Ordering::Relaxed);
+        false
+    } else if crate::quic_node_esp::queue_now_control_response(peer, payload) {
+        true
+    } else {
+        TX_FAILURES.fetch_add(1, Ordering::Relaxed);
+        false
+    }
+}
+
+/// Submit one pool-backed connectionless response from Main's event owner.
+/// This is event-driven and drains one packet per owner turn, keeping ESP-IDF
+/// action submission serialized with ordinary NOW bearer output.
+pub(crate) fn dispatch_pending_control_response() {
+    let Some((peer, packet)) = crate::quic_node_esp::take_pending_now_control_response() else {
+        if crate::quic_node_esp::now_control_response_pending() != Some(false) {
+            crate::main_runtime::request_quic_ingress();
+        }
+        return;
+    };
+    if !STARTED.load(Ordering::Acquire) {
+        TX_FAILURES.fetch_add(1, Ordering::Relaxed);
+        drop(packet);
+        return;
+    }
+    let _ = crate::wifi_nan_dw_capture_esp::request_permissive_capture(600);
+    if !transmit_from_worker(peer, packet.bytes()) {
+        TX_FAILURES.fetch_add(1, Ordering::Relaxed);
+    }
+    drop(packet);
+    if crate::quic_node_esp::now_control_response_pending() == Some(true) {
+        crate::main_runtime::request_quic_ingress();
+    }
 }
 
 /// Submit a NOW datagram from the already serialized packet worker.
 ///
-/// RX dispatch, client deadlines, server timers, and connection replies all
-/// run on that one worker, so submitting here retains the single radio owner
-/// while avoiding an extra queue turn inside the short C6 action reply window.
-/// Callers outside that worker must use [`transmit`].
+/// QUIC packet egress and deferred control replies call this only from Main's
+/// serialized event owner, retaining one radio submit owner and avoiding an
+/// extra queue turn inside the short C6 action reply window.
 pub(crate) fn transmit_from_worker(peer: EspNowPeer, payload: &[u8]) -> bool {
     transmit_submitted(peer, payload, NOW_ACTION_TX_SERVER_WAIT_MS)
 }
 
-/// Perform the actual ESP-IDF action submission after common egress
-/// serialization.  Only [`dispatch_egress`] calls this method, so the static
-/// action request is never concurrently initialized by a client deadline and
-/// a server response.
+/// Perform ESP-IDF action submission after common egress serialization, so the
+/// static action request is never concurrently initialized by independent
+/// client deadlines, connectionless callbacks, or server responses.
 fn transmit_submitted(peer: EspNowPeer, payload: &[u8], wait_time_ms: u32) -> bool {
     // Normal NOW-like traffic is deliberately independent of NAN discovery
     // windows.  The common NAN policy enables promiscuous *receive* only for
@@ -798,7 +807,10 @@ fn transmit_submitted(peer: EspNowPeer, payload: &[u8], wait_time_ms: u32) -> bo
 /// registered QUIC bearer.
 pub fn broadcast_discovery(record: &[u8]) -> bool {
     dmesh_server::announce::decode_announce(record).is_some()
-        && transmit(EspNowPeer { mac: [0xff; 6] }, record)
+        // Main runtime calls announcements from its serialized owner. The
+        // shared ingress TX hook is intentionally absent: submit directly
+        // through the NOW action lane rather than silently dropping them.
+        && transmit_from_worker(EspNowPeer { mac: [0xff; 6] }, record)
 }
 
 /// Send a pre-built public action body through the same ESP-IDF action-TX

@@ -757,6 +757,18 @@ The request fields below are optional unless the handler description says otherw
 An empty request uses an empty CBOR map. Response fields are handler-specific and
 are described by the method purpose above.
 
+### `status` response fields
+
+| Field | Type | Description |
+|---|---|---|
+| `status` | `string` | `ok` for a successful status response. |
+| `role` | `string` | `main` for the running Main firmware. |
+| `uptime_secs` | `u64` | Main uptime in seconds. |
+| `sta_enabled` | `bool` | Whether the persisted profile enables infrastructure STA. |
+| `sta_associated` | `bool` | Whether STA is currently associated to an access point. |
+| `sta_bssid` | `string` | Associated AP BSSID, or `unavailable` when not associated. |
+| `sta_ipv4` | `string` | Current STA IPv4 address, or `unavailable` until DHCP assigns one. |
+
 ### `runtime.snapshot` request fields
 
 | Tag | Field | Type | Values |
@@ -961,13 +973,16 @@ The payload is the complete CoC SDU. It has no bearer-local length prefix.
 | 49 | `nan_sdfs` | `u32` | — |
 | 50 | `nan_followups` | `u32` | — |
 
-### `radio.snapshot` request fields
+### `radio.snapshot` response fields
 
 | Tag | Field | Type | Values |
 |---:|---|---|---|
 | 20 | `epoch` | `u32` | — |
 | 21 | `applied_channel` | `u8` | — |
 | 22 | `sta_associated` | `bool` | — |
+| 128 | `sta_enabled` | `bool` | Infrastructure STA requested by the active profile. |
+| 129 | `sta_bssid` | `mac` | Associated AP BSSID; absent when not associated or unavailable. |
+| 130 | `sta_ipv4` | `bytes` | Four IPv4 octets in network order; absent without a lease. |
 | 23 | `applied_promiscuous` | `bool` | — |
 | 24 | `dw_capturing` | `bool` | — |
 | 25 | `applied_comparator_bssid` | `mac` | — |

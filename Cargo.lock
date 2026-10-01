@@ -1528,6 +1528,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum",
+ "dmesh-rawnan",
  "hex",
  "mesh",
  "mesh-api",
@@ -1536,6 +1538,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "ssh-mesh",
  "tempfile",
  "tokio",
  "tracing",
@@ -3299,6 +3302,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum",
  "dmesh-rawnan",
  "dmesh-server",
  "libc",
@@ -3312,6 +3316,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "ssh-mesh",
  "tokio",
  "toml",
  "tracing",
@@ -3346,6 +3351,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "ssh-mesh",
  "tempfile",
  "tokio",
  "toml",
@@ -3456,7 +3462,6 @@ dependencies = [
 [[package]]
 name = "mesh"
 version = "0.1.0"
-source = "git+https://github.com/costinm/ssh-mesh#5fbdaeeae73e2dde842069c6ab50a4853cd65cc2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3480,7 +3485,6 @@ dependencies = [
 [[package]]
 name = "mesh-api"
 version = "0.1.0"
-source = "git+https://github.com/costinm/ssh-mesh#5fbdaeeae73e2dde842069c6ab50a4853cd65cc2"
 dependencies = [
  "serde",
 ]
@@ -3488,7 +3492,6 @@ dependencies = [
 [[package]]
 name = "mesh-mcp"
 version = "0.1.0"
-source = "git+https://github.com/costinm/ssh-mesh#5fbdaeeae73e2dde842069c6ab50a4853cd65cc2"
 dependencies = [
  "mesh",
  "serde",
@@ -5652,7 +5655,6 @@ dependencies = [
 [[package]]
 name = "sftp-server"
 version = "0.1.0"
-source = "git+https://github.com/costinm/ssh-mesh#5fbdaeeae73e2dde842069c6ab50a4853cd65cc2"
 dependencies = [
  "anyhow",
  "bytes",
@@ -6158,7 +6160,6 @@ dependencies = [
 [[package]]
 name = "ssh-config"
 version = "0.57.0"
-source = "git+https://github.com/costinm/ssh-mesh#5fbdaeeae73e2dde842069c6ab50a4853cd65cc2"
 dependencies = [
  "futures",
  "glob",
@@ -6221,7 +6222,6 @@ dependencies = [
 [[package]]
 name = "ssh-mesh"
 version = "0.1.0"
-source = "git+https://github.com/costinm/ssh-mesh#5fbdaeeae73e2dde842069c6ab50a4853cd65cc2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8109,7 +8109,6 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 [[package]]
 name = "ws"
 version = "0.1.0"
-source = "git+https://github.com/costinm/ssh-mesh#5fbdaeeae73e2dde842069c6ab50a4853cd65cc2"
 dependencies = [
  "async-trait",
  "axum",

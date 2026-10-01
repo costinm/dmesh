@@ -13,7 +13,96 @@ use crate::{
     tagged::{Name, Record, decode},
 };
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU8, AtomicU16, Ordering};
 use sha2::{Digest, Sha256};
+
+const HANDOFF_EMPTY: u8 = 0;
+const HANDOFF_WRITING: u8 = 1;
+const HANDOFF_READY: u8 = 2;
+
+/// One allocation-free callback-to-owner handoff for a small service record.
+/// Producers never run semantic handlers on a radio callback stack; when the
+/// slot is occupied they reject the new record so a later broadcast can retry.
+pub struct ServiceInfoHandoff<const N: usize> {
+    state: AtomicU8,
+    peer: [AtomicU8; 6],
+    len: AtomicU16,
+    bytes: [AtomicU8; N],
+}
+
+impl<const N: usize> ServiceInfoHandoff<N> {
+    pub const fn new() -> Self {
+        Self {
+            state: AtomicU8::new(HANDOFF_EMPTY),
+            peer: [const { AtomicU8::new(0) }; 6],
+            len: AtomicU16::new(0),
+            bytes: [const { AtomicU8::new(0) }; N],
+        }
+    }
+
+    /// Retain a copied record if the slot is empty and it fits the capacity.
+    pub fn try_store(&self, peer: [u8; 6], bytes: &[u8]) -> bool {
+        if bytes.len() > N
+            || bytes.len() > u16::MAX as usize
+            || self
+                .state
+                .compare_exchange(
+                    HANDOFF_EMPTY,
+                    HANDOFF_WRITING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+        {
+            return false;
+        }
+        for (target, value) in self.peer.iter().zip(peer) {
+            target.store(value, Ordering::Relaxed);
+        }
+        for (target, value) in self.bytes.iter().zip(bytes.iter().copied()) {
+            target.store(value, Ordering::Relaxed);
+        }
+        self.len.store(bytes.len() as u16, Ordering::Relaxed);
+        self.state.store(HANDOFF_READY, Ordering::Release);
+        true
+    }
+
+    /// Move the retained record into caller-owned storage. A too-small output
+    /// leaves the record ready for a later, correctly sized receive buffer.
+    pub fn take(&self, peer: &mut [u8; 6], output: &mut [u8]) -> Option<usize> {
+        if self
+            .state
+            .compare_exchange(
+                HANDOFF_READY,
+                HANDOFF_WRITING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return None;
+        }
+        let len = usize::from(self.len.load(Ordering::Relaxed));
+        if output.len() < len {
+            self.state.store(HANDOFF_READY, Ordering::Release);
+            return None;
+        }
+        for (target, source) in peer.iter_mut().zip(&self.peer) {
+            *target = source.load(Ordering::Relaxed);
+        }
+        for (target, source) in output.iter_mut().zip(&self.bytes[..len]) {
+            *target = source.load(Ordering::Relaxed);
+        }
+        self.state.store(HANDOFF_EMPTY, Ordering::Release);
+        Some(len)
+    }
+}
+
+impl<const N: usize> Default for ServiceInfoHandoff<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Verify a host-observed signed identity before promoting it to ownership.
 #[cfg(feature = "std")]
@@ -1336,6 +1425,64 @@ pub fn decode_record(record: Record<'_>) -> Option<Announce> {
 mod tests {
     use super::*;
     use std::net::Ipv6Addr;
+
+    #[test]
+    fn service_info_handoff_copies_one_record_and_preserves_it_for_small_output() {
+        let handoff = ServiceInfoHandoff::<4>::new();
+        let peer = [1, 2, 3, 4, 5, 6];
+        assert!(handoff.try_store(peer, b"data"));
+        assert!(!handoff.try_store([6, 5, 4, 3, 2, 1], b"busy"));
+
+        let mut taken_peer = [0; 6];
+        let mut short = [0; 3];
+        assert_eq!(handoff.take(&mut taken_peer, &mut short), None);
+
+        let mut output = [0; 4];
+        let len = handoff.take(&mut taken_peer, &mut output).unwrap();
+        assert_eq!(len, 4);
+        assert_eq!(taken_peer, peer);
+        assert_eq!(&output[..len], b"data");
+        assert!(handoff.try_store(peer, b"next"));
+        assert!(!handoff.try_store(peer, b"oversize"));
+    }
+
+    #[test]
+    fn service_info_handoff_admits_only_one_concurrent_callback_record() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let handoff = Arc::new(ServiceInfoHandoff::<8>::new());
+        let start = Arc::new(Barrier::new(3));
+        let producers = [
+            ([1, 2, 3, 4, 5, 6], *b"first!!!"),
+            ([6, 5, 4, 3, 2, 1], *b"second!!"),
+        ];
+        let results = producers.map(|(peer, record)| {
+            let handoff = Arc::clone(&handoff);
+            let start = Arc::clone(&start);
+            thread::spawn(move || {
+                start.wait();
+                (peer, record, handoff.try_store(peer, &record))
+            })
+        });
+
+        start.wait();
+        let outcomes = results.map(|producer| producer.join().unwrap());
+        assert_eq!(
+            outcomes.iter().filter(|(_, _, accepted)| *accepted).count(),
+            1
+        );
+
+        let (expected_peer, expected_record, _) = outcomes
+            .into_iter()
+            .find(|(_, _, accepted)| *accepted)
+            .unwrap();
+        let mut peer = [0; 6];
+        let mut record = [0; 8];
+        assert_eq!(handoff.take(&mut peer, &mut record), Some(record.len()));
+        assert_eq!(peer, expected_peer);
+        assert_eq!(record, expected_record);
+    }
 
     #[test]
     fn concrete_esp_classes_select_the_matching_flash_cpu() {

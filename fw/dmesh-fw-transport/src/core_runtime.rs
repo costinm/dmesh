@@ -129,9 +129,10 @@ pub(crate) fn receive_raw_udp6(
     path: quic_lite::PeerL2Address,
     _peer: crate::wifi_raw_udp6_esp::RawUdp6Peer,
     packet: &[u8],
-    response: &mut [u8; crate::TRANSPORT_MTU],
+    _response: &mut [u8; crate::TRANSPORT_MTU],
 ) -> Option<usize> {
-    receive_connection_frame(path, packet, response)
+    crate::quic_node_esp::receive_udp6(path, packet);
+    None
 }
 pub(crate) fn receive_main_raw_udp6(
     path: quic_lite::PeerL2Address,
@@ -186,15 +187,36 @@ pub(crate) fn receive_udp6_connectionless(
     crate::wifi_raw_udp6_esp::ConnectionlessUdp6Outcome::Response(encoded.len())
 }
 pub(crate) fn receive_main_espnow(
-    _peer: crate::wifi_espnow_esp::EspNowPeer,
-    _packet: &[u8],
-    _response: &mut [u8; crate::TRANSPORT_MTU],
+    peer: crate::wifi_espnow_esp::EspNowPeer,
+    packet: &[u8],
+    response: &mut [u8; crate::TRANSPORT_MTU],
 ) -> Option<usize> {
-    None
+    match dmesh_server::raw_wifi::classify_espnow_payload(packet) {
+        dmesh_server::raw_wifi::EspNowPayloadClass::NowSync => None,
+        dmesh_server::raw_wifi::EspNowPayloadClass::TaggedControl => {
+            let mut used = None;
+            let accepted = crate::main_runtime::receive_connectionless_request(packet, |bytes| {
+                if bytes.len() <= response.len() {
+                    response[..bytes.len()].copy_from_slice(bytes);
+                    used = Some(bytes.len());
+                }
+            });
+            accepted.then_some(used).flatten()
+        }
+        dmesh_server::raw_wifi::EspNowPayloadClass::QuicDatagram => {
+            crate::quic_node_esp::receive_now_packet(peer, packet);
+            None
+        }
+    }
 }
 pub(crate) fn poll_espnow(
-    _peer: crate::wifi_espnow_esp::EspNowPeer,
-    _response: &mut [u8; crate::TRANSPORT_MTU],
+    peer: crate::wifi_espnow_esp::EspNowPeer,
+    response: &mut [u8; crate::TRANSPORT_MTU],
 ) -> Option<usize> {
-    None
+    let value = peer
+        .mac
+        .into_iter()
+        .fold(0_u64, |value, octet| (value << 8) | u64::from(octet));
+    quic_lite::PeerL2Address::new(value.max(1))
+        .and_then(|path| poll_connection(path, response))
 }

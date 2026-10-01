@@ -43,3 +43,7 @@ name = "dmesh_server"
 [dependencies.quic-lite]
 path = "../quic-lite"
 default-features = false
+
+[dependencies.dmesh-rawnan]
+path = "../rawnan"
+default-features = false

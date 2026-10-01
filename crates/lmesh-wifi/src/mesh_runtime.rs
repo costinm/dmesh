@@ -68,11 +68,12 @@ fn public_tools_json() -> serde_json::Value {
 pub async fn run_mesh_service(
     defaults: RuntimeDefaults,
     node: HostQuicNode,
+    now_bearer: quic_lite::BearerId,
     espnow_ingress: Arc<dyn crate::espnow_bearer::EspNowIngress>,
 ) -> Result<()> {
     let (trace_buffer, _trace_guard) = mesh::local_trace::init("lmesh");
     mesh::local_trace::serve("lmesh", trace_buffer.clone());
-    if let Err(error) = run_server(defaults, node, espnow_ingress).await {
+    if let Err(error) = run_server(defaults, node, now_bearer, espnow_ingress).await {
         // mesh-init intentionally discards child stderr in the production
         // service unit. Persist the startup failure in the service log so a
         // stale control socket is diagnosable without changing radio state or
@@ -86,6 +87,7 @@ pub async fn run_mesh_service(
 async fn run_server(
     defaults: RuntimeDefaults,
     node: HostQuicNode,
+    now_bearer: quic_lite::BearerId,
     espnow_ingress: Arc<dyn crate::espnow_bearer::EspNowIngress>,
 ) -> Result<()> {
     let (node, driver) = quic_lite::tokio::TokioNodeDriver::new(
@@ -107,6 +109,7 @@ async fn run_server(
     discovery.start().await?;
     let discovery = Arc::new(discovery);
     let service = Arc::new(LmeshService::new(discovery.clone()));
+    service.set_now_quic_client(node.clone(), now_bearer);
     service.set_espnow_ingress(espnow_ingress);
     // Netlink is only an advisory hint. A base-device event waits for the USB
     // driver to settle, then runs the same presence-edge check as the periodic

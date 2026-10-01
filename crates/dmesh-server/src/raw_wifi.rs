@@ -50,6 +50,28 @@ pub const RAW_WIFI_SNAPSHOT_MAX_BYTES: usize = 448;
 /// response below the common bearer MTU while allowing ten visible DMesh APs.
 pub const RAW_WIFI_RESPONSE_MAX_BYTES: usize = 768;
 
+/// Common admission result for an ESP-NOW action payload. Synchronization and
+/// tagged connectionless records stay on discovery/control handling; only an
+/// opaque payload reaches the QUIC packet bearer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EspNowPayloadClass {
+    NowSync,
+    TaggedControl,
+    QuicDatagram,
+}
+
+/// Classify one already-framed ESP-NOW payload before it enters QUIC. Kept in
+/// the portable server crate so Linux and ESP adapters apply the same rule.
+pub fn classify_espnow_payload(payload: &[u8]) -> EspNowPayloadClass {
+    if dmesh_rawnan::parse_now_sync_body(payload).is_some() {
+        EspNowPayloadClass::NowSync
+    } else if decode(payload).is_some() {
+        EspNowPayloadClass::TaggedControl
+    } else {
+        EspNowPayloadClass::QuicDatagram
+    }
+}
+
 /// Encode a complete tagged raw-action-injection request. The frame stays a
 /// borrowed byte string at the decoder boundary; this constructor does not
 /// fragment, copy into a transport queue, or imply that the selected adapter
@@ -1028,7 +1050,13 @@ impl RawWifiCounters {
 pub struct RawWifiSnapshot {
     pub epoch: u32,
     pub channel: Option<u8>,
+    /// Whether the current product profile requests infrastructure STA.
+    pub sta_enabled: Option<bool>,
     pub sta_associated: Option<bool>,
+    /// BSSID of the associated infrastructure AP, distinct from `sta_mac`.
+    pub sta_bssid: Option<[u8; 6]>,
+    /// Current infrastructure STA IPv4 address in network octet order.
+    pub sta_ipv4: Option<[u8; 4]>,
     pub promiscuous: Option<bool>,
     pub dw_capturing: Option<bool>,
     /// Configured NAN DW cadence; unlike `dw_capturing`, it remains present
@@ -1172,7 +1200,10 @@ pub fn encode_raw_wifi_snapshot(
         return None;
     }
     let optional = usize::from(snapshot.channel.is_some())
+        + usize::from(snapshot.sta_enabled.is_some())
         + usize::from(snapshot.sta_associated.is_some())
+        + usize::from(snapshot.sta_bssid.is_some())
+        + usize::from(snapshot.sta_ipv4.is_some())
         + usize::from(snapshot.promiscuous.is_some())
         + usize::from(snapshot.dw_capturing.is_some())
         + usize::from(snapshot.nan_dw_interval.is_some())
@@ -1222,9 +1253,21 @@ pub fn encode_raw_wifi_snapshot(
         e.uint(21)?;
         e.uint(u64::from(channel))?;
     }
+    if let Some(value) = snapshot.sta_enabled {
+        e.uint(128)?;
+        e.boolean(value)?;
+    }
     if let Some(value) = snapshot.sta_associated {
         e.uint(22)?;
         e.boolean(value)?;
+    }
+    if let Some(value) = snapshot.sta_bssid {
+        e.uint(129)?;
+        e.bytes_value(&value)?;
+    }
+    if let Some(value) = snapshot.sta_ipv4 {
+        e.uint(130)?;
+        e.bytes_value(&value)?;
     }
     if let Some(value) = snapshot.promiscuous {
         e.uint(23)?;
@@ -1458,7 +1501,24 @@ pub fn decode_raw_wifi_snapshot(data: &[u8]) -> Result<(u64, RawWifiSnapshot), &
                         .map_err(|_| "radio channel")?,
                 )
             }
+            128 => snapshot.sta_enabled = Some(decoder.boolean().ok_or("radio STA enabled")?),
             22 => snapshot.sta_associated = Some(decoder.boolean().ok_or("radio STA")?),
+            129 => {
+                snapshot.sta_bssid = Some(
+                    decoder
+                        .bytes_ref()
+                        .and_then(|v| v.try_into().ok())
+                        .ok_or("radio STA BSSID")?,
+                )
+            }
+            130 => {
+                snapshot.sta_ipv4 = Some(
+                    decoder
+                        .bytes_ref()
+                        .and_then(|v| v.try_into().ok())
+                        .ok_or("radio STA IPv4")?,
+                )
+            }
             23 => snapshot.promiscuous = Some(decoder.boolean().ok_or("radio promiscuous")?),
             24 => snapshot.dw_capturing = Some(decoder.boolean().ok_or("radio DW")?),
             96 => {
@@ -2298,6 +2358,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn espnow_admission_separates_sync_control_and_opaque_quic() {
+        let sync = dmesh_rawnan::build_now_sync_body([1; 6], [2; 6], 3, 512, 0, &[]).unwrap();
+        let tagged_control = [0xa3, 1, 6, 2, 1, 3, 1];
+        let quic_datagram = [0x40, 0x01, 0x02, 0x03];
+
+        assert_eq!(classify_espnow_payload(&sync), EspNowPayloadClass::NowSync);
+        assert_eq!(
+            classify_espnow_payload(&tagged_control),
+            EspNowPayloadClass::TaggedControl
+        );
+        assert_eq!(
+            classify_espnow_payload(&quic_datagram),
+            EspNowPayloadClass::QuicDatagram
+        );
+    }
+
+    #[test]
     fn capture_counters_are_bounded_and_classified_without_packet_storage() {
         let mut counters = WifiCaptureCounters::default();
         counters.observe_80211(0, 8, 128);
@@ -2722,6 +2799,10 @@ mod tests {
         let expected = RawWifiSnapshot {
             epoch: 9,
             channel: Some(6),
+            sta_enabled: Some(true),
+            sta_associated: Some(true),
+            sta_bssid: Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]),
+            sta_ipv4: Some([192, 168, 4, 10]),
             dw_capturing: Some(true),
             sta_mac: Some([0x10, 0, 0, 0, 0, 1]),
             ap_mac: Some([0x10, 0, 0, 0, 0, 2]),

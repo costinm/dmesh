@@ -145,14 +145,12 @@ fn synchronous_driver_receives_and_replies_to_stream_shaped_message() {
     assert!(client.association_is_established(association));
 
     let mut request = client.open_stream(association).unwrap();
-    assert_eq!(
-        client
-            .write_stream_and_finish(&mut request, b"ping")
-            .unwrap(),
-        4
-    );
+    assert_eq!(client.write_stream(&mut request, b"ping").unwrap(), 4);
+    client.finish_stream(&mut request).unwrap();
     let request_packets = core::mem::take(&mut *client_sent.lock().unwrap());
-    assert_eq!(request_packets.len(), 1);
+    // This matches the host service client, which writes its request and then
+    // shuts down the stream in a separate transport packet.
+    assert_eq!(request_packets.len(), 2);
     let mut received_stream = None;
     let mut received_bytes = Vec::new();
     let mut received_fin = false;

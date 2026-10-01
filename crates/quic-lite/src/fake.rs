@@ -169,18 +169,65 @@ struct FaultPacket {
 #[derive(Debug)]
 pub(crate) struct FaultQueue {
     config: FaultConfig,
+    profile: FaultProfile,
     queue: VecDeque<FaultPacket>,
     sent: u64,
+    random_state: u64,
+    last_ready_at: u64,
+}
+
+#[cfg(test)]
+/// Additional deterministic link behavior. Rates use bytes per virtual tick;
+/// jitter is a uniformly selected integer in `0..=jitter_ticks`. Loss uses a
+/// seeded xorshift generator and is expressed in parts per million.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FaultProfile {
+    pub seed: u64,
+    pub loss_per_million: u32,
+    pub jitter_ticks: u64,
+    pub rate_bytes_per_tick: u64,
+    pub queue_packets: usize,
+}
+
+#[cfg(test)]
+impl Default for FaultProfile {
+    fn default() -> Self {
+        Self {
+            seed: 1,
+            loss_per_million: 0,
+            jitter_ticks: 0,
+            rate_bytes_per_tick: 0,
+            queue_packets: usize::MAX,
+        }
+    }
 }
 
 #[cfg(test)]
 impl FaultQueue {
     pub(crate) fn new(config: FaultConfig) -> Self {
+        Self::with_profile(config, FaultProfile::default())
+    }
+
+    pub(crate) fn with_profile(config: FaultConfig, profile: FaultProfile) -> Self {
+        let random_state = if profile.seed == 0 { 1 } else { profile.seed };
         Self {
             config,
+            profile,
             queue: VecDeque::new(),
             sent: 0,
+            random_state,
+            last_ready_at: 0,
         }
+    }
+
+    fn random(&mut self) -> u64 {
+        let mut value = self.random_state;
+        value ^= value << 13;
+        value ^= value >> 7;
+        value ^= value << 17;
+        self.random_state = value;
+        value
     }
 
     pub(crate) fn submit_at(&mut self, now: u64, payload: &[u8]) -> Result<(), crate::Error> {
@@ -189,13 +236,32 @@ impl FaultQueue {
             .config
             .drop_every
             .is_some_and(|n| n != 0 && self.sent % n == 0)
+            || self.random() % 1_000_000 < u64::from(self.profile.loss_per_million.min(1_000_000))
+            || payload.len() > self.config.mtu
+            || self.queue.len() >= self.profile.queue_packets
         {
             return Ok(());
         }
-        let mut bytes = payload.to_vec();
-        bytes.truncate(self.config.mtu);
+        let bytes = payload.to_vec();
+        let jitter = if self.profile.jitter_ticks == 0 {
+            0
+        } else {
+            self.random() % self.profile.jitter_ticks.saturating_add(1)
+        };
+        let serialization = if self.profile.rate_bytes_per_tick == 0 {
+            0
+        } else {
+            (payload.len() as u64).saturating_add(self.profile.rate_bytes_per_tick - 1)
+                / self.profile.rate_bytes_per_tick
+        };
+        let ready_at = now
+            .max(self.last_ready_at)
+            .saturating_add(self.config.latency_ticks)
+            .saturating_add(jitter)
+            .saturating_add(serialization);
+        self.last_ready_at = ready_at;
         let packet = FaultPacket {
-            ready_at: now.saturating_add(self.config.latency_ticks),
+            ready_at,
             ordinal: self.sent,
             bytes,
         };
@@ -229,5 +295,69 @@ impl FaultQueue {
             .into_iter()
             .map(|packet| OwnedPacket::from_buffer(packet.bytes))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod fault_profile_tests {
+    use super::*;
+
+    fn configured() -> FaultConfig {
+        FaultConfig {
+            latency_ticks: 3,
+            drop_every: None,
+            duplicate: false,
+            reorder: false,
+            mtu: 8,
+        }
+    }
+
+    #[test]
+    fn seeded_profile_repeats_loss_jitter_rate_and_mtu_decisions() {
+        let profile = FaultProfile {
+            seed: 0xfeed_beef,
+            loss_per_million: 350_000,
+            jitter_ticks: 5,
+            rate_bytes_per_tick: 2,
+            queue_packets: 16,
+        };
+        let mut first = FaultQueue::with_profile(configured(), profile);
+        let mut second = FaultQueue::with_profile(configured(), profile);
+        for i in 0..12 {
+            first.submit_at(i, b"12345678").unwrap();
+            second.submit_at(i, b"12345678").unwrap();
+        }
+        let first: Vec<_> = first
+            .poll_owned(10_000)
+            .into_iter()
+            .map(|packet| packet.bytes().to_vec())
+            .collect();
+        let second: Vec<_> = second
+            .poll_owned(10_000)
+            .into_iter()
+            .map(|packet| packet.bytes().to_vec())
+            .collect();
+        assert_eq!(first, second);
+        assert!(first.len() < 12, "seeded loss should drop packets");
+
+        let mut mtu = FaultQueue::with_profile(configured(), FaultProfile::default());
+        mtu.submit_at(0, b"123456789").unwrap();
+        assert!(mtu.poll_owned(u64::MAX).is_empty());
+    }
+
+    #[test]
+    fn rate_and_jitter_delay_packet_delivery() {
+        let mut link = FaultQueue::with_profile(
+            configured(),
+            FaultProfile {
+                seed: 7,
+                jitter_ticks: 4,
+                rate_bytes_per_tick: 2,
+                ..FaultProfile::default()
+            },
+        );
+        link.submit_at(0, b"12345678").unwrap();
+        assert!(link.poll_owned(6).is_empty());
+        assert_eq!(link.poll_owned(100).len(), 1);
     }
 }

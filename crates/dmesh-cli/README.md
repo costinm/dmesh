@@ -104,6 +104,10 @@ explicit --baud 115200; packetized USB/JTAG needs no nominal baud. A reset or
 boot line alone is not proof of Main health: follow it with firmware.identity
 and status.
 
+Direct UART stream commands use a three-second response deadline by default.
+For slow radio/firmware diagnostics, pass `--timeout-secs N` after the method
+and its fields; for example, `dmesh-cli "$UART_TARGET" status --timeout-secs 10`.
+
 ## Read radio, runtime, and performance state
 
 ~~~sh

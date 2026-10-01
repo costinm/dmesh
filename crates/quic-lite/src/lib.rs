@@ -2345,9 +2345,13 @@ impl CongestionController {
     }
 
     pub(crate) fn on_ack(&mut self, acked_bytes: u64) {
+        self.on_ack_with_growth(acked_bytes, true);
+    }
+
+    pub(crate) fn on_ack_with_growth(&mut self, acked_bytes: u64, allow_growth: bool) {
         let acked = min(acked_bytes, self.bytes_in_flight);
         self.bytes_in_flight -= acked;
-        if acked == 0 {
+        if acked == 0 || !allow_growth {
             return;
         }
         if self.congestion_window < self.slow_start_threshold {
@@ -2804,6 +2808,11 @@ pub(crate) struct EndpointState<const P: usize = DEFAULT_MAX_PACKET_SIZE> {
     pub next_packet_number: u32,
     pub largest_acked_by_peer: Option<u32>,
     sent_packets: Vec<Option<SentPacket<P>>>,
+    /// Stream bytes are association-owned and stored once per logical range;
+    /// transmission metadata refers to the matching slot instead of embedding
+    /// a packet-sized payload array in every history record.
+    send_buffer: Vec<Option<Vec<u8>>>,
+    send_buffer_limit_bytes: usize,
     local_cid: Option<ConnectionId>,
     peer_cid: Option<ConnectionId>,
     control_pending: bool,
@@ -2891,9 +2900,11 @@ struct SentPacket<const P: usize> {
     stream_id: u64,
     offset: u64,
     fin: bool,
-    payload_len: usize,
-    payload: [u8; P],
+    send_buffer_slot: usize,
     sent_at: u64,
+    /// Whether this transmission was sent while the congestion window was
+    /// the limiting resource for the path.
+    window_limited: bool,
     lost: bool,
 }
 
@@ -2954,6 +2965,9 @@ impl<const P: usize> EndpointState<P> {
             core::ptr::addr_of_mut!((*out).next_packet_number).write(0);
             core::ptr::addr_of_mut!((*out).largest_acked_by_peer).write(None);
             core::ptr::addr_of_mut!((*out).sent_packets).write(alloc::vec![None; history_capacity]);
+            core::ptr::addr_of_mut!((*out).send_buffer).write(alloc::vec![None; history_capacity]);
+            core::ptr::addr_of_mut!((*out).send_buffer_limit_bytes)
+                .write(history_capacity.saturating_mul(P));
             core::ptr::addr_of_mut!((*out).local_cid).write(None);
             core::ptr::addr_of_mut!((*out).peer_cid).write(None);
             core::ptr::addr_of_mut!((*out).control_pending).write(false);
@@ -3026,6 +3040,8 @@ impl<const P: usize> EndpointState<P> {
             next_packet_number: 0,
             largest_acked_by_peer: None,
             sent_packets: alloc::vec![None; history_capacity],
+            send_buffer: alloc::vec![None; history_capacity],
+            send_buffer_limit_bytes: history_capacity.saturating_mul(P),
             local_cid: None,
             peer_cid: None,
             control_pending: false,
@@ -3254,14 +3270,30 @@ impl<const P: usize> EndpointState<P> {
             self.sent_packets
                 .try_reserve(limit - self.sent_packets.len())
                 .map_err(|_| Error::HistoryFull)?;
+            self.send_buffer
+                .try_reserve(limit - self.send_buffer.len())
+                .map_err(|_| Error::HistoryFull)?;
             self.sent_packets.resize(limit, None);
+            self.send_buffer.resize_with(limit, || None);
         } else if limit < self.sent_packets.len()
             && self.sent_packets.iter().skip(limit).all(Option::is_none)
         {
             self.sent_packets.truncate(limit);
             self.sent_packets.shrink_to_fit();
+            self.send_buffer.truncate(limit);
+            self.send_buffer.shrink_to_fit();
         }
         self.history_limit = limit;
+        Ok(())
+    }
+
+    /// Set the independent byte limit for association-owned stream data.
+    /// Existing retained data is never evicted to satisfy a smaller limit.
+    pub(crate) fn set_send_buffer_limit_bytes(&mut self, limit: usize) -> Result<(), Error> {
+        if self.retained_payload_bytes() > limit {
+            return Err(Error::HistoryFull);
+        }
+        self.send_buffer_limit_bytes = limit;
         Ok(())
     }
 
@@ -3324,20 +3356,16 @@ impl<const P: usize> EndpointState<P> {
         P
     }
 
-    /// Number of retransmittable stream payload bytes currently retained.
-    /// This is intentionally exposed for diagnostics and bounded-memory
+    /// Number of stream payload bytes currently retained for retransmission.
+    /// This is intentionally exposed for diagnostics and size-limit
     /// assertions; packet metadata is accounted separately by the profile.
     pub(crate) fn retained_payload_bytes(&self) -> usize {
-        self.sent_packets
-            .iter()
-            .flatten()
-            .map(|packet| packet.payload_len)
-            .sum()
+        self.send_buffer.iter().flatten().map(Vec::len).sum()
     }
 
     /// Maximum payload bytes that this endpoint can retain in its ledger.
     pub(crate) const fn retransmission_capacity_bytes(&self) -> usize {
-        self.history_limit.saturating_mul(P)
+        self.send_buffer_limit_bytes
     }
 
     /// Advance the transport clock in milliseconds.
@@ -3434,6 +3462,22 @@ impl<const P: usize> EndpointState<P> {
             .filter(|packet| !packet.lost)
             .map(|packet| packet.sent_at)
             .min();
+        let base_rtt = self
+            .rtt
+            .latest()
+            .unwrap_or(25_000)
+            .max(self.rtt.smoothed().unwrap_or(25_000))
+            .max(1);
+        let loss_threshold =
+            base_rtt.saturating_mul(9).saturating_add(7) / 8 + self.peer_max_ack_delay_us;
+        let loss_deadline = self.largest_acked_by_peer.and_then(|largest_acked| {
+            self.sent_packets
+                .iter()
+                .flatten()
+                .filter(|packet| !packet.lost && packet.packet_number < largest_acked)
+                .map(|packet| packet.sent_at.saturating_add(loss_threshold))
+                .min()
+        });
         let pto_deadline = earliest_sent.map(|sent_at| {
             let interval =
                 pto.saturating_mul(1u64 << self.pto_backoff.min(MAX_PTO_BACKOFF_EXPONENT));
@@ -3444,6 +3488,7 @@ impl<const P: usize> EndpointState<P> {
         ack_deadline
             .into_iter()
             .chain(credit_deadline)
+            .chain(loss_deadline)
             .chain(pto_deadline)
             .min()
     }
@@ -4381,11 +4426,23 @@ impl<const P: usize> EndpointState<P> {
                     if sent.fin && !acknowledged_fins.contains(&sent.stream_id) {
                         acknowledged_fins.push(sent.stream_id);
                     }
-                    if largest_acked.is_some_and(|packet| sent.packet_number == packet) {
+                    if !sent.lost
+                        && largest_acked.is_some_and(|packet| sent.packet_number == packet)
+                    {
                         rtt_sample = Some(self.send_clock.saturating_sub(sent.sent_at));
                     }
-                    self.congestion.on_ack(sent.bytes);
+                    if !sent.lost {
+                        let after_recovery_start = self
+                            .congestion
+                            .recovery_start_packet
+                            .is_none_or(|start| sent.packet_number > start);
+                        self.congestion.on_ack_with_growth(
+                            sent.bytes,
+                            sent.window_limited && after_recovery_start,
+                        );
+                    }
                     *slot = None;
+                    self.send_buffer[sent.send_buffer_slot] = None;
                     newly_acked = true;
                 }
             }
@@ -4502,24 +4559,38 @@ impl<const P: usize> EndpointState<P> {
         {
             return Err(Error::HistoryFull);
         }
+        let slot_index = self
+            .sent_packets
+            .iter()
+            .take(self.history_limit)
+            .position(Option::is_none)
+            .ok_or(Error::HistoryFull)?;
+        let mut retained_data = Vec::new();
+        retained_data
+            .try_reserve(data.len())
+            .map_err(|_| Error::HistoryFull)?;
+        retained_data.extend_from_slice(data);
+        let next_packet_number = self
+            .next_packet_number
+            .checked_add(1)
+            .ok_or(Error::PacketNumberExhausted)?;
         if !self.congestion.can_send(p as u64) {
             return Err(Error::Blocked);
         }
         self.send.reserve(stream_id, offset, data.len())?;
+        let window_limited = self
+            .congestion
+            .bytes_in_flight
+            .saturating_add(p as u64)
+            .saturating_add(self.congestion.max_packet_size)
+            > self.congestion.congestion_window;
         if !self.congestion.on_packet_sent(p as u64) {
             return Err(Error::Blocked);
         }
         let packet_number = self.next_packet_number;
-        self.next_packet_number = self
-            .next_packet_number
-            .checked_add(1)
-            .ok_or(Error::PacketNumberExhausted)?;
-        let slot = self
-            .sent_packets
-            .iter_mut()
-            .take(self.history_limit)
-            .find(|slot| slot.is_none())
-            .ok_or(Error::HistoryFull)?;
+        self.next_packet_number = next_packet_number;
+        self.send_buffer[slot_index] = Some(retained_data);
+        let slot = &mut self.sent_packets[slot_index];
         *slot = Some(SentPacket {
             packet_number,
             prior_packet_numbers: [0; 16],
@@ -4528,13 +4599,9 @@ impl<const P: usize> EndpointState<P> {
             stream_id,
             offset,
             fin,
-            payload_len: data.len(),
-            payload: {
-                let mut payload = [0u8; P];
-                payload[..data.len()].copy_from_slice(data);
-                payload
-            },
+            send_buffer_slot: slot_index,
             sent_at: self.send_clock,
+            window_limited,
             lost: false,
         });
         if fin {
@@ -4613,6 +4680,15 @@ impl<const P: usize> EndpointState<P> {
         packet_number: u32,
         out: &mut [u8],
     ) -> Result<Option<(usize, u32)>, Error> {
+        self.retransmit_stream_packet_with_probe(packet_number, out, true)
+    }
+
+    fn retransmit_stream_packet_with_probe(
+        &mut self,
+        packet_number: u32,
+        out: &mut [u8],
+        allow_probe_overrun: bool,
+    ) -> Result<Option<(usize, u32)>, Error> {
         let Some(index) = self.sent_packets.iter().position(|slot| {
             slot.map(|packet| packet.packet_number == packet_number)
                 .unwrap_or(false)
@@ -4620,7 +4696,12 @@ impl<const P: usize> EndpointState<P> {
             return Ok(None);
         };
         let peer_cid = self.peer_cid.ok_or(Error::WrongConnectionId)?;
-        let sent = self.sent_packets[index].take().ok_or(Error::Invalid)?;
+        let sent = self.sent_packets[index].ok_or(Error::Invalid)?;
+        let payload = self
+            .send_buffer
+            .get(sent.send_buffer_slot)
+            .and_then(Option::as_deref)
+            .ok_or(Error::Invalid)?;
         let previous_congestion = self.congestion;
         // Loss detection already removed marked packets from bytes in flight
         // and entered NewReno recovery. A PTO is a probe, not a declaration
@@ -4628,7 +4709,6 @@ impl<const P: usize> EndpointState<P> {
         if !sent.lost {
             self.congestion.remove_in_flight(sent.bytes);
         }
-        let payload = &sent.payload[..sent.payload_len];
         let packet_number = self.next_packet_number;
         let header = ShortHeader {
             flags: FLAG_FIXED,
@@ -4640,7 +4720,6 @@ impl<const P: usize> EndpointState<P> {
             Ok(used) => used,
             Err(error) => {
                 self.congestion = previous_congestion;
-                self.sent_packets[index] = Some(sent);
                 return Err(error);
             }
         };
@@ -4655,11 +4734,16 @@ impl<const P: usize> EndpointState<P> {
             Ok(used_frame) => used + used_frame,
             Err(error) => {
                 self.congestion = previous_congestion;
-                self.sent_packets[index] = Some(sent);
                 return Err(error);
             }
         };
-        self.congestion.on_retransmission_sent(used as u64);
+        if allow_probe_overrun {
+            // PTO probes may exceed the reduced window to recover a path.
+            self.congestion.on_retransmission_sent(used as u64);
+        } else if !self.congestion.on_packet_sent(used as u64) {
+            self.congestion = previous_congestion;
+            return Ok(None);
+        }
         self.next_packet_number = self
             .next_packet_number
             .checked_add(1)
@@ -4685,6 +4769,8 @@ impl<const P: usize> EndpointState<P> {
         pto: u64,
         out: &mut [u8],
     ) -> Result<Option<(usize, u32)>, Error> {
+        self.send_clock = now;
+        self.detect_ack_losses(self.largest_acked_by_peer);
         if let Some(retransmission) = self.retransmit_marked_loss(out)? {
             return Ok(Some(retransmission));
         }
@@ -4707,7 +4793,8 @@ impl<const P: usize> EndpointState<P> {
             .map(|packet| packet.packet_number);
         match candidate {
             Some(packet_number) => {
-                let retransmission = self.retransmit_stream_packet(packet_number, out)?;
+                let retransmission =
+                    self.retransmit_stream_packet_with_probe(packet_number, out, false)?;
                 if retransmission.is_some() {
                     self.stats.loss_retransmitted_packets =
                         self.stats.loss_retransmitted_packets.saturating_add(1);
@@ -4771,8 +4858,8 @@ impl<const P: usize> EndpointState<P> {
         let base_rtt = self
             .rtt
             .latest()
-            .or(self.rtt.smoothed())
             .unwrap_or(25_000)
+            .max(self.rtt.smoothed().unwrap_or(25_000))
             .max(1);
         // RFC 9002's 9/8 time threshold, rounded up in the microsecond clock.
         // `base_rtt` is ACK-delay compensated, while an outstanding sibling
@@ -4822,9 +4909,8 @@ impl<const P: usize> EndpointState<P> {
         }
     }
 
-    /// Remove a packet that loss detection has conclusively declared lost.
-    /// This is separate from retransmission so a bearer can account a packet
-    /// as lost even when its replacement is queued by a different scheduler.
+    /// Declare a packet lost while retaining its stream bytes and metadata for
+    /// retransmission or a late ACK. Loss removes flight exactly once.
     pub(crate) fn mark_lost(&mut self, packet_number: u32) -> bool {
         let Some(index) = self.sent_packets.iter().position(|slot| {
             slot.map(|packet| packet.packet_number == packet_number)
@@ -4832,9 +4918,14 @@ impl<const P: usize> EndpointState<P> {
         }) else {
             return false;
         };
-        let Some(packet) = self.sent_packets[index].take() else {
+        let Some(mut packet) = self.sent_packets[index] else {
             return false;
         };
+        if packet.lost {
+            return false;
+        }
+        packet.lost = true;
+        self.sent_packets[index] = Some(packet);
         self.congestion.on_packet_lost(
             packet.bytes,
             // This public loss entry point is also used by bearers that
@@ -5738,7 +5829,7 @@ mod tests {
         assert_eq!(client.history_capacity(), 1);
         assert_eq!(
             client.retransmission_capacity_bytes(),
-            DEFAULT_MAX_PACKET_SIZE
+            2 * DEFAULT_MAX_PACKET_SIZE
         );
         assert_eq!(client.set_history_capacity(0), Err(Error::HistoryFull));
         client.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
@@ -5929,9 +6020,62 @@ mod tests {
         endpoint.set_history_capacity(12).unwrap();
         assert_eq!(endpoint.history_capacity(), 12);
         assert_eq!(endpoint.history_storage_slots(), 12);
+        assert_eq!(endpoint.retransmission_capacity_bytes(), 4 * 128);
+        endpoint.set_send_buffer_limit_bytes(12 * 128).unwrap();
         assert_eq!(endpoint.retransmission_capacity_bytes(), 12 * 128);
         endpoint.set_history_capacity(6).unwrap();
         assert_eq!(endpoint.history_storage_slots(), 6);
+        assert_eq!(endpoint.retransmission_capacity_bytes(), 12 * 128);
+    }
+
+    #[test]
+    fn association_send_buffer_has_an_independent_cap_and_survives_loss() {
+        let local = ConnectionId::new(0x4713).unwrap();
+        let peer = ConnectionId::new(0x4714).unwrap();
+        let mut sender = EndpointState::<64>::new(Role::Client, ConnectionLimits::default(), 1200);
+        let mut receiver =
+            EndpointState::<64>::new(Role::Server, ConnectionLimits::default(), 1200);
+        sender.install_connection_ids(local, peer).unwrap();
+        receiver.install_connection_ids(peer, local).unwrap();
+        sender.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
+        receiver.set_ack_frequency(1);
+        sender.set_send_buffer_limit_bytes(3).unwrap();
+
+        let before = (
+            sender.next_packet_number,
+            sender.send.sent_data,
+            sender.bytes_in_flight(),
+        );
+        let mut packet = [0u8; 128];
+        assert_eq!(
+            sender
+                .encode_stream_packet(peer, 4, 0, false, b"full", &mut packet)
+                .unwrap_err(),
+            Error::HistoryFull
+        );
+        assert_eq!(
+            before,
+            (
+                sender.next_packet_number,
+                sender.send.sent_data,
+                sender.bytes_in_flight()
+            )
+        );
+
+        let (initial_used, first_packet) = sender
+            .encode_stream_packet(peer, 4, 0, false, b"abc", &mut packet)
+            .unwrap();
+        assert_eq!(sender.retained_payload_bytes(), 3);
+        assert!(sender.mark_lost(first_packet));
+        assert_eq!(sender.retained_payload_bytes(), 3);
+        let cwnd_after_loss = sender.congestion.congestion_window;
+        receiver.receive_packet(&packet[..initial_used]).unwrap();
+        let mut ack = [0u8; 128];
+        let ack_len = receiver.poll_transmit(&mut ack).unwrap().unwrap();
+        sender.receive_packet(&ack[..ack_len]).unwrap();
+        assert_eq!(sender.retained_payload_bytes(), 0);
+        assert_eq!(sender.bytes_in_flight(), 0);
+        assert_eq!(sender.congestion.congestion_window, cwnd_after_loss);
     }
 
     #[test]
@@ -6021,7 +6165,7 @@ mod tests {
             for packet_number in packet_numbers {
                 sender.mark_lost(packet_number);
             }
-            assert_eq!(sender.retained_payload_bytes(), 0);
+            assert!(sender.retained_payload_bytes() <= sender.retransmission_capacity_bytes());
         }
     }
 
@@ -6249,6 +6393,47 @@ mod tests {
         receiver.set_time(25_000);
         receiver.on_bearer_timeout();
         assert!(receiver.poll_transmit(&mut ack).unwrap().is_some());
+    }
+
+    #[test]
+    fn time_threshold_loss_has_its_own_bearer_deadline() {
+        let local = ConnectionId::new(0x751).unwrap();
+        let peer = ConnectionId::new(0x752).unwrap();
+        let mut sender = EndpointState::<128>::new(Role::Client, ConnectionLimits::default(), 1200);
+        sender.install_connection_ids(local, peer).unwrap();
+        sender.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
+        sender.set_time(1);
+        let mut packet = [0u8; 256];
+        for offset in 0..3_u64 {
+            sender
+                .encode_stream_packet(peer, 4, offset, false, b"x", &mut packet)
+                .unwrap();
+        }
+        let later: Vec<_> = sender
+            .sent_packets
+            .iter_mut()
+            .flatten()
+            .filter(|entry| entry.packet_number > 0)
+            .map(|entry| entry.bytes)
+            .collect();
+        for bytes in later {
+            sender.congestion.on_ack(bytes);
+        }
+        for slot in &mut sender.sent_packets {
+            if slot.is_some_and(|entry| entry.packet_number > 0) {
+                *slot = None;
+            }
+        }
+        sender.largest_acked_by_peer = Some(2);
+        let deadline = 1 + (25_000_u64 * 9).div_ceil(8) + sender.peer_max_ack_delay_us;
+        assert_eq!(sender.next_bearer_deadline(), Some(deadline));
+        sender.set_time(deadline);
+        let (_, retransmitted_pn) = sender
+            .retransmit_due(deadline, sender.pto_timeout(), &mut packet)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retransmitted_pn, 3);
+        assert_eq!(sender.stats().loss_time_threshold_packets, 1);
     }
 
     #[test]
@@ -7239,8 +7424,8 @@ mod tests {
                 for packet_number in active_numbers {
                     sender.mark_lost(packet_number);
                 }
-                assert_eq!(sender.history_len(), 0, "H={H}");
-                assert_eq!(sender.retained_payload_bytes(), 0, "H={H}");
+                assert!(sender.history_len() <= H, "H={H}");
+                assert!(sender.retained_payload_bytes() <= H * 64, "H={H}");
             }
         }
 
@@ -7503,6 +7688,86 @@ mod tests {
         sender.send.extend_stream(3, 16).unwrap();
         assert!(sender.reserve_send(3, 4, 4).is_ok());
         assert_eq!(sender.send.stream(7).unwrap().sent, 4);
+    }
+
+    #[test]
+    fn app_limited_ack_releases_flight_without_growing_window() {
+        let mut congestion = CongestionController::new(1200);
+        assert!(congestion.on_packet_sent(800));
+        let initial_window = congestion.congestion_window;
+        congestion.on_ack_with_growth(800, false);
+        assert_eq!(congestion.bytes_in_flight, 0);
+        assert_eq!(congestion.congestion_window, initial_window);
+    }
+
+    #[test]
+    fn declared_loss_retransmission_waits_for_congestion_credit() {
+        let local = ConnectionId::new(0x731).unwrap();
+        let peer = ConnectionId::new(0x732).unwrap();
+        let mut sender = EndpointState::<128>::new(Role::Client, ConnectionLimits::default(), 1200);
+        sender.install_connection_ids(local, peer).unwrap();
+        sender.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
+        let mut packet = [0u8; 256];
+        let (_, lost_pn) = sender
+            .encode_stream_packet(peer, 4, 0, false, b"lost", &mut packet)
+            .unwrap();
+        for offset in 0..3_u64 {
+            sender
+                .encode_stream_packet(peer, 4, 8 + offset, false, b"x", &mut packet)
+                .unwrap();
+        }
+        sender.detect_ack_losses(Some(lost_pn + 3));
+        let later_pn = lost_pn + 1;
+        assert!(
+            sender
+                .sent_packets
+                .iter()
+                .flatten()
+                .any(|entry| entry.packet_number == lost_pn && entry.lost)
+        );
+        sender.congestion.congestion_window = 1;
+        let flight_before = sender.congestion.bytes_in_flight;
+        assert!(
+            sender
+                .retransmit_marked_loss(&mut packet)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(sender.congestion.bytes_in_flight, flight_before);
+        assert!(
+            sender
+                .sent_packets
+                .iter()
+                .flatten()
+                .any(|entry| entry.packet_number == lost_pn && entry.lost)
+        );
+        assert!(
+            sender
+                .sent_packets
+                .iter()
+                .flatten()
+                .any(|entry| entry.packet_number == later_pn)
+        );
+    }
+
+    #[test]
+    fn app_limited_transmission_is_recorded_for_ack_growth_policy() {
+        let local = ConnectionId::new(0x741).unwrap();
+        let peer = ConnectionId::new(0x742).unwrap();
+        let mut sender = EndpointState::<128>::new(Role::Client, ConnectionLimits::default(), 1200);
+        sender.install_connection_ids(local, peer).unwrap();
+        sender.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
+        let mut packet = [0u8; 256];
+        let (_, packet_number) = sender
+            .encode_stream_packet(peer, 4, 0, true, b"app limited", &mut packet)
+            .unwrap();
+        let sent = sender
+            .sent_packets
+            .iter()
+            .flatten()
+            .find(|entry| entry.packet_number == packet_number)
+            .unwrap();
+        assert!(!sent.window_limited);
     }
 
     #[test]

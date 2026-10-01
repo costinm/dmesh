@@ -376,7 +376,8 @@ impl<const PACKET: usize> ServerStreamConnection<PACKET> {
     ) -> Result<(), crate::Error> {
         self.mux.endpoint.set_history_capacity(history_packets)?;
         self.mux.endpoint.congestion.congestion_window = initial_window_bytes;
-        self.mux.endpoint.congestion.slow_start_threshold = initial_window_bytes;
+        // Start at the configured initial window and grow in slow start.
+        self.mux.endpoint.congestion.slow_start_threshold = u64::MAX;
         self.mux
             .endpoint
             .set_ack_policy(ack_frequency, ack_delay.saturating_mul(1_000));
@@ -1134,5 +1135,11 @@ mod tests {
         };
         server.set_runtime_limits(limits).unwrap();
         assert_eq!(server.mux.delivery_limits(), (3, 1234));
+        server.configure_transport(8, 6_000, 2, 25).unwrap();
+        assert_eq!(server.mux.endpoint.congestion.congestion_window, 6_000);
+        assert_eq!(
+            server.mux.endpoint.congestion.slow_start_threshold,
+            u64::MAX
+        );
     }
 }

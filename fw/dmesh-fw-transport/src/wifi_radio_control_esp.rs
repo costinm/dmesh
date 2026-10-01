@@ -234,7 +234,12 @@ pub fn snapshot() -> RawWifiSnapshot {
     RawWifiSnapshot {
         epoch: EPOCH.load(Ordering::Acquire),
         channel: channel(),
+        sta_enabled: Some(crate::main_runtime::wants_sta(
+            &crate::profile_store::snapshot(),
+        )),
         sta_associated: Some(crate::wifi_esp::sta_associated()),
+        sta_bssid: crate::wifi_esp::sta_ap_bssid(),
+        sta_ipv4: crate::wifi_esp::sta_ipv4(),
         promiscuous: crate::wifi_esp::promiscuous_enabled().ok(),
         dw_capturing: Some(capturing),
         nan_dw_interval: Some(crate::wifi_nan_dw_capture_esp::interval()),

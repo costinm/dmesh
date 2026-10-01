@@ -905,6 +905,10 @@ fn bind_udp_peer(peer: RawUdp6Peer) -> Option<quic_lite::PeerL2Address> {
     }
 }
 
+pub(crate) fn peer_for_path(path: quic_lite::PeerL2Address) -> Option<RawUdp6Peer> {
+    unsafe { (*core::ptr::addr_of!(UDP_PATH_BINDINGS)).get(path) }
+}
+
 pub(crate) fn transmit_udp6(
     link: crate::shared_ingress_esp::IngressLink,
     peer: RawUdp6Peer,

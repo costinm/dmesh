@@ -76,6 +76,14 @@ impl DeviceSession {
             .map_err(|error| error.to_string())
     }
 
+    /// Send the transport-neutral UART wake record without initiating a
+    /// QUIC-lite exchange.
+    pub fn send_wake(&mut self) -> Result<(), String> {
+        self.port
+            .send_wake_blocking()
+            .map_err(|error| error.to_string())
+    }
+
     pub fn set_history_limit(&mut self, limit: usize) {
         self.history_limit = limit.max(1);
         while self.history.len() > self.history_limit {

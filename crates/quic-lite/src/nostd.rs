@@ -6,6 +6,7 @@
 //! resulting application association/stream events.
 
 use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 
 use crate::node::{
@@ -19,6 +20,7 @@ use crate::{
 struct IngressQueue<B> {
     packets: Mutex<VecDeque<crate::bearer::ReceivedPacket<B>>>,
     capacity: usize,
+    enqueue_drops: AtomicUsize,
 }
 
 impl<B> IngressQueue<B> {
@@ -26,18 +28,32 @@ impl<B> IngressQueue<B> {
         Self {
             packets: Mutex::new(VecDeque::with_capacity(capacity)),
             capacity,
+            enqueue_drops: AtomicUsize::new(0),
         }
     }
 
     fn pop(&self) -> Option<crate::bearer::ReceivedPacket<B>> {
         self.packets.lock().pop_front()
     }
+
+    fn take_enqueue_drops(&self) -> usize {
+        self.enqueue_drops.swap(0, Ordering::AcqRel)
+    }
 }
 
 impl<B: AsRef<[u8]> + Send> crate::bearer::PacketIngressQueue<B> for IngressQueue<B> {
     fn enqueue_packet(&self, meta: PacketMeta, packet: OwnedPacket<B>) {
-        let mut packets = self.packets.lock();
+        // A physical receive callback can preempt the node owner while it
+        // briefly holds this queue lock. Spinning in that callback would
+        // deadlock a single-core target, so contention is treated like a
+        // dropped UDP/UART datagram and left to QUIC retransmission.
+        let Some(mut packets) = self.packets.try_lock() else {
+            self.enqueue_drops.fetch_add(1, Ordering::Relaxed);
+            drop(packet);
+            return;
+        };
         if packets.len() == self.capacity {
+            self.enqueue_drops.fetch_add(1, Ordering::Relaxed);
             drop(packet);
         } else {
             packets.push_back(crate::bearer::ReceivedPacket { meta, packet });
@@ -64,11 +80,13 @@ pub struct NoStdRuntime<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bearer::PacketIngressQueue;
     use crate::packet_pool::PacketPool as FixedPool;
     use crate::{
         BearerContext, BearerInfo, BearerName, EgressSubmission, PacketBearer, PacketEgress,
         PacketSendOutcome, PacketSubmitError, PeerL2Address, StatelessResetKey,
     };
+    use core::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     type Pool = FixedPool<4, { crate::DEFAULT_PACKET_POOL_SLOT_SIZE }>;
@@ -109,6 +127,47 @@ mod tests {
         }
     }
 
+    struct ToggleBlocker {
+        context: Arc<Mutex<Option<BearerContext<Pool>>>>,
+        blocked: Arc<AtomicBool>,
+    }
+
+    impl PacketEgress<<Pool as PacketPool>::Buffer> for ToggleBlocker {
+        fn submit(
+            &mut self,
+            _peer: PeerL2Address,
+            submission: EgressSubmission<<Pool as PacketPool>::Buffer>,
+        ) -> Result<(), PacketSubmitError<<Pool as PacketPool>::Buffer>> {
+            if self.blocked.load(Ordering::Acquire) {
+                return Err(PacketSubmitError::WouldBlock(submission));
+            }
+            submission.complete(PacketSendOutcome::Sent, 0);
+            Ok(())
+        }
+    }
+
+    impl PacketBearer<Pool> for ToggleBlocker {
+        type AttachError = core::convert::Infallible;
+
+        fn info(&self) -> BearerInfo {
+            BearerInfo {
+                name: BearerName::new("blocked").unwrap(),
+                max_packet_size: crate::DEFAULT_MAX_PACKET_SIZE,
+                prefix_required: crate::PACKET_PREFIX_RESERVE,
+                suffix_required: 0,
+                requires_packet_encryption: false,
+                secure_link: false,
+                nominal_bitrate_bps: 115_200,
+                local_mac: None,
+            }
+        }
+
+        fn attach(&mut self, context: BearerContext<Pool>) -> Result<(), Self::AttachError> {
+            *self.context.lock().unwrap() = Some(context);
+            Ok(())
+        }
+    }
+
     #[test]
     fn immediate_driver_uses_registered_bearer_pool_without_ingress_queue() {
         let retained = Arc::new(Mutex::new(None));
@@ -134,6 +193,86 @@ mod tests {
         assert!(driver.progress().unwrap());
         assert!(driver.next_association().is_none());
         assert!(driver.next_stream_chunk().is_none());
+    }
+
+    #[test]
+    fn ingress_callback_drops_on_lock_contention_instead_of_spinning() {
+        let queue = IngressQueue::new(1);
+        let mut writer =
+            PacketPool::acquire_writer(&POOL, crate::PACKET_PREFIX_RESERVE, 0).unwrap();
+        writer.payload_mut()[0] = 0;
+        let packet = crate::PacketWriter::commit(writer, 1).unwrap();
+        let guard = queue.packets.lock();
+
+        crate::bearer::PacketIngressQueue::enqueue_packet(
+            &queue,
+            PacketMeta {
+                bearer: crate::BearerId::new(1).unwrap(),
+                peer_l2_address: PeerL2Address::new(1).unwrap(),
+                received_at_us: 1,
+            },
+            packet,
+        );
+
+        assert_eq!(queue.take_enqueue_drops(), 1);
+        drop(guard);
+        assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn blocked_egress_pauses_ingress_until_bearer_readiness() {
+        let context = Arc::new(Mutex::new(None));
+        let blocked = Arc::new(AtomicBool::new(true));
+        let node = QuicNode::<Pool>::new(None, &POOL);
+        let mut driver = NoStdRuntime::new(node, ConnectionLimits::default());
+        let bearer = driver
+            .add_bearer(ToggleBlocker {
+                context: context.clone(),
+                blocked: blocked.clone(),
+            })
+            .unwrap();
+        let peer = PeerL2Address::new(1).unwrap();
+
+        let mut writer =
+            PacketPool::acquire_writer(&POOL, crate::PACKET_PREFIX_RESERVE, 0).unwrap();
+        writer.payload_mut()[0] = 1;
+        let packet = crate::PacketWriter::commit(writer, 1).unwrap();
+        driver
+            .node
+            .submit_egress(bearer, peer, packet)
+            .expect("first blocked send is retained by the bearer registry");
+
+        let mut writer =
+            PacketPool::acquire_writer(&POOL, crate::PACKET_PREFIX_RESERVE, 0).unwrap();
+        writer.payload_mut()[0] = 0;
+        let packet = crate::PacketWriter::commit(writer, 1).unwrap();
+        driver.ingress.enqueue_packet(
+            PacketMeta {
+                bearer,
+                peer_l2_address: peer,
+                received_at_us: 1,
+            },
+            packet,
+        );
+
+        assert!(!driver.progress().unwrap());
+        assert_eq!(driver.ingress.packets.lock().len(), 1);
+
+        blocked.store(false, Ordering::Release);
+        context.lock().unwrap().as_ref().unwrap().send_ready();
+        // Retry is accepted and completes synchronously; consume that queued
+        // completion before allowing the retained ingress packet to proceed.
+        assert!(
+            !driver
+                .progress_with_stream(|_, _, _, bytes| Ok(bytes.len()))
+                .unwrap()
+        );
+        assert!(
+            driver
+                .progress_with_stream(|_, _, _, bytes| Ok(bytes.len()))
+                .unwrap()
+        );
+        assert!(driver.ingress.packets.lock().is_empty());
     }
 
     #[test]
@@ -176,6 +315,22 @@ where
     P: PacketPool + 'static,
     P::Buffer: Send,
 {
+    /// Return and clear the number of ingress packets dropped because the
+    /// bounded queue was full or briefly locked by the node owner.
+    pub fn take_ingress_drops(&self) -> usize {
+        self.ingress.take_enqueue_drops()
+    }
+
+    /// Current node-wide admission limits.
+    pub fn limits(&self) -> crate::NodeLimits {
+        self.node.limits()
+    }
+
+    /// Current defaults inherited by associations admitted after this call.
+    pub fn default_association_limits(&self) -> crate::AssociationLimits {
+        self.node.default_association_limits()
+    }
+
     /// Replace node-wide runtime admission limits.
     pub fn set_limits(&mut self, limits: crate::NodeLimits) -> Result<(), crate::QuicNodeError> {
         self.node.set_limits(limits)
@@ -322,6 +477,14 @@ where
         self.node.finish_stream(stream)
     }
 
+    /// Peer-advertised byte credit at the stream's current ordered position.
+    pub fn stream_send_window(
+        &self,
+        stream: &crate::QuicStream,
+    ) -> Result<u64, QuicNodeEgressError> {
+        self.node.stream_send_window(stream)
+    }
+
     /// Whether the association has completed client establishment or is an
     /// admitted server association. Role remains node-private.
     pub fn association_is_established(&self, association: QuicAssociation) -> bool {
@@ -331,10 +494,14 @@ where
     /// Process at most one queued bearer event.
     ///
     /// An RTOS task calls this after its bearer wake notification. Returning
-    /// `true` means one packet was consumed; returning `false` means no ingress
-    /// packet was pending. The method does not wait or poll in a loop.
+    /// `true` means one packet was consumed; returning `false` means ingress
+    /// was empty or is paused until a retained egress packet can be retried.
+    /// The method does not wait or poll in a loop.
     pub fn progress(&mut self) -> Result<bool, QuicNodeEgressError> {
         self.node.drain_bearer_events();
+        if !self.node.can_progress_ingress() {
+            return Ok(false);
+        }
         let Some(received) = self.ingress.pop() else {
             return Ok(false);
         };
@@ -344,6 +511,20 @@ where
             None,
         )?;
         Ok(true)
+    }
+
+    /// Drain all packets currently queued by bearer callbacks.
+    ///
+    /// Callback wakeups may coalesce when several datagrams arrive before the
+    /// owner task runs. Owners that receive one wake per burst should use this
+    /// method (or repeat [`Self::progress`]) so every queued packet is handled
+    /// before sleeping again.
+    pub fn progress_all(&mut self) -> Result<usize, QuicNodeEgressError> {
+        let mut processed = 0usize;
+        while self.progress()? {
+            processed = processed.saturating_add(1);
+        }
+        Ok(processed)
     }
 
     /// Process one bearer event while delivering associated stream bytes
@@ -359,11 +540,34 @@ where
         F: FnMut(crate::QuicStream, u64, bool, &[u8]) -> Result<usize, crate::Error>,
     {
         self.node.drain_bearer_events();
+        // Processing another packet can itself generate an ACK or flow-control
+        // packet. Leave ingress queued until any previously blocked egress is
+        // retried, rather than submitting past the bearer-owned retained slot.
+        if !self.node.can_progress_ingress() {
+            return Ok(false);
+        }
         let Some(received) = self.ingress.pop() else {
             return Ok(false);
         };
         self.process_packet(received.meta, received.packet, Some(&mut on_stream))?;
         Ok(true)
+    }
+
+    /// Drain every currently queued packet while delivering stream bytes to
+    /// one application callback. This is the burst-safe form of
+    /// [`Self::progress_with_stream`] for event-coalescing bearers.
+    pub fn progress_all_with_stream<F>(
+        &mut self,
+        mut on_stream: F,
+    ) -> Result<usize, QuicNodeEgressError>
+    where
+        F: FnMut(crate::QuicStream, u64, bool, &[u8]) -> Result<usize, crate::Error>,
+    {
+        let mut processed = 0usize;
+        while self.progress_with_stream(&mut on_stream)? {
+            processed = processed.saturating_add(1);
+        }
+        Ok(processed)
     }
 
     /// Advance transport timers and retain any terminal association event.

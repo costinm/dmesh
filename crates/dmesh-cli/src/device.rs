@@ -194,9 +194,13 @@ pub fn resolve_catalog_target(target: &str) -> Result<Option<DeviceProfile>, Str
     catalog
         .devices
         .iter()
-        .find(|device| device.name.eq_ignore_ascii_case(target) && device.vip6.is_some())
+        .find(|device| catalog_device_is_target(device, target))
         .map(profile_from_device)
         .transpose()
+}
+
+fn catalog_device_is_target(device: &CatalogDevice, target: &str) -> bool {
+    device.name.eq_ignore_ascii_case(target) && (device.vip6.is_some() || device.mac.is_some())
 }
 
 fn profile_from_device(device: &CatalogDevice) -> Result<DeviceProfile, String> {
@@ -356,5 +360,23 @@ mod tests {
             assert_eq!(by_name, by_vip6);
             assert!(resolve_catalog_target("2001:db8::8").unwrap().is_none());
         }
+    }
+
+    #[test]
+    fn mac_catalog_target_uses_identity_discovery_instead_of_static_ipv4() {
+        let device = super::CatalogDevice {
+            name: "node-under-test".into(),
+            serial: None,
+            serial_glob: None,
+            uart_baud: None,
+            mac: Some("02:11:22:33:44:55".into()),
+            ipv4: Some("192.0.2.44".into()),
+            vip6: None,
+            ipv6_link_local: None,
+            udp6_iface: None,
+            udp_port: DEFAULT_UDP_PORT,
+            auth_secret_ref: None,
+        };
+        assert!(super::catalog_device_is_target(&device, "NODE-UNDER-TEST"));
     }
 }

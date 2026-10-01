@@ -662,8 +662,7 @@ pub(crate) fn maybe_enter_sleep(
     now_ms: u64,
     sleepy_awake_until_ms: &mut u64,
 ) -> bool {
-    if role == 1 && is_sleepy_profile(profile)
-        && UART_WAKE_REQUESTED.swap(false, Ordering::AcqRel)
+    if role == 1 && is_sleepy_profile(profile) && UART_WAKE_REQUESTED.swap(false, Ordering::AcqRel)
     {
         *sleepy_awake_until_ms = now_ms.saturating_add(DEBUG_AWAKE_GRACE_MS);
         crate::commands::send_response(b"UART wake: radio active for 60 seconds");
@@ -914,8 +913,12 @@ pub(crate) fn maybe_enter_sleep(
 /// or packet poll. Wi-Fi callbacks record bounded state and return, while this
 /// owner task performs the selected follow-up driver operation that may block.
 pub(crate) fn service_radio_deadline(services: u8) {
+    if services & DEADLINE_RECHECK != 0 {
+        crate::wifi_nan_dw_capture_esp::dispatch_deferred_service_info();
+    }
     if services & DEADLINE_QUIC_INGRESS != 0 {
         crate::quic_node_esp::progress();
+        crate::wifi_espnow_esp::dispatch_pending_control_response();
     }
     if services & DEADLINE_NAN_CAPTURE != 0 {
         crate::wifi_nan_dw_capture_esp::service_deadline();
@@ -1877,8 +1880,9 @@ pub(crate) enum MainRuntimeEvent {
 
 const DEADLINE_NAN_CAPTURE: u8 = 1 << 0;
 const DEADLINE_ROC: u8 = 1 << 1;
-/// A bearer enqueued a QUIC packet. Parsing and handler dispatch run on Main's
-/// owner task rather than on a UART or Wi-Fi adapter stack.
+/// A bearer enqueued a QUIC packet or a pool-backed connectionless response.
+/// Parsing and radio submission run on Main's owner task, never an adapter
+/// callback stack.
 const DEADLINE_QUIC_INGRESS: u8 = 1 << 2;
 /// A server-side connection PTO. Main only queues the typed event; the
 /// shared packet worker owns the service ledger and performs the egress turn.
@@ -3561,6 +3565,10 @@ pub(crate) fn run_main_service(service: MainRuntimeService) {
     // fixed-size and shared by UDP6/QUIC and NOW action adapters; no per-bearer
     // command implementation or queue is created here.
     let _ = dmesh_server::services::register_tagged_component(
+        dmesh_server::services::DIAGNOSTIC_COMPONENT,
+        crate::main_runtime::receive_tagged_diagnostics,
+    );
+    let _ = dmesh_server::services::register_tagged_component(
         dmesh_server::services::FIRMWARE_COMPONENT,
         crate::firmware_identity::receive_tagged_identity,
     );
@@ -4003,6 +4011,76 @@ pub(crate) fn published_snapshot() -> MainRuntimeSnapshot {
             return snapshot_from_words(words);
         }
     }
+}
+
+/// Serve the public compact device status over the normal tagged stream. In
+/// particular, STA link and address state are observed locally here rather
+/// than inferred from a discovery beacon or host-side interface state.
+pub(crate) fn receive_tagged_diagnostics(
+    record: dmesh_server::tagged::Record<'_>,
+) -> Option<alloc::vec::Vec<u8>> {
+    let id = record.id?;
+    let dmesh_server::tagged::Name::Tag(method) = record.method? else {
+        return None;
+    };
+    if method != dmesh_server::services::DIAGNOSTIC_STATUS_METHOD {
+        let mut response = [0u8; 96];
+        let used = dmesh_server::tagged::encode_numeric_error(
+            dmesh_server::services::DIAGNOSTIC_COMPONENT,
+            method,
+            id,
+            b"unsupported diagnostic method",
+            &mut response,
+        )?;
+        return Some(alloc::vec::Vec::from(&response[..used]));
+    }
+
+    let sta_enabled = wants_sta(&crate::profile_store::snapshot());
+    let sta_associated = crate::wifi_esp::sta_associated();
+    let bssid = crate::wifi_esp::sta_ap_bssid()
+        .map(|value| {
+            alloc::format!(
+                "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                value[0],
+                value[1],
+                value[2],
+                value[3],
+                value[4],
+                value[5]
+            )
+        })
+        .unwrap_or_else(|| "unavailable".into());
+    let ipv4 = crate::wifi_esp::sta_ipv4()
+        .map(|value| alloc::format!("{}.{}.{}.{}", value[0], value[1], value[2], value[3]))
+        .unwrap_or_else(|| "unavailable".into());
+    let uptime_secs = (unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) as u64) / 1_000_000;
+    let response = dmesh_server::services::encode_device_status_response(
+        id,
+        dmesh_server::services::DeviceStatus {
+            uptime_secs,
+            sta_enabled,
+            sta_associated,
+            sta_bssid: bssid.as_bytes(),
+            sta_ipv4: ipv4.as_bytes(),
+        },
+    )?;
+    let log_line = alloc::format!(
+        "wifi STA status enabled={} associated={} bssid={} ipv4={}",
+        sta_enabled,
+        sta_associated,
+        bssid,
+        ipv4
+    );
+    // UART text is deliberately best-effort. If the ESP-IDF log bridge has
+    // filled its small queue, give the sole writer a few ticks to drain it so
+    // an explicitly requested status snapshot is more likely to be observed.
+    for _ in 0..4 {
+        if crate::uart_esp::send_debug_text(log_line.as_bytes()) {
+            break;
+        }
+        unsafe { esp_idf_sys::vTaskDelay(1) };
+    }
+    Some(response)
 }
 
 /// Serve a correlated, bounded runtime snapshot over any tagged bearer.

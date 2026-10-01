@@ -202,3 +202,39 @@ impl<P: PacketPool + 'static> PooledDecoder<P> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::encode_payload;
+
+    static POOL: quic_lite::packet_pool::PacketPool<1, 128> =
+        quic_lite::packet_pool::PacketPool::new();
+
+    #[test]
+    fn exact_wake_marker_is_not_admitted_as_quic() {
+        let wire = encode_payload(&[WAKE_MARKER], 8).unwrap();
+        let mut decoder = PooledDecoder::new(&POOL);
+        let mut wakes = 0;
+        let mut packets = 0;
+        decoder.push(&wire, 0, |frame| match frame {
+            PooledFrame::Wake => wakes += 1,
+            PooledFrame::Packet(_) => packets += 1,
+            _ => {}
+        });
+        assert_eq!((wakes, packets), (1, 0));
+    }
+
+    #[test]
+    fn wake_marker_with_payload_is_rejected() {
+        let wire = encode_payload(&[WAKE_MARKER, 1], 8).unwrap();
+        let mut decoder = PooledDecoder::new(&POOL);
+        let mut wakes = 0;
+        decoder.push(&wire, 0, |frame| {
+            if matches!(frame, PooledFrame::Wake) {
+                wakes += 1;
+            }
+        });
+        assert_eq!(wakes, 0);
+    }
+}

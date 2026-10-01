@@ -991,6 +991,13 @@ pub enum BearerRegistryError {
 pub enum AddBearerError<E> {
     /// The node could not reserve a registry entry.
     Registry(BearerRegistryError),
+    /// The bearer cannot carry the node's configured common packet size.
+    PacketTooSmall {
+        /// Payload size declared by the bearer.
+        actual: usize,
+        /// Minimum payload size required by the node.
+        required: usize,
+    },
     /// Registration succeeded but the bearer rejected its context.
     Attach(E),
 }
