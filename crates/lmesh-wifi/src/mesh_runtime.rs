@@ -249,12 +249,11 @@ async fn run_server(
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&cbor_path, std::fs::Permissions::from_mode(0o660))?;
     }
-    start_http_admin(&cbor_path, defaults.http_port).await?;
-    // lmesh is the local control-plane endpoint.  Once both its UDS and
-    // optional HTTP listener are ready, actively ask every enabled bearer for
-    // current peer presence.  This complements (rather than replaces) the
-    // boot/periodic multicast announcement above: it prompts NAN/NOW peers to
-    // publish immediately and sends the matching UDP6 multicast announce.
+    // lmesh is the local control-plane endpoint. Once its UDS listener is
+    // ready, actively ask every enabled bearer for current peer presence.
+    // This complements (rather than replaces) the boot/periodic multicast
+    // announcement above: it prompts NAN/NOW peers to publish immediately
+    // and sends the matching UDP6 multicast announce.
     // Run it outside the accept loop so a slow or unavailable optional radio
     // never delays control-socket readiness.
     let boot_discovery_service = service.clone();
@@ -281,40 +280,6 @@ async fn run_server(
             }
         });
     }
-}
-
-async fn start_http_admin(socket: &str, port: u16) -> Result<()> {
-    let node = Arc::new(ssh_mesh::MeshNode::new(None, None));
-    let manager = Arc::new(ssh_mesh::sshc::SshClientManager::new(
-        node.private_key().clone(),
-        (*node.ca_keys).clone(),
-        None,
-        None,
-    ));
-    let config = dmesh_server::http::HttpConfig {
-        bind: std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
-        node,
-        client_manager: manager,
-        service: dmesh_server::http::HttpService {
-            name: "lmesh".to_owned(),
-            backend: ssh_mesh::mesh_rest::MeshServiceBackend::UdsSeqpacket(PathBuf::from(socket)),
-        },
-        web_root: http_web_root("LMESH_HTTP_WEB_DIR"),
-    };
-    tokio::spawn(async move {
-        if let Err(error) = dmesh_server::http::serve(config).await {
-            error!(%error, "lmesh_http_admin_terminated");
-        }
-    });
-    debug!(port, "lmesh_http_admin_started");
-    Ok(())
-}
-
-/// Use an operator-supplied dashboard, or upstream ssh-mesh admin assets.
-fn http_web_root(service_env: &str) -> Option<PathBuf> {
-    std::env::var_os(service_env)
-        .or_else(|| std::env::var_os("MESH_HTTP_WEB_DIR"))
-        .map(PathBuf::from)
 }
 
 fn announce_interval() -> Duration {

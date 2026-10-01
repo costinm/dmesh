@@ -1,0 +1,34 @@
+[package]
+name = "dmeshtui-android"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "dmeshui"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "dmeshui"
+path = "src/main.rs"
+
+[dependencies]
+dmeshtui = { path = "../dmeshtui", default-features = false }
+egui = { version = "0.35", default-features = false, features = ["default_fonts"] }
+log = "0.4"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+eframe = { version = "0.35", default-features = false, features = [
+    "default_fonts",
+    "glow",
+] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.14"
+egui_glow = { version = "0.35", default-features = false }
+glow = { version = "0.17", default-features = false }
+glutin_egl_sys = "0.7"
+jni = "0.21.1"
+libloading = "0.8"
+ndk = { version = "0.9", default-features = false }
+ndk-sys = "0.6"

@@ -605,9 +605,16 @@ impl dmesh_server::ble_service::BleBackend for AndroidBleBackend {
 
 #[cfg(target_os = "android")]
 pub(crate) fn register_ble_service(services: &ssh_mesh::mesh_rest::MeshServiceRegistry) -> bool {
-    match dmesh_server::ble_service::BleService::mesh_service(Arc::new(AndroidBleBackend)) {
-        Ok(service) => {
-            services.register(dmesh_server::ble_service::SERVICE_NAME, service);
+    match dmesh_server::ble_service::BleService::new(Arc::new(AndroidBleBackend)) {
+        Ok(handler) => {
+            services.register(
+                dmesh_server::ble_service::SERVICE_NAME,
+                ssh_mesh::mesh_rest::MeshService {
+                    backend: ssh_mesh::mesh_rest::MeshServiceBackend::Direct(Arc::new(handler)),
+                    encoding: ssh_mesh::mesh_rest::MeshServiceEncoding::TaggedCbor,
+                    component: dmesh_server::ble_service::SERVICE_NAME.to_owned(),
+                },
+            );
             true
         }
         Err(error) => {
@@ -763,11 +770,16 @@ impl dmesh_server::companion_service::CompanionBackend for AndroidCompanionBacke
 pub(crate) fn register_companion_service(
     services: &ssh_mesh::mesh_rest::MeshServiceRegistry,
 ) -> bool {
-    match dmesh_server::companion_service::CompanionService::mesh_service(Arc::new(
-        AndroidCompanionBackend,
-    )) {
-        Ok(service) => {
-            services.register(dmesh_server::companion_service::SERVICE_NAME, service);
+    match dmesh_server::companion_service::CompanionService::new(Arc::new(AndroidCompanionBackend)) {
+        Ok(handler) => {
+            services.register(
+                dmesh_server::companion_service::SERVICE_NAME,
+                ssh_mesh::mesh_rest::MeshService {
+                    backend: ssh_mesh::mesh_rest::MeshServiceBackend::Direct(Arc::new(handler)),
+                    encoding: ssh_mesh::mesh_rest::MeshServiceEncoding::TaggedCbor,
+                    component: dmesh_server::companion_service::SERVICE_NAME.to_owned(),
+                },
+            );
             true
         }
         Err(error) => {
@@ -857,9 +869,16 @@ impl dmesh_server::usb_service::UsbBackend for AndroidUsbBackend {
 
 #[cfg(target_os = "android")]
 pub(crate) fn register_usb_service(services: &ssh_mesh::mesh_rest::MeshServiceRegistry) -> bool {
-    match dmesh_server::usb_service::UsbService::mesh_service(Arc::new(AndroidUsbBackend)) {
-        Ok(service) => {
-            services.register(dmesh_server::usb_service::SERVICE_NAME, service);
+    match dmesh_server::usb_service::UsbService::new(Arc::new(AndroidUsbBackend)) {
+        Ok(handler) => {
+            services.register(
+                dmesh_server::usb_service::SERVICE_NAME,
+                ssh_mesh::mesh_rest::MeshService {
+                    backend: ssh_mesh::mesh_rest::MeshServiceBackend::Direct(Arc::new(handler)),
+                    encoding: ssh_mesh::mesh_rest::MeshServiceEncoding::TaggedCbor,
+                    component: dmesh_server::usb_service::SERVICE_NAME.to_owned(),
+                },
+            );
             true
         }
         Err(error) => {
@@ -956,9 +975,16 @@ impl dmesh_server::wifi_service::WifiBackend for AndroidWifiBackend {
 
 #[cfg(target_os = "android")]
 pub(crate) fn register_wifi_service(services: &ssh_mesh::mesh_rest::MeshServiceRegistry) -> bool {
-    match dmesh_server::wifi_service::WifiService::mesh_service(Arc::new(AndroidWifiBackend)) {
-        Ok(service) => {
-            services.register(dmesh_server::wifi_service::SERVICE_NAME, service);
+    match dmesh_server::wifi_service::WifiService::new(Arc::new(AndroidWifiBackend)) {
+        Ok(handler) => {
+            services.register(
+                dmesh_server::wifi_service::SERVICE_NAME,
+                ssh_mesh::mesh_rest::MeshService {
+                    backend: ssh_mesh::mesh_rest::MeshServiceBackend::Direct(Arc::new(handler)),
+                    encoding: ssh_mesh::mesh_rest::MeshServiceEncoding::TaggedCbor,
+                    component: dmesh_server::wifi_service::SERVICE_NAME.to_owned(),
+                },
+            );
             true
         }
         Err(error) => {
@@ -1036,11 +1062,18 @@ impl dmesh_server::transport_service::TransportBackend for AndroidTransportBacke
 pub(crate) fn register_transport_service(
     services: &ssh_mesh::mesh_rest::MeshServiceRegistry,
 ) -> bool {
-    match dmesh_server::transport_service::TransportService::mesh_service(Arc::new(
+    match dmesh_server::transport_service::TransportService::new(Arc::new(
         AndroidTransportBackend,
     )) {
-        Ok(service) => {
-            services.register(dmesh_server::transport_service::SERVICE_NAME, service);
+        Ok(handler) => {
+            services.register(
+                dmesh_server::transport_service::SERVICE_NAME,
+                ssh_mesh::mesh_rest::MeshService {
+                    backend: ssh_mesh::mesh_rest::MeshServiceBackend::Direct(Arc::new(handler)),
+                    encoding: ssh_mesh::mesh_rest::MeshServiceEncoding::TaggedCbor,
+                    component: dmesh_server::transport_service::SERVICE_NAME.to_owned(),
+                },
+            );
             true
         }
         Err(error) => {
@@ -1187,11 +1220,18 @@ impl dmesh_server::history_service::HistoryBackend for AndroidHistoryBackend {
 pub(crate) fn register_history_service(
     services: &ssh_mesh::mesh_rest::MeshServiceRegistry,
 ) -> bool {
-    match dmesh_server::history_service::HistoryService::mesh_service(Arc::new(
+    match dmesh_server::history_service::HistoryService::new(Arc::new(
         AndroidHistoryBackend,
     )) {
-        Ok(service) => {
-            services.register(dmesh_server::history_service::SERVICE_NAME, service);
+        Ok(handler) => {
+            services.register(
+                dmesh_server::history_service::SERVICE_NAME,
+                ssh_mesh::mesh_rest::MeshService {
+                    backend: ssh_mesh::mesh_rest::MeshServiceBackend::Direct(Arc::new(handler)),
+                    encoding: ssh_mesh::mesh_rest::MeshServiceEncoding::TaggedCbor,
+                    component: dmesh_server::history_service::SERVICE_NAME.to_owned(),
+                },
+            );
             true
         }
         Err(error) => {

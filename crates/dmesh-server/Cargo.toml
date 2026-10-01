@@ -14,8 +14,6 @@ serde_json = { version = "1", optional = true }
 tokio = { version = "1", default-features = false, features = ["macros", "net", "rt", "rt-multi-thread", "io-util", "time", "sync", "fs"], optional = true }
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
-axum = { version = "0.7", optional = true }
-ssh-mesh = { git = "https://github.com/costinm/ssh-mesh", package = "ssh-mesh", optional = true }
 mesh = { git = "https://github.com/costinm/ssh-mesh", package = "mesh", optional = true }
 async-trait = { version = "0.1", optional = true }
 
@@ -23,6 +21,7 @@ async-trait = { version = "0.1", optional = true }
 default = ["std"]
 std = [
     "dep:anyhow",
+    "dep:async-trait",
     "dep:hex",
     "dep:serde",
     "dep:serde_json",
@@ -30,10 +29,10 @@ std = [
     "dep:tracing",
     "dep:tracing-subscriber",
     "dep:p256",
+    "mesh-session",
     "quic-lite/tokio",
 ]
-mesh-session = ["std", "dep:mesh"]
-http = ["mesh-session", "dep:axum", "dep:ssh-mesh", "dep:async-trait"]
+mesh-session = ["dep:mesh"]
 
 [dev-dependencies]
 tempfile = "3"

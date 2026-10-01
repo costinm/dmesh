@@ -77,22 +77,20 @@ pub mod transport_state;
 /// Cross-platform selection of NAN observers for waking a sleepy peer.
 pub mod wake;
 
-/// Shared Tokio HTTP/UI adapter used by Linux and Android host integrations.
-#[cfg(feature = "http")]
+/// Service adapters used by Linux and Android host integrations.
+#[cfg(feature = "std")]
 pub mod ble_service;
-#[cfg(feature = "http")]
+#[cfg(feature = "std")]
 pub mod companion_service;
-#[cfg(feature = "http")]
+#[cfg(feature = "std")]
 pub mod history_service;
-#[cfg(feature = "http")]
-pub mod http;
 #[cfg(feature = "std")]
 mod platform_catalog;
-#[cfg(feature = "http")]
+#[cfg(feature = "std")]
 pub mod transport_service;
-#[cfg(feature = "http")]
+#[cfg(feature = "std")]
 pub mod usb_service;
-#[cfg(feature = "http")]
+#[cfg(feature = "std")]
 pub mod wifi_service;
 
 #[cfg(feature = "std")]
