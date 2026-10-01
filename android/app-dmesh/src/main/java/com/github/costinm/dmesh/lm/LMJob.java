@@ -40,10 +40,14 @@ public class LMJob extends JobService {
                 .setPersisted(true)
                 .setPeriodic(interval)
                 .build();
-        if (RESULT_SUCCESS == js.schedule(job)) {
-            Log.d(TAG, "Scheduled periodic reconciliation after " + interval / 1000 + "s");
-        } else {
-            Log.w(TAG, "Failed to schedule periodic reconciliation");
+        try {
+            if (RESULT_SUCCESS == js.schedule(job)) {
+                Log.d(TAG, "Scheduled periodic reconciliation after " + interval / 1000 + "s");
+            } else {
+                Log.w(TAG, "Failed to schedule periodic reconciliation");
+            }
+        } catch (IllegalStateException e) {
+            Log.w(TAG, "Job scheduler rate limited; reconciliation job kept as-is", e);
         }
     }
 

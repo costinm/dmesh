@@ -843,6 +843,20 @@ are described by the method purpose above.
 | 10 | `parallel_streams` | `u8` | — |
 | 11 | `initial_consume_delay_ms` | `u32` | — |
 | 12 | `consume_delay_ms` | `u32` | — |
+| 13 | `peer` | `uri` | Optional responder destination, e.g. `espnow://02:11:22:33:44:55` or `mesh://<VIP>`. |
+
+The top-level `to` routing destination selects the node that executes the
+probe as QUIC client; it accepts the same URI syntax. Registered bearer names
+such as `udp`, `uart`, `ble`, and `espnow` select explicit transports. A
+`mesh://<VIP>` destination is resolved through discovery to the current
+address and available transport. Query options can be added to the URI later;
+comma-separated multipath destinations are not accepted until multipath is
+implemented.
+
+For a peer-targeted probe, the correlated `probe` result contains `status`,
+`peer`, `requested_bytes`, `received_bytes`, and `elapsed_us`. Wakeup of a
+sleepy peer is a separate transport/discovery policy and is not part of this
+request; discovery-based resolution may invoke the appropriate wake mechanism.
 
 ### `object.flash` request fields
 
