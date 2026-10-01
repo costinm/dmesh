@@ -5,7 +5,6 @@ use async_trait::async_trait;
 use mesh::tagged::{TaggedCatalog, TaggedRecord};
 use mesh::wire::{TaggedRecordHandler, response_error, response_ok};
 use serde_json::{Value, json};
-use ssh_mesh::mesh_rest::{MeshService, MeshServiceBackend};
 
 pub const SERVICE_NAME: &str = "ble";
 
@@ -36,13 +35,6 @@ impl BleService {
         Ok(Self { backend, catalog })
     }
 
-    pub fn mesh_service(backend: Arc<dyn BleBackend>) -> anyhow::Result<MeshService> {
-        Ok(MeshService {
-            backend: MeshServiceBackend::Direct(Arc::new(Self::new(backend)?)),
-            encoding: ssh_mesh::mesh_rest::MeshServiceEncoding::TaggedCbor,
-            component: "ble".to_owned(),
-        })
-    }
 }
 
 #[async_trait]
@@ -173,12 +165,8 @@ mod tests {
     }
 
     #[test]
-    fn ble_service_mesh_registration_uses_the_shared_catalog() {
-        let service = BleService::mesh_service(Arc::new(MockBackend)).unwrap();
-        assert_eq!(
-            service.encoding,
-            ssh_mesh::mesh_rest::MeshServiceEncoding::TaggedCbor
-        );
+    fn ble_service_catalog_contains_scan_results() {
+        let _service = BleService::new(Arc::new(MockBackend)).unwrap();
         let names = TaggedCatalog::from_tools_json(&tools_json())
             .unwrap()
             .method("ble.scan_results")

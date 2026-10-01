@@ -5,7 +5,6 @@ use async_trait::async_trait;
 use mesh::tagged::{TaggedCatalog, TaggedRecord};
 use mesh::wire::{TaggedRecordHandler, response_error, response_ok};
 use serde_json::{Value, json};
-use ssh_mesh::mesh_rest::{MeshService, MeshServiceBackend};
 use std::sync::Arc;
 
 pub const SERVICE_NAME: &str = "companion";
@@ -37,14 +36,6 @@ impl CompanionService {
         Ok(Self {
             backend,
             catalog: TaggedCatalog::from_tools_json(&tools_json())?,
-        })
-    }
-
-    pub fn mesh_service(backend: Arc<dyn CompanionBackend>) -> anyhow::Result<MeshService> {
-        Ok(MeshService {
-            backend: MeshServiceBackend::Direct(Arc::new(Self::new(backend)?)),
-            encoding: ssh_mesh::mesh_rest::MeshServiceEncoding::TaggedCbor,
-            component: SERVICE_NAME.to_owned(),
         })
     }
 

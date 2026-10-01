@@ -5,7 +5,6 @@ use async_trait::async_trait;
 use mesh::tagged::{TaggedCatalog, TaggedRecord};
 use mesh::wire::{TaggedRecordHandler, response_error, response_ok};
 use serde_json::{Value, json};
-use ssh_mesh::mesh_rest::{MeshService, MeshServiceBackend};
 
 pub const SERVICE_NAME: &str = "transport";
 
@@ -38,14 +37,6 @@ impl TransportService {
         let catalog = TaggedCatalog::from_tools_json(&tools_json())
             .context("transport service catalog must be valid")?;
         Ok(Self { backend, catalog })
-    }
-
-    pub fn mesh_service(backend: Arc<dyn TransportBackend>) -> anyhow::Result<MeshService> {
-        Ok(MeshService {
-            backend: MeshServiceBackend::Direct(Arc::new(Self::new(backend)?)),
-            encoding: ssh_mesh::mesh_rest::MeshServiceEncoding::TaggedCbor,
-            component: "transport".to_owned(),
-        })
     }
 }
 

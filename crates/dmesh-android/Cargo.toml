@@ -13,7 +13,7 @@ jni-wrapper = ["dep:jni"]
 ssh-mesh = { git = "https://github.com/costinm/ssh-mesh", package = "ssh-mesh" }
 mesh-tun = { path = "../tun", default-features = false }
 dmesh-store = { path = "../dmesh-store" }
-dmesh-server = { path = "../dmesh-server", features = ["http"] }
+dmesh-server = { path = "../dmesh-server" }
 dmesh-rawnan = { path = "../rawnan" }
 quic-lite = { path = "../quic-lite", features = ["tokio"] }
 uart-codec = { path = "../uart-codec" }
