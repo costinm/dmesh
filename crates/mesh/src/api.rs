@@ -63,7 +63,14 @@ pub struct TraceSubscribeRequest;
 
 /// Acknowledge trace-subscription capability on this control endpoint
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TraceSubscribeResponse;
+pub struct TraceSubscribeResponse {
+    /// API field `subscribed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscribed: Option<bool>,
+    /// API field `service`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+}
 
 /// Set this process's reloadable tracing EnvFilter
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -75,7 +82,14 @@ pub struct TraceSetLevelRequest {
 
 /// Set this process's reloadable tracing EnvFilter
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TraceSetLevelResponse;
+pub struct TraceSetLevelResponse {
+    /// API field `level`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<String>,
+    /// API field `message`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
 
 /// Return this process's current configured tracing EnvFilter
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -83,4 +97,11 @@ pub struct TraceGetLevelRequest;
 
 /// Return this process's current configured tracing EnvFilter
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TraceGetLevelResponse;
+pub struct TraceGetLevelResponse {
+    /// API field `level`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<String>,
+    /// API field `message`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}

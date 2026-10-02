@@ -33,7 +33,7 @@
       "required": [],
       "type": "object"
     },
-    "x-component-index": 1,
+    "x-component-index": 2000,
     "x-method-index": 1,
     "x-standard-errors": [
       "unauthenticated",
@@ -66,7 +66,7 @@
       "required": [],
       "type": "object"
     },
-    "x-component-index": 1,
+    "x-component-index": 2000,
     "x-method-index": 2,
     "x-standard-errors": [
       "unauthenticated",
@@ -89,11 +89,22 @@
     },
     "name": "trace.subscribe",
     "outputSchema": {
-      "properties": {},
+      "properties": {
+        "service": {
+          "type": "string",
+          "x-protobuf-index": 2,
+          "x-protobuf-type": "string"
+        },
+        "subscribed": {
+          "type": "boolean",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "bool"
+        }
+      },
       "required": [],
       "type": "object"
     },
-    "x-component-index": 2,
+    "x-component-index": 2001,
     "x-method-index": 1,
     "x-standard-errors": [
       "unauthenticated",
@@ -122,11 +133,22 @@
     },
     "name": "trace.set_level",
     "outputSchema": {
-      "properties": {},
+      "properties": {
+        "level": {
+          "type": "string",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "string"
+        },
+        "message": {
+          "type": "string",
+          "x-protobuf-index": 2,
+          "x-protobuf-type": "string"
+        }
+      },
       "required": [],
       "type": "object"
     },
-    "x-component-index": 2,
+    "x-component-index": 2001,
     "x-method-index": 2,
     "x-standard-errors": [
       "unauthenticated",
@@ -149,11 +171,22 @@
     },
     "name": "trace.get_level",
     "outputSchema": {
-      "properties": {},
+      "properties": {
+        "level": {
+          "type": "string",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "string"
+        },
+        "message": {
+          "type": "string",
+          "x-protobuf-index": 2,
+          "x-protobuf-type": "string"
+        }
+      },
       "required": [],
       "type": "object"
     },
-    "x-component-index": 2,
+    "x-component-index": 2001,
     "x-method-index": 3,
     "x-standard-errors": [
       "unauthenticated",

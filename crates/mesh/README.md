@@ -112,9 +112,12 @@ gate runs `mesh-api-gen --check` against all three artifacts.
 During local development,
 `MESH_RES_DIR` can point at a crate's `resources/` directory for service-owned
 runtime resources. Client-side schema resolution is separate: `MESH_TOOLS` is
-an exact override, `MESH_SCHEMA_DIR` is a multi-service root, and packages put
-catalogs under `/opt/<service>/etc/schemas/tools.json`. Packaged services use
-the normal `MESH_OPT_BASE`/`MESH_APP_OPT` resource lookup.
+an exact override, `MESH_SCHEMA_DIR` is a multi-service root, and the shared
+resolver scans `/opt/<service>/etc/schemas/`, `$HOME/opt/<service>/etc/schemas/`,
+and `$HOME/etc/schemas/`, loading every `.json` file it finds. The directory
+order, merge rules, and the gateway's `?view=all`/default catalog views are
+documented in `src/catalog.rs`. Packaged services use the normal
+`MESH_OPT_BASE`/`MESH_APP_OPT` resource lookup.
 
 If the app is exposing HTTP over TCP without TLS - ideally localhost
 is used, and normal port forwarding by the mesh proxy, with H2 or SSH

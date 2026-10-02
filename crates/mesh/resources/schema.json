@@ -11,7 +11,7 @@
         "method"
       ],
       "type": "object",
-      "x-component-index": 1,
+      "x-component-index": 2000,
       "x-method-index": 1
     },
     {
@@ -24,7 +24,7 @@
         "method"
       ],
       "type": "object",
-      "x-component-index": 1,
+      "x-component-index": 2000,
       "x-method-index": 2
     },
     {
@@ -37,7 +37,7 @@
         "method"
       ],
       "type": "object",
-      "x-component-index": 2,
+      "x-component-index": 2001,
       "x-method-index": 1
     },
     {
@@ -55,7 +55,7 @@
         "method"
       ],
       "type": "object",
-      "x-component-index": 2,
+      "x-component-index": 2001,
       "x-method-index": 2
     },
     {
@@ -68,7 +68,7 @@
         "method"
       ],
       "type": "object",
-      "x-component-index": 2,
+      "x-component-index": 2001,
       "x-method-index": 3
     }
   ]

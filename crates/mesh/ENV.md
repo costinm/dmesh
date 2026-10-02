@@ -17,8 +17,8 @@ prefer the common helper when possible.
 | `MESH_APP_OPT` | `<opt_base>/<app>` | Overrides the full packaged/read-only app path used by `AppPaths::for_app`. |
 | `MESH_RUN_BASE` | `$HOME/.local/run` for non-root, `/run/mesh` for root | Base directory for public mesh IPC endpoints. App endpoints are `<MESH_RUN_BASE>/<app>/mesh.sock`. An explicit `MESH_HOME` retains the pseudo-root layout at `<MESH_HOME>/run/mesh`. |
 | `MESH_RES_DIR` | `<app_home>/etc/resources`, then `<app_opt>/resources` | Replaces the normal resource lookup overlay with one explicit resource directory. |
-| `MESH_TOOLS` | unset | Exact client-owned `tools.json` override used by the shared catalog resolver. |
-| `MESH_SCHEMA_DIR` | unset | Common schema root; service `S` resolves as `$MESH_SCHEMA_DIR/S/tools.json` before `$HOME/opt/S/etc/schemas/tools.json` and `/opt/S/etc/schemas/tools.json`. |
+| `MESH_TOOLS` | unset | Exact client-owned `tools.json` override used by the shared catalog resolver. Failure to load an explicit override is an error. |
+| `MESH_SCHEMA_DIR` | unset | Common schema root; service `S` resolves all `.json` files under `$MESH_SCHEMA_DIR/S/`, then `/opt/S/etc/schemas/`, `$HOME/opt/S/etc/schemas/`, and `$HOME/etc/schemas/` (user-installed schemas). |
 
 Deprecated:
 | `MESH_HOME_BASE` | `<MESH_HOME>/home` for non-root, `/home` for root | Base directory for mutable app homes when `MESH_APP_HOME` is unset. Takes precedence over `MESH_HOME`. |
@@ -43,8 +43,10 @@ Deprecated:
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `RUST_LOG` | tracing subscriber default | Initial tracing filter for `local_trace::init` and binaries using `EnvFilter::from_default_env`. |
-| `MESH_LOG_FILE` | unset | Exact JSON trace log path for `local_trace::init`, for example `/dev/stderr` or `/tmp/ssh-mesh.log`. Takes precedence over `MESH_LOG_DIR` and does not rotate, so streams and special files remain usable. |
-| `MESH_LOG_DIR` | `./logs` | Directory for `local_trace::init` JSON trace logs; writes a daily-rotated `<MESH_LOG_DIR>/<service>.log` file. With mesh-init, `service` is the unit name; otherwise it is the application name. If unset, `./logs` is relative to the process working directory. |
+| `MESH_LOG_FILE` | unset | Exact JSON trace log path for `local_trace::init`, for example `/dev/stderr` or `/tmp/ssh-mesh.log`. Takes precedence over `MESH_LOG_DIR`. Regular files rotate by size (`MESH_LOG_FILE_MAX_BYTES`); special files under `/dev` are opened as-is and never rotate. |
+| `MESH_LOG_DIR` | `./logs` | Directory for `local_trace::init` JSON trace logs; writes `<MESH_LOG_DIR>/<service>.log` with size-based rotation. With mesh-init, `service` is the unit name; otherwise it is the application name. If unset, `./logs` is relative to the process working directory. |
+| `MESH_LOG_FILE_MAX_BYTES` | `8m` | Size at which the active log file rotates to `<file>.1` (backups shift to `.2`, ...). Suffixes k/m/g (or kib/mib/gib) are accepted. `0` disables rotation. |
+| `MESH_LOG_MAX_TOTAL_BYTES` | `64m` | Maximum combined size kept for rotated `<file>.*` backups; oldest backups are removed first so backups plus one full active file fit within the cap. Also bounds legacy rotated files at startup. |
 | `TRACE_SOCKET_DIR` | `<mesh_home>/run/mesh` | Shared directory for local trace sockets; producer sockets are `<TRACE_SOCKET_DIR>/<app>.sock`. |
 
 ## Generated Variables

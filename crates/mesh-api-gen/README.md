@@ -206,6 +206,10 @@ typed string-keyed map form for review. New compound forms should be added only
 when an enrolled API needs them and every generated representation can preserve
 their meaning.
 
+An optional `Required` column marks fields that must appear even when their
+value is zero or false. Without that column, fields retain their optional
+default behavior.
+
 Field tags and enum values must not be reused. Removed record tags can be
 retained explicitly:
 
@@ -271,6 +275,12 @@ cargo run -p mesh-api-gen -- \
   --out-rust crates/service/src/api.rs \
   --check
 ```
+
+`--rust-tags` also implements `mesh::tagged::TaggedFields` for every generated
+Rust type, so the same serde structs encode and decode the tag-keyed CBOR of
+`API.md` (`mesh::tagged::{to_tagged_value, from_tagged_value, request_fields,
+response_record}`) without a catalog at runtime. The consuming crate depends on
+`mesh`.
 
 `tools.json` is the machine-readable method catalog for CLIs and gateways. It
 contains descriptions, field schemas, ordering, visibility/UI hints, and
