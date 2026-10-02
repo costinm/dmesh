@@ -8,7 +8,8 @@ static TOOLS: LazyLock<Vec<Value>> = LazyLock::new(|| {
         .expect("platform tools.json must be generated from API.md")
 });
 
-pub(crate) fn tools_for(prefix: &str) -> Value {
+/// The generated tools whose names start with `prefix`.
+pub fn tools_for(prefix: &str) -> Value {
     Value::Array(
         TOOLS
             .iter()

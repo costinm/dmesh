@@ -3014,6 +3014,19 @@ where
         self.node.limits()
     }
 
+    /// Read-only transport counters and send state for one live association.
+    pub fn association_telemetry(
+        &self,
+        association: QuicAssociation,
+    ) -> Option<crate::AssociationTelemetry> {
+        self.node.association_telemetry(association)
+    }
+
+    /// Aggregate QUIC counters over currently live associations.
+    pub fn telemetry(&self) -> crate::NodeTelemetry {
+        self.node.telemetry()
+    }
+
     /// Current defaults inherited by associations admitted after this call.
     pub fn default_association_limits(&self) -> crate::AssociationLimits {
         self.node.default_association_limits()

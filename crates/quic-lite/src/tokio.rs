@@ -55,6 +55,9 @@ pub(crate) fn initial_local_cid_seed() -> u64 {
 
 enum DriverCommand {
     Wake,
+    Telemetry {
+        reply: oneshot::Sender<crate::NodeTelemetry>,
+    },
     RemoveBearer {
         bearer: BearerId,
         reply: oneshot::Sender<bool>,
@@ -163,6 +166,15 @@ pub struct TokioAssociation {
 }
 
 impl TokioNode {
+    /// Return a snapshot of QUIC counters from the node-owning driver.
+    pub async fn telemetry(&self) -> Option<crate::NodeTelemetry> {
+        let (reply, receive) = oneshot::channel();
+        self.commands
+            .send(DriverCommand::Telemetry { reply })
+            .ok()?;
+        receive.await.ok()
+    }
+
     /// Accept the next independently owned peer stream.
     pub async fn accept_stream(&self) -> Option<TokioStream> {
         self.incoming.lock().await.recv().await
@@ -722,6 +734,8 @@ where
 
     /// Run until every command handle has been dropped or the node fails.
     pub async fn run(mut self) -> Result<(), QuicNodeEgressError> {
+        let clock_started = ::tokio::time::Instant::now();
+        let clock_base_us = self.node.clock_us();
         loop {
             self.dispatch_stream_chunks();
             self.dispatch_association_events();
@@ -729,6 +743,27 @@ where
             self.retry_pending_opens();
             self.retry_pending_writes();
             self.retry_finishes();
+            // The driver owns every node timer (pacing, loss, ACK delay, PTO,
+            // idle). Without one, a send that pacing defers after the initial
+            // burst would never be retried while the driver waits for packets
+            // or commands.
+            let now = clock_base_us.saturating_add(
+                u64::try_from(clock_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            );
+            self.node.advance_clock(now);
+            let deadline = self.node.next_deadline();
+            let timer = async move {
+                match deadline {
+                    Some(deadline) => {
+                        ::tokio::time::sleep(std::time::Duration::from_micros(
+                            deadline.saturating_sub(now),
+                        ))
+                        .await;
+                    }
+                    None => core::future::pending::<()>().await,
+                }
+            };
+            ::tokio::pin!(timer);
             ::tokio::select! {
                 command = self.commands.recv() => {
                     let Some(command) = command else { return Ok(()); };
@@ -737,7 +772,36 @@ where
                 event = core::future::poll_fn(|context| {
                     self.node.poll_one_event(context, Some(self.limits))
                 }) => {
-                    event?;
+                    if let Err(error) = event {
+                        // A socket or pool that is momentarily full is not a
+                        // reason to stop the node: loss recovery resends, and
+                        // the short pause stops this loop from spinning.
+                        if !error.is_retryable() {
+                            return Err(error);
+                        }
+                        ::tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                }
+                () = &mut timer => {
+                    let now = deadline.unwrap_or(now);
+                    self.node.advance_clock(now);
+                    match self.node.timer_expired(now) {
+                        Ok(Some(crate::node::NodeTimer::Egress(packet))) => {
+                            match self.node.submit_node_packet(packet) {
+                                Ok(()) => {}
+                                Err(error) if error.is_retryable() => {}
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        Ok(Some(crate::node::NodeTimer::BootstrapTimedOut { .. })) => {
+                            return Err(QuicNodeEgressError::AssociationTimedOut);
+                        }
+                        Ok(Some(crate::node::NodeTimer::IdleTimedOut { .. }))
+                        | Ok(Some(crate::node::NodeTimer::CircuitSetupTimedOut { .. }))
+                        | Ok(None) => {}
+                        Err(error) if error.is_retryable() => {}
+                        Err(error) => return Err(error),
+                    }
                 }
             }
         }
@@ -825,6 +889,9 @@ where
     fn handle_command(&mut self, command: DriverCommand) -> Result<(), QuicNodeEgressError> {
         match command {
             DriverCommand::Wake => {}
+            DriverCommand::Telemetry { reply } => {
+                let _ = reply.send(self.node.telemetry());
+            }
             DriverCommand::RemoveBearer { bearer, reply } => {
                 let _ = reply.send(self.node.remove_bearer(bearer));
             }

@@ -18,7 +18,29 @@ pub const NAN_METRICS_METHOD: u64 = 3;
 pub const UDP6_METRICS_METHOD: u64 = 4;
 pub const WIFI_LINK_METRICS_METHOD: u64 = 5;
 pub const BATTERY_METHOD: u64 = 6;
+pub const QUIC_METRICS_METHOD: u64 = 7;
+pub const QUIC_ASSOCIATIONS_METHOD: u64 = 8;
+pub const BEARERS_METHOD: u64 = 9;
+pub const MEMORY_METHOD: u64 = 10;
+pub const POWER_METHOD: u64 = 11;
+pub const RUNTIME_METHOD: u64 = 12;
+/// Every telemetry method: each takes an empty request.
+pub const METHODS: [u64; 12] = [
+    NAN_STATUS_METHOD,
+    NOW_METRICS_METHOD,
+    NAN_METRICS_METHOD,
+    UDP6_METRICS_METHOD,
+    WIFI_LINK_METRICS_METHOD,
+    BATTERY_METHOD,
+    QUIC_METRICS_METHOD,
+    QUIC_ASSOCIATIONS_METHOD,
+    BEARERS_METHOD,
+    MEMORY_METHOD,
+    POWER_METHOD,
+    RUNTIME_METHOD,
+];
 pub const TELEMETRY_RESPONSE_MAX_BYTES: usize = 512;
+include!("generated_quic_telemetry.rs");
 /// A complete NAN snapshot currently has 35 scalar counters.  Leave bounded
 /// room for additions while retaining one compact response inside the shared
 /// transport MTU.
@@ -156,15 +178,7 @@ pub struct Metric {
 
 /// Encode an empty, correlated read request for one telemetry method.
 pub fn encode_request(method: u64, id: u64, out: &mut [u8]) -> Option<usize> {
-    if !matches!(
-        method,
-        NAN_STATUS_METHOD
-            | NOW_METRICS_METHOD
-            | NAN_METRICS_METHOD
-            | UDP6_METRICS_METHOD
-            | WIFI_LINK_METRICS_METHOD
-            | BATTERY_METHOD
-    ) {
+    if !METHODS.contains(&method) {
         return None;
     }
     let mut e = Encoder::new(out);
@@ -199,16 +213,7 @@ pub fn decode_request_record(record: crate::tagged::Record<'_>) -> Option<(u64, 
         return None;
     }
     let method = match record.method? {
-        Name::Tag(method)
-            if matches!(
-                method,
-                NAN_STATUS_METHOD
-                    | NOW_METRICS_METHOD
-                    | NAN_METRICS_METHOD
-                    | UDP6_METRICS_METHOD
-                    | WIFI_LINK_METRICS_METHOD
-                    | BATTERY_METHOD
-            ) =>
+        Name::Tag(method) if METHODS.contains(&method) =>
         {
             method
         }
@@ -318,6 +323,26 @@ pub fn encode_metrics(metrics: &[Metric], out: &mut [u8]) -> Option<usize> {
     Some(e.len())
 }
 
+/// Encode QUIC-lite node counters using the generated `API.md` response type.
+pub fn encode_quic_metrics(telemetry: quic_lite::NodeTelemetry, out: &mut [u8]) -> Option<usize> {
+    TelemetryQuicResponse {
+        live_associations: telemetry.live_associations,
+        received_packets: telemetry.received_packets,
+        sent_packets: telemetry.sent_packets,
+        received_stream_packets: telemetry.received_stream_packets,
+        received_control_packets: telemetry.received_control_packets,
+        sent_stream_packets: telemetry.sent_stream_packets,
+        sent_control_packets: telemetry.sent_control_packets,
+        duplicate_packets: telemetry.duplicate_packets,
+        out_of_order_packets: telemetry.out_of_order_packets,
+        inferred_missing_packets: telemetry.inferred_missing_packets,
+        retransmitted_packets: telemetry.retransmitted_packets,
+        loss_events: telemetry.loss_events,
+        submission_failures: telemetry.submission_failures,
+    }
+    .encode_cbor(out)
+}
+
 /// Encode the existing common optional per-peer link record. Field numbers
 /// follow `WifiLinkMetrics` declaration order and unavailable facts vanish.
 pub fn encode_wifi_link_metrics(metrics: WifiLinkMetrics, out: &mut [u8]) -> Option<usize> {
@@ -384,6 +409,103 @@ pub fn encode_wifi_link_metrics(metrics: WifiLinkMetrics, out: &mut [u8]) -> Opt
 
 #[cfg(test)]
 mod tests {
+    /// `API.md` is the one definition of each telemetry response. These tests
+    /// hold the encoders and the metric-id constants to the typed structs
+    /// generated from it, so the documentation cannot drift from the wire.
+    mod spec {
+        use super::super::*;
+        use crate::platform_api as api;
+        use mesh::tagged::TaggedFields;
+
+        /// Every `pub const NAME: u16 = N;` of one metric module is a field of
+        /// the response, named in lowercase with the same tag.
+        fn assert_ids_are_fields<T: TaggedFields>(module: &str) {
+            let source = include_str!("telemetry.rs");
+            let start = source.find(&format!("pub mod {module} {{")).unwrap();
+            let body = &source[start..start + source[start..].find("\n}").unwrap()];
+            let mut seen = 0;
+            for line in body.lines() {
+                let line = line.trim();
+                let Some(rest) = line.strip_prefix("pub const ") else {
+                    continue;
+                };
+                let (name, value) = rest.split_once(": u16 = ").unwrap();
+                let tag: u32 = value.trim_end_matches(';').parse().unwrap();
+                let name = name.to_ascii_lowercase();
+                assert!(
+                    T::FIELDS.iter().any(|(field, t)| *field == name && *t == tag),
+                    "{module}::{name} = {tag} is not in the API.md response"
+                );
+                seen += 1;
+            }
+            assert_eq!(seen, T::FIELDS.len(), "{module}: API.md has fields with no constant");
+        }
+
+        fn decode<T: TaggedFields>(wire: &[u8]) -> T {
+            let value = mesh::cbor::decode_value_bytes(wire).unwrap();
+            mesh::tagged::from_tagged_value(&value).unwrap()
+        }
+
+        #[test]
+        fn metric_ids_are_the_documented_field_tags() {
+            assert_ids_are_fields::<api::TelemetryNowResponse>("now_metric");
+            assert_ids_are_fields::<api::TelemetryNanResponse>("nan_metric");
+            assert_ids_are_fields::<api::TelemetryUdp6Response>("udp6_metric");
+        }
+
+        #[test]
+        fn a_metric_map_decodes_as_the_documented_response() {
+            let mut wire = [0u8; 64];
+            let used = encode_metrics(
+                &[
+                    Metric { id: udp6_metric::RX_FRAMES, value: 7 },
+                    Metric { id: udp6_metric::TX_FAILURES, value: 2 },
+                ],
+                &mut wire,
+            )
+            .unwrap();
+            let response: api::TelemetryUdp6Response = decode(&wire[..used]);
+            assert_eq!(response.rx_frames, Some(7));
+            assert_eq!(response.tx_failures, Some(2));
+            // Counters the device omitted are absent, not zero.
+            assert_eq!(response.rx_invalid, None);
+        }
+
+        #[test]
+        fn wifi_link_and_battery_encoders_match_their_tables() {
+            let mut link = WifiLinkMetrics::new();
+            // `peer_mac` (tag 3) is a byte string; the JSON projection used by
+            // `decode` renders those as `base64:` text, so it is left out here.
+            link.rx_bytes = Some(10);
+            link.tx_bytes = Some(20);
+            link.signal_dbm = Some(-40);
+            link.bearer_tx_failures = Some(3);
+            link.raw_tx_completion_failures = Some(4);
+            let mut wire = [0u8; 128];
+            let used = encode_wifi_link_metrics(link, &mut wire).unwrap();
+            let response: api::TelemetryWifiLinkResponse = decode(&wire[..used]);
+            assert_eq!(response.rx_bytes, Some(10));
+            assert_eq!(response.tx_bytes, Some(20));
+            assert_eq!(response.signal_dbm, Some(-40));
+            assert_eq!(response.bearer_tx_failures, Some(3));
+            assert_eq!(response.raw_tx_completion_failures, Some(4));
+            assert_eq!(response.schema_version, Some(crate::raw_wifi::WIFI_LINK_METRICS_SCHEMA_VERSION));
+
+            let battery = BatteryState {
+                battery_percent: Some(81),
+                charging: Some(true),
+                idle_ms: Some(900),
+                ..BatteryState::default()
+            };
+            let used = encode_battery_status(battery, &mut wire).unwrap();
+            let response: api::TelemetryBatteryResponse = decode(&wire[..used]);
+            assert_eq!(response.battery_percent, Some(81));
+            assert_eq!(response.charging, Some(true));
+            assert_eq!(response.idle_ms, Some(900));
+            assert_eq!(response.power_save, None);
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -424,6 +546,33 @@ mod tests {
         let mut request = [0u8; 32];
         let used = encode_request(BATTERY_METHOD, 9, &mut request).unwrap();
         assert_eq!(decode_request(&request[..used]), Some((BATTERY_METHOD, 9)));
+    }
+
+    #[test]
+    fn generated_quic_response_round_trips_numeric_cbor() {
+        let input = quic_lite::NodeTelemetry {
+            live_associations: 3,
+            received_packets: 10,
+            sent_packets: 12,
+            received_stream_packets: 4,
+            received_control_packets: 6,
+            sent_stream_packets: 5,
+            sent_control_packets: 7,
+            duplicate_packets: 1,
+            out_of_order_packets: 2,
+            inferred_missing_packets: 3,
+            retransmitted_packets: 4,
+            loss_events: 1,
+            submission_failures: 2,
+        };
+        let mut wire = [0u8; 256];
+        let used = encode_quic_metrics(input, &mut wire).unwrap();
+        let decoded = TelemetryQuicResponse::decode_cbor(&wire[..used]).unwrap();
+        assert_eq!(decoded.live_associations, 3);
+        assert_eq!(decoded.received_packets, 10);
+        assert_eq!(decoded.sent_packets, 12);
+        assert_eq!(decoded.retransmitted_packets, 4);
+        assert_eq!(decoded.submission_failures, 2);
     }
 
     #[test]

@@ -119,13 +119,11 @@ rate/profile, discovery-window cadence, and operational timeout.
 
 ## QUIC-lite connection primitives
 
-Component `3` owns bearer-neutral QUIC-lite connection primitives. Its first
-method is `1=connection.configure`, whose fields are ACK frequency/delay, TX
-burst, path policy, and timeout. The portable value type is
-`quic_lite::connection::ConnectionPolicy`; its manager owns connection IDs,
-stream allocation, RPC, forwarding, credits, and memory grants. Future
-`connection.open`, `stream.open`, `rpc`, and `forward` operations belong to
-this component, not to `transport.*` or any radio component.
+QUIC-lite owns connection IDs, stream allocation, RPC, forwarding, credits, and
+memory grants. There is currently no tagged method for them; the former
+`connection.configure` (component 3) was removed because no platform executed
+it. Future `connection.open`, `stream.open`, `rpc`, and `forward` operations
+belong to a connection component, not to `transport.*` or any radio component.
 
 A physical transport only makes one or more paths available to that manager.
 Hosts can exercise the connection surface over in-memory or loopback bearers.

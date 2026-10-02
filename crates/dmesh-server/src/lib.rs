@@ -13,8 +13,6 @@ extern crate alloc;
 /// NAN Service Discovery.
 pub mod announce;
 pub mod cbor;
-/// Tagged entry point for bearer-neutral QUIC-lite connection policy.
-pub mod connection;
 /// Explicit connectionless application-message allowlist and replay support.
 pub mod connectionless;
 /// Tagged-CBOR control handlers shared by direct records and streams.
@@ -36,6 +34,9 @@ pub mod main_runtime_state;
 pub mod net;
 /// Discovery-driven circuit selection and device-local relay reputation.
 pub mod path_builder;
+/// `log.watch`: one record type and retained history for logs, events and
+/// telemetry snapshots.
+pub mod log_watch;
 /// Common, bearer-independent platform power and memory observation contract.
 /// Android, Linux, and ESP adapters report facts; server policy consumes this
 /// state without depending on framework callback types.
@@ -50,9 +51,15 @@ pub mod provision;
 pub mod raw_dispatch;
 /// CBOR-decoded, socket-free raw 802.11 hardware request schema.
 pub mod raw_wifi;
-/// Canonical numeric tagged-CBOR identities shared by CLI, HTTP, Linux, and
-/// Android Rust adapters.
-pub mod service_catalog;
+/// The one registration and dispatch path for tagged-CBOR handlers, shared by
+/// Linux, Android, and firmware.
+pub mod registry;
+/// Handler streams: the header scanner, handler traits and server stream
+/// state machine shared by every ingress.
+pub mod stream;
+/// Bridges between the registry and ssh-mesh `TaggedRecordHandler`s.
+#[cfg(feature = "mesh-session")]
+pub mod registry_bridge;
 /// Predefined common stream services and schemas.  This is deliberately
 /// above `quic-lite`: transport provides ordered streams, while this module
 /// owns service tags, CBOR/object operations, diagnostics, and log watching.
@@ -68,6 +75,9 @@ pub mod sta_selection;
 /// dmesh-server handlers accept ordinary asynchronous streams.
 #[cfg(feature = "std")]
 pub mod stream_service;
+/// Transport-neutral asynchronous client exchanges.
+#[cfg(feature = "std")]
+pub mod stream_client;
 /// Bounded borrowed tagged-CBOR envelope shared with host mesh control.
 pub mod tagged;
 /// Portable local discovery status and transport-owned metric views.
@@ -84,10 +94,13 @@ pub mod wake;
 pub mod ble_service;
 #[cfg(feature = "std")]
 pub mod companion_service;
+/// Typed request/response structs for every `portable` and `android` method,
+/// generated from `API.md` (serde plus `mesh::tagged::TaggedFields`).
 #[cfg(feature = "std")]
-pub mod history_service;
+pub mod platform_api;
+/// Catalog of the Android platform methods generated from `API.md`.
 #[cfg(feature = "std")]
-mod platform_catalog;
+pub mod platform_catalog;
 #[cfg(feature = "std")]
 pub mod transport_service;
 #[cfg(feature = "std")]

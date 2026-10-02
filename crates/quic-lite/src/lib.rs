@@ -666,17 +666,24 @@ pub(crate) enum CommittedStreamDisposition {
 /// Transport-owned diagnostics. Bearers may report this snapshot without
 /// inspecting ACK frames, packet numbers, or other transport mechanics.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct TransportStats {
+pub struct TransportStats {
+    /// Valid packets received by the endpoint.
     pub received_packets: u64,
     /// Distinct receive ranges omitted from ACK state after its fixed capacity
     /// filled. New high ranges replace the oldest range; a lower late range is
     /// discarded so recent delivery remains reportable.
     pub ack_ranges_dropped: u64,
+    /// Received packets containing STREAM data.
     pub stream_packets: u64,
+    /// Received packets without STREAM data.
     pub control_packets: u64,
+    /// Received packets already present in the ACK ranges.
     pub duplicate_packets: u64,
+    /// Received packets arriving ahead of a missing packet number.
     pub out_of_order_packets: u64,
+    /// Packet numbers inferred missing from later receive progress.
     pub inferred_missing_packets: u64,
+    /// Packets emitted by the endpoint.
     pub sent_packets: u64,
     /// Application STREAM packets emitted by this endpoint, including
     /// replacement transmissions. This is transport accounting: bearers do
@@ -686,8 +693,9 @@ pub(crate) struct TransportStats {
     /// endpoint. Comparing this with the peer's received control count makes
     /// packet-number gaps diagnosable without packet-path logging.
     pub sent_control_packets: u64,
+    /// Packets sent again after their first transmission.
     pub retransmitted_packets: u64,
-    /// Stream packets declared lost from an ACK packet-number gap.
+    /// Packets declared lost after ACK packet-number gaps.
     pub loss_packet_threshold_packets: u64,
     /// Stream packets declared lost only because their send age exceeded
     /// the negotiated RTT/ACK-delay threshold.
@@ -704,16 +712,82 @@ pub(crate) struct TransportStats {
     pub loss_retransmitted_packets: u64,
     /// Retransmissions selected only by the PTO timer.
     pub pto_retransmitted_packets: u64,
+    /// ACK_FREQUENCY frames received.
     pub ack_frequency_received: u64,
+    /// ACK_FREQUENCY frames sent.
     pub ack_frequency_sent: u64,
+    /// ACK packets emitted.
     pub ack_packets: u64,
+    /// ACK packets emitted before the ordinary ACK threshold.
     pub ack_immediate_packets: u64,
+    /// ACK packets emitted due to packet-count threshold.
     pub ack_threshold_packets: u64,
+    /// ACK packets emitted by the ACK timer.
     pub ack_timer_packets: u64,
+    /// Samples in the receive interpacket interval accumulator.
     pub receive_interpacket_samples: u64,
+    /// Sum of receive interpacket intervals in microseconds.
     pub receive_interpacket_total: u64,
+    /// Minimum observed receive interpacket interval in microseconds.
     pub receive_interpacket_min: u64,
+    /// Maximum observed receive interpacket interval in microseconds.
     pub receive_interpacket_max: u64,
+}
+
+impl TransportStats {
+    /// QUIC packets received by this endpoint.
+    pub const fn received_packets(self) -> u64 {
+        self.received_packets
+    }
+}
+
+/// Read-only QUIC transport snapshot for one association.
+///
+/// These values describe QUIC processing and local send state. They do not
+/// prove that an application accepted bytes or that a bearer delivered them.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AssociationTelemetry {
+    /// QUIC packet, ACK, loss, and retransmission counters.
+    pub transport: TransportStats,
+    /// Largest packet number acknowledged by the peer, if any.
+    pub largest_acked_by_peer: Option<u32>,
+    /// Stream bytes currently retained in flight awaiting peer ACKs.
+    pub bytes_in_flight: u64,
+    /// Peer-advertised connection-level send credit.
+    pub peer_max_data: u64,
+    /// New stream bytes charged against peer connection-level credit.
+    pub peer_sent_data: u64,
+}
+
+/// Aggregate QUIC counters for a node, suitable for diagnostics export.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NodeTelemetry {
+    /// Associations with an active QUIC endpoint included in these counters.
+    pub live_associations: u64,
+    /// Valid QUIC packets received across live associations.
+    pub received_packets: u64,
+    /// QUIC packets emitted across live associations.
+    pub sent_packets: u64,
+    /// Received packets containing stream data.
+    pub received_stream_packets: u64,
+    /// Received packets containing only control frames.
+    pub received_control_packets: u64,
+    /// Emitted stream packets, including retransmissions.
+    pub sent_stream_packets: u64,
+    /// Emitted ACK and control packets.
+    pub sent_control_packets: u64,
+    /// Duplicate received packets.
+    pub duplicate_packets: u64,
+    /// Out-of-order received packets.
+    pub out_of_order_packets: u64,
+    /// Missing packet numbers inferred from receive progress.
+    pub inferred_missing_packets: u64,
+    /// Packets sent again after initial transmission.
+    pub retransmitted_packets: u64,
+    /// Loss-detection events.
+    pub loss_events: u64,
+    /// Bearer submission failures reported to QUIC.
+    pub submission_failures: u64,
 }
 
 /// Stream lifecycle counts for one endpoint direction.
@@ -4852,6 +4926,17 @@ impl<const P: usize> EndpointState<P> {
         })
     }
 
+    /// A congestion/history-limited status attempt commits no packet. Retain
+    /// its intent and use the adaptive loss clock for the next timer attempt,
+    /// rather than keeping an immediately due deadline in the runtime.
+    pub(crate) fn defer_path_status(&mut self, path_id: usize, egress_path: usize) {
+        let retry_at = self.paths[egress_path].send_clock
+            .saturating_add(self.pto_timeout_for_path(egress_path));
+        if self.paths[path_id].pending_local_status.is_some() {
+            self.paths[path_id].status_retry_at_us = Some(retry_at);
+        }
+    }
+
     pub(crate) fn status_egress_path(&self) -> Option<usize> {
         self.paths.iter().position(PathState::is_probe_eligible)
     }
@@ -5566,6 +5651,16 @@ impl<const P: usize> EndpointState<P> {
     /// Return transport diagnostics for the current measurement interval.
     pub(crate) const fn stats(&self) -> TransportStats {
         self.stats
+    }
+
+    pub(crate) fn telemetry(&self) -> AssociationTelemetry {
+        AssociationTelemetry {
+            transport: self.stats,
+            largest_acked_by_peer: self.largest_acked_by_peer,
+            bytes_in_flight: self.bytes_in_flight(),
+            peer_max_data: self.send.max_data,
+            peer_sent_data: self.send.sent_data,
+        }
     }
 
     /// Start a fresh diagnostics interval without disturbing protocol state.

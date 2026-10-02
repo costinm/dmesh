@@ -56,7 +56,7 @@ pub(crate) fn is_fatal_diagnostic(line: &str) -> bool {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: dmesh-cli SERIAL|DEVICE --reset\n       dmesh-cli SERIAL|DEVICE --wake [--baud PHYSICAL_UART_BAUD]\n       dmesh-cli SERIAL|DEVICE --watch [--reset] [--interactive] [--baud PHYSICAL_UART_BAUD] [--timeout-secs N]\n       dmesh-cli DEVICE METHOD [--field=value ...]\n       dmesh-cli SERIAL METHOD [--baud PHYSICAL_UART_BAUD] [--timeout-secs N] [--field=value ...]\n       dmesh-cli devices check|backfill [--dry-run]\n       dmesh-cli discover\n       dmesh-cli flash TARGET [--target main|recovery|stage2|MODULE] [--file IMAGE]\n       dmesh-cli SERIAL|DEVICE [--msg TEXT | --direct-hex HEX] [--timeout-secs N]\n       dmesh-cli lmesh METHOD [--field=value ...]\n       dmesh-cli NODE check\n       dmesh-cli udp://HOST:PORT --socket PATH\n       dmesh-cli http://HOST:PORT SERVICE.METHOD [--field=value ...]"
+        "usage: dmesh-cli SERIAL|DEVICE --reset\n       dmesh-cli SERIAL|DEVICE --wake [--baud PHYSICAL_UART_BAUD]\n       dmesh-cli SERIAL|DEVICE --watch [--reset] [--interactive] [--baud PHYSICAL_UART_BAUD] [--timeout-secs N]\n       dmesh-cli DEVICE METHOD [--field=value ...] [--bearer udp[,uart]]\n       dmesh-cli SERIAL METHOD [--baud PHYSICAL_UART_BAUD] [--timeout-secs N] [--linger-secs N] [--repeat-secs N] [--field=value ...]\n       dmesh-cli devices check|backfill [--dry-run]\n       dmesh-cli discover\n       dmesh-cli flash TARGET [--target main|recovery|stage2|MODULE] [--file IMAGE]\n       dmesh-cli SERIAL|DEVICE [--msg TEXT | --direct-hex HEX] [--timeout-secs N]\n       dmesh-cli lmesh METHOD [--field=value ...]\n       dmesh-cli NODE check\n       dmesh-cli udp://HOST:PORT --socket PATH\n       dmesh-cli http://HOST:PORT SERVICE.METHOD [--field=value ...]"
     );
     std::process::exit(2)
 }
@@ -403,11 +403,11 @@ impl WatchTextFilter {
     }
 }
 
-/// Directly list a device's registered stream handlers through its UART L2.
-/// This intentionally shares the exact bootstrap and request packets used by
-/// the UDP client; only PPP framing and file I/O differ.
+/// Directly invoke a stream handler through UART L2. The ordinary request and
+/// probe paths share QUIC streams; probe payload validation stays incremental
+/// on each bearer.
 fn run_serial_stream_command(arguments: &[String]) -> Result<(), String> {
-    let (service_arguments, baud, timeout) =
+    let (service_arguments, baud, mut timeout, timeout_explicit, linger, repeat_interval) =
         parse_serial_stream_arguments(arguments.get(1..).unwrap_or_default())?;
     let body = encode_stream_argv_with_id(&service_arguments, fresh_request_id())
         .map_err(|error| error.to_string())?;
@@ -418,25 +418,78 @@ fn run_serial_stream_command(arguments: &[String]) -> Result<(), String> {
                 .into(),
         );
     }
+    let probe_request = dmesh_server::tagged::decode(&body)
+        .and_then(dmesh_server::probe::decode_probe_start_record)
+        .filter(|(_, request)| request.peer.is_none());
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
-    let response = runtime
-        .block_on(crate::node_client::request_uart(path, baud, &body, timeout))?
-        .bytes;
-    println!(
-        "dmesh_cli_stream_command target={} fin=true bytes={} {}",
+    if let Some((id, probe_request)) = probe_request {
+        if !timeout_explicit {
+            timeout = probe_request_timeout(probe_request.bytes);
+        }
+        // Without a `peer` the CLI is the probe's client: it calls the probed
+        // node's registered `probe.handler` handler and validates the payload.
+        let mut source = [0u8; dmesh_server::probe::PROBE_REQUEST_MAX];
+        let used = dmesh_server::probe::encode_probe_handler_request(probe_request, id, &mut source)
+            .ok_or("probe request does not fit a probe.handler header")?;
+        let result = runtime.block_on(crate::node_client::probe_uart(
+            path,
+            baud,
+            &source[..used],
+            probe_request,
+            timeout,
+        ))?;
+        println!(
+            "dmesh_cli_probe bearer=uart target={path} bytes={} elapsed_us={} bits_per_second={} callback_errors={:?}",
+            result.bytes,
+            result.elapsed_us,
+            result.bits_per_second(),
+            result.callback_errors,
+        );
+        return Ok(());
+    }
+    let repeat_arguments = service_arguments.clone();
+    let schema = load_tagged_schema();
+    let _last_response = runtime.block_on(crate::node_client::request_uart_monitor(
         path,
-        response.len(),
-        render_device_record(&load_tagged_schema(), &response),
-    );
+        baud,
+        || {
+            encode_stream_argv_with_id(&repeat_arguments, fresh_request_id())
+                .map_err(|error| error.to_string())
+        },
+        timeout,
+        repeat_interval,
+        linger,
+        |response| {
+            println!(
+                "dmesh_cli_stream_command target={} fin=true bytes={} {}",
+                path,
+                response.bytes.len(),
+                render_device_record(&schema, &response.bytes),
+            );
+        },
+    ))?;
     Ok(())
 }
 
 fn parse_serial_stream_arguments(
     arguments: &[String],
-) -> Result<(Vec<String>, Option<u32>, Duration), String> {
+) -> Result<
+    (
+        Vec<String>,
+        Option<u32>,
+        Duration,
+        bool,
+        Duration,
+        Option<Duration>,
+    ),
+    String,
+> {
     let mut service_arguments = Vec::new();
     let mut baud = None;
     let mut timeout = Duration::from_secs(3);
+    let mut timeout_explicit = false;
+    let mut linger = Duration::ZERO;
+    let mut repeat_interval = None;
     let mut index = 0;
     while index < arguments.len() {
         match arguments[index].as_str() {
@@ -452,6 +505,7 @@ fn parse_serial_stream_arguments(
             }
             "--timeout-secs" => {
                 index += 1;
+                timeout_explicit = true;
                 timeout = Duration::from_secs(
                     arguments
                         .get(index)
@@ -460,11 +514,50 @@ fn parse_serial_stream_arguments(
                         .map_err(|error| error.to_string())?,
                 );
             }
+            "--linger-secs" => {
+                index += 1;
+                linger = Duration::from_secs(
+                    arguments
+                        .get(index)
+                        .ok_or("missing --linger-secs value")?
+                        .parse::<u64>()
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+            "--repeat-secs" => {
+                index += 1;
+                let seconds = arguments
+                    .get(index)
+                    .ok_or("missing --repeat-secs value")?
+                    .parse::<u64>()
+                    .map_err(|error| error.to_string())?;
+                if seconds == 0 {
+                    return Err("--repeat-secs must be greater than zero".into());
+                }
+                repeat_interval = Some(Duration::from_secs(seconds));
+            }
             _ => service_arguments.push(arguments[index].clone()),
         }
         index += 1;
     }
-    Ok((service_arguments, baud, timeout))
+    if repeat_interval.is_some()
+        && !matches!(
+            service_arguments.first().map(String::as_str),
+            Some("status" | "services")
+        )
+    {
+        return Err(
+            "--repeat-secs is limited to the read-only status and services commands".into(),
+        );
+    }
+    Ok((
+        service_arguments,
+        baud,
+        timeout,
+        timeout_explicit,
+        linger,
+        repeat_interval,
+    ))
 }
 
 /// Preserve the catalog's physical-UART contract when a node name resolved to
@@ -635,11 +728,11 @@ fn run_serial_watch(arguments: &[String]) -> Result<(), String> {
     // Print the resolved physical contract before touching RTS.  A board name
     // has already been expanded to this exact `/dev/serial/by-id` path, and
     // an explicit baud makes a CP210x capture reproducible instead of relying
-    // on whichever termios settings a prior owner left behind.  `None` is the
-    // intentional packetized-native-USB case (for example C6 USB-JTAG).
+    // on whichever termios settings a prior owner left behind. `None` selects
+    // the protocol default of 115200; native USB-JTAG ignores line coding.
     println!(
-        "dmesh_uart_watch_open target={path} baud={}",
-        baud.map_or("driver-default".to_owned(), |value| value.to_string())
+        "uart_watch event=open target={path} baud={}",
+        baud.unwrap_or(uart_codec::host::DEFAULT_BAUD)
     );
     if reset_after_open {
         session.reset()?;
@@ -703,29 +796,26 @@ fn run_serial_watch(arguments: &[String]) -> Result<(), String> {
             match event {
                 DeviceSessionEvent::Diagnostic(line) => {
                     if text_filter.retain(&line) {
-                        println!(
-                            "dmesh_uart_watch_text {}",
-                            serde_json::to_string(&line).unwrap()
-                        );
+                            println!("{line}");
                     }
                 }
                 DeviceSessionEvent::Message(message) => {
-                    println!("dmesh_uart_watch_message bytes={}", message.len());
+                    println!("uart_watch event=message bytes={}", message.len());
                 }
                 DeviceSessionEvent::Datagram(packet) => {
                     transport_packets = transport_packets.saturating_add(1);
-                    println!("dmesh_uart_watch_transport bytes={}", packet.len());
+                    println!("uart_watch event=transport bytes={}", packet.len());
                 }
             }
         }
         thread::sleep(Duration::from_millis(1));
     }
     println!(
-        "dmesh_uart_watch_timeout observations={observations} transport_packets={transport_packets}"
+        "uart_watch event=timeout observations={observations} transport_packets={transport_packets}"
     );
     if text_filter.suppressed_disable_sniffer != 0 {
         println!(
-            "dmesh_uart_watch_suppressed text=ic_disable_sniffer count={}",
+            "uart_watch event=suppressed text=ic_disable_sniffer count={}",
             text_filter.suppressed_disable_sniffer
         );
     }
@@ -759,6 +849,7 @@ fn parse_interactive_service_command(line: &str) -> Result<Vec<u8>, String> {
 /// the CLI only opens a byte stream and renders the returned tagged record.
 pub(crate) fn run_udp_service_client(arguments: &[String]) -> Result<(), String> {
     let (arguments, object_file) = split_object_file_argument(arguments)?;
+    let (arguments, uart_path, uart_baud) = split_uart_bearer_arguments(&arguments)?;
     let peer = arguments
         .first()
         .and_then(|target| target.strip_prefix("udp://"))
@@ -771,12 +862,17 @@ pub(crate) fn run_udp_service_client(arguments: &[String]) -> Result<(), String>
     let request = encode_stream_argv_with_id(&arguments[1..], fresh_request_id())
         .map_err(|error| error.to_string())?;
     let timeout = stream_request_timeout(&request)?;
-    let probe_request = dmesh_server::probe::decode_probe_run_record(
+    let probe_request = dmesh_server::probe::decode_probe_start_record(
         dmesh_server::tagged::decode(&request).ok_or("invalid tagged request")?,
     );
     let started = Instant::now();
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
     let response = if command == "object.flash" {
+        if uart_path.is_some() {
+            return Err(
+                "object.flash selects UDP for bulk image transfer; omit --uart-bearer".into(),
+            );
+        }
         let (_, flash) = dmesh_server::verified_object::decode_flash_handler_request(&request)
             .ok_or("invalid object.flash request")?;
         let (manifest, image, artifact) =
@@ -789,24 +885,38 @@ pub(crate) fn run_udp_service_client(arguments: &[String]) -> Result<(), String>
             .block_on(crate::node_client::flash_udp(
                 udp_bind_for_peer(peer),
                 peer,
+                &request,
                 &manifest,
                 &image,
                 object_upload_timeout(),
             ))?
             .bytes
     } else {
-        if let Some((_, probe_request)) =
+        if let Some((id, probe_request)) =
             probe_request.filter(|(_, request)| request.peer.is_none())
         {
-            let result = runtime.block_on(crate::node_client::probe_udp(
+            // The CLI is the probe's client: it calls the probed node's
+            // registered `probe.handler` handler and validates the payload.
+            let mut source = [0u8; dmesh_server::probe::PROBE_REQUEST_MAX];
+            let used =
+                dmesh_server::probe::encode_probe_handler_request(probe_request, id, &mut source)
+                    .ok_or("probe request does not fit a probe.handler header")?;
+            let result = runtime.block_on(crate::node_client::probe_udp_with_uart(
                 udp_bind_for_peer(peer),
                 peer,
-                &request,
+                uart_path.as_deref(),
+                uart_baud,
+                &source[..used],
                 probe_request,
                 timeout,
             ))?;
             println!(
-                "dmesh_cli_probe bearer=udp target={peer} bytes={} elapsed_us={} bits_per_second={} callback_errors={:?}",
+                "dmesh_cli_probe bearer={} target={peer} bytes={} elapsed_us={} bits_per_second={} callback_errors={:?}",
+                if uart_path.is_some() {
+                    "udp+uart"
+                } else {
+                    "udp"
+                },
                 result.bytes,
                 result.elapsed_us,
                 result.bits_per_second(),
@@ -815,9 +925,11 @@ pub(crate) fn run_udp_service_client(arguments: &[String]) -> Result<(), String>
             return Ok(());
         }
         runtime
-            .block_on(crate::node_client::request_udp(
+            .block_on(crate::node_client::request_udp_with_uart(
                 udp_bind_for_peer(peer),
                 peer,
+                uart_path.as_deref(),
+                uart_baud,
                 &request,
                 timeout,
             ))?
@@ -835,14 +947,78 @@ pub(crate) fn run_udp_service_client(arguments: &[String]) -> Result<(), String>
     Ok(())
 }
 
+fn split_uart_bearer_arguments(
+    arguments: &[String],
+) -> Result<(Vec<String>, Option<String>, Option<u32>), String> {
+    let mut retained = Vec::with_capacity(arguments.len());
+    let mut uart_path = None;
+    let mut uart_baud = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--uart-bearer" => {
+                let value = arguments
+                    .get(index + 1)
+                    .ok_or("missing --uart-bearer path")?;
+                if uart_path.replace(value.clone()).is_some() {
+                    return Err("only one --uart-bearer path may be selected".into());
+                }
+                index += 2;
+            }
+            "--uart-baud" => {
+                let value = arguments
+                    .get(index + 1)
+                    .ok_or("missing --uart-baud value")?;
+                uart_baud = Some(value.parse::<u32>().map_err(|error| error.to_string())?);
+                index += 2;
+            }
+            "--bearer" => {
+                let value = arguments.get(index + 1).ok_or("missing --bearer value")?;
+                match value.as_str() {
+                    "udp" => {}
+                    "uart" => {
+                        return Err(
+                            "--bearer uart needs a device profile or --uart-bearer PATH".into()
+                        );
+                    }
+                    "espnow" => {
+                        return Err(
+                            "ESP-NOW bearer selection requires the supervised lmesh node".into(),
+                        );
+                    }
+                    other => return Err(format!("unknown bearer {other:?}")),
+                }
+                index += 2;
+            }
+            _ => {
+                retained.push(arguments[index].clone());
+                index += 1;
+            }
+        }
+    }
+    if uart_baud.is_some() && uart_path.is_none() {
+        return Err("--uart-baud requires --uart-bearer PATH".into());
+    }
+    Ok((retained, uart_path, uart_baud))
+}
+
 fn stream_request_timeout(request: &[u8]) -> Result<Duration, String> {
     let record = dmesh_server::tagged::decode(request).ok_or("invalid tagged request")?;
-    let long_running = dmesh_server::probe::decode_probe_run_record(record).is_some();
-    Ok(if long_running {
-        Duration::from_secs(45)
-    } else {
-        Duration::from_secs(3)
-    })
+    Ok(dmesh_server::probe::decode_probe_start_record(record)
+        .map(|(_, request)| probe_request_timeout(request.bytes))
+        .unwrap_or_else(|| Duration::from_secs(3)))
+}
+
+/// Allow a full-rate UART probe at 115200 baud, with headroom for QUIC
+/// framing, retransmission, and device scheduling. The caller can override
+/// this per request with `--timeout-secs`.
+fn probe_request_timeout(bytes: u64) -> Duration {
+    Duration::from_secs(
+        bytes
+            .saturating_add(8 * 1024 - 1)
+            .div_euclid(8 * 1024)
+            .max(45),
+    )
 }
 
 /// Remove the CLI-only object source selector before schema encoding.  A
@@ -923,11 +1099,43 @@ pub(crate) fn direct_discovery_announce(
 /// discovery and NAN wake sequence as flash when association is unavailable.
 fn run_catalog_target_service(arguments: &[String], profile: &DeviceProfile) -> Result<(), String> {
     let name = profile.name.as_deref().unwrap_or("catalog-device");
+    let (mut command_arguments, selected_bearers) = split_catalog_bearers(arguments)?;
+    let uart_path = if selected_bearers
+        .as_ref()
+        .is_some_and(|bearers| bearers.iter().any(|bearer| bearer == "uart"))
+    {
+        Some(
+            profile
+                .serial_path()?
+                .ok_or_else(|| format!("device {name:?} has no serial path for --bearer uart"))?,
+        )
+    } else {
+        None
+    };
+    let use_udp = selected_bearers
+        .as_ref()
+        .is_none_or(|bearers| bearers.iter().any(|bearer| bearer == "udp"));
+    if !use_udp {
+        let path = uart_path
+            .as_ref()
+            .ok_or_else(|| format!("device {name:?} has no selected bearer"))?;
+        command_arguments[0] = path.display().to_string();
+        append_catalog_uart_baud(&mut command_arguments, profile);
+        return run_serial_stream_command(&command_arguments);
+    }
+    if let Some(path) = &uart_path {
+        command_arguments.push("--uart-bearer".into());
+        command_arguments.push(path.display().to_string());
+        if let Some(baud) = profile.uart_baud {
+            command_arguments.push("--uart-baud".into());
+            command_arguments.push(baud.to_string());
+        }
+    }
     if let Some(peer) = catalog_udp6_peer(profile)? {
         match direct_discovery_announce(peer) {
             Ok((_, announce)) if catalog_profile_matches_announce(profile, &announce) => {
                 println!("dmesh_catalog_udp6_association name={name} peer={peer} associated=true");
-                let mut udp_arguments = arguments.to_vec();
+                let mut udp_arguments = command_arguments;
                 udp_arguments[0] = format!("udp://{peer}");
                 return run_udp_service_client(&udp_arguments);
             }
@@ -948,9 +1156,45 @@ fn run_catalog_target_service(arguments: &[String], profile: &DeviceProfile) -> 
     let target = flash_target_from_catalog_profile(profile)?;
     let (peer, _) = discover_and_nan_activate(&target)?;
     println!("dmesh_catalog_fallback name={name} peer={peer} discovery=true nan_activation=true");
-    let mut udp_arguments = arguments.to_vec();
+    let mut udp_arguments = command_arguments;
     udp_arguments[0] = format!("udp://{peer}");
     run_udp_service_client(&udp_arguments)
+}
+
+fn split_catalog_bearers(
+    arguments: &[String],
+) -> Result<(Vec<String>, Option<Vec<String>>), String> {
+    let mut retained = Vec::with_capacity(arguments.len());
+    let mut selected = Vec::new();
+    let mut index = 0;
+    while index < arguments.len() {
+        if arguments[index] == "--bearer" {
+            let value = arguments.get(index + 1).ok_or("missing --bearer value")?;
+            for bearer in value
+                .split(',')
+                .map(str::trim)
+                .filter(|bearer| !bearer.is_empty())
+            {
+                if !matches!(bearer, "udp" | "uart" | "espnow") {
+                    return Err(format!(
+                        "unknown bearer {bearer:?}; expected udp, uart, or espnow"
+                    ));
+                }
+                if selected.iter().any(|existing| existing == bearer) {
+                    return Err(format!("duplicate --bearer {bearer}"));
+                }
+                selected.push(bearer.to_owned());
+            }
+            index += 2;
+        } else {
+            retained.push(arguments[index].clone());
+            index += 1;
+        }
+    }
+    if selected.contains(&"espnow".to_owned()) {
+        return Err("ESP-NOW is owned by the supervised lmesh node; direct dmesh-cli bearer selection currently supports UDP and UART".into());
+    }
+    Ok((retained, (!selected.is_empty()).then_some(selected)))
 }
 
 pub(crate) fn catalog_udp6_peer(profile: &DeviceProfile) -> Result<Option<SocketAddr>, String> {
@@ -1847,9 +2091,26 @@ fn exchange_udp_stream_record_with_timeout(
 mod tests {
     use super::{
         FlashTarget, flash_target_matches_announce, parse_serial_stream_arguments,
-        stream_request_timeout,
+        probe_request_timeout, split_catalog_bearers,
     };
     use std::time::Duration;
+
+    #[test]
+    fn catalog_bearer_selection_accepts_udp_and_uart_together() {
+        let args = [
+            "status".to_owned(),
+            "--bearer".to_owned(),
+            "udp,uart".to_owned(),
+            "verbose=true".to_owned(),
+        ];
+        assert_eq!(
+            split_catalog_bearers(&args),
+            Ok((
+                vec!["status".to_owned(), "verbose=true".to_owned()],
+                Some(vec!["udp".to_owned(), "uart".to_owned()]),
+            ))
+        );
+    }
 
     #[test]
     fn serial_stream_timeout_and_baud_are_not_forwarded_as_service_fields() {
@@ -1867,7 +2128,70 @@ mod tests {
                 vec!["status".to_owned(), "verbose=true".to_owned()],
                 Some(115_200),
                 Duration::from_secs(10),
+                true,
+                Duration::ZERO,
+                None,
             ))
+        );
+    }
+
+    #[test]
+    fn serial_stream_linger_and_repeat_options_are_not_forwarded() {
+        let args = [
+            "status".to_owned(),
+            "--linger-secs".to_owned(),
+            "5".to_owned(),
+            "--repeat-secs".to_owned(),
+            "2".to_owned(),
+        ];
+        assert_eq!(
+            parse_serial_stream_arguments(&args),
+            Ok((
+                vec!["status".to_owned()],
+                None,
+                Duration::from_secs(3),
+                false,
+                Duration::from_secs(5),
+                Some(Duration::from_secs(2)),
+            ))
+        );
+    }
+
+    #[test]
+    fn serial_stream_rejects_zero_repeat_interval() {
+        let args = [
+            "status".to_owned(),
+            "--repeat-secs".to_owned(),
+            "0".to_owned(),
+        ];
+        assert_eq!(
+            parse_serial_stream_arguments(&args),
+            Err("--repeat-secs must be greater than zero".to_owned())
+        );
+    }
+
+    #[test]
+    fn serial_stream_repeat_is_limited_to_read_only_commands() {
+        let args = [
+            "transport.set".to_owned(),
+            "--repeat-secs".to_owned(),
+            "1".to_owned(),
+        ];
+        assert_eq!(
+            parse_serial_stream_arguments(&args),
+            Err(
+                "--repeat-secs is limited to the read-only status and services commands".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn probe_timeout_scales_for_large_uart_workloads() {
+        assert_eq!(probe_request_timeout(64 * 1024), Duration::from_secs(45));
+        assert_eq!(probe_request_timeout(1024 * 1024), Duration::from_secs(128));
+        assert_eq!(
+            probe_request_timeout(64 * 1024 * 1024),
+            Duration::from_secs(8192)
         );
     }
 

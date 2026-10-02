@@ -138,12 +138,13 @@ check_lmesh_api() {
         if [ -f ./env.sh ]; then
             . ./env.sh
         fi
-        local generated generated_api generated_rust
+        local generated generated_api generated_rust generated_quic_api
         generated="$(mktemp)"
         generated_api="$(mktemp)"
         generated_rust="$(mktemp)"
+        generated_quic_api="$(mktemp)"
         for group in portable settings nan; do
-            python3 "$DMESH_REPO/scripts/dmesh_api.py" "$group" "$generated_api"
+            python3 "$DMESH_REPO/scripts/dmesh_api.py" "$group" "$generated_api" L
             cargo run -p mesh-api-gen -- --api "$generated_api" --out-tools "$generated"
             jq -e --slurpfile schema "$DMESH_REPO/crates/lmesh/resources/tools.json" '
                 all(.[]; . as $tool |
@@ -160,13 +161,25 @@ check_lmesh_api() {
         cargo run -p mesh-api-gen -- --api "$generated_api" --out-tools "$generated" \
             --out-rust "$generated_rust"
         cmp "$generated_rust" "$DMESH_REPO/crates/lmesh-wifi/src/mesh_core_api.rs"
-        python3 "$DMESH_REPO/scripts/dmesh_api.py" portable+linux "$generated_api"
+        python3 "$DMESH_REPO/scripts/dmesh_api.py" portable+linux "$generated_api" L
         cargo run -p mesh-api-gen -- --api "$generated_api" --out-tools "$generated"
         python3 "$DMESH_REPO/scripts/generate-lmesh-tools.py" --check --local-tools "$generated"
-        python3 "$DMESH_REPO/scripts/dmesh_api.py" portable+android "$generated_api"
+        python3 "$DMESH_REPO/scripts/dmesh_api.py" portable+android "$generated_api" A
         cargo run -p mesh-api-gen -- --api "$generated_api" --out-tools "$generated"
         cmp "$generated" "$DMESH_REPO/crates/dmesh-server/platform/tools.json"
-        rm -f "$generated" "$generated_api" "$generated_rust"
+        # The shared request/response types cover every portable and Android
+        # method on every platform, so Linux handlers use them too; only the
+        # Android catalog above is platform-filtered.
+        python3 "$DMESH_REPO/scripts/dmesh_api.py" portable+android "$generated_api"
+        cargo run -p mesh-api-gen -- --api "$generated_api" --out-tools "$generated" \
+            --out-rust "$generated_rust" --rust-tags
+        cmp "$generated_rust" "$DMESH_REPO/crates/dmesh-server/src/platform_api.rs"
+        python3 "$DMESH_REPO/scripts/dmesh_api.py" portable "$generated_api" E
+        cargo run -p mesh-api-gen -- --api "$generated_api" --method telemetry.quic \
+            --out-rust-cbor "$generated_quic_api"
+        rustfmt --edition 2024 "$generated_quic_api"
+        cmp "$generated_quic_api" "$DMESH_REPO/crates/dmesh-server/src/generated_quic_telemetry.rs"
+        rm -f "$generated" "$generated_api" "$generated_rust" "$generated_quic_api"
     )
 }
 

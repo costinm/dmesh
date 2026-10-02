@@ -92,6 +92,138 @@ Filters:
 wlan_mgt.ssid contains "DIRECT"
 
 ```
+
+## Host UART and QUIC captures
+
+The host tools can save serial sideband logs and capture opaque QUIC packets
+crossing Tokio bearers. Set either or both variables on the `dmesh-cli`
+invocation:
+
+```sh
+UART_TARGET=/dev/serial/by-id/DEVICE
+UART_CODEC_LOG=/tmp/dmesh-uart.log \
+QUIC_LITE_PCAP=/tmp/dmesh-quic.pcap \
+  dmesh-cli "$UART_TARGET" status --timeout-secs 3 \
+    --repeat-secs 2 --linger-secs 10
+```
+
+`UART_CODEC_LOG` appends complete unframed UART console/sideband text lines
+observed by the host reader; it excludes bytes inside marked QUIC packets.
+`QUIC_LITE_PCAP` creates a classic PCAP of QUIC packets crossing the Tokio
+node's bearer boundary, for all bearers attached to that node—not just UART.
+The Linux cooked-v2 header records ingress/egress direction and bearer ID.
+For UART, capture occurs after PPP decoding on receive and before PPP framing
+on send; it does not include raw serial bytes, framing errors, or non-QUIC
+sideband traffic.
+
+The UART log is appended, but each new Tokio node creates/truncates its PCAP
+path. Use a fresh PCAP filename for each process when preserving earlier
+captures. Capture I/O errors are reported to stderr and do not stop packet
+delivery. These are host observations; use `dmesh-cli SERIAL --watch` or a
+tagged `log.watch` request to collect device-side logs separately.
+
+For a UDP firmware object upload, set `QUIC_LITE_PCAP` on the `object.flash`
+process; it records that process's flash association across the UDP bearer.
+Run a separate `dmesh-cli SERIAL --watch` process with `UART_CODEC_LOG` set to
+capture UART sideband logs. The PCAP is a capture at the host QUIC bearer boundary, not
+a record of raw UDP/IP headers or proof that the device application consumed
+the captured bytes. Use a fresh capture path for each upload process.
+
+Firmware UART diagnostics are emitted as one-line `key=value` records with a
+monotonic `ts_ms`, `level`, and `event`; `dmesh-cli SERIAL --watch` prints
+those device lines directly. QUIC dispatch records include the phase,
+component/method tags, request ID, association handle, stream ID, and match
+result. `object_flash.progress` is emitted every five seconds while a transfer
+is active. It reports application-consumed body bytes and selected QUIC-core
+counters; zero progress with increasing QUIC receive/ACK counters distinguishes
+transport processing from application acceptance. The debug UART queue is
+lossy, so use `UART_CODEC_LOG` to retain what the host actually observed.
+
+`telemetry.quic` returns a node-wide snapshot over associations with
+an active QUIC endpoint on firmware, Linux, and Android. The Rust
+`quic_lite::NodeTelemetry` and
+`AssociationTelemetry` snapshots expose QUIC packet, ACK, loss,
+retransmission, and submission-failure counters; bearer-specific telemetry
+remains the source for radio/UDP receive and transmit failures. QUIC ACKs and
+retransmissions are not application-delivery or flash-commit proof. Aggregate
+counters disappear when their association is removed and restart with the
+node; use live `object_flash.progress` records for one upload.
+
+Query the snapshot from any reachable DMesh node with
+`dmesh-cli DEVICE telemetry.quic`. It is an empty request and returns
+the required numeric counters documented in [`API.md`](../API.md).
+
+Example: capture an object upload over UDP while passively watching UART logs
+(run these in separate terminals; substitute a selected serial device and
+discovered, scoped link-local endpoint):
+
+```sh
+UART_CODEC_LOG=/tmp/device-uart.log \
+  dmesh-cli SERIAL status --timeout-secs 10 --linger-secs 300
+
+QUIC_LITE_PCAP=/tmp/object-flash.pcap \
+  dmesh-cli 'udp://[DEVICE_LINK_LOCAL%IFACE]:3339' object.flash \
+    cpu=CPU target=TARGET dry_run=true --file IMAGE
+```
+
+The upload command reports completion only after the terminal `object.flash`
+result; ACKs are not upload-completion evidence.
+
+Firmware handler streams expire after 15 seconds without application progress.
+Successful handler work records its **completion** time: a synchronous partition
+erase may take longer than 15 seconds and must not make a progressing upload
+look idle immediately afterward. Flash is not exempt from the idle timeout.
+An `object_flash.idle_timeout` record before a terminal success means the
+upload was abandoned; the destination may already be erased or partly written.
+
+A full congestion window is retryable QUIC `Blocked`, not
+`MissingEgressAddress`: the route still exists. Stream producers retain the
+unchanged bytes/FIN until ACK or capacity progress. A host-driver exit reporting
+`Transport(Blocked)` is not an application flash rejection; capture both
+control/timer traffic and UART logs to locate the runtime path that treated
+backpressure as fatal. Neither error proves a durable flash commit.
+
+Host and Android stream applications use `AsyncRead`/`AsyncWrite`; the Tokio
+node driver owns QUIC pacing, timers, credit and retryable backpressure.
+Do not add window checks or QUIC retry loops to flash/probe handlers or clients.
+QUIC-lite's `stream_probe` tests run identical generic byte-stream workloads
+over TCP and QUIC bearers. Its `tokio_node_driver` tests also cover a slow
+reader transferring more bytes than a 16 KiB receive window. These tests do
+not replace a device upload and durable-commit check.
+
+`dmesh_server::stream_client` provides common request, flash and probe
+exchanges over `AsyncRead + AsyncWrite`. Flash's multipart body is assembled
+there, not in a QUIC-specific client. Request/flash exchanges read responses
+concurrently with writes; a TCP test checks the same flash helper and exact
+header/manifest-length/manifest/content ordering. QUIC-lite separately tests
+a 1 MiB transfer through delayed, reordered, lossy and `WouldBlock` links.
+Path-status congestion/history pressure retains the status on the adaptive
+loss clock, rather than stopping the driver or spinning an overdue timer.
+Association CLOSE waits for a retained bearer packet before retiring state.
+
+The 2026-10-02 common-stream canary uploaded a 899,568-byte Recovery image
+through Main over UDP in 6.85 seconds with terminal `object.flash` success;
+post-upload status and a 64 KiB probe passed. Evidence is under
+`target/evidence/e8-common-stream-IJiUMKQ8/`. This did not test booting Recovery
+or flashing Main from Recovery. Detailed flash UART diagnostics were missing:
+the current formatter's association Debug braces include `0x7d`, which
+`send_debug_text` rejects. Do not interpret their absence as no handler
+admission; correlate the terminal response and packet capture.
+
+The passive `--watch` path does not use `UART_CODEC_LOG`; redirect its output
+to a file if using that mode. `status --linger-secs` uses the Tokio UART bearer
+and therefore saves sideband logs through `UART_CODEC_LOG` while UDP uploads
+run separately. Do not let two processes open the same serial device.
+
+For UART QUIC diagnosis, `--repeat-secs N` keeps one host serial reader and
+Tokio node open, repeats the read-only `status` or `services` request on a
+fresh QUIC association after each N-second delay, and prints each response. It stops on the first
+request failure, then continues collecting UART logs for `--linger-secs N`
+before returning the error. Without `--repeat-secs`, `--linger-secs N` keeps
+the reader alive after the one response for that many seconds. This is useful
+for retaining crash or sleep-transition logs in the same `UART_CODEC_LOG`
+file; it does not change the device's logging behavior.
+
 ## Remote adb
 
 - Ssh with `LocalForward 6018 127.0.0.1:5027`
@@ -550,6 +682,57 @@ curl -sS -X POST \
   'http://127.0.0.1:18480/_m/api/sshc/connections/1/forward/remote' \
   -H 'content-type: application/json' \
   -d '{"remote_port":10080,"local_host":"127.0.0.1","local_port":8080}'
+```
+
+# Telemetry and logs
+
+Counters, state snapshots and logs are registered handlers like any other, and
+`API.md` defines each response (`telemetry` and `log` sections). A device
+omits a value it does not have; it never sends zero for "unknown".
+
+- Firmware today: `telemetry.now`, `nan`, `udp6`, `wifi_link`, `quic`,
+  `memory`, `power`, `runtime`, `bearers`, and `log.watch`. Linux and Android
+  still answer the older `metrics`, `events`, `log-watch` and snapshot methods
+  until they migrate.
+- `log.watch` polls retained records (`since_seq`, `limit`, `level`, `source`,
+  `kind`) and returns a `cursor` for the next poll. With `stream=true` and a
+  `timeout` the same method keeps the stream open and, with `snapshots`
+  (`telemetry.quic`, ...) and `interval_ms`, interleaves each snapshot as a
+  record whose `fields` are that method's response. The CLI does not decode the
+  streamed body yet.
+- Firmware logs are the last 32 ESP-IDF lines; a streamed `log.watch` is polled
+  every 100 ms by the owner while it waits, so keep streams short.
+
+# Handler registry
+
+Any request may carry `timeout=MS` (envelope key 8, milliseconds): the time the
+caller allows. `dmesh-cli DEVICE probe.start peer=... bytes=... timeout=60000`
+lets the probe run for a minute; without it a probe runs for a size-based
+default (30 s up to 300 s). A request that runs out is answered with a
+`timeout` error. See ssh-mesh `crates/mesh-api/PROTOCOLS.md`.
+
+Every platform registers its tagged-CBOR handlers in the one
+`dmesh_server::registry`, by component and method number plus name, and every
+ingress (QUIC streams, UART/UDP/NOW records, the Linux control socket, the
+Android HTTP gateway) dispatches through it by number. Only implemented methods
+are registered, so `services` lists exactly what a platform answers
+(`[component, method, "name"]`) and a request for anything else receives
+`unsupported or invalid stream request` with the request's component, method
+and id. Stubs are not registered: Android has no `metrics`, `memory.snapshot` or
+`telemetry.*_metrics`; Linux has no `telemetry.battery`, `power.snapshot`,
+`memory.snapshot` or BLE scan/connect; boot, module, runtime-reset and
+flash methods are firmware-only.
+
+Android's platform methods (`ble` 201, `radio` 202, `usb` 204, `wifi` 205,
+`companion`, `transport.set`) are registered local-only. The HTTP gateway
+routes `/_m/mesh/services/<name>/call/<method>` to the registry as local
+ingress; a QUIC peer calling the same numbers gets the unsupported error. Check
+what a device registers with:
+
+```sh
+dmesh-cli DEVICE services
+curl -sS -X POST 'http://127.0.0.1:18480/_m/mesh/services/ble/call/ble.status' \
+  -H 'content-type: application/json' -d '{}'
 ```
 
 # Permissions

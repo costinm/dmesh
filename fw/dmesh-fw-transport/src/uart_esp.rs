@@ -54,8 +54,6 @@ static C6_USB_JTAG_SELECTED: AtomicBool = AtomicBool::new(false);
 
 static UART_RX_EVENT_COUNT: AtomicU32 = AtomicU32::new(0);
 static UART_RX_BYTE_COUNT: AtomicU32 = AtomicU32::new(0);
-static UART_RX_BYTES_REPORTED: AtomicBool = AtomicBool::new(false);
-static UART_RX_PACKET_REPORTED: AtomicBool = AtomicBool::new(false);
 /// Optional firmware-owner wake hook. The L2 task has no dependency on Main,
 /// Recovery, commands, or a particular executor; an owner can install this
 /// one-shot notification so its dispatcher need not wait for a housekeeping
@@ -87,7 +85,10 @@ type UartPoolSubmission = EgressSubmission<crate::shared_ingress_esp::SharedPack
 // The bearer accepts only one pool lease at a time. The FreeRTOS queue carries
 // a wake record, never the packet or its ownership-bearing Rust value.
 static UART_POOL_SUBMISSION_STATE: AtomicUsize = AtomicUsize::new(0);
-static UART_POOL_TX_DIAGNOSTICS: AtomicUsize = AtomicUsize::new(0);
+/// Set only after QUIC receives `WouldBlock` because the single physical TX
+/// slot is occupied. The writer reports readiness only for this edge, rather
+/// than publishing one ready event for every successful packet completion.
+static UART_SEND_BLOCKED: AtomicBool = AtomicBool::new(false);
 static mut UART_POOL_SUBMISSION: core::mem::MaybeUninit<UartPoolSubmission> =
     core::mem::MaybeUninit::uninit();
 static UART_APB_LOCK: AtomicPtr<esp_idf_sys::esp_pm_lock> = AtomicPtr::new(core::ptr::null_mut());
@@ -308,6 +309,7 @@ pub fn activate_window_for(window_ms: u32) {
 }
 
 pub fn poll_active_window() {
+    #[cfg(not(target_arch = "riscv32"))]
     if UART_ALWAYS_ON.load(Ordering::Acquire) {
         return;
     }
@@ -333,6 +335,10 @@ pub fn set_always_on(enabled: bool) {
     UART_ALWAYS_ON.store(enabled, Ordering::Release);
     if enabled {
         UART_DEBUG_ENABLED.store(true, Ordering::Release);
+        // Always-on means the driver/bearer remains enabled, not that it
+        // owns a permanent PM lock. NAN-only Main may enter light sleep and
+        // receive again when the CPU wakes for its discovery window.
+        #[cfg(not(target_arch = "riscv32"))]
         let _ = ensure_power_locks();
     } else {
         UART_ACTIVE_UNTIL_MS.store(0, Ordering::Release);
@@ -392,7 +398,19 @@ fn ensure_power_locks() -> bool {
     if !UART_PM_LOCKS_ENABLED {
         return true;
     }
-    ensure_apb_lock() && ensure_no_light_sleep_lock()
+    // RISC-V UART/USB-Serial-JTAG clocks do not need the classic ESP32 APB
+    // lock, and neither interface should veto NAN-only light sleep. Keep the
+    // driver installed; reception resumes when the CPU wakes. Classic UART0
+    // still needs its APB and no-light-sleep locks during an active window to
+    // preserve its configured baud.
+    #[cfg(target_arch = "riscv32")]
+    {
+        ensure_apb_lock()
+    }
+    #[cfg(not(target_arch = "riscv32"))]
+    {
+        ensure_apb_lock() && ensure_no_light_sleep_lock()
+    }
 }
 
 fn active_window_open() -> bool {
@@ -561,11 +579,20 @@ impl PacketEgress<crate::shared_ingress_esp::SharedPacketLease> for EspUartBeare
         _peer_l2_address: PeerL2Address,
         submission: UartPoolSubmission,
     ) -> Result<(), PacketSubmitError<crate::shared_ingress_esp::SharedPacketLease>> {
-        if !physical_bearer_active()
-            || UART_POOL_SUBMISSION_STATE
-                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
+        if !physical_bearer_active() {
+            return Err(PacketSubmitError::WouldBlock(submission));
+        }
+        if UART_POOL_SUBMISSION_STATE
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
         {
+            UART_SEND_BLOCKED.store(true, Ordering::Release);
+            // Close the race where the writer completed after the failed CAS
+            // but before the blocked flag was published. If completion runs
+            // later, its normal readiness callback consumes the same latch.
+            if UART_POOL_SUBMISSION_STATE.load(Ordering::Acquire) == 0 {
+                notify_egress_ready();
+            }
             return Err(PacketSubmitError::WouldBlock(submission));
         }
         unsafe {
@@ -757,6 +784,14 @@ pub fn set_egress_notify(callback: Option<fn()>) {
     EGRESS_NOTIFY.store(callback, Ordering::Release);
 }
 
+/// Consume the one-shot QUIC readiness edge recorded after an egress submit
+/// returned `WouldBlock`. Successful packet completion alone is not a new
+/// readiness event; its independent completion notification still wakes the
+/// QUIC owner to release the packet lease.
+pub(crate) fn take_send_blocked() -> bool {
+    UART_SEND_BLOCKED.swap(false, Ordering::AcqRel)
+}
+
 fn notify_ingress() {
     let callback = INGRESS_NOTIFY.load(Ordering::Acquire);
     if callback != 0 {
@@ -874,12 +909,8 @@ fn write_pool_submission_if_ready() -> bool {
         },
         0,
     );
-    if UART_POOL_TX_DIAGNOSTICS.fetch_add(1, Ordering::Relaxed) < 16 {
-        let _ = send_debug_text(if result {
-            b"DMESH UART packet transmit completed"
-        } else {
-            b"DMESH UART packet transmit failed"
-        });
+    if !result {
+        let _ = send_debug_text(b"DMESH UART packet transmit failed");
     }
     notify_egress_ready();
     true
@@ -1225,9 +1256,6 @@ fn drain_uart_driver(
             break;
         }
         UART_RX_BYTE_COUNT.fetch_add(count as u32, Ordering::Relaxed);
-        if !UART_RX_BYTES_REPORTED.swap(true, Ordering::AcqRel) {
-            let _ = send_debug_text(b"DMESH uart: first physical rx bytes");
-        }
         consume_uart_bytes(decoder, &bytes[..count as usize]);
     }
 }
@@ -1250,9 +1278,6 @@ fn consume_uart_bytes(
         |frame| match frame {
             PooledFrame::Packet(packet) => {
                 activate_window();
-                if !UART_RX_PACKET_REPORTED.swap(true, Ordering::AcqRel) {
-                    let _ = send_debug_text(b"DMESH uart: first pooled packet rx");
-                }
                 crate::quic_node_esp::receive_uart(packet);
                 notify_ingress();
             }

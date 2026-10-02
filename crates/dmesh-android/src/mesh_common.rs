@@ -35,7 +35,7 @@ pub struct MeshHandle {
     pub announce_server_handle: Option<tokio::task::JoinHandle<()>>,
     /// Platform network transitions request an immediate announce without
     /// changing the fifteen-minute periodic cadence.
-    pub announce_trigger: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    pub announce_trigger: Option<tokio::sync::mpsc::UnboundedSender<bool>>,
     pub mesh_services: ssh_mesh::mesh_rest::MeshServiceRegistry,
 }
 
@@ -117,6 +117,8 @@ pub fn start_mesh(
     #[cfg(target_os = "android")]
     crate::mesh_jni::android_note_started();
     #[cfg(target_os = "android")]
+    crate::mesh_jni::register_android_methods();
+    #[cfg(target_os = "android")]
     crate::mesh_jni::register_ble_service(&mesh_services);
     #[cfg(target_os = "android")]
     crate::mesh_jni::register_companion_service(&mesh_services);
@@ -130,6 +132,8 @@ pub fn start_mesh(
     crate::mesh_jni::register_history_service(&mesh_services);
     #[cfg(target_os = "android")]
     crate::mesh_jni::register_status_service(&mesh_services);
+    #[cfg(target_os = "android")]
+    crate::mesh_jni::register_probe_service(&mesh_services);
 
     // Spawn HTTP server if port configured
     let mut http_server_handle = None;
@@ -184,6 +188,9 @@ pub fn start_mesh(
             .to_openssh()
             .unwrap_or_default();
         let (trigger, receiver) = tokio::sync::mpsc::unbounded_channel();
+        // A restarted service replaces nothing here: the first trigger stays
+        // valid only while its worker runs, so a send error means "not running".
+        let _ = SOLICIT.set(trigger.clone());
         (
             Some(runtime.spawn(android_announce_loop(
                 public_key,
@@ -216,7 +223,19 @@ pub fn trigger_announce(handle: &MeshHandle) -> bool {
     handle
         .announce_trigger
         .as_ref()
-        .is_some_and(|trigger| trigger.send(()).is_ok())
+        .is_some_and(|trigger| trigger.send(false).is_ok())
+}
+
+/// The running announce worker's trigger, for `discovery.active`, which has no
+/// access to the mesh handle. `true` also multicasts a discovery request.
+static SOLICIT: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<bool>> =
+    std::sync::OnceLock::new();
+
+/// Announce now and multicast a discovery request on every IPv6 interface, so
+/// each listener (lmesh, ESP, other Android) answers with a directed announce.
+/// False when the announce worker is not running.
+pub fn solicit_discovery() -> bool {
+    SOLICIT.get().is_some_and(|trigger| trigger.send(true).is_ok())
 }
 
 /// Stop a mesh node, aborting all server tasks and shutting down the runtime.
@@ -239,7 +258,7 @@ pub fn stop_mesh(handle: MeshHandle) {
 #[cfg(target_os = "android")]
 async fn android_announce_loop(
     public_key: String,
-    mut trigger: tokio::sync::mpsc::UnboundedReceiver<()>,
+    mut trigger: tokio::sync::mpsc::UnboundedReceiver<bool>,
     android_discovery_fd: Option<i32>,
 ) {
     const PORT: u16 = 5227;
@@ -285,13 +304,16 @@ async fn android_announce_loop(
                     &public_key, started.elapsed().as_secs(), boot_pending).await;
                 if sent { boot_pending = false; }
             }
-            Some(()) = trigger.recv() => {
+            Some(solicit) = trigger.recv() => {
                 // A P2P group may appear long after service boot. Join its
                 // scoped multicast interface and emit the same bounded record
                 // now, rather than waiting for the periodic interval.
                 let sent = send_android_announce(&socket, group, PORT, &mut joined_interfaces,
                     &public_key, started.elapsed().as_secs(), boot_pending).await;
                 if sent { boot_pending = false; }
+                if solicit {
+                    send_android_discovery_request(&socket, group, PORT, &joined_interfaces).await;
+                }
             }
             received = socket.recv_from(&mut receive) => match received {
                 Ok((len, sender)) => {
@@ -392,6 +414,27 @@ async fn send_android_announce(
         }
     }
     sent
+}
+
+/// Multicast one `announce.discovery` request on every joined interface.
+#[cfg(target_os = "android")]
+async fn send_android_discovery_request(
+    socket: &tokio::net::UdpSocket,
+    group: Ipv6Addr,
+    port: u16,
+    joined_interfaces: &BTreeSet<u32>,
+) {
+    let mut request = [0u8; 96];
+    let id = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(1);
+    let Some(used) = dmesh_server::announce::encode_discovery_request(id, &mut request) else {
+        return;
+    };
+    for interface_index in joined_interfaces {
+        let destination = SocketAddr::V6(SocketAddrV6::new(group, port, 0, *interface_index));
+        if let Err(error) = socket.send_to(&request[..used], destination).await {
+            log::warn!("Android discovery request failed on interface {interface_index}: {error}");
+        }
+    }
 }
 
 /// Return each enabled, non-loopback IPv6 interface index. Android's

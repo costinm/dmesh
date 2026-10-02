@@ -14,6 +14,11 @@ pub trait WifiBackend: Send + Sync {
     async fn scan(&self) -> anyhow::Result<Value>;
 }
 
+/// The methods this service implements, with their numbers and names.
+pub fn methods() -> Vec<crate::registry::Method> {
+    crate::registry_bridge::methods_from_tools(&tools_json())
+}
+
 pub fn tools_json() -> Value {
     crate::platform_catalog::tools_for("wifi.")
 }

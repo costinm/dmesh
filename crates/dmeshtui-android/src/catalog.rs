@@ -203,9 +203,9 @@ pub static CATALOG: &[CatalogItem] = &[
         desc: "List observed bearer-neutral announces",
     },
     CatalogItem {
-        name: "lmesh.probe",
+        name: "probe.start",
         title: "",
-        desc: "Run a NAN-first peer health probe and select a bearer",
+        desc: "Ask a node (to) to run a QUIC probe against a peer",
     },
     CatalogItem {
         name: "wifi.rawnan.status",

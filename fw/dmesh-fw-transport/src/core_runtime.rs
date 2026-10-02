@@ -109,9 +109,10 @@ pub(crate) fn schedule_connection_timer() {
     crate::quic_node_esp::schedule_connection_timer();
 }
 pub(crate) fn schedule_uart_egress_ready() {
-    // Send completion returns the retained pool lease and may unblock a stream
-    // write which lost the race with an ACK. Wake the sole QUIC owner so it
-    // drains that completion and retries the unchanged stream bytes.
+    // UART may have returned WouldBlock while its one physical TX slot was
+    // active. Completion returns that slot; report the readiness edge to the
+    // registered bearer before waking the owner to retry its retained packet.
+    crate::quic_node_esp::uart_send_ready();
     crate::main_runtime::request_quic_ingress();
 }
 pub(crate) fn connection_last_error() -> u32 {
@@ -151,42 +152,33 @@ pub(crate) fn poll_raw_udp6(
     poll_connection(path, response)
 }
 
+/// Recovery admits the same connectionless messages as Main; only the handlers
+/// it registers (its discovery answer) can respond.
 pub(crate) fn receive_recovery_connectionless(
-    _peer: crate::wifi_raw_udp6_esp::RawUdp6Peer,
-    packet: &[u8],
-    response: &mut [u8; crate::TRANSPORT_MTU],
-) -> crate::wifi_raw_udp6_esp::ConnectionlessUdp6Outcome {
-    let Some(id) = dmesh_server::announce::discovery_request_id(packet) else {
-        return crate::wifi_raw_udp6_esp::ConnectionlessUdp6Outcome::Rejected;
-    };
-    let Some((record, used)) = crate::main_runtime::recovery_discovery_record(0) else {
-        return crate::wifi_raw_udp6_esp::ConnectionlessUdp6Outcome::Rejected;
-    };
-    let Some(announce) = dmesh_server::announce::decode_announce(&record[..used]) else {
-        return crate::wifi_raw_udp6_esp::ConnectionlessUdp6Outcome::Rejected;
-    };
-    let Some(used) = dmesh_server::announce::encode_discovery_response(announce, id, response)
-    else {
-        return crate::wifi_raw_udp6_esp::ConnectionlessUdp6Outcome::Rejected;
-    };
-    crate::wifi_raw_udp6_esp::ConnectionlessUdp6Outcome::Response(used)
-}
-pub(crate) fn receive_udp6_connectionless(
     peer: crate::wifi_raw_udp6_esp::RawUdp6Peer,
     packet: &[u8],
     response: &mut [u8; crate::TRANSPORT_MTU],
 ) -> crate::wifi_raw_udp6_esp::ConnectionlessUdp6Outcome {
-    let Some(record) = dmesh_server::tagged::decode(packet) else {
-        return crate::wifi_raw_udp6_esp::ConnectionlessUdp6Outcome::Rejected;
-    };
-    let Some(encoded) = crate::main_runtime::receive_tagged_discovery(record) else {
-        return crate::wifi_raw_udp6_esp::ConnectionlessUdp6Outcome::Rejected;
-    };
-    if encoded.len() > response.len() {
-        return crate::wifi_raw_udp6_esp::ConnectionlessUdp6Outcome::Rejected;
+    receive_udp6_connectionless(peer, packet, response)
+}
+
+/// One connectionless UDP6 message: the allow-list, then the registry.
+pub(crate) fn receive_udp6_connectionless(
+    _peer: crate::wifi_raw_udp6_esp::RawUdp6Peer,
+    packet: &[u8],
+    response: &mut [u8; crate::TRANSPORT_MTU],
+) -> crate::wifi_raw_udp6_esp::ConnectionlessUdp6Outcome {
+    let mut used = None;
+    let accepted = crate::main_runtime::receive_connectionless_request(packet, |bytes| {
+        if bytes.len() <= response.len() {
+            response[..bytes.len()].copy_from_slice(bytes);
+            used = Some(bytes.len());
+        }
+    });
+    match (accepted, used) {
+        (true, Some(len)) => crate::wifi_raw_udp6_esp::ConnectionlessUdp6Outcome::Response(len),
+        _ => crate::wifi_raw_udp6_esp::ConnectionlessUdp6Outcome::Rejected,
     }
-    response[..encoded.len()].copy_from_slice(&encoded);
-    crate::wifi_raw_udp6_esp::ConnectionlessUdp6Outcome::Response(encoded.len())
 }
 pub(crate) fn receive_main_espnow(
     peer: crate::wifi_espnow_esp::EspNowPeer,

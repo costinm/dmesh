@@ -108,7 +108,7 @@ static TX_ACTIONS: AtomicU32 = AtomicU32::new(0);
 static TX_FAILURES: AtomicU32 = AtomicU32::new(0);
 // NOW-only submit-path metrics. The generic TX_ACTIONS/TX_FAILURES counters
 // also include NAN/public action traffic and local queue/preflight failures,
-// so they are not suitable for telemetry.now_metrics.
+// so they are not suitable for telemetry.now.
 static NOW_TX_ATTEMPTED: AtomicU32 = AtomicU32::new(0);
 static NOW_TX_ACCEPTED: AtomicU32 = AtomicU32::new(0);
 static NOW_TX_FAILED: AtomicU32 = AtomicU32::new(0);

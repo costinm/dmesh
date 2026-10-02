@@ -1814,27 +1814,6 @@ pub enum Request {
     },
     #[serde(rename = "companion.unpair")]
     Unpair { kind: String, id: String },
-    /// Run the normal QUIC probe service to a routed node. The destination
-    /// selects a connection path; callers never select a Wi-Fi-specific
-    /// probe implementation.
-    #[serde(rename = "probe")]
-    Probe {
-        to: String,
-        #[serde(default)]
-        bytes: Option<u64>,
-        #[serde(default)]
-        packet_size: Option<u16>,
-        /// Number of concurrent normal QUIC streams. This remains part of
-        /// the probe service request rather than a NOW/UDP adapter setting.
-        #[serde(default)]
-        parallel_streams: Option<u8>,
-        #[serde(default)]
-        initial_consume_delay_ms: Option<u32>,
-        #[serde(default)]
-        consume_delay_ms: Option<u32>,
-        #[serde(default)]
-        timeout_ms: Option<u64>,
-    },
     /// Send a mesh payload over the selected radio.
     #[serde(rename = "send")]
     Send {
@@ -1923,17 +1902,20 @@ pub enum Request {
     #[serde(rename = "telemetry.nan_status")]
     NanStatus,
     /// Local ESP-NOW/action transport counters. Missing facts are omitted.
-    #[serde(rename = "telemetry.now_metrics")]
+    #[serde(rename = "telemetry.now")]
     NowMetrics,
     /// Local NAN capture and semantic dispatch counters.
-    #[serde(rename = "telemetry.nan_metrics")]
+    #[serde(rename = "telemetry.nan")]
     NanMetrics,
     /// Local raw IPv6, UDP, and NDP counters.
-    #[serde(rename = "telemetry.udp6_metrics")]
+    #[serde(rename = "telemetry.udp6")]
     Udp6Metrics,
     /// Common optional per-peer Wi-Fi link observations.
-    #[serde(rename = "telemetry.wifi_link_metrics")]
+    #[serde(rename = "telemetry.wifi_link")]
     WifiLinkMetrics,
+    /// QUIC transport counters for this node's live associations.
+    #[serde(rename = "telemetry.quic")]
+    QuicMetrics,
     /// Size a NAN object transfer without opening an IP socket or touching a
     /// device. The same envelope is used by data frames and action diagnostics.
     #[serde(rename = "object.nan.dry_run")]
@@ -2212,7 +2194,6 @@ async fn request_udp_stream_local(
     payload: &[u8],
     timeout: Duration,
 ) -> Result<Vec<u8>> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     type Pool = quic_lite::packet_pool::PacketPool<8, { quic_lite::DEFAULT_PACKET_POOL_SLOT_SIZE }>;
     type Node = quic_lite::QuicNode<Pool>;
@@ -2255,10 +2236,7 @@ async fn request_udp_stream_local(
             .open_stream()
             .await
             .map_err(|error| anyhow::anyhow!("open UDP request stream: {error:?}"))?;
-        stream.write_all(payload).await?;
-        stream.shutdown().await?;
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).await?;
+        let response = dmesh_server::stream_client::exchange(&mut stream, &[payload]).await?;
         association
             .finish()
             .await
@@ -2284,7 +2262,6 @@ async fn request_now_stream(
     payload: &[u8],
     timeout: Duration,
 ) -> Result<Vec<u8>> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     tokio::time::timeout(timeout, async {
         let association = node
@@ -2306,10 +2283,7 @@ async fn request_now_stream(
             .open_stream()
             .await
             .map_err(|error| anyhow::anyhow!("open ESP-NOW request stream: {error:?}"))?;
-        stream.write_all(payload).await?;
-        stream.shutdown().await?;
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).await?;
+        let response = dmesh_server::stream_client::exchange(&mut stream, &[payload]).await?;
         association
             .finish()
             .await
@@ -2356,75 +2330,47 @@ impl LmeshService {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((node, bearer));
     }
 
-    async fn run_routed_probe(
+    /// Run a probe with this node as the client: call the probed node's
+    /// registered `probe.handler` handler and validate the payload that follows
+    /// its response header. `destination` is a probe destination URI or a bare
+    /// mesh node identifier.
+    pub async fn probe_exchange(
         &self,
         destination: &str,
-        bytes: Option<u64>,
-        packet_size: Option<u16>,
-        parallel_streams: Option<u8>,
-        initial_consume_delay_ms: Option<u32>,
-        consume_delay_ms: Option<u32>,
-        timeout_ms: Option<u64>,
-    ) -> Result<serde_json::Value> {
-        let mut request = dmesh_server::probe::ProbeServiceRequest::new(
-            bytes.unwrap_or(64 * 1024),
-            packet_size.unwrap_or(1024),
-        );
-        request.parallel_streams = parallel_streams;
-        request.initial_consume_delay_ms = initial_consume_delay_ms;
-        request.consume_delay_ms = consume_delay_ms;
+        request: dmesh_server::probe::ProbeServiceRequest,
+        timeout: Duration,
+    ) -> Result<quic_lite::probe::ProbeResult> {
         let id = NEXT_ROUTED_PROBE_ID.fetch_add(1, Ordering::Relaxed).max(1);
-        let mut wire = [0; dmesh_server::probe::PROBE_RUN_REQUEST_MAX];
-        let used = dmesh_server::probe::encode_probe_run_request(request, id, &mut wire)
+        let mut wire = [0; dmesh_server::probe::PROBE_REQUEST_MAX];
+        let used = dmesh_server::probe::encode_probe_handler_request(request, id, &mut wire)
             .context("encode routed QUIC probe request")?;
-        let timeout = Duration::from_millis(timeout_ms.unwrap_or(30_000).max(1));
         let started = std::time::Instant::now();
         let response = self
             .request_probe_stream(destination, &wire[..used], timeout)
             .await?;
-        if let Some(record) = dmesh_server::tagged::decode(&response)
-            && record.error.is_some()
-        {
-            anyhow::bail!("remote QUIC probe request was rejected");
-        }
-        let plan = quic_lite::probe::ProbePlan::from_request(
-            request.workload(),
-            quic_lite::DEFAULT_MAX_STREAM_PAYLOAD,
-        );
         let expected = request.bytes.min(quic_lite::probe::MAX_BYTES);
-        let mut receiver = quic_lite::probe::ProbeReceiver::new(2);
-        let mut offset = 0u64;
-        for chunk in response.chunks(plan.packet_size.max(4)) {
-            let next = offset.saturating_add(chunk.len() as u64);
-            receiver
-                .receive(offset, next == expected, chunk)
-                .map_err(|error| anyhow::anyhow!("invalid QUIC probe response: {error:?}"))?;
-            offset = next;
-        }
-        if !receiver.is_complete() || receiver.bytes() != expected {
+        let mut reader = dmesh_server::probe::ProbeResponseReader::new(expected);
+        reader.push(&response).map_err(|error| match error {
+            dmesh_server::probe::ProbeClientError::Rejected => {
+                anyhow::anyhow!("remote QUIC probe request was rejected")
+            }
+            other => anyhow::anyhow!("invalid QUIC probe response: {other:?}"),
+        })?;
+        if !reader.is_complete() {
             anyhow::bail!(
                 "QUIC probe response ended after {} of {expected} bytes",
-                receiver.bytes()
+                reader.bytes()
             );
         }
         let elapsed_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-        let result = quic_lite::probe::ProbeResult {
-            bytes: receiver.bytes(),
-            normal_bytes: receiver.bytes(),
+        Ok(quic_lite::probe::ProbeResult {
+            bytes: reader.bytes(),
+            normal_bytes: reader.bytes(),
             high_bytes: 0,
             low_bytes: 0,
             elapsed_us,
-            callback_errors: *receiver.callback_errors(),
-        };
-        Ok(serde_json::json!({
-            "status": "ok",
-            "bytes": result.bytes,
-            "normal_bytes": result.normal_bytes,
-            "high_bytes": result.high_bytes,
-            "low_bytes": result.low_bytes,
-            "elapsed_us": result.elapsed_us,
-            "callback_errors": result.callback_errors,
-        }))
+            callback_errors: [0; 6],
+        })
     }
 
     async fn request_probe_stream(
@@ -2647,7 +2593,7 @@ impl LmeshService {
             .await
     }
 
-    async fn forward_tagged_record_with_timeout(
+    pub(crate) async fn forward_tagged_record_with_timeout(
         &self,
         destination: &str,
         record: &[u8],
@@ -2715,29 +2661,6 @@ impl LmeshService {
                     Err(error) => mesh::protocol::Response::err(error.to_string()),
                 }
             }
-            Request::Probe {
-                to,
-                bytes,
-                packet_size,
-                parallel_streams,
-                initial_consume_delay_ms,
-                consume_delay_ms,
-                timeout_ms,
-            } => match self
-                .run_routed_probe(
-                    &to,
-                    bytes,
-                    packet_size,
-                    parallel_streams,
-                    initial_consume_delay_ms,
-                    consume_delay_ms,
-                    timeout_ms,
-                )
-                .await
-            {
-                Ok(value) => mesh::protocol::Response::ok_with_data(value),
-                Err(error) => mesh::protocol::Response::err(error.to_string()),
-            },
             Request::Send {
                 radio,
                 destination,
@@ -2872,6 +2795,36 @@ impl LmeshService {
             Request::WifiLinkMetrics => {
                 mesh::protocol::Response::ok_with_data(self.radio.wifi_link_metrics(None))
             }
+            Request::QuicMetrics => {
+                let node = self
+                    .now_quic_client
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                    .map(|(node, _)| node.clone());
+                let stats = match node {
+                    Some(node) => node.telemetry().await,
+                    None => None,
+                };
+                match stats {
+                    Some(stats) => mesh::protocol::Response::ok_with_data(serde_json::json!({
+                        "live_associations": stats.live_associations,
+                        "received_packets": stats.received_packets,
+                        "sent_packets": stats.sent_packets,
+                        "received_stream_packets": stats.received_stream_packets,
+                        "received_control_packets": stats.received_control_packets,
+                        "sent_stream_packets": stats.sent_stream_packets,
+                        "sent_control_packets": stats.sent_control_packets,
+                        "duplicate_packets": stats.duplicate_packets,
+                        "out_of_order_packets": stats.out_of_order_packets,
+                        "inferred_missing_packets": stats.inferred_missing_packets,
+                        "retransmitted_packets": stats.retransmitted_packets,
+                        "loss_events": stats.loss_events,
+                        "submission_failures": stats.submission_failures,
+                    })),
+                    None => mesh::protocol::Response::err("QUIC node telemetry unavailable"),
+                }
+            }
             Request::ObjectNanDryRun { image_size, mtu } => mesh::protocol::Response::ok_with_data(
                 nan_object_dry_run(image_size, mtu.unwrap_or(1_200)),
             ),
@@ -3004,12 +2957,7 @@ impl LmeshService {
     /// compatibility block keeps its established shape; the host identity
     /// fields mirror the firmware `status` vocabulary.
     pub fn host_status(&self) -> mesh::protocol::Response {
-        let mut status = self
-            .radio
-            .status()
-            .as_object()
-            .cloned()
-            .unwrap_or_default();
+        let mut status = self.radio.status().as_object().cloned().unwrap_or_default();
         status.insert("status".to_owned(), serde_json::json!("ok"));
         status.insert("role".to_owned(), serde_json::json!("host"));
         status.insert("service".to_owned(), serde_json::json!("lmesh"));
@@ -3042,7 +2990,8 @@ impl LmeshService {
         records: Option<u64>,
     ) -> mesh::protocol::Response {
         mesh::protocol::Response::ok_with_data(
-            self.radio.diagnostic_events(since_ms, records.map(|value| value as usize)),
+            self.radio
+                .diagnostic_events(since_ms, records.map(|value| value as usize)),
         )
     }
 
@@ -3134,9 +3083,13 @@ impl LmeshService {
                 }
                 None => not_owned.push("rate".to_owned()),
             }
-        } else if let Some(disable_11b) = fields.get("disable_11b").and_then(serde_json::Value::as_bool)
+        } else if let Some(disable_11b) = fields
+            .get("disable_11b")
+            .and_then(serde_json::Value::as_bool)
         {
-            let result = self.radio.wifi_rate_profile(None, "auto".to_owned(), disable_11b);
+            let result = self
+                .radio
+                .wifi_rate_profile(None, "auto".to_owned(), disable_11b);
             applied.insert("disable_11b".to_owned(), result);
         }
         for (name, present) in [
@@ -3278,30 +3231,6 @@ mod tests {
                 "{method}"
             );
         }
-    }
-
-    #[test]
-    fn probe_request_names_only_the_node_and_service_parameters() {
-        let request = serde_json::from_value::<Request>(serde_json::json!({
-            "method": "probe",
-            "to": "02:00:00:00:00:44",
-            "bytes": 4096,
-            "packet_size": 512,
-            "parallel_streams": 2,
-            "timeout_ms": 5000
-        }))
-        .unwrap();
-        assert!(matches!(
-            request,
-            Request::Probe {
-                to,
-                bytes: Some(4096),
-                packet_size: Some(512),
-                parallel_streams: Some(2),
-                timeout_ms: Some(5000),
-                ..
-            } if to == "02:00:00:00:00:44"
-        ));
     }
 
     #[test]

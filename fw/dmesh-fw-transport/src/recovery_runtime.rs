@@ -18,9 +18,21 @@ pub fn run() {
     // Recovery exposes only its running-image identity and the verified flash
     // operation. This is the same tagged QUIC handler used by Main and does
     // not install a diagnostic catalog, UART input, or another transport.
-    let _ = dmesh_server::services::register_tagged_component(
-        dmesh_server::services::FIRMWARE_COMPONENT,
-        crate::firmware_identity::receive_tagged_identity,
+    use dmesh_server::registry::{self, SyncFn, methods};
+    let _ = registry::register(
+        methods::FIRMWARE_IDENTITY,
+        SyncFn(crate::firmware_identity::receive_tagged_identity),
+    );
+    let _ = registry::register_stream(
+        methods::OBJECT_FLASH,
+        dmesh_server::verified_object::FlashHandler(crate::flash::EspFlashPlatform),
+    );
+    crate::quic_node_esp::register_probe_handlers();
+    // Recovery answers a discovery check with its own announce, as a registered
+    // handler like every other method, whichever delivery form carries it.
+    let _ = registry::register(
+        methods::DISCOVERY_CHECK,
+        dmesh_server::registry::SyncBytesFn(recovery_discovery_response),
     );
     let mut profile = crate::TransportProfile::new();
     if !crate::sta_profile_esp::load(&mut profile) {
@@ -263,4 +275,15 @@ fn return_to_main() -> ! {
         );
     }
     unsafe { esp_idf_sys::esp_restart() }
+}
+
+/// Recovery's answer to a discovery check: its signed announce, correlated to
+/// the request.
+fn recovery_discovery_response(request: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+    let id = dmesh_server::announce::discovery_request_id(request)?;
+    let (record, used) = crate::main_runtime::recovery_discovery_record(0)?;
+    let announce = dmesh_server::announce::decode_announce(&record[..used])?;
+    let mut response = [0u8; crate::TRANSPORT_MTU];
+    let used = dmesh_server::announce::encode_discovery_response(announce, id, &mut response)?;
+    Some(alloc::vec::Vec::from(&response[..used]))
 }

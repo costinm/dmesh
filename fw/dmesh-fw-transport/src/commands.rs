@@ -11,11 +11,8 @@ extern crate alloc;
 use core::fmt::{self, Write};
 
 use dmesh_server::{
-    connection::{self, ConnectionManager, ConnectionPolicy},
     control::{self, Handler, TransportConfig, TransportKind},
-    firmware_profile::{
-        apply_connection_policy, apply_transport_config, clear_sta_passphrase, set_ssid,
-    },
+    firmware_profile::{apply_transport_config, clear_sta_passphrase, set_ssid},
 };
 
 use crate::TransportProfile;
@@ -248,18 +245,6 @@ const fn mac_le(mac: [u8; 6]) -> u64 {
     u64::from_le_bytes([mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], 0, 0])
 }
 
-/// QUIC-lite owns this policy boundary, independently of bearer start/stop.
-/// The firmware profile is only a fixed-capacity cache used while constructing
-/// the next raw association; it does not make the radio an owner of streams.
-impl ConnectionManager for ProfileControl<'_> {
-    type Error = ProfileControlError;
-
-    fn configure_connection(&mut self, policy: ConnectionPolicy) -> Result<(), Self::Error> {
-        apply_connection_policy(policy, self.profile);
-        Ok(())
-    }
-}
-
 /// Apply one common tagged control request to transient transport state.
 /// The only firmware responsibility is applying typed values to ESP-owned
 /// state. It contains no command grammar, method tags, or CBOR traversal.
@@ -296,20 +281,7 @@ pub fn apply_control_record_result(
         });
         return Some(outcome);
     }
-    let request = connection::decode_request(packet)?;
-    Some(
-        connection::dispatch_request(
-            request,
-            &mut ProfileControl {
-                profile: params,
-                nan_wake_sta_requested: false,
-            },
-        )
-        .map(|()| ControlApplyResult {
-            transport_set: false,
-            changed: false,
-        }),
-    )
+    None
 }
 
 /// Apply the sole mutable application-control record admitted on the direct
@@ -375,20 +347,7 @@ pub fn apply_control_record_decoded(
         });
         return Some(outcome);
     }
-    let request = connection::decode_record(record)?;
-    Some(
-        connection::dispatch_request(
-            request,
-            &mut ProfileControl {
-                profile: params,
-                nan_wake_sta_requested: false,
-            },
-        )
-        .map(|()| ControlApplyResult {
-            transport_set: false,
-            changed: false,
-        }),
-    )
+    None
 }
 
 /// Encode the empty successful result for a decoded control/connection record.
@@ -408,15 +367,6 @@ pub fn encode_control_response_decoded(
             out,
         );
     }
-    if let Some(request) = connection::decode_record(record) {
-        return dmesh_server::tagged::encode_numeric_response(
-            connection::CONNECTION_COMPONENT,
-            connection_method(request),
-            id,
-            &[0xa0],
-            out,
-        );
-    }
     None
 }
 
@@ -425,7 +375,7 @@ pub fn encode_control_response_decoded(
 /// of a driver-owned receive buffer; application of the record remains on the
 /// shared ingress worker through [`apply_control_record_result`].
 pub fn is_control_record(packet: &[u8]) -> bool {
-    control::decode_request(packet).is_some() || connection::decode_request(packet).is_some()
+    control::decode_request(packet).is_some()
 }
 
 /// True only for wire method `1/4`, published as `transport.set`.
@@ -454,13 +404,8 @@ pub fn encode_control_error(
 ) -> Option<usize> {
     let record = dmesh_server::tagged::decode(packet)?;
     let id = record.id?;
-    let (component, method) = if let Some(request) = control::decode_record(record) {
-        (control::CONTROL_COMPONENT, control_method(request))
-    } else if let Some(request) = connection::decode_record(record) {
-        (connection::CONNECTION_COMPONENT, connection_method(request))
-    } else {
-        return None;
-    };
+    let request = control::decode_record(record)?;
+    let (component, method) = (control::CONTROL_COMPONENT, control_method(request));
     dmesh_server::tagged::encode_numeric_error(component, method, id, error.as_bytes(), out)
 }
 
@@ -472,13 +417,8 @@ pub fn encode_control_error_decoded(
     out: &mut [u8],
 ) -> Option<usize> {
     let id = record.id?;
-    let (component, method) = if let Some(request) = control::decode_record(record) {
-        (control::CONTROL_COMPONENT, control_method(request))
-    } else if let Some(request) = connection::decode_record(record) {
-        (connection::CONNECTION_COMPONENT, connection_method(request))
-    } else {
-        return None;
-    };
+    let request = control::decode_record(record)?;
+    let (component, method) = (control::CONTROL_COMPONENT, control_method(request));
     dmesh_server::tagged::encode_numeric_error(component, method, id, error.as_bytes(), out)
 }
 
@@ -488,12 +428,6 @@ fn control_method(request: control::Request<'_>) -> u64 {
         control::Request::SettingsSet { .. } => control::SETTINGS_SET,
         control::Request::SettingsList => control::SETTINGS_LIST,
         control::Request::TransportSet { .. } => control::TRANSPORT_SET,
-    }
-}
-
-fn connection_method(request: connection::Request) -> u64 {
-    match request {
-        connection::Request::Configure(_) => connection::CONNECTION_CONFIGURE,
     }
 }
 

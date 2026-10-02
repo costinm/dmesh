@@ -25,6 +25,8 @@ use std::{
 
 const MAX_LOG_LINE: usize = 512;
 const UART_LOG_ENV: &str = "UART_CODEC_LOG";
+/// Default line rate used by DMesh physical UART bearers when no override is supplied.
+pub const DEFAULT_BAUD: u32 = 115_200;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SidebandState {
@@ -225,7 +227,11 @@ impl UartPort {
         if unsafe { libc::ioctl(file.as_raw_fd(), libc::TIOCEXCL) } < 0 {
             return Err(io::Error::last_os_error());
         }
-        configure(&file, baud)?;
+        // A tty may retain its previous line coding after the last process
+        // closes it. In particular, B0 left by a flasher silently disables a
+        // subsequent default-baud session unless we restore the protocol's
+        // physical UART default here. Native USB-JTAG ignores this setting.
+        configure(&file, Some(baud.unwrap_or(DEFAULT_BAUD)))?;
         Ok(Self {
             file,
             path: path.to_path_buf(),
@@ -906,6 +912,47 @@ mod tests {
 
     static NODE_POOL: PacketPool<4, { quic_lite::DEFAULT_PACKET_POOL_SLOT_SIZE }> =
         PacketPool::new();
+
+    #[test]
+    fn open_without_baud_restores_protocol_default_from_b0() {
+        let mut master = 0;
+        let mut slave = 0;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        let _master = unsafe { File::from_raw_fd(master) };
+        let slave = unsafe { File::from_raw_fd(slave) };
+        let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut termios) },
+            0
+        );
+        assert_eq!(unsafe { libc::cfsetispeed(&mut termios, libc::B0) }, 0);
+        assert_eq!(unsafe { libc::cfsetospeed(&mut termios, libc::B0) }, 0);
+        assert_eq!(
+            unsafe { libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &termios) },
+            0
+        );
+
+        let path = fs::read_link(format!("/proc/self/fd/{}", slave.as_raw_fd())).unwrap();
+        let port = UartPort::open(&path, None).unwrap();
+        let mut actual: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::tcgetattr(port.file.as_raw_fd(), &mut actual) },
+            0
+        );
+        assert_eq!(unsafe { libc::cfgetispeed(&actual) }, libc::B115200);
+        assert_eq!(unsafe { libc::cfgetospeed(&actual) }, libc::B115200);
+    }
 
     #[test]
     fn enumeration_deduplicates_stable_names_without_opening() {

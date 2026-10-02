@@ -221,6 +221,84 @@ impl ProbeSender {
     }
 }
 
+/// The probe payload as a plain byte stream, independent of how a transport
+/// splits it into chunks.
+///
+/// Packet `k` of `packet_size` bytes starts with `k` as a big-endian `u32`; every
+/// other byte is its own stream offset modulo 256. That is the byte pattern
+/// [`ProbeSender`] and [`ProbeReceiver`] use for full-size packets, so both
+/// can be used together, but this form can be produced and checked from any
+/// chunking, which a header in front of the payload makes necessary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProbePayload {
+    packet_size: usize,
+    total: u64,
+    offset: u64,
+}
+
+impl ProbePayload {
+    /// A payload of `total` bytes in packets of `packet_size` (at least 4).
+    pub fn new(total: u64, packet_size: usize) -> Option<Self> {
+        (total != 0 && total <= MAX_BYTES && packet_size >= 4).then_some(Self {
+            packet_size,
+            total,
+            offset: 0,
+        })
+    }
+
+    /// Bytes produced or checked so far.
+    pub const fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Total payload length.
+    pub const fn total(&self) -> u64 {
+        self.total
+    }
+
+    /// Whether every byte has been produced or checked.
+    pub const fn is_complete(&self) -> bool {
+        self.offset == self.total
+    }
+
+    fn expected(&self, position: u64) -> u8 {
+        let within = (position % self.packet_size as u64) as usize;
+        if within < 4 {
+            let packet = u32::try_from(position / self.packet_size as u64).unwrap_or(u32::MAX);
+            packet.to_be_bytes()[within]
+        } else {
+            position as u8
+        }
+    }
+
+    /// Fill `out` with the next payload bytes and return how many (zero when
+    /// the payload is complete).
+    pub fn fill(&mut self, out: &mut [u8]) -> usize {
+        let count = usize::try_from(self.total - self.offset)
+            .unwrap_or(usize::MAX)
+            .min(out.len());
+        for (index, byte) in out[..count].iter_mut().enumerate() {
+            *byte = self.expected(self.offset + index as u64);
+        }
+        self.offset += count as u64;
+        count
+    }
+
+    /// Check the next received payload bytes against the pattern.
+    pub fn check(&mut self, bytes: &[u8]) -> Result<(), ProbeError> {
+        if bytes.len() as u64 > self.total - self.offset {
+            return Err(ProbeError::UnexpectedRange);
+        }
+        for (index, byte) in bytes.iter().enumerate() {
+            if *byte != self.expected(self.offset + index as u64) {
+                return Err(ProbeError::InvalidPayload);
+            }
+        }
+        self.offset += bytes.len() as u64;
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Validation failure shared by TCP and QUIC probe runs.
 ///
@@ -427,7 +505,7 @@ impl<const NORMAL: usize> ProbeRun<NORMAL> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProbeError, ProbeReceiver, ProbeRun, ProbeSender};
+    use super::{ProbeError, ProbePayload, ProbeReceiver, ProbeRun, ProbeSender};
 
     #[test]
     fn sender_waits_for_credit_and_commits_only_accepted_ranges() {
@@ -484,5 +562,54 @@ mod tests {
         let result = run.result(8);
         assert_eq!(result.bytes, 16);
         assert_eq!(result.bits_per_second(), 16_000_000);
+    }
+
+    #[test]
+    fn payload_is_independent_of_chunking() {
+        let mut sender = ProbePayload::new(1_000, 100).unwrap();
+        let mut all = [0u8; 1_000];
+        let mut produced = 0;
+        for size in [7usize, 100, 1, 250, 3].iter().cycle() {
+            if produced == all.len() {
+                break;
+            }
+            let end = (produced + size).min(all.len());
+            produced += sender.fill(&mut all[produced..end]);
+        }
+        assert!(sender.is_complete());
+        // The same bytes validate under a different split.
+        let mut receiver = ProbePayload::new(1_000, 100).unwrap();
+        for chunk in all.chunks(333) {
+            receiver.check(chunk).unwrap();
+        }
+        assert!(receiver.is_complete());
+        // A flipped byte, or too many bytes, is rejected.
+        let mut receiver = ProbePayload::new(1_000, 100).unwrap();
+        let mut bad = all;
+        bad[501] ^= 1;
+        assert_eq!(receiver.check(&bad[..600]), Err(ProbeError::InvalidPayload));
+        let mut receiver = ProbePayload::new(10, 4).unwrap();
+        assert_eq!(receiver.check(&all[..11]), Err(ProbeError::UnexpectedRange));
+    }
+
+    #[test]
+    fn payload_matches_the_chunked_sender_for_full_packets() {
+        let mut sender = ProbeSender::new(3, 12, 4).unwrap();
+        let mut by_sender = [0u8; 12];
+        let mut offset = 0;
+        loop {
+            let mut out = [0u8; 4];
+            let Some(chunk) = sender.prepare(u64::MAX, &mut out) else {
+                break;
+            };
+            by_sender[offset..offset + chunk.len].copy_from_slice(&out[..chunk.len]);
+            offset += chunk.len;
+            sender.commit(chunk).unwrap();
+        }
+        assert_eq!(offset, 12);
+        let mut payload = ProbePayload::new(12, 4).unwrap();
+        let mut by_payload = [0u8; 12];
+        assert_eq!(payload.fill(&mut by_payload), 12);
+        assert_eq!(by_sender, by_payload);
     }
 }

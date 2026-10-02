@@ -5,6 +5,10 @@ use std::sync::Arc;
 
 const CATALOG_SERVICE: &str = "lmesh";
 
+/// The catalog tag of a field named `to` that is the envelope's destination.
+/// Other methods use tag 15 for unrelated fields (`transport.set`'s `now`).
+const ENVELOPE_TO_TAG: u32 = 15;
+
 /// The installed service catalog is the source for named and tagged requests.
 pub fn load_tagged_schema() -> Arc<TaggedSchema> {
     mesh::catalog::service_catalog_resolver()
@@ -48,7 +52,7 @@ fn decode_tagged_reply(schema: &TaggedSchema, payload: &[u8]) -> Result<Value> {
     // mislabel (for example) `status` as `bytes`.
     if wire.component == Some(dmesh_server::tagged::Name::Tag(
         dmesh_server::probe::PROBE_COMPONENT,
-    )) && wire.method == Some(dmesh_server::tagged::Name::Tag(dmesh_server::probe::PROBE_RUN))
+    )) && wire.method == Some(dmesh_server::tagged::Name::Tag(dmesh_server::probe::PROBE_START))
     {
         if let Some(result) = record.result.as_mut().and_then(Value::as_object_mut) {
             for (tag, name) in [
@@ -171,12 +175,23 @@ fn encode_schema_fields_with_id(
     direct: bool,
 ) -> Result<Vec<u8>> {
     let mut request_fields = fields.clone();
-    let probe_client = if method == "probe" {
-        request_fields.remove("to")
-    } else {
-        None
-    };
+    // `timeout=MS` is the envelope's allowance for the request, unless the
+    // method declares a field of that name itself.
+    let envelope_timeout = request_fields.remove("timeout");
     let entry = schema.validate_fields(method, &request_fields)?;
+    let envelope_timeout = match envelope_timeout {
+        Some(value) if entry.fields.contains_key("timeout") => {
+            request_fields.insert("timeout".to_owned(), value);
+            None
+        }
+        Some(value) => Some(
+            value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+                .ok_or_else(|| anyhow::anyhow!("`timeout` is a number of milliseconds"))?,
+        ),
+        None => None,
+    };
     if direct && (method != "transport.set" || entry.component != NameOrTag::Tag(1)) {
         anyhow::bail!("{method} is stream-only; only transport.set has a direct encoding");
     }
@@ -236,14 +251,26 @@ fn encode_schema_fields_with_id(
         return Ok(wire[..used].to_vec());
     }
     let mut record = schema.record_from_value(method, &Value::Object(request_fields))?;
-    if let Some(probe_client) = probe_client {
-        let uri = probe_client
+    // A `to` field with tag 15 is the envelope's destination: the node that runs
+    // the method, not a field of its request. A catalogued method that declares it
+    // (such as `probe.start`) can therefore be started from any node.
+    let to_is_envelope = entry
+        .fields
+        .get("to")
+        .is_some_and(|field| field.tag == ENVELOPE_TO_TAG);
+    if to_is_envelope
+        && let Some(to) = record.env.remove(&NameOrTag::Tag(ENVELOPE_TO_TAG))
+    {
+        let raw = to
             .as_str()
-            .and_then(dmesh_server::probe::ProbeDestination::parse)
-            .ok_or_else(|| anyhow::anyhow!("invalid probe destination URI in to"))?;
-        record.to = Some(Value::String(uri.as_str().to_owned()));
+            .ok_or_else(|| anyhow::anyhow!("`to` must be a destination string"))?;
+        let normalized = dmesh_server::probe::ProbeDestination::parse(raw)
+            .map(|uri| uri.as_str().to_owned())
+            .unwrap_or_else(|| raw.to_owned());
+        record.to = Some(Value::String(normalized));
     }
     record.id = Some(Value::from(id));
+    record.timeout = envelope_timeout;
     mesh::cbor::encode_record(&record)
 }
 
@@ -412,12 +439,38 @@ mod tests {
     }
 
     #[test]
-    fn relay_list_is_a_catalogued_stream_command() {
-        let record = encode_stream_command_with_id("relay.list", 21).unwrap();
-        let record = dmesh_server::tagged::decode(&record).unwrap();
-        assert_eq!(record.component, Some(dmesh_server::tagged::Name::Tag(5)));
-        assert_eq!(record.method, Some(dmesh_server::tagged::Name::Tag(3)));
-        assert_eq!(record.id, Some(21));
+    fn the_catalog_encodes_log_watch_and_the_firmware_telemetry_snapshots() {
+        let command =
+            encode_stream_command_with_id("log.watch since_seq=5 limit=2 level=2 source=nan", 3).unwrap();
+        let request = dmesh_server::log_watch::WatchRequest::decode(
+            dmesh_server::tagged::decode(&command).unwrap().fields,
+        )
+        .unwrap_or_else(|| panic!("log.watch fields: {command:02x?}"));
+        assert_eq!(
+            (request.since_seq, request.limit, request.level, request.source.as_deref()),
+            (5, 2, 2, Some("nan"))
+        );
+        for (name, method) in [
+            ("telemetry.memory", 10),
+            ("telemetry.power", 11),
+            ("telemetry.runtime", 12),
+            ("telemetry.bearers", 9),
+        ] {
+            let command = encode_stream_command_with_id(name, 4).unwrap();
+            let envelope = dmesh_server::tagged::decode(&command).unwrap();
+            assert_eq!(envelope.component, Some(dmesh_server::tagged::Name::Tag(7)), "{name}");
+            assert_eq!(envelope.method, Some(dmesh_server::tagged::Name::Tag(method)), "{name}");
+        }
+    }
+
+    #[test]
+    fn timeout_is_the_envelope_allowance_not_a_method_field() {
+        let command = encode_stream_command_with_id("probe.start bytes=4096 timeout=2500", 5).unwrap();
+        let envelope = dmesh_server::tagged::decode(&command).expect("envelope");
+        assert_eq!(envelope.timeout, Some(2500));
+        assert_eq!(envelope.id, Some(5));
+        let without = encode_stream_command_with_id("probe.start bytes=4096", 5).unwrap();
+        assert_eq!(dmesh_server::tagged::decode(&without).unwrap().timeout, None);
     }
 
     #[test]
@@ -500,16 +553,16 @@ mod tests {
             Some(&Value::String("two words".to_owned()))
         );
         assert!(encode_stream_command_with_id("settings.set 99=demo", 77).is_err());
-        assert!(encode_direct_command("probe bytes=4096 packet_size=512").is_err());
-        let command = encode_stream_command_with_id("probe bytes=4096 packet_size=512", 44)
+        assert!(encode_direct_command("probe.start bytes=4096 packet_size=512").is_err());
+        let command = encode_stream_command_with_id("probe.start bytes=4096 packet_size=512", 44)
             .expect("stream probe command");
         let record = dmesh_server::tagged::decode(&command).expect("tagged probe request");
         assert_eq!(
-            dmesh_server::probe::decode_probe_run_record(record),
+            dmesh_server::probe::decode_probe_start_record(record),
             Some((44, dmesh_server::probe::ProbeServiceRequest::new(4096, 512)))
         );
         let directed = encode_stream_command_with_id(
-            "probe to=mesh://fc00::a4 bytes=256 packet_size=128 peer=espnow://02:11:22:33:44:55",
+            "probe.start to=mesh://fc00::a4 bytes=256 packet_size=128 peer=espnow://02:11:22:33:44:55",
             45,
         )
         .expect("device-directed probe remains the probe method");
@@ -520,7 +573,7 @@ mod tests {
             "wire={directed:02x?}"
         );
         let (id, request) =
-            dmesh_server::probe::decode_probe_run_record(record).expect("directed probe fields");
+            dmesh_server::probe::decode_probe_start_record(record).expect("directed probe fields");
         assert_eq!(id, 45);
         assert_eq!(
             request
@@ -809,7 +862,7 @@ mod tests {
     #[test]
     fn radio_control_is_stream_only() {
         assert!(encode_direct_command("radio.control channel=6").is_err());
-        let telemetry = encode_stream_command_with_id("telemetry.nan_metrics", 43)
+        let telemetry = encode_stream_command_with_id("telemetry.nan", 43)
             .expect("stream telemetry command");
         assert_eq!(
             dmesh_server::telemetry::decode_request(&telemetry),

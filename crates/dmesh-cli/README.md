@@ -69,7 +69,7 @@ then signed discovery and NAN wake when needed:
 ~~~sh
 dmesh-cli DEVICE status
 dmesh-cli DEVICE telemetry.nan_status
-dmesh-cli DEVICE probe --bytes=4096 --packet_size=256
+dmesh-cli DEVICE probe.start --bytes=4096 --packet_size=256
 ~~~
 
 For step-by-step diagnosis, ask a reachable observer:
@@ -88,15 +88,16 @@ the target radio MAC from the catalog or observation, not its VIP6.
 ## Logs, serial reset, and local diagnostics
 
 ~~~sh
-dmesh-cli DEVICE log-watch --records=16               # Poll bounded firmware log records.
-dmesh-cli DEVICE log-watch --since=100 --records=32     # Continue from a record cursor.
-dmesh-cli DEVICE events --since=100                  # Read subsequent service events.
+dmesh-cli DEVICE log.watch --limit=16                # Poll retained log and event records.
+dmesh-cli DEVICE log.watch --since_seq=100 --limit=32  # Continue from the returned cursor.
+dmesh-cli DEVICE log.watch --level=2                 # Errors and warnings only.
+dmesh-cli DEVICE log.watch --source=nan --kind=nan.  # One source, event kinds with a prefix.
 dmesh-cli DEVICE --watch --timeout-secs 30          # Passively read serial boot/platform text.
 dmesh-cli DEVICE --watch --reset --timeout-secs 30  # Reset while capturing the new boot.
 dmesh-cli DEVICE --reset                            # Pulse the local serial RTS reset line.
 ~~~
 
-log-watch and events are service requests and can use Wi-Fi. --watch and
+log.watch is a service request and can use Wi-Fi. --watch and
 --reset require a local serial path or a catalog entry with serial_id; they
 cannot reset a remote device through lmesh. --watch --interactive also accepts
 terminal input. A physical UART bridge uses its catalog uart_baud or an
@@ -113,17 +114,20 @@ and its fields; for example, `dmesh-cli "$UART_TARGET" status --timeout-secs 10`
 ~~~sh
 dmesh-cli DEVICE metrics                         # General service counters.
 dmesh-cli DEVICE telemetry.nan_status            # NAN sync and publish state.
-dmesh-cli DEVICE telemetry.nan_metrics           # NAN RX/TX and admission counters.
-dmesh-cli DEVICE telemetry.now_metrics           # ESP-NOW TX and RX counters.
-dmesh-cli DEVICE telemetry.udp6_metrics          # Raw IPv6/UDP delivery and failures.
-dmesh-cli DEVICE telemetry.wifi_link_metrics     # Available per-peer Wi-Fi link facts.
-dmesh-cli DEVICE runtime.snapshot                # Desired and applied runtime state.
-dmesh-cli DEVICE power.snapshot                  # Power management observations.
-dmesh-cli DEVICE memory.snapshot                 # Packet pool and memory observations.
+dmesh-cli DEVICE telemetry.quic          # QUIC packet, loss, and retransmission counters.
+dmesh-cli DEVICE telemetry.nan           # NAN RX/TX and admission counters.
+dmesh-cli DEVICE telemetry.now           # ESP-NOW TX and RX counters.
+dmesh-cli DEVICE telemetry.udp6          # Raw IPv6/UDP delivery and failures.
+dmesh-cli DEVICE telemetry.wifi_link     # Available per-peer Wi-Fi link facts.
+dmesh-cli DEVICE telemetry.runtime       # Desired and applied runtime state (firmware).
+dmesh-cli DEVICE telemetry.power         # Power management observations (firmware).
+dmesh-cli DEVICE telemetry.memory        # Packet pool and memory observations (firmware).
+dmesh-cli DEVICE telemetry.bearers       # Per-bearer submit/receive counters (firmware).
 dmesh-cli DEVICE radio.snapshot                  # Raw radio state and counters.
 dmesh-cli DEVICE wifi.scan --last_results=true     # Retained Wi-Fi scan results.
-dmesh-cli DEVICE probe --bytes=4096 --packet_size=256 # Bounded QUIC-lite transfer.
-dmesh-cli DEVICE probe --bytes=65536 --packet_size=1024 --parallel_streams=2
+dmesh-cli DEVICE probe.start --bytes=4096 --packet_size=256 # CLI probes DEVICE (calls its probe.handler).
+dmesh-cli DEVICE probe.start --bytes=65536 --packet_size=1024 --parallel_streams=2
+dmesh-cli DEVICE probe.start --peer=udp://HOST:3337 --bytes=65536 # DEVICE probes HOST.
 ~~~
 
 probe reports bytes and timing; it does not prove that a separate application
@@ -153,8 +157,6 @@ dmesh-cli DEVICE settings.get --key=name             # Read one key.
 dmesh-cli DEVICE settings.set --key=name --value=demo  # Set one key.
 dmesh-cli DEVICE settings.set --1=name --2=demo        # Same request using numeric tags.
 dmesh-cli DEVICE settings.set --key=quic.pool --value=32 # Larger per-device packet ceiling.
-dmesh-cli DEVICE relay.list                        # Inspect known relay entries.
-dmesh-cli DEVICE connection.configure --ack_frequency=2 --ack_delay_ms=10
 ~~~
 
 These controls change device state; choose values for the selected device:

@@ -1,6 +1,6 @@
 //! Regular mesh-stream throughput probe contract.
 //!
-//! `probe.run` is an ordinary registered DMesh stream service. A host or
+//! `probe.start` is an ordinary registered DMesh stream service. A host or
 //! Android caller opens it through the Tokio-backed `mesh::MeshClient`; the selected client
 //! implementation may reuse or establish a QUIC association, or later use
 //! SSH/HTTP2, without exposing that detail to the probe. The payload plan and
@@ -10,9 +10,11 @@
 //! a second peer transport protocol.
 
 pub use crate::probe_service::{
-    PROBE_COMPONENT, PROBE_MAX_BYTES, PROBE_MAX_NORMAL_STREAMS, PROBE_RUN, PROBE_RUN_REQUEST_MAX,
-    ProbeDestination, ProbeServicePlan, ProbeServiceRequest, decode_probe_run_record,
-    encode_probe_result_response, encode_probe_run_request,
+    PROBE_COMPONENT, PROBE_MAX_BYTES, PROBE_MAX_NORMAL_STREAMS, PROBE_START, PROBE_REQUEST_MAX,
+    PROBE_HANDLER, ProbeClientError, ProbeDestination, ProbeResponseReader, ProbeServicePlan,
+    ProbeServiceRequest, ProbeHandler, decode_probe_start_record, decode_probe_handler_record,
+    encode_probe_result_response, probe_timeout_ms, encode_probe_start_request, encode_probe_handler_request,
+    encode_probe_handler_response,
 };
 pub use crate::probe_stream::{ProbeReceiver, ProbeRun, ProbeSender};
 

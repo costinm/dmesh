@@ -107,6 +107,8 @@ impl PacketBearer<Pool> for JavaPacketBearer {
 pub struct BearerRuntime {
     node: quic_lite::tokio::TokioNode,
     bearers: HashMap<String, quic_lite::BearerId>,
+    /// The UDP bearer, kept so probe destinations can be registered as peers.
+    udp: Option<quic_lite::bearer_udp::TokioUdpBearer<16>>,
     contexts: Arc<Mutex<HashMap<String, BearerContext<Pool>>>>,
     state: Arc<Mutex<HashMap<String, ConnectionStatus>>>,
     started: Instant,
@@ -160,10 +162,12 @@ impl BearerRuntime {
                             }
                         }
                     }
+                    let mut udp_handle = None;
                     if let Some(socket) = udp_socket {
                         match quic_lite::bearer_udp::TokioUdpBearer::<16>::from_std(socket)
                             .map_err(|error| error.to_string())
                             .and_then(|bearer| {
+                                udp_handle = Some(bearer.clone());
                                 raw_node
                                     .add_bearer(bearer)
                                     .map_err(|error| format!("{error:?}"))
@@ -180,7 +184,7 @@ impl BearerRuntime {
                         raw_node,
                         quic_lite::AssociationLimits::host().connection,
                     );
-                    if ready.send((node, bearers)).is_err() {
+                    if ready.send((node, bearers, udp_handle)).is_err() {
                         return;
                     }
                     if let Err(error) = driver.run().await {
@@ -189,7 +193,7 @@ impl BearerRuntime {
                 });
             })
             .expect("start Android QUIC driver thread");
-        let (node, bearers) = initialized
+        let (node, bearers, udp) = initialized
             .recv()
             .expect("Android QUIC driver initialized without a handle");
         #[cfg(target_os = "android")]
@@ -204,6 +208,7 @@ impl BearerRuntime {
         Arc::new(Self {
             node,
             bearers,
+            udp,
             contexts,
             state,
             started: Instant::now(),
@@ -275,6 +280,116 @@ impl BearerRuntime {
                 Err(error)
             }
         }
+    }
+
+    /// Run a probe with this node as the QUIC client: call the probed node's
+    /// registered `probe.handler` and validate the payload that follows its
+    /// response header. `destination` is `udp://HOST:PORT`, `usb://` or `ble://`.
+    pub async fn probe(
+        &self,
+        destination: &dmesh_server::probe::ProbeDestination,
+        request: dmesh_server::probe::ProbeServiceRequest,
+        timeout: Duration,
+    ) -> Result<quic_lite::probe::ProbeResult, String> {
+        let (bearer_id, peer_l2_address) = match destination.scheme() {
+            "udp" => {
+                let address = crate::mesh_jni::parse_udp_endpoint(destination.target())?;
+                let udp = self.udp.as_ref().ok_or("Android has no UDP bearer")?;
+                let peer = udp
+                    .register_peer(address)
+                    .map_err(|error| format!("register UDP peer: {error:?}"))?;
+                (self.bearers["udp"], peer)
+            }
+            scheme @ ("usb" | "ble") => (
+                *self
+                    .bearers
+                    .get(scheme)
+                    .ok_or_else(|| format!("unknown Android bearer {scheme}"))?,
+                PEER,
+            ),
+            other => return Err(format!("Android cannot probe over {other}://")),
+        };
+        let operation = async {
+            let association = self
+                .node
+                .associate(
+                    PacketMeta {
+                        bearer: bearer_id,
+                        peer_l2_address,
+                        received_at_us: self.now_us(),
+                    },
+                    self.now_us(),
+                )
+                .await
+                .map_err(|error| format!("start association: {error:?}"))?;
+            association
+                .wait_established()
+                .await
+                .map_err(|error| format!("establish association: {error:?}"))?;
+            let mut stream = association
+                .open_stream()
+                .await
+                .map_err(|error| format!("open probe stream: {error:?}"))?;
+            // The request is a header and no body: FIN follows the header.
+            let mut header = [0u8; dmesh_server::probe::PROBE_REQUEST_MAX];
+            let mut outbound = request;
+            outbound.peer = None;
+            let used = dmesh_server::probe::encode_probe_handler_request(outbound, 1, &mut header)
+                .ok_or("probe request does not fit a probe.handler header")?;
+            stream
+                .write_all(&header[..used])
+                .await
+                .map_err(|error| format!("write probe request: {error}"))?;
+            stream
+                .shutdown()
+                .await
+                .map_err(|error| format!("finish probe request: {error}"))?;
+            let expected = request.bytes.min(quic_lite::probe::MAX_BYTES);
+            let mut reader = dmesh_server::probe::ProbeResponseReader::new(expected);
+            let started = Instant::now();
+            let mut chunk = vec![0u8; 2048];
+            loop {
+                let count = stream
+                    .read(&mut chunk)
+                    .await
+                    .map_err(|error| format!("read probe response: {error}"))?;
+                if count == 0 {
+                    break;
+                }
+                reader.push(&chunk[..count]).map_err(|error| match error {
+                    dmesh_server::probe::ProbeClientError::Rejected => {
+                        "peer rejected the probe request".to_owned()
+                    }
+                    other => format!("invalid probe response: {other:?}"),
+                })?;
+            }
+            if !reader.is_complete() {
+                return Err(format!(
+                    "probe response ended after {} of {expected} bytes",
+                    reader.bytes()
+                ));
+            }
+            association
+                .finish()
+                .await
+                .map_err(|error| format!("finish association: {error:?}"))?;
+            let elapsed_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+            Ok(quic_lite::probe::ProbeResult {
+                bytes: reader.bytes(),
+                normal_bytes: reader.bytes(),
+                high_bytes: 0,
+                low_bytes: 0,
+                elapsed_us,
+                callback_errors: [0; 6],
+            })
+        };
+        tokio::time::timeout(timeout, operation)
+            .await
+            .map_err(|_| "Android probe timed out".to_owned())?
+    }
+
+    pub async fn telemetry(&self) -> Option<quic_lite::NodeTelemetry> {
+        self.node.telemetry().await
     }
 
     fn open(&self, bearer: &str, args: &str) -> bool {
@@ -376,53 +491,14 @@ impl BearerRuntime {
 
 #[cfg(target_os = "android")]
 async fn serve_android_stream(mut stream: quic_lite::tokio::TokioStream) {
-    let mut request = Vec::new();
-    if let Err(error) = stream.read_to_end(&mut request).await {
-        log::warn!("Android QUIC request read failed: {error}");
-        return;
-    }
-    // Android-specific handlers first, then the shared component surface, and
-    // finally the common numeric error so an unknown correlated request from
-    // a constrained peer is never left without a correlated reply.
-    let response = crate::mesh_jni::android_discovery_active_response(&request)
-        .or_else(|| crate::mesh_jni::android_nan_wakeup_response(&request))
-        .or_else(|| crate::mesh_jni::android_battery_response(&request))
-        .or_else(|| crate::mesh_jni::android_telemetry_response(&request))
-        .or_else(|| crate::mesh_jni::android_discovery_nodes_response(&request))
-        .or_else(|| crate::mesh_jni::android_diag_status_response(&request))
-        .or_else(|| crate::mesh_jni::android_services_response(&request))
-        .or_else(|| crate::mesh_jni::android_diag_metrics_response(&request))
-        .or_else(|| crate::mesh_jni::android_diag_events_response(&request, false))
-        .or_else(|| crate::mesh_jni::android_diag_events_response(&request, true))
-        .or_else(|| crate::mesh_jni::android_ble_component_response(&request))
-        .or_else(|| crate::mesh_jni::android_identity_response(&request))
-        .or_else(|| {
-            crate::mesh_jni::android_snapshot_response(
-                &request,
-                dmesh_server::services::RUNTIME_SNAPSHOT_COMPONENT,
-            )
-        })
-        .or_else(|| {
-            crate::mesh_jni::android_snapshot_response(
-                &request,
-                dmesh_server::services::POWER_SNAPSHOT_COMPONENT,
-            )
-        })
-        .or_else(|| {
-            crate::mesh_jni::android_snapshot_response(
-                &request,
-                dmesh_server::services::MEMORY_SNAPSHOT_COMPONENT,
-            )
-        })
-        .or_else(|| crate::mesh_jni::android_device_only_response(&request))
-        .or_else(|| dmesh_server::services::dispatch_tagged_stream(&request));
-    if let Some(response) = response
-        && let Err(error) = stream.write_all(&response).await
-    {
-        log::warn!("Android QUIC response write failed: {error}");
-    }
-    if let Err(error) = stream.shutdown().await {
-        log::warn!("Android QUIC response finish failed: {error}");
+    use dmesh_server::stream_service::RegistryStreamHandler;
+    // One registry serves every ingress, as handler streams (a header, then an
+    // optional raw body). A method Android does not implement is not
+    // registered and receives the shared numeric error, so a correlated
+    // request is never left without a reply. Network peers are not local
+    // ingress.
+    if let Err(error) = RegistryStreamHandler::global().serve(&mut stream).await {
+        log::warn!("Android QUIC stream failed: {error}");
     }
 }
 
@@ -623,5 +699,145 @@ mod tests {
             sent.push(inner.to_vec())
         });
         assert_eq!(sent, vec![vec![0x40, 1, 2]]);
+    }
+
+    struct NoEgress;
+    impl BearerEgress for NoEgress {
+        fn send_packet(&self, _bearer: &str, _packet: &[u8]) {}
+    }
+
+    /// Android as the probe's client reaches a probed node's registered
+    /// `probe.handler` over its UDP bearer, and validates the payload.
+    #[test]
+    fn android_probes_a_registered_handler_over_udp() {
+        static SERVER_POOL: Pool = Pool::new();
+        let server_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_address = server_socket.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let bearer =
+                    quic_lite::bearer_udp::TokioUdpBearer::<8>::from_std(server_socket).unwrap();
+                let mut node = Node::new(&SERVER_POOL);
+                node.set_limits(quic_lite::NodeLimits::host()).unwrap();
+                node.set_default_association_limits(quic_lite::AssociationLimits::host())
+                    .unwrap();
+                node.add_bearer(bearer).unwrap();
+                let (server, driver) = quic_lite::tokio::TokioNodeDriver::new(
+                    node,
+                    quic_lite::AssociationLimits::host().connection,
+                );
+                let registry = Arc::new(dmesh_server::registry::Registry::new());
+                assert!(registry.register_stream(
+                    dmesh_server::registry::methods::PROBE_HANDLER,
+                    dmesh_server::probe::ProbeHandler,
+                ));
+                let serve = async {
+                    let mut stream =
+                        tokio::time::timeout(Duration::from_secs(5), server.accept_stream())
+                            .await
+                            .expect("probe stream accepted")
+                            .expect("stream");
+                    dmesh_server::stream_service::RegistryStreamHandler::new(registry)
+                        .serve(&mut stream)
+                        .await
+                        .unwrap();
+                };
+                tokio::select! {
+                    result = driver.run() => panic!("server driver stopped: {result:?}"),
+                    () = serve => {},
+                }
+            });
+        });
+
+        let client_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let bearers =
+            BearerRuntime::spawn_with_udp(runtime.handle().clone(), Arc::new(NoEgress), Some(client_socket));
+        let destination = dmesh_server::probe::ProbeDestination::parse(&format!(
+            "udp://{server_address}"
+        ))
+        .unwrap();
+        let request = dmesh_server::probe::ProbeServiceRequest::new(100_000, 1000);
+        let result = runtime
+            .block_on(bearers.probe(&destination, request, Duration::from_secs(10)))
+            .expect("Android probe");
+        server.join().unwrap();
+        assert_eq!(result.bytes, 100_000);
+        assert!(result.elapsed_us > 0);
+        // An unsupported destination is refused, not guessed.
+        let mesh = dmesh_server::probe::ProbeDestination::parse("mesh://fc00::1").unwrap();
+        assert!(runtime
+            .block_on(bearers.probe(&mesh, request, Duration::from_secs(1)))
+            .is_err());
+    }
+}
+
+/// `probe.start` on Android: run the probe with this node as the client, over
+/// its UDP, USB or BLE bearer, and answer with the outcome header.
+#[derive(Clone, Copy)]
+pub struct ProbeStartHandler;
+
+impl dmesh_server::registry::Handler for ProbeStartHandler {
+    fn call<'a>(
+        &'a self,
+        call: dmesh_server::registry::Call<'a>,
+    ) -> dmesh_server::registry::Reply<'a> {
+        Box::pin(async move {
+            let (id, request) = dmesh_server::probe::decode_probe_start_record(call.record)?;
+            let requested = request.peer?;
+            // A `mesh://` or bare node identifier is looked up in the discovery
+            // inventory (multicast and NAN announces) and probed over UDP.
+            let peer = if requested.scheme() == "mesh" {
+                match crate::mesh_jni::discovered_udp_endpoint(requested.target())
+                    .and_then(|address| {
+                        dmesh_server::probe::ProbeDestination::parse(&format!("udp://{address}"))
+                            .ok_or_else(|| "resolved endpoint is not a probe destination".to_owned())
+                    }) {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        log::warn!("Android probe lookup of {} failed: {error}", requested.as_str());
+                        let mut response = vec![0u8; 256];
+                        let used = dmesh_server::probe::encode_probe_result_response(
+                            id, request, false, 0, 0, &mut response,
+                        )?;
+                        response.truncate(used);
+                        return Some(response);
+                    }
+                }
+            } else {
+                requested
+            };
+            let runtime = current();
+            let started = Instant::now();
+            let timeout = Duration::from_millis(dmesh_server::probe::probe_timeout_ms(
+                call.context.timeout_ms,
+                request.bytes,
+            ));
+            let outcome = match runtime {
+                Some(runtime) => runtime.probe(&peer, request, timeout).await,
+                None => Err("Android QUIC node is not running".to_owned()),
+            };
+            let (success, received, elapsed) = match outcome {
+                Ok(result) => (true, result.bytes, result.elapsed_us),
+                Err(error) => {
+                    log::warn!("Android probe to {} failed: {error}", peer.as_str());
+                    (
+                        false,
+                        0,
+                        started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+                    )
+                }
+            };
+            let mut response = vec![0u8; 256];
+            let used = dmesh_server::probe::encode_probe_result_response(
+                id, request, success, received, elapsed, &mut response,
+            )?;
+            response.truncate(used);
+            Some(response)
+        })
     }
 }

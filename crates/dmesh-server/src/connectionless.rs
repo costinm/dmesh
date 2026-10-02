@@ -15,6 +15,18 @@ pub enum ConnectionlessKind {
     PairWakeup,
 }
 
+/// Whether `payload` may be invoked as a connectionless message.
+///
+/// A message is a handler call delivered as one packet with no association
+/// (see "Delivery forms of one handler" in ssh-mesh `PROTOCOLS.md`). It has
+/// no registration of its own: this allow-list is the ingress policy that
+/// admits some registered methods without an authenticated association, and
+/// the call is then dispatched through the registry with
+/// `Delivery::Message`.
+pub fn allowed(payload: &[u8]) -> bool {
+    classify(payload).is_some() || crate::announce::discovery_request_id(payload).is_some()
+}
+
 /// Classify one tagged-CBOR payload against the connectionless allowlist.
 pub fn classify(payload: &[u8]) -> Option<ConnectionlessKind> {
     let record = decode(payload)?;

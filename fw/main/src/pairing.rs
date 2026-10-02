@@ -6,8 +6,9 @@ use dmesh_server::{provision, tagged::{self, Name, Record}};
 use dmesh_fw_transport::shared_ingress_esp::{self, IngressKind};
 
 pub fn register() {
-    assert!(dmesh_server::services::register_tagged_component(
-        provision::COMPONENT, handle,
+    assert!(dmesh_server::registry::register(
+        dmesh_server::registry::methods::PROVISION_INSTALL,
+        dmesh_server::registry::SyncFn(handle),
     ));
 }
 

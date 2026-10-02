@@ -9,7 +9,6 @@ use dmesh_server::main_runtime_state::RadioLifecycle;
 use dmesh_server::transport_state::TransportStateObserver;
 use dmesh_server::{
     cbor::{Decoder, Encoder},
-    services,
     tagged::{self, Name, Record},
 };
 use quic_lite::PeerL2Address;
@@ -92,9 +91,18 @@ static BLE_EGRESS_BLOCKED_PENDING: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
 pub fn register() {
-    assert!(services::register_tagged_component(
-        BLE_COMPONENT,
-        handle_ble
+    use dmesh_server::registry::{self, SyncFn, methods};
+    assert!(registry::register_all(
+        &[
+            methods::BLE_START,
+            methods::BLE_STOP,
+            methods::BLE_SCAN,
+            methods::BLE_STATUS,
+            methods::BLE_SCAN_STOP,
+            methods::BLE_CONNECT,
+            methods::BLE_COC_SEND,
+        ],
+        SyncFn(handle_ble),
     ));
     assert!(
         dmesh_server::transport_state::register_transport_state_observer(&BLE_TRANSPORT_OBSERVER)

@@ -1,13 +1,14 @@
 use std::{
-    future::Future,
     path::PathBuf,
-    pin::Pin,
     sync::{Arc, LazyLock},
     time::Instant,
 };
 
 use crate::mesh_core::{LmeshService, LocalDiscovery};
 use anyhow::{Context, Result};
+use dmesh_server::registry::{
+    Call, CallContext, Handler, LocalOnly, Method, Registry, Reply, methods,
+};
 use tokio::time::{Duration, sleep};
 use tracing::{debug, error, warn};
 
@@ -109,9 +110,7 @@ async fn run_server(
     // a closed QUIC stream receiver. In particular, if the driver exits or
     // panics, let mesh-init restart the whole service (and its radio/bearers)
     // instead of spinning in the accept loop and logging BrokenPipe forever.
-    let mut quic_driver = tokio::task::spawn_local(async move {
-        driver.run().await
-    });
+    let mut quic_driver = tokio::task::spawn_local(async move { driver.run().await });
     let mut discovery = LocalDiscovery::new(None).await?;
     // The shared LAN label is local configuration only. The wire announce
     // carries the resulting IPv6 address and this service's distinct UDP
@@ -169,14 +168,15 @@ async fn run_server(
             }
         }
     });
-    let udp_handler = Arc::new(dmesh_server::stream_service::RecordStreamHandler::new(
-        LmeshRecordHandler {
-            handler: LmeshCborHandler {
-                service: service.clone(),
-            },
-        },
-        64 * 1024,
-    ));
+    // One registry serves both the QUIC streams and the control socket.
+    let cbor_handler = LmeshCborHandler::new(service.clone());
+    // QUIC streams are served from the registry as handler streams (header,
+    // then an optional raw body). A text-named common ssh-mesh method is
+    // numbered at the edge, before dispatch.
+    let udp_handler = Arc::new(
+        dmesh_server::stream_service::RegistryStreamHandler::new(cbor_handler.registry.clone())
+            .with_header_rewrite(number_common_names_in_header),
+    );
     tokio::task::spawn_local(async move {
         loop {
             if let Err(error) =
@@ -296,9 +296,9 @@ async fn run_server(
             }
             result = listener.accept() => result.context("lmesh CBOR accept")?,
         };
-        let service = service.clone();
+        let handler = cbor_handler.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_seqpacket_connection(stream, service).await {
+            if let Err(error) = handle_seqpacket_connection(stream, handler).await {
                 error!(%error, "lmesh_cbor_connection_error");
             }
         });
@@ -346,9 +346,8 @@ fn resolve_relative_path(path: PathBuf) -> Result<PathBuf> {
 
 async fn handle_seqpacket_connection(
     stream: mesh::seqpacket::UnixSeqpacket,
-    service: Arc<LmeshService>,
+    handler: LmeshCborHandler,
 ) -> Result<()> {
-    let handler = LmeshCborHandler { service };
     while let Some((record, fds)) = stream.recv_cbor_record().await? {
         anyhow::ensure!(
             fds.is_empty(),
@@ -373,75 +372,273 @@ async fn handle_seqpacket_connection(
     Ok(())
 }
 
+#[derive(Clone)]
 struct LmeshCborHandler {
     service: Arc<LmeshService>,
+    registry: Arc<Registry>,
 }
 
-struct LmeshRecordHandler {
-    handler: LmeshCborHandler,
+impl LmeshCborHandler {
+    fn new(service: Arc<LmeshService>) -> Self {
+        Self {
+            registry: linux_registry(service.clone()),
+            service,
+        }
+    }
+
+    /// Dispatch one request through the registry, by number. `context` says
+    /// whether the caller is the local control socket or a network peer.
+    async fn dispatch_numbered(&self, request: &[u8], context: CallContext) -> Option<Vec<u8>> {
+        self.registry.dispatch(request, true, context).await
+    }
 }
 
-impl dmesh_server::stream_service::RecordHandler for LmeshRecordHandler {
-    fn handle<'a>(
-        &'a self,
-        request: Vec<u8>,
-    ) -> Pin<Box<dyn Future<Output = std::io::Result<Vec<u8>>> + 'a>> {
+/// Edge translation for a gateway that addresses a common ssh-mesh method by
+/// text name (for example `mesh mesh-init`-style `mesh.initialize`): rewrite it
+/// to its number, so only the numeric registry dispatches.
+fn number_common_names(mut record: mesh::tagged::TaggedRecord) -> mesh::tagged::TaggedRecord {
+    use mesh::tagged::NameOrTag;
+    let (NameOrTag::Name(_) | NameOrTag::Tag(_), NameOrTag::Name(_)) =
+        (&record.component, &record.method)
+    else {
+        return record;
+    };
+    let name = match (&record.component, &record.method) {
+        (NameOrTag::Name(component), NameOrTag::Name(method)) if !component.is_empty() => {
+            format!("{component}.{method}")
+        }
+        (_, NameOrTag::Name(method)) => method.clone(),
+        _ => return record,
+    };
+    if let Some((component, method)) = mesh::registry::common_method_identity(&name) {
+        record.component = NameOrTag::Tag(component as u32);
+        record.method = NameOrTag::Tag(method as u32);
+    }
+    record
+}
+
+/// [`number_common_names`] for a raw header: `None` when it needs no change.
+fn number_common_names_in_header(header: &[u8]) -> Option<Vec<u8>> {
+    let record = mesh::cbor::decode_record(header).ok()?;
+    let numbered = number_common_names(record.clone());
+    (numbered.component != record.component || numbered.method != record.method)
+        .then(|| mesh::cbor::encode_record(&numbered).ok())
+        .flatten()
+}
+
+/// Host methods answered directly by [`host_component_response`].
+const HOST_METHODS: &[Method] = &[
+    methods::STATUS,
+    methods::SERVICES,
+    methods::METRICS,
+    methods::EVENTS,
+    methods::LOG_WATCH,
+    methods::SETTINGS_GET,
+    methods::SETTINGS_SET,
+    methods::SETTINGS_LIST,
+    methods::RADIO_TX,
+    methods::RADIO_CONTROL,
+    methods::RADIO_SNAPSHOT,
+    methods::RADIO_RESET_COUNTERS,
+    methods::NAN_PAIR_WAKEUP,
+    methods::RUNTIME_SNAPSHOT,
+    methods::FIRMWARE_IDENTITY,
+];
+
+const fn lmesh(
+    component: u64,
+    component_name: &'static str,
+    method: u64,
+    name: &'static str,
+) -> Method {
+    Method::new(component, component_name, method, name)
+}
+
+/// Methods answered by the lmesh request adapter ([`decode_lmesh_tagged_request`]
+/// and `LmeshService::handle_request`): the common methods Linux implements
+/// plus the Linux-only and development methods.
+const REQUEST_METHODS: &[Method] = &[
+    methods::TRANSPORT_SET,
+    methods::DISCOVERY_NODES,
+    methods::DISCOVERY_ACTIVE,
+    methods::NAN_WAKEUP,
+    methods::TELEMETRY_NAN_STATUS,
+    methods::TELEMETRY_NOW_METRICS,
+    methods::TELEMETRY_NAN_METRICS,
+    methods::TELEMETRY_UDP6_METRICS,
+    methods::TELEMETRY_WIFI_LINK_METRICS,
+    methods::TELEMETRY_QUIC_METRICS,
+    methods::WIFI_SCAN,
+    lmesh(209, "companion", 1, "pair"),
+    lmesh(209, "companion", 2, "unpair"),
+    lmesh(4, "lmesh", 8, "send"),
+    lmesh(4, "lmesh", 10, "messages.history"),
+    lmesh(221, "link", 30, "steer"),
+    lmesh(224, "object", 30, "nan.dry_run"),
+    lmesh(5, "wifi", 13, "mgmt.capture"),
+    lmesh(5, "wifi", 30, "interface.list"),
+    lmesh(5, "wifi", 31, "interface.up"),
+    lmesh(5, "wifi", 32, "interface.channel"),
+    lmesh(5, "wifi", 33, "ocb.start"),
+    lmesh(5, "wifi", 34, "rate.profile"),
+    lmesh(5, "wifi", 35, "data.listen"),
+    lmesh(5, "wifi", 36, "data.send"),
+    lmesh(5, "wifi", 37, "ap.start_open"),
+    lmesh(5, "wifi", 38, "ap.stop"),
+    lmesh(5, "wifi", 39, "ap.station.add"),
+    lmesh(5, "wifi", 40, "sta.join_open"),
+    lmesh(5, "wifi", 41, "sta.configure_ipv4"),
+];
+
+/// How a registered Linux method is executed.
+#[derive(Clone, Copy)]
+enum Executor {
+    Host,
+    Request,
+}
+
+/// A registered Linux handler: decode the tagged request, run it against the
+/// service, and answer with a correlated tagged record. A handler that
+/// returns `None` leaves the dispatcher to answer the shared numeric error.
+#[derive(Clone)]
+struct LinuxHandler {
+    service: Arc<LmeshService>,
+    executor: Executor,
+}
+
+impl Handler for LinuxHandler {
+    fn call<'a>(&'a self, call: Call<'a>) -> Reply<'a> {
         Box::pin(async move {
-            let record = mesh::cbor::decode_record(&request).map_err(std::io::Error::other)?;
-            // A constrained QUIC peer may only read numeric-tagged envelopes.
-            // Anything outside the reviewed catalog receives the shared
-            // numeric error instead of a host-shaped response it cannot
-            // decode.
-            if numeric_stream_fallback(&record) {
-                return dmesh_server::services::dispatch_tagged_stream(&request).ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Unsupported,
-                        "diagnostic handler rejected request",
-                    )
-                });
-            }
-            let response = mesh::wire::TaggedRecordHandler::handle_record(&self.handler, record)
-                .await
-                .map_err(std::io::Error::other)?
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Unsupported,
-                        "lmesh handler declined request",
-                    )
-                })?;
-            mesh::cbor::encode_record(&response).map_err(std::io::Error::other)
+            let record = mesh::cbor::decode_record(call.data).ok()?;
+            let id = record.id.clone()?;
+            let response = match self.executor {
+                Executor::Host => host_component_response(&self.service, &record).await?,
+                Executor::Request => match decode_lmesh_tagged_request(&record) {
+                    Ok(request) => self.service.handle_request(request).await,
+                    Err(error) => {
+                        mesh::protocol::Response::err(format!("invalid request: {error}"))
+                    }
+                },
+            };
+            let response = if response.success {
+                mesh::wire::response_ok(id, response.data.unwrap_or(serde_json::Value::Null))
+            } else {
+                mesh::wire::response_error(
+                    id,
+                    serde_json::json!({
+                        "message": response.error.unwrap_or_else(|| "Unknown error".to_owned()),
+                    }),
+                )
+            };
+            mesh::cbor::encode_record(&response).ok()
         })
     }
 }
 
-/// True when a numeric-tagged request is outside the reviewed catalog, so a
-/// constrained QUIC peer must receive the shared numeric-tagged error
-/// instead of a name-keyed host response.
-fn numeric_stream_fallback(record: &mesh::tagged::TaggedRecord) -> bool {
-    let (mesh::tagged::NameOrTag::Tag(_), mesh::tagged::NameOrTag::Tag(_)) =
-        (&record.component, &record.method)
-    else {
-        return false;
-    };
-    record.to.is_none()
-        && record.id.is_some()
-        && CONTROL_CATALOG.method_name(record).is_none()
+/// The registry for one lmesh service: every method Linux implements, and
+/// nothing else. `battery`, `power.snapshot`, `memory.snapshot` and the BLE
+/// scan/connect methods have no Linux source today and are not registered.
+fn linux_registry(service: Arc<LmeshService>) -> Arc<Registry> {
+    let registry = Registry::new();
+    for (list, executor) in [
+        (HOST_METHODS, Executor::Host),
+        (REQUEST_METHODS, Executor::Request),
+    ] {
+        let registered = registry.register_all(
+            list,
+            LinuxHandler {
+                service: service.clone(),
+                executor,
+            },
+        );
+        assert!(registered, "lmesh method registered twice or table full");
+    }
+    // The probed node's end of a probe: a header, then the payload as the
+    // response body. Any node can be probed by any other.
+    assert!(
+        registry.register_stream(methods::PROBE_HANDLER, dmesh_server::probe::ProbeHandler),
+        "probe.handler registered twice"
+    );
+    // `probe`: run a probe against `peer` with this node as the client. Header
+    // only in both directions; the response header is the outcome.
+    assert!(
+        registry.register(methods::PROBE_START, ProbeStartHandler(service.clone())),
+        "probe registered twice"
+    );
+    register_common_methods(&registry);
+    Arc::new(registry)
 }
 
-/// The diagnostic component belongs to the QUIC connection service rather
-/// than the lmesh radio/application request adapter. Keep its stable numeric
-/// methods recognizable even if a presentation catalog is temporarily stale.
-fn is_connection_diagnostic(record: &mesh::tagged::TaggedRecord) -> bool {
-    matches!(
-        (&record.component, &record.method),
-        (
-            mesh::tagged::NameOrTag::Tag(component),
-            mesh::tagged::NameOrTag::Tag(method)
-        ) if u64::from(*component) == dmesh_server::services::DIAGNOSTIC_COMPONENT
-            && (dmesh_server::services::DIAGNOSTIC_STATUS_METHOD
-                ..=dmesh_server::services::DIAGNOSTIC_LOG_WATCH_METHOD)
-                .contains(&u64::from(*method))
-    )
+/// The common ssh-mesh methods (`mesh.*`, `trace.*`) have reserved numbers
+/// and dispatch by CBOR. The supervisor-private `mesh.lifecycle` and the
+/// mutating `trace.set_level` are local-only.
+fn register_common_methods(registry: &Registry) {
+    for (component, method, name) in mesh::registry::COMMON_METHODS {
+        let (component_name, method_name) = name.split_once('.').unwrap_or(("", name));
+        let handler = CommonHandler;
+        let method = Method::new(*component, component_name, *method, method_name);
+        let registered = if matches!(*name, "mesh.lifecycle" | "trace.set_level") {
+            registry.register(method, LocalOnly(handler))
+        } else {
+            registry.register(method, handler)
+        };
+        assert!(registered, "common method registered twice");
+    }
+}
+
+/// `probe` on Linux: run the exchange with the node named by `peer` and answer
+/// with the outcome header.
+#[derive(Clone)]
+struct ProbeStartHandler(Arc<LmeshService>);
+
+impl Handler for ProbeStartHandler {
+    fn call<'a>(&'a self, call: Call<'a>) -> Reply<'a> {
+        Box::pin(async move {
+            let (id, request) = dmesh_server::probe::decode_probe_start_record(call.record)?;
+            let peer = request.peer?;
+            let mut outbound = request;
+            outbound.peer = None;
+            let started = std::time::Instant::now();
+            let timeout = std::time::Duration::from_millis(dmesh_server::probe::probe_timeout_ms(
+                call.context.timeout_ms,
+                request.bytes,
+            ));
+            let outcome = self
+                .0
+                .probe_exchange(peer.as_str(), outbound, timeout)
+                .await;
+            let (success, received, elapsed) = match outcome {
+                Ok(result) => (true, result.bytes, result.elapsed_us),
+                Err(_) => (
+                    false,
+                    0,
+                    started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+                ),
+            };
+            let mut response = vec![0u8; 256];
+            let used = dmesh_server::probe::encode_probe_result_response(
+                id, request, success, received, elapsed, &mut response,
+            )?;
+            response.truncate(used);
+            Some(response)
+        })
+    }
+}
+
+/// ssh-mesh's common methods, dispatched by number as tagged CBOR.
+#[derive(Clone, Copy)]
+struct CommonHandler;
+
+impl Handler for CommonHandler {
+    fn call<'a>(&'a self, call: Call<'a>) -> Reply<'a> {
+        Box::pin(async move {
+            COMMON_REGISTRY
+                .dispatch_cbor(call.data)
+                .await
+                .ok()
+                .flatten()
+        })
+    }
 }
 
 #[async_trait::async_trait]
@@ -450,33 +647,14 @@ impl mesh::wire::TaggedRecordHandler for LmeshCborHandler {
         &self,
         record: mesh::tagged::TaggedRecord,
     ) -> Result<Option<mesh::tagged::TaggedRecord>> {
-        if let Some(response) = COMMON_REGISTRY.dispatch_tagged(&record).await? {
-            return Ok(Some(response));
-        }
-        let id = record
-            .id
-            .clone()
-            .context("tagged-CBOR request missing id")?;
-        let response = if let Some(response) = host_component_response(&self.service, &record).await
-        {
-            response
-        } else {
-            match decode_lmesh_tagged_request(&record) {
-                Ok(request) => self.service.handle_request(request).await,
-                Err(error) => mesh::protocol::Response::err(format!("invalid request: {error}")),
-            }
-        };
-        let response = if response.success {
-            mesh::wire::response_ok(id, response.data.unwrap_or(serde_json::Value::Null))
-        } else {
-            mesh::wire::response_error(
-                id,
-                serde_json::json!({
-                    "message": response.error.unwrap_or_else(|| "Unknown error".to_owned()),
-                }),
-            )
-        };
-        Ok(Some(response))
+        anyhow::ensure!(record.id.is_some(), "tagged-CBOR request missing id");
+        // The control socket is local ingress.
+        let request = mesh::cbor::encode_record(&number_common_names(record))?;
+        let response = self
+            .dispatch_numbered(&request, CallContext::local())
+            .await
+            .context("lmesh registry did not answer the request")?;
+        Ok(Some(mesh::cbor::decode_record(&response)?))
     }
 
     async fn forward_record(
@@ -504,10 +682,20 @@ impl mesh::wire::TaggedRecordHandler for LmeshCborHandler {
         // forwarded application field.
         record.to = None;
         let wire = raw_wifi_tx_wire(&record, &id)?.unwrap_or(mesh::cbor::encode_record(&record)?);
-        let response = self
-            .service
-            .forward_tagged_record(&destination, &wire)
-            .await;
+        // The caller's `timeout` bounds the whole directed exchange; the
+        // remote gets the same allowance in the record it receives.
+        let response = match record.timeout {
+            Some(timeout) => {
+                self.service
+                    .forward_tagged_record_with_timeout(
+                        &destination,
+                        &wire,
+                        std::time::Duration::from_millis(timeout),
+                    )
+                    .await
+            }
+            None => self.service.forward_tagged_record(&destination, &wire).await,
+        };
         match response {
             Ok(response) if response.id == Some(id.clone()) => Ok(Some(response)),
             Ok(_) => Ok(Some(mesh::wire::response_error(
@@ -569,7 +757,6 @@ fn record_keeps_to_as_local_argument(record: &mesh::tagged::TaggedRecord) -> boo
     matches!(
         decode_lmesh_tagged_request(record),
         Ok(crate::mesh_core::Request::DiscoveryActive { .. }
-            | crate::mesh_core::Request::Probe { .. }
             | crate::mesh_core::Request::NanWakeup { .. })
     )
 }
@@ -589,21 +776,9 @@ async fn host_component_response(
         return None;
     };
     let (component, method) = (u64::from(*component), u64::from(*method));
-    // The reviewed-surface gate: an unnumbered or unknown method never gains
-    // a host handler here and falls through to the JSON request adapter.
-    if CONTROL_CATALOG.method_name(record).is_none() && !is_connection_diagnostic(record) {
-        return None;
-    }
     let fields = CONTROL_CATALOG.to_jsonl(record);
-    let field_u64 = |name: &str| {
-        fields
-            .get(name)
-            .and_then(serde_json::Value::as_u64)
-    };
-    let response = match (
-        component,
-        method,
-    ) {
+    let field_u64 = |name: &str| fields.get(name).and_then(serde_json::Value::as_u64);
+    let response = match (component, method) {
         // Connection diagnostics (status/services/metrics/events/log-watch).
         (
             dmesh_server::services::DIAGNOSTIC_COMPONENT,
@@ -620,33 +795,24 @@ async fn host_component_response(
         (
             dmesh_server::services::DIAGNOSTIC_COMPONENT,
             dmesh_server::services::DIAGNOSTIC_EVENTS_METHOD,
-        ) => service.host_events(
-            field_u64("since"),
-            Some(field_u64("records").unwrap_or(64)),
-        ),
+        ) => service.host_events(field_u64("since"), Some(field_u64("records").unwrap_or(64))),
         (
             dmesh_server::services::DIAGNOSTIC_COMPONENT,
             dmesh_server::services::DIAGNOSTIC_LOG_WATCH_METHOD,
-        ) => service.host_log_watch(
-            field_u64("since"),
-            Some(field_u64("records").unwrap_or(16)),
-        ),
+        ) => service.host_log_watch(field_u64("since"), Some(field_u64("records").unwrap_or(16))),
         // Common control-plane settings, backed by the shared settings store.
-        (
-            dmesh_server::control::CONTROL_COMPONENT,
-            dmesh_server::control::SETTINGS_GET,
-        ) => host_settings_get(fields.get("key").and_then(serde_json::Value::as_str)),
-        (
-            dmesh_server::control::CONTROL_COMPONENT,
-            dmesh_server::control::SETTINGS_SET,
-        ) => host_settings_set(
-            fields.get("key").and_then(serde_json::Value::as_str),
-            fields.get("value").and_then(serde_json::Value::as_str),
-        ),
-        (
-            dmesh_server::control::CONTROL_COMPONENT,
-            dmesh_server::control::SETTINGS_LIST,
-        ) => host_settings_list(),
+        (dmesh_server::control::CONTROL_COMPONENT, dmesh_server::control::SETTINGS_GET) => {
+            host_settings_get(fields.get("key").and_then(serde_json::Value::as_str))
+        }
+        (dmesh_server::control::CONTROL_COMPONENT, dmesh_server::control::SETTINGS_SET) => {
+            host_settings_set(
+                fields.get("key").and_then(serde_json::Value::as_str),
+                fields.get("value").and_then(serde_json::Value::as_str),
+            )
+        }
+        (dmesh_server::control::CONTROL_COMPONENT, dmesh_server::control::SETTINGS_LIST) => {
+            host_settings_list()
+        }
         // Raw-radio laboratory surface.
         (
             dmesh_server::raw_wifi::RAW_WIFI_COMPONENT,
@@ -672,68 +838,15 @@ async fn host_component_response(
             Some(to) => service.host_pair_wakeup(to),
             None => mesh::protocol::Response::err("nan.pair_wakeup requires to"),
         },
-        // Connection policy belongs to a routed QUIC association; the local
-        // control plane reports that it does not apply one here.
-        (
-            dmesh_server::connection::CONNECTION_COMPONENT,
-            dmesh_server::connection::CONNECTION_CONFIGURE,
-        ) => mesh::protocol::Response::err(
-            "connection.configure requires a routed QUIC connection",
-        ),
-        // Optional battery/power snapshot.
-        (
-            dmesh_server::telemetry::TELEMETRY_COMPONENT,
-            dmesh_server::telemetry::BATTERY_METHOD,
-        ) => mesh::protocol::Response::ok_with_data(serde_json::json!({
-            "available": false,
-            "note": "Linux host exposes no battery telemetry integration",
-        })),
-        // Runtime snapshot and lifecycle.
+        // Host runtime and identity.
         (
             dmesh_server::services::RUNTIME_SNAPSHOT_COMPONENT,
             dmesh_server::services::RUNTIME_SNAPSHOT_METHOD,
         ) => host_runtime_snapshot(),
         (
-            dmesh_server::services::RUNTIME_SNAPSHOT_COMPONENT,
-            dmesh_server::services::RUNTIME_RESET_METHOD,
-        ) => mesh::protocol::Response::err(
-            "runtime reset is a device-only operation",
-        ),
-        (dmesh_server::services::POWER_SNAPSHOT_COMPONENT, _) => {
-            host_power_snapshot()
-        }
-        (dmesh_server::services::MEMORY_SNAPSHOT_COMPONENT, _) => {
-            host_memory_snapshot()
-        }
-        // Linux BLE is a startup-selected CoC bearer; the scan/advertising
-        // state machine is a device-side adapter.
-        (
-            dmesh_server::services::BLE_COMPONENT,
-            dmesh_server::services::BLE_STATUS_METHOD,
-        ) => host_ble_status(),
-        (dmesh_server::services::BLE_COMPONENT, _) => mesh::protocol::Response::err(
-            "Linux BLE runs only as the startup-selected LMESH_BLE_COC bearer; \
-             scan/advertising/connect need a device-side adapter",
-        ),
-        // Host firmware/service identity.
-        (
             dmesh_server::services::FIRMWARE_COMPONENT,
             dmesh_server::services::FIRMWARE_IDENTITY_METHOD,
         ) => host_firmware_identity(),
-        // Device-only operations. The host control plane never boots a
-        // module or writes flash; direct callers to a device instead.
-        (dmesh_server::services::BOOT_COMPONENT, _) => mesh::protocol::Response::err(
-            "boot.recovery is a device-only operation",
-        ),
-        (dmesh_server::services::MODULE_COMPONENT, _) => mesh::protocol::Response::err(
-            "module control is a device-only operation",
-        ),
-        (dmesh_server::verified_object::OBJECT_COMPONENT, _) => {
-            mesh::protocol::Response::err(
-                "object.flash runs on the target device; the host only serves \
-                 object bytes for a remote flash",
-            )
-        }
         _ => return None,
     };
     Some(response)
@@ -748,8 +861,7 @@ fn host_services_response() -> mesh::protocol::Response {
 }
 
 /// The host settings file: an explicit path wins over the service home.
-fn host_settings_store(
-) -> Result<dmesh_server::settings::FileSettings, String> {
+fn host_settings_store() -> Result<dmesh_server::settings::FileSettings, String> {
     let path = std::env::var_os("DMESH_SETTINGS_FILE")
         .map(std::path::PathBuf::from)
         .or_else(|| {
@@ -873,9 +985,7 @@ fn raw_wifi_interface(interface: Option<serde_json::Value>) -> Option<String> {
 fn hex_decode_bytes(value: &str) -> Option<Vec<u8>> {
     let value = value.trim().trim_start_matches("hex:");
     (0..value.len() / 2)
-        .map(|index| {
-            u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()
-        })
+        .map(|index| u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok())
         .collect()
 }
 
@@ -889,38 +999,6 @@ fn host_runtime_snapshot() -> mesh::protocol::Response {
         "udp_port": LMESH_DEFAULTS.udp_port,
         "http_port": LMESH_DEFAULTS.http_port,
         "announce_interval_secs": announce_interval().as_secs(),
-    }))
-}
-
-/// A Linux host has no battery/power management telemetry. The response is a
-/// proper correlated result so controllers treat the platform as unavailable
-/// instead of timing out.
-fn host_power_snapshot() -> mesh::protocol::Response {
-    mesh::protocol::Response::ok_with_data(serde_json::json!({
-        "available": false,
-        "battery": {"available": false},
-        "note": "Linux host exposes no power management telemetry",
-    }))
-}
-
-/// Linux cannot observe the firmware heap/packet-pool vocabulary; the
-/// response stays a proper correlated result with that fact explicit.
-fn host_memory_snapshot() -> mesh::protocol::Response {
-    mesh::protocol::Response::ok_with_data(serde_json::json!({
-        "available": false,
-        "note": "Linux host exposes no allocator packet-pool telemetry",
-    }))
-}
-
-/// Linux BLE exists only as the startup-selected CoC bearer.
-fn host_ble_status() -> mesh::protocol::Response {
-    mesh::protocol::Response::ok_with_data(serde_json::json!({
-        "ok": true,
-        "ready": false,
-        "advertising": false,
-        "connected": false,
-        "coc_connected": false,
-        "note": "Linux BLE runs only as the LMESH_BLE_COC bearer selected at startup",
     }))
 }
 
@@ -972,10 +1050,11 @@ fn decode_lmesh_tagged_request(
         "discovery.active" => serde_json::from_value(value),
         "discovery.status" => Ok(crate::mesh_core::Request::DiscoveryStatus),
         "telemetry.nan_status" => Ok(crate::mesh_core::Request::NanStatus),
-        "telemetry.now_metrics" => Ok(crate::mesh_core::Request::NowMetrics),
-        "telemetry.nan_metrics" => Ok(crate::mesh_core::Request::NanMetrics),
-        "telemetry.udp6_metrics" => Ok(crate::mesh_core::Request::Udp6Metrics),
-        "telemetry.wifi_link_metrics" => Ok(crate::mesh_core::Request::WifiLinkMetrics),
+        "telemetry.now" => Ok(crate::mesh_core::Request::NowMetrics),
+        "telemetry.nan" => Ok(crate::mesh_core::Request::NanMetrics),
+        "telemetry.udp6" => Ok(crate::mesh_core::Request::Udp6Metrics),
+        "telemetry.wifi_link" => Ok(crate::mesh_core::Request::WifiLinkMetrics),
+        "telemetry.quic" => Ok(crate::mesh_core::Request::QuicMetrics),
         "wifi.mgmt.capture" => serde_json::from_value::<
             crate::mesh_core::api::WifiMgmtCaptureRequest,
         >(value)
@@ -1005,9 +1084,8 @@ mod tests {
 
     #[test]
     fn quic_driver_error_is_preserved_for_service_supervision() {
-        let error = quic_driver_exit_error(Ok(Err(
-            quic_lite::QuicNodeEgressError::AssociationTimedOut,
-        )));
+        let error =
+            quic_driver_exit_error(Ok(Err(quic_lite::QuicNodeEgressError::AssociationTimedOut)));
         assert!(error.to_string().contains("AssociationTimedOut"));
     }
 
@@ -1040,6 +1118,105 @@ mod tests {
     }
 
     #[test]
+    fn registered_methods_match_the_installed_catalog_numbers_and_names() {
+        let catalog = public_tools_json();
+        let tools = catalog.as_array().unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for method in HOST_METHODS.iter().chain(REQUEST_METHODS) {
+            assert!(
+                seen.insert((method.component, method.method)),
+                "{} is registered twice",
+                method.wire_name()
+            );
+            let tool = tools
+                .iter()
+                .find(|tool| tool["name"] == method.wire_name().as_str())
+                .unwrap_or_else(|| panic!("{} is not in tools.json", method.wire_name()));
+            assert_eq!(
+                tool["x-component-index"],
+                method.component,
+                "{}",
+                method.wire_name()
+            );
+            assert_eq!(
+                tool["x-method-index"],
+                method.method,
+                "{}",
+                method.wire_name()
+            );
+        }
+    }
+
+    #[test]
+    fn text_named_common_methods_are_numbered_at_the_edge() {
+        use mesh::tagged::{NameOrTag, TaggedRecord};
+        let named = TaggedRecord {
+            component: NameOrTag::Name("mesh".to_owned()),
+            method: NameOrTag::Name("initialize".to_owned()),
+            id: Some(serde_json::json!(1)),
+            ..Default::default()
+        };
+        let numbered = number_common_names(named);
+        assert_eq!(numbered.component, NameOrTag::Tag(2000));
+        assert_eq!(numbered.method, NameOrTag::Tag(1));
+
+        let whole_name = TaggedRecord {
+            component: NameOrTag::Name(String::new()),
+            method: NameOrTag::Name("trace.get_level".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(
+            number_common_names(whole_name).component,
+            NameOrTag::Tag(2001)
+        );
+
+        let own = TaggedRecord {
+            component: NameOrTag::Tag(7),
+            method: NameOrTag::Tag(1),
+            ..Default::default()
+        };
+        assert_eq!(number_common_names(own.clone()).component, own.component);
+    }
+
+    #[tokio::test]
+    async fn common_methods_dispatch_by_number_and_private_ones_are_local_only() {
+        let registry = Registry::new();
+        register_common_methods(&registry);
+        let request = |component: u64, method: u64| {
+            mesh::cbor::encode_record(&mesh::tagged::TaggedRecord {
+                component: mesh::tagged::NameOrTag::Tag(component as u32),
+                method: mesh::tagged::NameOrTag::Tag(method as u32),
+                id: Some(serde_json::json!(4)),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        // mesh.initialize is answered for a network caller.
+        let reply = registry
+            .dispatch(&request(2000, 1), true, CallContext::default())
+            .await
+            .unwrap();
+        let reply = mesh::cbor::decode_record(&reply).unwrap();
+        assert_eq!(reply.id, Some(serde_json::json!(4)));
+        assert!(reply.result.is_some());
+        // trace.set_level is declined for a network caller, accepted locally.
+        let network = registry
+            .dispatch(&request(2001, 2), true, CallContext::default())
+            .await
+            .unwrap();
+        assert!(
+            dmesh_server::tagged::decode(&network)
+                .unwrap()
+                .error
+                .is_some()
+        );
+        assert_eq!(
+            registry.methods().len(),
+            mesh::registry::COMMON_METHODS.len()
+        );
+    }
+
+    #[test]
     fn parse_announce_interval_accepts_positive_seconds() {
         assert_eq!(parse_announce_interval_secs("5"), Some(5));
         assert_eq!(parse_announce_interval_secs(" 30 "), Some(30));
@@ -1049,15 +1226,6 @@ mod tests {
     fn parse_announce_interval_rejects_zero_and_invalid_values() {
         assert_eq!(parse_announce_interval_secs("0"), None);
         assert_eq!(parse_announce_interval_secs("nope"), None);
-    }
-
-    #[test]
-    fn http_assets_use_upstream_default_without_override() {
-        let unique = "LMESH_UNSET_HTTP_WEB_DIR_TEST";
-        assert!(std::env::var_os(unique).is_none());
-        if std::env::var_os("MESH_HTTP_WEB_DIR").is_none() {
-            assert!(http_web_root(unique).is_none());
-        }
     }
 
     #[test]
@@ -1109,7 +1277,8 @@ mod tests {
             .iter()
             .filter_map(|tool| tool["name"].as_str())
             .collect::<Vec<_>>();
-        assert!(names.contains(&"probe"));
+        assert!(names.contains(&"probe.start"));
+        assert!(names.contains(&"probe.handler"));
         assert!(names.contains(&"telemetry.nan_status"));
         assert!(names.contains(&"settings.get"));
         assert!(names.contains(&"settings.set"));
@@ -1157,21 +1326,23 @@ mod tests {
             "discovery.nodes",
             "events",
             "log-watch",
-            "memory.snapshot",
+            "log.watch",
             "metrics",
-            "power.snapshot",
-            "probe",
+            "probe.start",
             "radio.snapshot",
-            "runtime.snapshot",
             "services",
             "settings.get",
             "settings.list",
             "status",
-            "telemetry.nan_metrics",
+            "telemetry.bearers",
+            "telemetry.memory",
+            "telemetry.nan",
             "telemetry.nan_status",
-            "telemetry.now_metrics",
-            "telemetry.udp6_metrics",
-            "telemetry.wifi_link_metrics",
+            "telemetry.now",
+            "telemetry.power",
+            "telemetry.runtime",
+            "telemetry.udp6",
+            "telemetry.wifi_link",
             "wifi.scan",
         ]
         .into_iter()
@@ -1181,7 +1352,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|tool| tool["name"] == "probe")
+            .find(|tool| tool["name"] == "probe.start")
             .expect("probe must be catalogued for fleet checks");
         assert_eq!(
             probe["x-check-all"],
@@ -1280,36 +1451,6 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(request, crate::mesh_core::Request::NanMetrics));
-    }
-
-    #[test]
-    fn catalogued_diagnostics_route_to_the_host_adapter() {
-        // Every shared diagnostic method is inside the reviewed catalog, so
-        // the stream adapter serves it through the unified host handler.
-        for method in [
-            dmesh_server::services::DIAGNOSTIC_STATUS_METHOD,
-            dmesh_server::services::DIAGNOSTIC_SERVICES_METHOD,
-            dmesh_server::services::DIAGNOSTIC_METRICS_METHOD,
-            dmesh_server::services::DIAGNOSTIC_EVENTS_METHOD,
-            dmesh_server::services::DIAGNOSTIC_LOG_WATCH_METHOD,
-        ] {
-            assert!(!numeric_stream_fallback(&mesh::tagged::TaggedRecord {
-                component: mesh::tagged::NameOrTag::Tag(
-                    dmesh_server::services::DIAGNOSTIC_COMPONENT as u32,
-                ),
-                method: mesh::tagged::NameOrTag::Tag(method as u32),
-                id: Some(serde_json::json!(7)),
-                ..Default::default()
-            }));
-        }
-        // A numeric request outside the reviewed catalog keeps the shared
-        // numeric error path for constrained QUIC peers.
-        assert!(numeric_stream_fallback(&mesh::tagged::TaggedRecord {
-            component: mesh::tagged::NameOrTag::Tag(7),
-            method: mesh::tagged::NameOrTag::Tag(99),
-            id: Some(serde_json::json!(7)),
-            ..Default::default()
-        }));
     }
 
     #[test]

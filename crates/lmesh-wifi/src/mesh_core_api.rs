@@ -2,36 +2,6 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Run a time-limited QUIC probe through the selected Linux radio path
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct LmeshProbeRequest {
-    /// API field `to`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub to: Option<String>,
-    /// API field `bytes`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bytes: Option<u64>,
-    /// API field `packet_size`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub packet_size: Option<u16>,
-    /// API field `parallel_streams`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parallel_streams: Option<u8>,
-    /// API field `initial_consume_delay_ms`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub initial_consume_delay_ms: Option<u32>,
-    /// API field `consume_delay_ms`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub consume_delay_ms: Option<u32>,
-    /// API field `timeout_ms`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout_ms: Option<u64>,
-}
-
-/// Run a time-limited QUIC probe through the selected Linux radio path
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct LmeshProbeResponse;
-
 /// Send a payload through the selected mesh radio
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct LmeshSendRequest {

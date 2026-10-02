@@ -264,11 +264,9 @@ is not a no-regression result.
 ## Control schema
 
 The canonical CBOR decoders are `dmesh-server::control` for settings/physical
-transport lifecycle and `dmesh-server::connection` for bearer-neutral
-QUIC-lite association policy. Firmware calls `apply_control_record` only as an adapter from an ingress record to the shared
-typed request. `transport.*` starts, stops, or configures a physical bearer;
-`connection.configure` updates QUIC-lite association defaults without starting
-or selecting a radio. Applying a control request itself does not reboot, flash,
+transport lifecycle. Firmware calls `apply_control_record` only as an adapter from an ingress record to the shared
+typed request. `transport.*` starts, stops, or configures a physical bearer.
+Applying a control request itself does not reboot, flash,
 open a connection, or mutate RTC.
 
 Direct CBOR records and QUIC-lite stream requests must reach the same handler

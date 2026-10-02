@@ -4,7 +4,6 @@
 //! and has no ESP-IDF, FreeRTOS, NVS, socket, or bearer dependency. Firmware
 //! supplies persistence and applies the resulting profile to its radio.
 
-use crate::connection::ConnectionPolicy;
 use crate::{
     cbor::Encoder,
     control::{self, TransportConfig, TransportKind},
@@ -245,26 +244,6 @@ pub fn apply_transport_config(config: TransportConfig, profile: &mut TransportPr
 pub fn clear_sta_passphrase(profile: &mut TransportProfile) {
     profile.sta_passphrase.fill(0);
     profile.sta_passphrase_len = 0;
-}
-
-/// Apply bearer-neutral QUIC-lite association policy.  The profile is merely
-/// an ESP adapter cache; the request schema itself has no bearer dependency.
-pub fn apply_connection_policy(policy: ConnectionPolicy, profile: &mut TransportProfile) {
-    if let Some(value) = policy.tx_burst_packets {
-        profile.tx_burst_packets = value;
-    }
-    if let Some(value) = policy.ack_frequency {
-        profile.ack_frequency = value;
-    }
-    if let Some(value) = policy.ack_delay_ms {
-        profile.ack_delay_ms = value;
-    }
-    if let Some(value) = policy.path_policy {
-        profile.path_policy = value;
-    }
-    if let Some(value) = policy.timeout_ms {
-        profile.timeout_ms = value;
-    }
 }
 
 /// Validate the bounded, transient STA SSID carried by `transport.start`.

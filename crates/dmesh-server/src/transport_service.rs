@@ -13,6 +13,11 @@ pub trait TransportBackend: Send + Sync {
     async fn set(&self, params: Value) -> anyhow::Result<Value>;
 }
 
+/// The methods this service implements, with their numbers and names.
+pub fn methods() -> Vec<crate::registry::Method> {
+    crate::registry_bridge::methods_from_tools(&tools_json())
+}
+
 pub fn tools_json() -> Value {
     let catalog: Value = serde_json::from_str(include_str!("../../lmesh/resources/tools.json"))
         .expect("lmesh tools catalog must be valid JSON");

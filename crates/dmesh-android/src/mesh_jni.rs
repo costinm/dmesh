@@ -332,7 +332,7 @@ pub(crate) fn android_battery_response(request: &[u8]) -> Option<Vec<u8>> {
 }
 
 pub(crate) fn android_telemetry_response(request: &[u8]) -> Option<Vec<u8>> {
-    use dmesh_server::telemetry::{self, Metric, NanStatus};
+    use dmesh_server::telemetry::{self, NanStatus};
 
     let record = dmesh_server::tagged::decode(request)?;
     let (method, id) = telemetry::decode_request_record(record)?;
@@ -351,15 +351,6 @@ pub(crate) fn android_telemetry_response(request: &[u8]) -> Option<Vec<u8>> {
                 &mut result,
             )?
         }
-        telemetry::NOW_METRICS_METHOD
-        | telemetry::NAN_METRICS_METHOD
-        | telemetry::UDP6_METRICS_METHOD
-        | telemetry::WIFI_LINK_METRICS_METHOD => {
-            // Android's framework callbacks do not expose the firmware's
-            // scalar counter contract. History retains available events;
-            // an empty metric map means these counters are unavailable.
-            telemetry::encode_metrics(&[] as &[Metric], &mut result)?
-        }
         _ => return None,
     };
     let mut response = [0u8; 160];
@@ -371,6 +362,31 @@ pub(crate) fn android_telemetry_response(request: &[u8]) -> Option<Vec<u8>> {
         &mut response,
     )?;
     Some(response[..size].to_vec())
+}
+
+#[cfg(target_os = "android")]
+fn android_quic_metrics_handler<'a>(
+    call: dmesh_server::registry::Call<'a>,
+) -> dmesh_server::registry::Reply<'a> {
+    Box::pin(async move {
+        let record = dmesh_server::tagged::decode(call.data)?;
+        let (method, id) = dmesh_server::telemetry::decode_request_record(record)?;
+        if method != dmesh_server::telemetry::QUIC_METRICS_METHOD {
+            return None;
+        }
+        let telemetry = crate::bearer::current()?.telemetry().await?;
+        let mut result = [0u8; dmesh_server::telemetry::TELEMETRY_RESPONSE_MAX_BYTES];
+        let used = dmesh_server::telemetry::encode_quic_metrics(telemetry, &mut result)?;
+        let mut response = [0u8; 640];
+        let size = dmesh_server::tagged::encode_numeric_response(
+            dmesh_server::telemetry::TELEMETRY_COMPONENT,
+            method,
+            id,
+            &result[..used],
+            &mut response,
+        )?;
+        Some(response[..size].to_vec())
+    })
 }
 
 /// Android QUIC-stream uptime. The mesh owner records its start so shared
@@ -430,13 +446,8 @@ fn android_numeric_error(request: &[u8], message: &[u8]) -> Option<Vec<u8>> {
     };
     let id = record.id?;
     let mut response = [0u8; 160];
-    let size = dmesh_server::tagged::encode_numeric_error(
-        component,
-        method,
-        id,
-        message,
-        &mut response,
-    )?;
+    let size =
+        dmesh_server::tagged::encode_numeric_error(component, method, id, message, &mut response)?;
     Some(response[..size].to_vec())
 }
 
@@ -497,45 +508,10 @@ pub(crate) fn android_services_response(request: &[u8]) -> Option<Vec<u8>> {
     Some(response[..size].to_vec())
 }
 
-/// Shared component-9 `metrics`: Android's framework callbacks retain
-/// history rather than the firmware scalar contract, so the shared metric
-/// map stays empty and history remains the authoritative observation source.
-#[cfg(target_os = "android")]
-pub(crate) fn android_diag_metrics_response(request: &[u8]) -> Option<Vec<u8>> {
-    use dmesh_server::telemetry::{self, Metric};
-
-    let record = dmesh_server::tagged::decode(request)?;
-    let dmesh_server::tagged::Name::Tag(component) = record.component? else {
-        return None;
-    };
-    let dmesh_server::tagged::Name::Tag(method) = record.method? else {
-        return None;
-    };
-    if u64::from(component) != dmesh_server::services::DIAGNOSTIC_COMPONENT
-        || u64::from(method) != dmesh_server::services::DIAGNOSTIC_METRICS_METHOD
-    {
-        return None;
-    }
-    let mut result = [0u8; 128];
-    let used = telemetry::encode_metrics(&[] as &[Metric], &mut result)?;
-    let mut response = [0u8; 160];
-    let size = dmesh_server::tagged::encode_numeric_response(
-        dmesh_server::services::DIAGNOSTIC_COMPONENT,
-        method,
-        record.id?,
-        &result[..used],
-        &mut response,
-    )?;
-    Some(response[..size].to_vec())
-}
-
 /// Shared component-9 `events` and `log-watch`, projected from the retained
 /// Android observation history.
 #[cfg(target_os = "android")]
-pub(crate) fn android_diag_events_response(
-    request: &[u8],
-    log_watch: bool,
-) -> Option<Vec<u8>> {
+pub(crate) fn android_diag_events_response(request: &[u8], log_watch: bool) -> Option<Vec<u8>> {
     let record = dmesh_server::tagged::decode(request)?;
     let dmesh_server::tagged::Name::Tag(component) = record.component? else {
         return None;
@@ -555,11 +531,7 @@ pub(crate) fn android_diag_events_response(
     }
     let fields = dmesh_server::services::decode_diagnostic_fields(record.fields)?;
     let (since, records) = fields;
-    let history = android_radio_history(
-        records,
-        since,
-        None,
-    );
+    let history = android_radio_history(records, since, None);
     if !log_watch {
         return android_json_response(
             request,
@@ -614,9 +586,9 @@ pub(crate) fn android_identity_response(request: &[u8]) -> Option<Vec<u8>> {
     )
 }
 
-/// Shared runtime/power/memory snapshots. Android reports its retained
-/// battery observation through the shared power state; allocator and
-/// packet-pool facts remain device-side.
+/// Shared runtime and power snapshots. Android reports its retained battery
+/// observation through the shared power state; it has no allocator or
+/// packet-pool telemetry, so `memory.snapshot` is not registered.
 #[cfg(target_os = "android")]
 pub(crate) fn android_snapshot_response(request: &[u8], component: u64) -> Option<Vec<u8>> {
     let result = match component {
@@ -631,10 +603,6 @@ pub(crate) fn android_snapshot_response(request: &[u8], component: u64) -> Optio
                 "battery": dmesh_server::power::battery_json_status(state),
             })
         }
-        dmesh_server::services::MEMORY_SNAPSHOT_COMPONENT => serde_json::json!({
-            "available": false,
-            "note": "Android exposes no allocator packet-pool telemetry",
-        }),
         _ => return None,
     };
     android_json_response(request, component, 1, &result)
@@ -673,14 +641,10 @@ pub(crate) fn android_ble_component_response(request: &[u8]) -> Option<Vec<u8>> 
         None
     };
     let value: anyhow::Result<Value> = match method {
-        dmesh_server::services::BLE_SCAN_METHOD => {
-            android_ble_command("ble.scan", &json!({}))
-                .context("Android BLE callback is unavailable")
-        }
-        dmesh_server::services::BLE_STATUS_METHOD => {
-            android_ble_command("ble.status", &json!({}))
-                .context("Android BLE callback is unavailable")
-        }
+        dmesh_server::services::BLE_SCAN_METHOD => android_ble_command("ble.scan", &json!({}))
+            .context("Android BLE callback is unavailable"),
+        dmesh_server::services::BLE_STATUS_METHOD => android_ble_command("ble.status", &json!({}))
+            .context("Android BLE callback is unavailable"),
         dmesh_server::services::BLE_SCAN_STOP_METHOD => {
             android_ble_command("ble.scan_stop", &json!({}))
                 .context("Android BLE callback is unavailable")
@@ -702,11 +666,6 @@ pub(crate) fn android_ble_component_response(request: &[u8]) -> Option<Vec<u8>> 
                 .context("Android BLE callback is unavailable")
             }
         }
-        dmesh_server::services::BLE_START_METHOD
-        | dmesh_server::services::BLE_STOP_METHOD
-        | dmesh_server::services::BLE_COC_SEND_METHOD => Err(anyhow::anyhow!(
-            "BLE start/stop/coc.send are device-side operations"
-        )),
         _ => return None,
     };
     android_json_response(
@@ -718,31 +677,6 @@ pub(crate) fn android_ble_component_response(request: &[u8]) -> Option<Vec<u8>> 
             Err(error) => return android_numeric_error(request, error.to_string().as_bytes()),
         },
     )
-}
-
-/// Device-only lifecycle operations on the Android host role.
-#[cfg(target_os = "android")]
-pub(crate) fn android_device_only_response(request: &[u8]) -> Option<Vec<u8>> {
-    let record = dmesh_server::tagged::decode(request)?;
-    let dmesh_server::tagged::Name::Tag(component) = record.component? else {
-        return None;
-    };
-    match u64::from(component) {
-        dmesh_server::services::BOOT_COMPONENT => {
-            android_numeric_error(request, b"boot.recovery is a device-only operation")
-        }
-        dmesh_server::services::MODULE_COMPONENT => {
-            android_numeric_error(request, b"module control is a device-only operation")
-        }
-        dmesh_server::verified_object::OBJECT_COMPONENT => android_numeric_error(
-            request,
-            b"object.flash runs on the target device",
-        ),
-        dmesh_server::services::RUNTIME_SNAPSHOT_COMPONENT => {
-            android_numeric_error(request, b"runtime reset is a device-only operation")
-        }
-        _ => None,
-    }
 }
 
 fn update_local_networks(payload: &[u8]) -> anyhow::Result<usize> {
@@ -859,7 +793,13 @@ pub(crate) fn android_discovery_active_response(request: &[u8]) -> Option<Vec<u8
     {
         return None;
     }
-    schedule_android_discovery_active()?;
+    // One pass on every bearer: the UDP multicast announce and request here,
+    // and the framework NAN/BLE scans through the Java owner.
+    let multicast = crate::mesh_common::solicit_discovery();
+    let framework = schedule_android_discovery_active().is_some();
+    if !multicast && !framework {
+        return None;
+    }
     let mut response = [0u8; 32];
     let used = dmesh_server::tagged::encode_numeric_response(
         dmesh_server::announce::ANNOUNCE_COMPONENT,
@@ -975,20 +915,154 @@ impl dmesh_server::ble_service::BleBackend for AndroidBleBackend {
     }
 }
 
+/// Register a platform service's methods in the one registry as local-only
+/// (the device's own control surface, never a network peer), and route its
+/// HTTP gateway name to the registry so the gateway reaches it the same way.
+#[cfg(target_os = "android")]
+fn register_local_service(
+    services: &ssh_mesh::mesh_rest::MeshServiceRegistry,
+    name: &str,
+    methods: Vec<dmesh_server::registry::Method>,
+    handler: impl mesh::wire::TaggedRecordHandler + 'static,
+) -> bool {
+    use dmesh_server::registry::{LocalOnly, register_all};
+    use dmesh_server::registry_bridge::RecordHandlerAdapter;
+    let registered = register_all(&methods, LocalOnly(RecordHandlerAdapter(Arc::new(handler))));
+    if !registered {
+        // A restart in the same process re-registers the same methods.
+        log::debug!("Android {name} methods were already registered");
+    }
+    register_gateway_route(services, name);
+    true
+}
+
+/// Route one HTTP gateway service name to the registry as local ingress.
+#[cfg(target_os = "android")]
+fn register_gateway_route(services: &ssh_mesh::mesh_rest::MeshServiceRegistry, name: &str) {
+    use dmesh_server::registry_bridge::RegistryRecordHandler;
+    services.register(
+        name,
+        ssh_mesh::mesh_rest::MeshService {
+            backend: ssh_mesh::mesh_rest::MeshServiceBackend::Direct(Arc::new(
+                RegistryRecordHandler::global(),
+            )),
+            encoding: ssh_mesh::mesh_rest::MeshServiceEncoding::TaggedCbor,
+            component: name.to_owned(),
+        },
+    );
+}
+
+/// Register the numbered methods Android implements for network peers. Only
+/// real implementations are registered: Android has no allocator telemetry,
+/// per-bearer metrics, device-side BLE start/stop/CoC send, or flash/boot
+/// control, so those methods are absent and answer the shared numeric error.
+#[cfg(target_os = "android")]
+pub(crate) fn register_android_methods() {
+    use dmesh_server::platform_api::{RadioHistoryRequest, StatusTextRequest};
+    use dmesh_server::registry::{
+        AsyncFn, CallContext, LocalOnly, Method, SyncBytesFn, methods, register, register_all,
+    };
+    use dmesh_server::registry_bridge::TypedHandler;
+    let registered = register(
+        methods::DISCOVERY_ACTIVE,
+        SyncBytesFn(android_discovery_active_response),
+    ) & register(
+        methods::NAN_WAKEUP,
+        SyncBytesFn(android_nan_wakeup_response),
+    ) & register(
+        methods::DISCOVERY_NODES,
+        SyncBytesFn(android_discovery_nodes_response),
+    ) & register(
+        methods::TELEMETRY_BATTERY,
+        SyncBytesFn(android_battery_response),
+    ) & register(
+        methods::TELEMETRY_NAN_STATUS,
+        SyncBytesFn(android_telemetry_response),
+    ) & register(
+        methods::TELEMETRY_QUIC_METRICS,
+        AsyncFn::new(android_quic_metrics_handler),
+    ) & register(methods::STATUS, SyncBytesFn(android_diag_status_response))
+        & register(methods::SERVICES, SyncBytesFn(android_services_response))
+        & register(
+            methods::EVENTS,
+            SyncBytesFn(|request| android_diag_events_response(request, false)),
+        )
+        & register(
+            methods::LOG_WATCH,
+            SyncBytesFn(|request| android_diag_events_response(request, true)),
+        )
+        & register_all(
+            &[
+                methods::BLE_SCAN,
+                methods::BLE_STATUS,
+                methods::BLE_SCAN_STOP,
+                methods::BLE_CONNECT,
+            ],
+            SyncBytesFn(android_ble_component_response),
+        )
+        & register(
+            Method::new(203, "status", 1, "text"),
+            LocalOnly(TypedHandler::new(
+                |_: StatusTextRequest, _: CallContext| async { Ok(status_text_response()) },
+            )),
+        )
+        & register(
+            Method::new(202, "radio", 1, "history"),
+            LocalOnly(TypedHandler::new(
+                |request: RadioHistoryRequest, _: CallContext| async move {
+                    radio_history_response(request)
+                },
+            )),
+        )
+        // Probing: this node can start a probe (as the client over its UDP, USB
+        // or BLE bearer) and can be probed (`probe.handler`), so any node can
+        // probe any other.
+        & register_all(
+            &[
+                methods::SETTINGS_GET,
+                methods::SETTINGS_SET,
+                methods::SETTINGS_LIST,
+            ],
+            SyncBytesFn(android_settings_response),
+        )
+        & register(methods::PROBE_START, crate::bearer::ProbeStartHandler)
+        & dmesh_server::registry::register_stream(
+            methods::PROBE_HANDLER,
+            dmesh_server::probe::ProbeHandler,
+        )
+        & register(
+            methods::FIRMWARE_IDENTITY,
+            SyncBytesFn(android_identity_response),
+        )
+        & register(
+            methods::RUNTIME_SNAPSHOT,
+            SyncBytesFn(|request| {
+                android_snapshot_response(
+                    request,
+                    dmesh_server::services::RUNTIME_SNAPSHOT_COMPONENT,
+                )
+            }),
+        )
+        & register(
+            methods::POWER_SNAPSHOT,
+            SyncBytesFn(|request| {
+                android_snapshot_response(request, dmesh_server::services::POWER_SNAPSHOT_COMPONENT)
+            }),
+        );
+    if !registered {
+        log::debug!("Android numbered methods were already registered");
+    }
+}
+
 #[cfg(target_os = "android")]
 pub(crate) fn register_ble_service(services: &ssh_mesh::mesh_rest::MeshServiceRegistry) -> bool {
     match dmesh_server::ble_service::BleService::new(Arc::new(AndroidBleBackend)) {
-        Ok(handler) => {
-            services.register(
-                dmesh_server::ble_service::SERVICE_NAME,
-                ssh_mesh::mesh_rest::MeshService {
-                    backend: ssh_mesh::mesh_rest::MeshServiceBackend::Direct(Arc::new(handler)),
-                    encoding: ssh_mesh::mesh_rest::MeshServiceEncoding::TaggedCbor,
-                    component: dmesh_server::ble_service::SERVICE_NAME.to_owned(),
-                },
-            );
-            true
-        }
+        Ok(handler) => register_local_service(
+            services,
+            dmesh_server::ble_service::SERVICE_NAME,
+            dmesh_server::ble_service::methods(),
+            handler,
+        ),
         Err(error) => {
             log::error!("Failed to register ble service: {error}");
             false
@@ -1142,18 +1216,14 @@ impl dmesh_server::companion_service::CompanionBackend for AndroidCompanionBacke
 pub(crate) fn register_companion_service(
     services: &ssh_mesh::mesh_rest::MeshServiceRegistry,
 ) -> bool {
-    match dmesh_server::companion_service::CompanionService::new(Arc::new(AndroidCompanionBackend)) {
-        Ok(handler) => {
-            services.register(
-                dmesh_server::companion_service::SERVICE_NAME,
-                ssh_mesh::mesh_rest::MeshService {
-                    backend: ssh_mesh::mesh_rest::MeshServiceBackend::Direct(Arc::new(handler)),
-                    encoding: ssh_mesh::mesh_rest::MeshServiceEncoding::TaggedCbor,
-                    component: dmesh_server::companion_service::SERVICE_NAME.to_owned(),
-                },
-            );
-            true
-        }
+    match dmesh_server::companion_service::CompanionService::new(Arc::new(AndroidCompanionBackend))
+    {
+        Ok(handler) => register_local_service(
+            services,
+            dmesh_server::companion_service::SERVICE_NAME,
+            dmesh_server::companion_service::methods(),
+            handler,
+        ),
         Err(error) => {
             log::error!("Failed to register companion service: {error}");
             false
@@ -1242,17 +1312,12 @@ impl dmesh_server::usb_service::UsbBackend for AndroidUsbBackend {
 #[cfg(target_os = "android")]
 pub(crate) fn register_usb_service(services: &ssh_mesh::mesh_rest::MeshServiceRegistry) -> bool {
     match dmesh_server::usb_service::UsbService::new(Arc::new(AndroidUsbBackend)) {
-        Ok(handler) => {
-            services.register(
-                dmesh_server::usb_service::SERVICE_NAME,
-                ssh_mesh::mesh_rest::MeshService {
-                    backend: ssh_mesh::mesh_rest::MeshServiceBackend::Direct(Arc::new(handler)),
-                    encoding: ssh_mesh::mesh_rest::MeshServiceEncoding::TaggedCbor,
-                    component: dmesh_server::usb_service::SERVICE_NAME.to_owned(),
-                },
-            );
-            true
-        }
+        Ok(handler) => register_local_service(
+            services,
+            dmesh_server::usb_service::SERVICE_NAME,
+            dmesh_server::usb_service::methods(),
+            handler,
+        ),
         Err(error) => {
             log::error!("Failed to register usb service: {error}");
             false
@@ -1348,17 +1413,12 @@ impl dmesh_server::wifi_service::WifiBackend for AndroidWifiBackend {
 #[cfg(target_os = "android")]
 pub(crate) fn register_wifi_service(services: &ssh_mesh::mesh_rest::MeshServiceRegistry) -> bool {
     match dmesh_server::wifi_service::WifiService::new(Arc::new(AndroidWifiBackend)) {
-        Ok(handler) => {
-            services.register(
-                dmesh_server::wifi_service::SERVICE_NAME,
-                ssh_mesh::mesh_rest::MeshService {
-                    backend: ssh_mesh::mesh_rest::MeshServiceBackend::Direct(Arc::new(handler)),
-                    encoding: ssh_mesh::mesh_rest::MeshServiceEncoding::TaggedCbor,
-                    component: dmesh_server::wifi_service::SERVICE_NAME.to_owned(),
-                },
-            );
-            true
-        }
+        Ok(handler) => register_local_service(
+            services,
+            dmesh_server::wifi_service::SERVICE_NAME,
+            dmesh_server::wifi_service::methods(),
+            handler,
+        ),
         Err(error) => {
             log::error!("Failed to register wifi service: {error}");
             false
@@ -1434,20 +1494,14 @@ impl dmesh_server::transport_service::TransportBackend for AndroidTransportBacke
 pub(crate) fn register_transport_service(
     services: &ssh_mesh::mesh_rest::MeshServiceRegistry,
 ) -> bool {
-    match dmesh_server::transport_service::TransportService::new(Arc::new(
-        AndroidTransportBackend,
-    )) {
-        Ok(handler) => {
-            services.register(
-                dmesh_server::transport_service::SERVICE_NAME,
-                ssh_mesh::mesh_rest::MeshService {
-                    backend: ssh_mesh::mesh_rest::MeshServiceBackend::Direct(Arc::new(handler)),
-                    encoding: ssh_mesh::mesh_rest::MeshServiceEncoding::TaggedCbor,
-                    component: dmesh_server::transport_service::SERVICE_NAME.to_owned(),
-                },
-            );
-            true
-        }
+    match dmesh_server::transport_service::TransportService::new(Arc::new(AndroidTransportBackend))
+    {
+        Ok(handler) => register_local_service(
+            services,
+            dmesh_server::transport_service::SERVICE_NAME,
+            dmesh_server::transport_service::methods(),
+            handler,
+        ),
         Err(error) => {
             log::error!("Failed to register transport service: {error}");
             false
@@ -1572,45 +1626,14 @@ fn android_radio_history(limit: Option<u64>, since_ms: Option<u64>, keys: Option
     })
 }
 
-#[cfg(target_os = "android")]
-struct AndroidHistoryBackend;
-
-#[cfg(target_os = "android")]
-#[async_trait]
-impl dmesh_server::history_service::HistoryBackend for AndroidHistoryBackend {
-    async fn radio_history(
-        &self,
-        limit: Option<u64>,
-        since_ms: Option<u64>,
-        keys: Option<String>,
-    ) -> anyhow::Result<Value> {
-        Ok(android_radio_history(limit, since_ms, keys))
-    }
-}
-
+/// Route the HTTP `history` service to the registry; `radio.history` itself is
+/// a typed handler registered by [`register_android_methods`].
 #[cfg(target_os = "android")]
 pub(crate) fn register_history_service(
     services: &ssh_mesh::mesh_rest::MeshServiceRegistry,
 ) -> bool {
-    match dmesh_server::history_service::HistoryService::new(Arc::new(
-        AndroidHistoryBackend,
-    )) {
-        Ok(handler) => {
-            services.register(
-                dmesh_server::history_service::SERVICE_NAME,
-                ssh_mesh::mesh_rest::MeshService {
-                    backend: ssh_mesh::mesh_rest::MeshServiceBackend::Direct(Arc::new(handler)),
-                    encoding: ssh_mesh::mesh_rest::MeshServiceEncoding::TaggedCbor,
-                    component: dmesh_server::history_service::SERVICE_NAME.to_owned(),
-                },
-            );
-            true
-        }
-        Err(error) => {
-            log::error!("Failed to register history service: {error}");
-            false
-        }
-    }
+    register_gateway_route(services, "history");
+    true
 }
 
 /// One compact letter per discovery bearer: A=Wifi Aware, B=BLE, N=ESP-NOW,
@@ -1962,66 +1985,45 @@ pub(crate) fn status_text() -> String {
     text
 }
 
-/// Tools catalog for the HTTP `status` service. The generated schema file
-/// must stay in sync with the direct backend below.
-#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+/// Tools catalog for the HTTP `status` service, generated from `API.md`.
 pub(crate) fn status_tools_json() -> Value {
-    json!([
-        {
-            "name": "status.text",
-            "title": "Status text",
-            "group": "Status",
-            "description": "Return the bounded Rust-generated status table.",
-            "inputSchema": {"type": "object", "properties": {}}
-        }
-    ])
+    dmesh_server::platform_catalog::tools_for("status.")
 }
 
-#[cfg(target_os = "android")]
-struct StatusTextService;
-
-#[cfg(target_os = "android")]
-impl StatusTextService {
-    fn mesh_service() -> anyhow::Result<ssh_mesh::mesh_rest::MeshService> {
-        Ok(ssh_mesh::mesh_rest::MeshService {
-            backend: ssh_mesh::mesh_rest::MeshServiceBackend::Direct(Arc::new(Self)),
-            encoding: ssh_mesh::mesh_rest::MeshServiceEncoding::TaggedCbor,
-            component: "status".to_owned(),
-        })
+/// `status.text` (203/1): the status table, typed from `API.md`.
+pub(crate) fn status_text_response() -> dmesh_server::platform_api::StatusTextResponse {
+    dmesh_server::platform_api::StatusTextResponse {
+        status_text: Some(status_text()),
     }
 }
 
+/// `radio.history` (202/1), typed from `API.md`.
 #[cfg(target_os = "android")]
-#[async_trait::async_trait]
-impl mesh::wire::TaggedRecordHandler for StatusTextService {
-    async fn handle_record(
-        &self,
-        record: mesh::tagged::TaggedRecord,
-    ) -> anyhow::Result<Option<mesh::tagged::TaggedRecord>> {
-        match record.kind()? {
-            mesh::tagged::RecordKind::Request => {}
-            _ => return Ok(None),
-        }
-        let id = record.id.context("status.text request missing id")?;
-        Ok(Some(mesh::wire::response_ok(
-            id,
-            json!({"status_text": status_text()}),
-        )))
-    }
+pub(crate) fn radio_history_response(
+    request: dmesh_server::platform_api::RadioHistoryRequest,
+) -> Result<dmesh_server::platform_api::RadioHistoryResponse, String> {
+    serde_json::from_value(android_radio_history(
+        request.limit,
+        request.since_ms,
+        request.keys,
+    ))
+    .map_err(|error| error.to_string())
 }
 
+/// Route the HTTP `probe` service to the registry, so the web UI and any HTTP
+/// client can start a probe (`probe.start`, with `to` naming the node that runs
+/// it and `peer` the node being probed) through the JSON-to-CBOR translator.
+#[cfg(target_os = "android")]
+pub(crate) fn register_probe_service(services: &ssh_mesh::mesh_rest::MeshServiceRegistry) -> bool {
+    register_gateway_route(services, "probe");
+    true
+}
+
+/// Route the HTTP `status` service to the registry.
 #[cfg(target_os = "android")]
 pub(crate) fn register_status_service(services: &ssh_mesh::mesh_rest::MeshServiceRegistry) -> bool {
-    match StatusTextService::mesh_service() {
-        Ok(service) => {
-            services.register("status", service);
-            true
-        }
-        Err(error) => {
-            log::error!("Failed to register status service: {error}");
-            false
-        }
-    }
+    register_gateway_route(services, "status");
+    true
 }
 
 /// Build Android's current bearer-neutral presence record from framework
@@ -2301,10 +2303,195 @@ pub(crate) fn observe_announce(
         "device_name": announce.device_name(),
         "network_name": announce.network_name(),
         "sta_link_local_v6": announce.sta_link_local_v6().map(std::net::Ipv6Addr::from).map(|address| address.to_string()),
+        "udp_link_local_v6": announce.udp_link_local_v6().map(std::net::Ipv6Addr::from).map(|address| address.to_string()),
+        "udp_port": announce.udp_port,
         "vip6": dmesh_server::announce::virtual_ip6(announce.public_key())
             .or_else(|| dmesh_server::announce::virtual_ip6_from_identity_hint(announce.device_id()))
             .map(std::net::Ipv6Addr::from).map(|address| address.to_string()),
     });
+}
+
+/// The Android settings file: app-private, next to the paired-device store.
+fn android_settings_store() -> Option<dmesh_server::settings::FileSettings> {
+    let base = ANDROID_OWNED_DEVICES_PATH.get()?.parent()?;
+    Some(dmesh_server::settings::FileSettings::new(
+        base.join("settings.conf"),
+        "android",
+    ))
+}
+
+/// `settings.get`/`set`/`list` on one settings store, in the same result
+/// shape the firmware returns: `{key, value}`, `{key, set}` or `{entries}`.
+/// Secrets (`sec:*`) are never read or written through this handler.
+pub(crate) fn settings_response_for(
+    store: &mut dmesh_server::settings::FileSettings,
+    request: &[u8],
+) -> Option<Vec<u8>> {
+    use dmesh_server::{cbor::Encoder, control, settings::SettingsHandler, tagged};
+    let id = tagged::decode(request)?.id?;
+    let request = control::decode_request(request)?;
+    let mut result = [0u8; 1024];
+    let mut encoder = Encoder::new(&mut result);
+    let method = match request {
+        control::Request::SettingsGet { key } => {
+            let name = core::str::from_utf8(key).ok().filter(|name| !name.starts_with("sec:"))?;
+            let value = SettingsHandler::new(store).get(name).ok()?;
+            encoder.map(2)?;
+            encoder.text_value(b"key")?;
+            encoder.text_value(key)?;
+            encoder.text_value(b"value")?;
+            encoder.text_value(value.as_bytes())?;
+            control::SETTINGS_GET
+        }
+        control::Request::SettingsSet { key, value } => {
+            let name = core::str::from_utf8(key).ok().filter(|name| !name.starts_with("sec:"))?;
+            let value = core::str::from_utf8(value).ok()?;
+            SettingsHandler::new(store).set(name, value).ok()?;
+            encoder.map(2)?;
+            encoder.text_value(b"key")?;
+            encoder.text_value(key)?;
+            encoder.text_value(b"set")?;
+            encoder.bool(true)?;
+            control::SETTINGS_SET
+        }
+        control::Request::SettingsList => {
+            let entries: Vec<_> = SettingsHandler::new(store)
+                .list()
+                .ok()?
+                .into_iter()
+                .filter(|(key, _)| !key.starts_with("sec:"))
+                .collect();
+            encoder.map(1)?;
+            encoder.text_value(b"entries")?;
+            encoder.array(entries.len() as u64)?;
+            for (key, value) in &entries {
+                encoder.map(2)?;
+                encoder.text_value(b"key")?;
+                encoder.text_value(key.as_bytes())?;
+                encoder.text_value(b"value")?;
+                encoder.text_value(value.as_bytes())?;
+            }
+            control::SETTINGS_LIST
+        }
+        _ => return None,
+    };
+    let used = encoder.len();
+    drop(encoder);
+    let mut out = vec![0u8; used + 32];
+    let written =
+        tagged::encode_numeric_response(control::CONTROL_COMPONENT, method, id, &result[..used], &mut out)?;
+    out.truncate(written);
+    Some(out)
+}
+
+fn android_settings_response(request: &[u8]) -> Option<Vec<u8>> {
+    settings_response_for(&mut android_settings_store()?, request)
+}
+
+/// Parse `host:port`, `[v6]:port` or `[v6%scope]:port`, the last being what
+/// `SocketAddr`'s `Display` prints for a scoped IPv6 address and `FromStr`
+/// does not read back.
+pub(crate) fn parse_udp_endpoint(text: &str) -> Result<std::net::SocketAddr, String> {
+    use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+    if let Ok(address) = text.parse::<SocketAddr>() {
+        return Ok(address);
+    }
+    let inner = text
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once("]:"))
+        .ok_or_else(|| format!("invalid UDP endpoint {text:?}"))?;
+    let (host, scope) = match inner.0.split_once('%') {
+        Some((host, scope)) => (host, scope.parse::<u32>().map_err(|_| format!("invalid scope in {text:?}"))?),
+        None => (inner.0, 0),
+    };
+    let ip: Ipv6Addr = host.parse().map_err(|_| format!("invalid address in {text:?}"))?;
+    let port: u16 = inner.1.parse().map_err(|_| format!("invalid port in {text:?}"))?;
+    Ok(SocketAddr::V6(SocketAddrV6::new(ip, port, 0, scope)))
+}
+
+/// Find where a discovered device accepts QUIC over UDP.
+///
+/// `key` is a mesh node identifier: a virtual IPv6 address (with or without a
+/// `mesh://` prefix) or the hex device identity (at least eight digits). The
+/// endpoint is what the device's own announce advertised (`udp_link_local_v6`
+/// and `udp_port`), with the interface scope of the multicast datagram that
+/// carried it. A device that was only seen over NAN or BLE has no UDP path
+/// that Android can open, so it is reported as unroutable instead of guessed.
+pub(crate) fn discovered_udp_endpoint(key: &str) -> Result<std::net::SocketAddr, String> {
+    let devices = discovered_devices()
+        .lock()
+        .map_err(|_| "discovery inventory poisoned".to_owned())?;
+    udp_endpoint_in(&devices, key)
+}
+
+fn udp_endpoint_in(
+    devices: &BTreeMap<String, DiscoveredDevice>,
+    key: &str,
+) -> Result<std::net::SocketAddr, String> {
+    use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+    let key = key.strip_prefix("mesh://").unwrap_or(key).to_ascii_lowercase();
+    let vip: Option<Ipv6Addr> = key.parse().ok();
+    let device = devices
+        .iter()
+        .find(|(id, device)| {
+            let device_vip = device
+                .info
+                .get("vip6")
+                .and_then(Value::as_str)
+                .and_then(|text| text.parse::<Ipv6Addr>().ok());
+            match vip {
+                Some(vip) => device_vip == Some(vip),
+                None => key.len() >= 8 && id.starts_with(&key),
+            }
+        })
+        .map(|(_, device)| device)
+        .ok_or_else(|| "unsupported/no_quic_route: destination is not discovered".to_owned())?;
+    let sender = device
+        .transports
+        .get("udp_multicast")
+        .and_then(|peer| parse_udp_endpoint(peer).ok());
+    let advertised = device
+        .info
+        .get("udp_link_local_v6")
+        .and_then(Value::as_str)
+        .and_then(|text| text.parse::<Ipv6Addr>().ok());
+    let ip = match (advertised, sender) {
+        (Some(ip), _) => ip,
+        (None, Some(SocketAddr::V6(sender))) => *sender.ip(),
+        _ => {
+            return Err(
+                "unsupported/no_quic_route: device was seen only over NAN or BLE, which Android \
+                 cannot open as a QUIC path"
+                    .to_owned(),
+            );
+        }
+    };
+    let port = match device.info.get("udp_port").and_then(Value::as_u64) {
+        Some(port) if port != 0 => u16::try_from(port).map_err(|_| "invalid advertised udp port".to_owned())?,
+        _ => {
+            let class = device
+                .info
+                .get("device_class")
+                .and_then(Value::as_u64)
+                .and_then(|class| u8::try_from(class).ok());
+            if class.is_some_and(dmesh_server::announce::is_esp_device_class) {
+                3339
+            } else {
+                dmesh_server::firmware_profile::DEFAULT_EVENT_PORT
+            }
+        }
+    };
+    let scope = match sender {
+        Some(SocketAddr::V6(sender)) => sender.scope_id(),
+        _ => 0,
+    };
+    if ip.is_unicast_link_local() && scope == 0 {
+        return Err(
+            "unsupported/no_quic_route: no interface scope is known for the link-local address"
+                .to_owned(),
+        );
+    }
+    Ok(SocketAddr::V6(SocketAddrV6::new(ip, port, 0, scope)))
 }
 
 #[cfg(target_os = "android")]
@@ -2335,8 +2522,9 @@ fn configure_android_mesh_paths(base_dir: &str) {
         ("usb", dmesh_server::usb_service::tools_json()),
         ("wifi", dmesh_server::wifi_service::tools_json()),
         ("transport", dmesh_server::transport_service::tools_json()),
-        ("radio", dmesh_server::history_service::tools_json()),
+        ("radio", dmesh_server::platform_catalog::tools_for("radio.")),
         ("status", status_tools_json()),
+        ("probe", dmesh_server::platform_catalog::tools_for("probe.")),
     ] {
         let dir = schema_base.join(component);
         let result = (|| -> std::io::Result<()> {
@@ -2970,10 +3158,10 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
         "status" => json!({"status_version": 1, "platform": "android"})
             .to_string()
             .into_bytes(),
-        "telemetry.now_metrics" | "telemetry.udp6_metrics" | "telemetry.wifi_link_metrics" => {
+        "telemetry.now" | "telemetry.udp6" | "telemetry.wifi_link" => {
             b"{}".to_vec()
         }
-        "telemetry.nan_metrics" => {
+        "telemetry.nan" => {
             let followups = nan_followups()
                 .lock()
                 .map_err(|_| anyhow::anyhow!("NAN follow-up cache poisoned"))?;
@@ -5038,6 +5226,124 @@ mod tests {
                 },
             })
         ));
+    }
+
+    #[test]
+    fn status_text_is_typed_from_api_md() {
+        let value = mesh::tagged::to_tagged_value(&status_text_response()).unwrap();
+        assert!(value["1"].is_string());
+    }
+
+    #[test]
+    fn a_discovered_device_resolves_to_its_advertised_udp_endpoint() {
+        let device = |vip: &str, class: u64, port: u64, udp: Option<&str>, sender: &str| {
+            let mut device = DiscoveredDevice {
+                last_seen_ms: 0,
+                peer: String::new(),
+                info: json!({
+                    "vip6": vip,
+                    "device_class": class,
+                    "udp_port": port,
+                    "udp_link_local_v6": udp,
+                }),
+                transports: BTreeMap::new(),
+                observations: BTreeMap::new(),
+            };
+            device
+                .transports
+                .insert("udp_multicast".to_owned(), sender.to_owned());
+            device
+        };
+        let mut devices = BTreeMap::new();
+        {
+            devices.insert(
+                "aabbccdd00112233aabbccdd00112233".to_owned(),
+                device("fd00::1", 1, 3337, Some("fe80::aa"), "[fe80::bb%7]:5227"),
+            );
+            // No advertised port: the scope still comes from the multicast sender.
+            devices.insert(
+                "11112222333344445555666677778888".to_owned(),
+                device(
+                    "fd00::2",
+                    u64::from(dmesh_server::announce::DEVICE_CLASS_ANDROID),
+                    0,
+                    None,
+                    "[fe80::cc%9]:5227",
+                ),
+            );
+            devices.insert(
+                "99990000999900009999000099990000".to_owned(),
+                DiscoveredDevice {
+                    last_seen_ms: 0,
+                    peer: String::new(),
+                    info: json!({"vip6": "fd00::3"}),
+                    transports: BTreeMap::new(),
+                    observations: BTreeMap::new(),
+                },
+            );
+        }
+        assert_eq!(
+            udp_endpoint_in(&devices, "mesh://fd00::1").unwrap().to_string(),
+            "[fe80::aa%7]:3337"
+        );
+        assert_eq!(
+            udp_endpoint_in(&devices, "aabbccdd").unwrap().to_string(),
+            "[fe80::aa%7]:3337"
+        );
+        assert_eq!(
+            udp_endpoint_in(&devices, "fd00::2").unwrap().to_string(),
+            format!(
+                "[fe80::cc%9]:{}",
+                dmesh_server::firmware_profile::DEFAULT_EVENT_PORT
+            )
+        );
+        // Seen only over NAN or BLE, or not at all: not routable, not guessed.
+        assert!(udp_endpoint_in(&devices, "fd00::3").unwrap_err().contains("no_quic_route"));
+        assert!(udp_endpoint_in(&devices, "fd00::99").unwrap_err().contains("not discovered"));
+    }
+
+    #[test]
+    fn scoped_udp_endpoints_round_trip() {
+        for text in ["192.0.2.1:3337", "[fd00::1]:3337", "[fe80::1%12]:3337"] {
+            assert_eq!(parse_udp_endpoint(text).unwrap().to_string(), text);
+        }
+        assert!(parse_udp_endpoint("fe80::1").is_err());
+    }
+
+    #[test]
+    fn android_settings_use_the_shared_store_and_firmware_result_shape() {
+        use dmesh_server::{control, tagged};
+        let directory = std::env::temp_dir().join(format!("dmesh-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut store =
+            dmesh_server::settings::FileSettings::new(directory.join("settings.conf"), "android");
+        let call = |store: &mut _, request: control::Request<'_>| {
+            let mut wire = [0u8; 128];
+            let used = control::encode_request(request, Some(5), &mut wire).unwrap();
+            settings_response_for(store, &wire[..used])
+        };
+        let set = call(
+            &mut store,
+            control::Request::SettingsSet { key: b"name", value: b"pixel" },
+        )
+        .expect("set");
+        assert!(set.windows(3).any(|window| window == b"set"));
+        let get = call(&mut store, control::Request::SettingsGet { key: b"name" }).expect("get");
+        let record = tagged::decode(&get).unwrap();
+        assert_eq!(record.id, Some(5));
+        assert!(get.windows(5).any(|window| window == b"pixel"));
+        let list = call(&mut store, control::Request::SettingsList).expect("list");
+        assert!(list.windows(7).any(|window| window == b"entries"));
+        // Secrets are not reachable through this handler.
+        assert!(call(&mut store, control::Request::SettingsGet { key: b"sec:key" }).is_none());
+        assert!(
+            call(
+                &mut store,
+                control::Request::SettingsSet { key: b"sec:key", value: b"x" }
+            )
+            .is_none()
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]

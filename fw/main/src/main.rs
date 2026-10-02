@@ -84,9 +84,9 @@ pub extern "C" fn app_main() {
     };
     dmesh_fw_transport::rtc::mark_main_start();
     let _ = esp_idf_sys::link_patches();
-    assert!(dmesh_server::services::register_tagged_component(
-        dmesh_server::services::BOOT_COMPONENT,
-        receive_boot_control,
+    assert!(dmesh_server::registry::register(
+        dmesh_server::registry::methods::BOOT_RECOVERY,
+        dmesh_server::registry::SyncFn(receive_boot_control),
     ));
     ble::register();
     pairing::register();

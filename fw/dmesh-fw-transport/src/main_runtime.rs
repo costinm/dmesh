@@ -607,17 +607,17 @@ pub(crate) fn is_sleepy_profile(profile: &crate::TransportProfile) -> bool {
         && matches!(profile.nan_dw_interval, 1 | 8 | 16)
         && profile.now == 2
         && profile.ap == 0
-        // Sleep is reserved for a NAN-only radio personality. An explicitly
-        // provisioned STA or enabled UART is another usable path and must
-        // keep Main awake for ordinary QUIC diagnostics and control.
+        // Sleep is reserved for a NAN-only Wi-Fi personality. STA/AP/NOW
+        // keep the radio reachable continuously; UART remains installed and
+        // can receive whenever the CPU is awake, but does not prevent sleep.
         && profile.ssid_len == 0
-        && profile.uart == dmesh_server::firmware_profile::UART_OFF
 }
 
-/// Physical light sleep is part of every explicit sleepy profile. USB-JTAG
-/// may disappear while a C6 sleeps, but that is an observation-path property,
-/// not permission to keep the radio and CPU awake indefinitely. A reboot
-/// restores the persisted active profile after an ephemeral test.
+/// Physical light sleep is part of every explicit sleepy profile. UART0 and
+/// USB-Serial-JTAG remain installed and enabled; sleep policy only releases
+/// temporary power-management locks. The L2 task processes records when the
+/// CPU is awake, including NAN discovery windows. A reboot restores the
+/// persisted active profile after an ephemeral test.
 fn usb_jtag_debug_hold(_: &crate::TransportProfile) -> bool {
     false
 }
@@ -2269,20 +2269,19 @@ fn receive_tagged_control_with_delivery(
     (response_len != 0).then(|| alloc::vec::Vec::from(&response[..response_len]))
 }
 
-/// Apply a stream control request, retaining its requested profile until the
-/// terminal response is delivery-confirmed on that same stream.
+/// The control component's handler for every delivery form. A stream request
+/// retains its requested profile until the terminal response is
+/// delivery-confirmed on that same stream. A connectionless message sends its
+/// copied reply before returning, so its profile transition proceeds
+/// immediately without a QUIC ACK edge.
 pub(crate) fn receive_tagged_control(
     record: dmesh_server::tagged::Record<'_>,
+    context: dmesh_server::registry::CallContext,
 ) -> Option<alloc::vec::Vec<u8>> {
-    receive_tagged_control_with_delivery(record, true)
-}
-
-/// Connectionless NAN/NOW control sends its copied reply before returning, so its
-/// profile transition can proceed immediately without a QUIC ACK edge.
-fn receive_connectionless_tagged_control(
-    record: dmesh_server::tagged::Record<'_>,
-) -> Option<alloc::vec::Vec<u8>> {
-    receive_tagged_control_with_delivery(record, false)
+    receive_tagged_control_with_delivery(
+        record,
+        context.delivery == dmesh_server::registry::Delivery::Stream,
+    )
 }
 
 /// Encode the complete, bounded result of a control-stream operation.
@@ -2469,8 +2468,15 @@ pub(crate) fn receive_tagged_discovery_nodes(
 /// a small body to this same handler.
 pub(crate) fn receive_tagged_discovery(
     record: dmesh_server::tagged::Record<'_>,
+    context: dmesh_server::registry::CallContext,
 ) -> Option<alloc::vec::Vec<u8>> {
     if let Some(target) = dmesh_server::announce::decode_nan_pair_wakeup_request(record) {
+        // As a connectionless message, `nan.pair_wakeup` is the invitation
+        // itself, addressed to the unpaired device. As a stream request it
+        // asks this node, as an observer, to send that invitation.
+        if context.delivery == dmesh_server::registry::Delivery::Message {
+            return pair_invitation(record, target);
+        }
         let id = record.id?;
         let queued = crate::wifi_nan_dw_capture_esp::queue_nan_pair_wakeup(target);
         let mut response = [0u8; 32];
@@ -2672,115 +2678,78 @@ pub(crate) fn receive_nan_service_info(peer: [u8; 6], packet: &[u8]) {
     );
 }
 
-/// Apply the one bootstrap-safe connectionless record and emit at most one
-/// copied response through the caller-selected bearer. Discovery itself uses
-/// the signed `announce.discovery` request/reply record; every other handler
-/// remains on a normal QUIC stream.
-pub(crate) fn receive_connectionless_transport_set_record<F>(
-    packet: &[u8],
-    send_response: F,
-) -> bool
-where
-    F: FnOnce(&[u8]),
-{
-    if dmesh_server::connectionless::classify(packet)
-        != Some(dmesh_server::connectionless::ConnectionlessKind::TransportSet)
-    {
-        return false;
+/// The unpaired device's end of `nan.pair_wakeup`: open a time-limited pairing
+/// window when the invitation names this device and it has no owner secret.
+fn pair_invitation(
+    record: dmesh_server::tagged::Record<'_>,
+    target: [u8; 6],
+) -> Option<alloc::vec::Vec<u8>> {
+    let station = crate::wifi_esp::interface_mac(crate::wifi_esp::RadioInterface::Sta);
+    let ap = crate::wifi_esp::interface_mac(crate::wifi_esp::RadioInterface::Ap);
+    if (station != Some(target) && ap != Some(target)) || shared_secret_exists() {
+        return None;
     }
-    let Some(record) = dmesh_server::tagged::decode(packet) else {
-        return false;
+    // Promote through the same target-checked profile handler as an ordinary
+    // NAN wake. No secret or ownership state is changed by this
+    // unauthenticated invitation.
+    let request = dmesh_server::control::Request::TransportSet {
+        kind: dmesh_server::control::TransportKind::Sta,
+        config: dmesh_server::control::TransportConfig {
+            wake_target: Some(target),
+            ..dmesh_server::control::TransportConfig::default()
+        },
     };
-    // This bootstrap-safe record invokes the same canonical tagged handler
-    // used by a normal QUIC stream, without acquiring a QUIC envelope.
-    let Some(response) = receive_connectionless_tagged_control(record) else {
-        return false;
-    };
-    crate::state::direct_record_accepted();
-    send_response(&response);
-    true
+    let mut encoded = [0u8; 96];
+    let used =
+        dmesh_server::control::encode_request(request, Some(record.id.unwrap_or(0)), &mut encoded)?;
+    let control_response = dmesh_server::registry::dispatch_now(
+        &encoded[..used],
+        dmesh_server::registry::CallContext {
+            delivery: dmesh_server::registry::Delivery::Message,
+            ..Default::default()
+        },
+    )?;
+    if dmesh_server::tagged::decode(&control_response).is_none_or(|reply| reply.error.is_some()) {
+        return None;
+    }
+    let now = (unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) as u64 / 1_000) as u32;
+    PAIRING_WINDOW_UNTIL_MS.store(now.wrapping_add(PAIRING_WINDOW_MS), Ordering::Release);
+    let mut response = [0u8; 32];
+    let used = dmesh_server::tagged::encode_numeric_response(
+        dmesh_server::announce::ANNOUNCE_COMPONENT,
+        dmesh_server::announce::ANNOUNCE_NAN_PAIR_WAKEUP,
+        record.id.unwrap_or(0),
+        &[0xa1, 1, 0xf5],
+        &mut response,
+    )?;
+    Some(alloc::vec::Vec::from(&response[..used]))
 }
 
-/// Dispatch one discovery request or mutable connectionless control record without
-/// knowledge of its bearer. Discovery is an application datagram shared by
-/// UDP multicast, BLE, NAN, and NOW; it does not enter the QUIC direct plane.
+/// Admit one connectionless message and emit at most one copied response
+/// through the caller-selected bearer.
+///
+/// A message is not a kind of handler. The allow-list in `connectionless` is the
+/// ingress policy that admits some registered methods without an association;
+/// the call is then dispatched through the registry like any other, with the
+/// `Message` delivery form. A declined message gets no reply.
 pub(crate) fn receive_connectionless_request<F>(packet: &[u8], send_response: F) -> bool
 where
     F: FnOnce(&[u8]),
 {
-    if dmesh_server::announce::discovery_request_id(packet).is_some() {
-        let Some(record) = dmesh_server::tagged::decode(packet) else {
-            return false;
-        };
-        let Some(response) = receive_tagged_discovery(record) else {
-            return false;
-        };
-        send_response(&response);
-        return true;
+    if !dmesh_server::connectionless::allowed(packet) {
+        return false;
     }
-    match dmesh_server::connectionless::classify(packet) {
-        Some(dmesh_server::connectionless::ConnectionlessKind::PairWakeup) => {
-            let Some(record) = dmesh_server::tagged::decode(packet) else {
-                return false;
-            };
-            let Some(target) = dmesh_server::announce::decode_nan_pair_wakeup_request(record)
-            else {
-                return false;
-            };
-            let station = crate::wifi_esp::interface_mac(crate::wifi_esp::RadioInterface::Sta);
-            let ap = crate::wifi_esp::interface_mac(crate::wifi_esp::RadioInterface::Ap);
-            if (station != Some(target) && ap != Some(target)) || shared_secret_exists() {
-                return false;
-            }
-            // Promote through the same target-checked profile handler as an
-            // ordinary NAN wake. No secret or ownership state is changed by
-            // this unauthenticated invitation.
-            let request = dmesh_server::control::Request::TransportSet {
-                kind: dmesh_server::control::TransportKind::Sta,
-                config: dmesh_server::control::TransportConfig {
-                    wake_target: Some(target),
-                    ..dmesh_server::control::TransportConfig::default()
-                },
-            };
-            let mut encoded = [0u8; 96];
-            let Some(used) = dmesh_server::control::encode_request(
-                request,
-                Some(record.id.unwrap_or(0)),
-                &mut encoded,
-            ) else {
-                return false;
-            };
-            let Some(control_record) = dmesh_server::tagged::decode(&encoded[..used]) else {
-                return false;
-            };
-            let Some(control_response) = receive_connectionless_tagged_control(control_record)
-            else {
-                return false;
-            };
-            if dmesh_server::tagged::decode(&control_response)
-                .is_none_or(|reply| reply.error.is_some())
-            {
-                return false;
-            }
-            let now = (unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) as u64 / 1_000) as u32;
-            PAIRING_WINDOW_UNTIL_MS.store(now.wrapping_add(PAIRING_WINDOW_MS), Ordering::Release);
-            let mut response = [0u8; 32];
-            if let Some(used) = dmesh_server::tagged::encode_numeric_response(
-                dmesh_server::announce::ANNOUNCE_COMPONENT,
-                dmesh_server::announce::ANNOUNCE_NAN_PAIR_WAKEUP,
-                record.id.unwrap_or(0),
-                &[0xa1, 1, 0xf5],
-                &mut response,
-            ) {
-                send_response(&response[..used]);
-            }
-            true
-        }
-        Some(dmesh_server::connectionless::ConnectionlessKind::TransportSet) => {
-            receive_connectionless_transport_set_record(packet, send_response)
-        }
-        _ => false,
-    }
+    let Some(response) = dmesh_server::registry::dispatch_now(
+        packet,
+        dmesh_server::registry::CallContext {
+            delivery: dmesh_server::registry::Delivery::Message,
+            ..Default::default()
+        },
+    ) else {
+        return false;
+    };
+    send_response(&response);
+    true
 }
 
 /// Stream projection of the bounded telemetry snapshot.
@@ -3110,6 +3079,9 @@ fn encode_telemetry_response_record(
         )?,
         t::WIFI_LINK_METRICS_METHOD => {
             t::encode_wifi_link_metrics(snapshot.link_metrics(), &mut result)?
+        }
+        t::QUIC_METRICS_METHOD => {
+            t::encode_quic_metrics(crate::quic_node_esp::node_telemetry(), &mut result)?
         }
         _ => return None,
     };
@@ -3504,11 +3476,9 @@ pub(crate) fn run_main_service(service: MainRuntimeService) {
             params.nan_dw_interval = 8;
             params.now = 2;
             params.ap = 0;
-            // Sleepy mode is reserved for NAN-only operation. Keep the
-            // physical UART disabled as well; active mode retains UART by
-            // default, and runtime policy independently rejects sleep while
-            // any other bearer is enabled.
-            params.uart = dmesh_server::firmware_profile::UART_OFF;
+            // Sleepy mode is NAN-only at the Wi-Fi layer. Keep the UART
+            // driver enabled across sleep; Main releases its temporary PM
+            // locks at the admitted sleep boundary and rearms it after wake.
         } else if service.role == 1 && !crate::main_runtime::apply_sta_profile_from_nvs(params) {
             // Main's active default is NAN+NOW only. An AP is an explicit
             // transport.start personality, not an unconditional boot side
@@ -3539,49 +3509,99 @@ pub(crate) fn run_main_service(service: MainRuntimeService) {
     // its reader is live; registering afterward leaves a startup window where
     // a valid tagged request (notably log-watch) has no component handler.
     // The same registry is used by UART, UDP6, and NOW-backed QUIC streams.
-    assert!(dmesh_server::services::register_tagged_component(
-        dmesh_server::services::DIAGNOSTIC_COMPONENT,
-        crate::main_runtime::receive_tagged_diagnostics,
+    // Only implemented methods are registered; anything else receives the
+    // shared numeric "unsupported" error. `metrics` and `events` are not
+    // implemented on Main and `telemetry.battery` has no source.
+    use dmesh_server::registry::{self, SyncCtxFn, SyncFn, methods};
+    assert!(registry::register_all(
+        &[methods::STATUS, methods::SERVICES],
+        SyncFn(crate::main_runtime::receive_tagged_diagnostics),
     ));
-    assert!(dmesh_server::services::register_tagged_component(
-        dmesh_server::services::FIRMWARE_COMPONENT,
-        crate::firmware_identity::receive_tagged_identity,
+    assert!(registry::register(
+        methods::FIRMWARE_IDENTITY,
+        SyncFn(crate::firmware_identity::receive_tagged_identity),
     ));
-    assert!(dmesh_server::services::register_tagged_component(
-        dmesh_server::verified_object::OBJECT_COMPONENT,
-        crate::flash::receive_tagged_flash,
+    assert!(registry::register_stream(
+        methods::OBJECT_FLASH,
+        dmesh_server::verified_object::FlashHandler(crate::flash::EspFlashPlatform),
     ));
-    assert!(dmesh_server::services::register_tagged_component(
-        dmesh_server::control::CONTROL_COMPONENT,
-        crate::main_runtime::receive_tagged_control,
+    crate::quic_node_esp::register_probe_handlers();
+    assert!(registry::register_all(
+        &[
+            methods::SETTINGS_GET,
+            methods::SETTINGS_SET,
+            methods::SETTINGS_LIST,
+            methods::TRANSPORT_SET,
+        ],
+        SyncCtxFn(crate::main_runtime::receive_tagged_control),
     ));
     // `discovery.nodes` is the bounded production inventory read used by a
     // relay controller to select its next hop. The compact direct form is
     // retained for UART/NAN/NOW diagnostics only; normal administration uses
     // this correlated QUIC-stream handler.
-    assert!(dmesh_server::services::register_tagged_component(
-        dmesh_server::announce::ANNOUNCE_COMPONENT,
-        crate::main_runtime::receive_tagged_discovery,
+    assert!(registry::register_all(
+        &[
+            methods::DISCOVERY_CHECK,
+            methods::DISCOVERY_NODES,
+            methods::DISCOVERY_ACTIVE,
+            methods::NAN_WAKEUP,
+            methods::NAN_PAIR_WAKEUP,
+        ],
+        SyncCtxFn(crate::main_runtime::receive_tagged_discovery),
     ));
-    assert!(dmesh_server::services::register_tagged_component(
-        dmesh_server::telemetry::TELEMETRY_COMPONENT,
-        crate::main_runtime::receive_tagged_telemetry,
+    assert!(registry::register_all(
+        &[
+            methods::TELEMETRY_NAN_STATUS,
+            methods::TELEMETRY_NOW_METRICS,
+            methods::TELEMETRY_NAN_METRICS,
+            methods::TELEMETRY_UDP6_METRICS,
+            methods::TELEMETRY_WIFI_LINK_METRICS,
+            methods::TELEMETRY_QUIC_METRICS,
+        ],
+        SyncFn(crate::main_runtime::receive_tagged_telemetry),
     ));
-    assert!(dmesh_server::services::register_tagged_component(
-        dmesh_server::raw_wifi::RAW_WIFI_COMPONENT,
-        crate::main_runtime::receive_tagged_raw_wifi,
+    assert!(registry::register_all(
+        &[
+            methods::RADIO_TX,
+            methods::RADIO_CONTROL,
+            methods::RADIO_SNAPSHOT,
+            methods::RADIO_RESET_COUNTERS,
+            methods::WIFI_SCAN,
+        ],
+        SyncFn(crate::main_runtime::receive_tagged_raw_wifi),
     ));
-    assert!(dmesh_server::services::register_tagged_component(
-        crate::main_runtime::RUNTIME_COMPONENT,
-        crate::main_runtime::receive_tagged_snapshot,
+    assert!(registry::register(
+        methods::RUNTIME_RESET,
+        SyncFn(crate::main_runtime::receive_tagged_snapshot),
     ));
-    assert!(dmesh_server::services::register_tagged_component(
-        crate::main_runtime::POWER_COMPONENT,
-        crate::main_runtime::receive_tagged_power_snapshot,
+    // The state snapshots are `telemetry.runtime`, `power` and `memory`, and the
+    // per-bearer counters `telemetry.bearers`; `log.watch` reads the retained
+    // log history and can stream periodic snapshots of any of them.
+    assert!(registry::register(
+        methods::TELEMETRY_RUNTIME,
+        SyncFn(crate::main_runtime::receive_tagged_runtime),
     ));
-    assert!(dmesh_server::services::register_tagged_component(
-        crate::main_runtime::MEMORY_COMPONENT,
-        crate::main_runtime::receive_tagged_memory_snapshot,
+    assert!(registry::register(
+        methods::TELEMETRY_POWER,
+        SyncFn(crate::main_runtime::receive_tagged_power_snapshot),
+    ));
+    assert!(registry::register(
+        methods::TELEMETRY_MEMORY,
+        SyncFn(crate::main_runtime::receive_tagged_memory_snapshot),
+    ));
+    assert!(registry::register(
+        methods::TELEMETRY_BEARERS,
+        SyncFn(crate::main_runtime::receive_tagged_bearers),
+    ));
+    let dispatch: dmesh_server::log_watch::Dispatch = alloc::sync::Arc::new(|request| {
+        registry::dispatch_now(request, dmesh_server::registry::CallContext::local())
+    });
+    assert!(registry::register_stream(
+        methods::LOG_WATCH_RECORDS,
+        dmesh_server::log_watch::LogWatchHandler::new(
+            alloc::sync::Arc::new(crate::log_history::Source),
+            Some(dispatch),
+        ),
     ));
 
     if service.role == 1 && !sleepy_boot {
@@ -3897,25 +3917,16 @@ pub fn run_with_boot_radio_ready(mark_healthy: fn(), hook: fn()) {
         .with_boot_radio_ready(hook)
         .run();
 }
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
 use dmesh_server::main_runtime_state::MainRuntimeSnapshot;
 
-/// Bearer-neutral component for one read-only Main runtime snapshot.
+/// Bearer-neutral component for the controlled Main restart.
 pub const RUNTIME_COMPONENT: u64 = 101;
-pub const RUNTIME_SNAPSHOT: u64 = 1;
 /// Schedule a controlled Main restart after the tagged response has left its
-/// QUIC-lite association. This is not a modem-line reset.
+/// QUIC-lite association. This is not a modem-line reset. The state snapshots
+/// are `telemetry.runtime`, `telemetry.power` and `telemetry.memory`.
 pub const RUNTIME_RESET: u64 = 2;
-/// Read-only ESP PM state. Separate from the portable runtime snapshot because
-/// frequency/PM-lock details are platform measurements, not transport policy.
-pub const POWER_COMPONENT: u64 = 102;
-pub const POWER_SNAPSHOT: u64 = 1;
-/// Read-only shared-ingress allocation and stack telemetry.  This is separate
-/// from PM because it measures allocator headroom and the only packet worker,
-/// not a requested power policy.
-pub const MEMORY_COMPONENT: u64 = 103;
-pub const MEMORY_SNAPSHOT: u64 = 1;
 
 // A status handler may run on a bearer worker while Main owns its mutable
 // state. Publish a copy through this seqlock instead of borrowing that state
@@ -4035,49 +4046,6 @@ pub(crate) fn receive_tagged_diagnostics(
         response.truncate(response_len);
         return Some(response);
     }
-    if method == dmesh_server::services::DIAGNOSTIC_LOG_WATCH_METHOD {
-        if record.to.is_some() || record.params.is_some() || record.data.is_some() {
-            return diagnostic_error(method, id, b"invalid log-watch request");
-        }
-        let Some((since, records)) =
-            dmesh_server::services::decode_diagnostic_fields(record.fields)
-        else {
-            return diagnostic_error(method, id, b"invalid log-watch fields");
-        };
-        let since = since.unwrap_or(0);
-        let limit = records.unwrap_or(16) as usize;
-        if !(1..=dmesh_server::services::LOG_WATCH_MAX_RECORDS).contains(&limit) {
-            return diagnostic_error(method, id, b"log record count out of range");
-        }
-        let (cursor, lines) =
-            crate::log_history::read(since, limit.min(crate::log_history::CAPACITY));
-        let mut result = alloc::vec![0u8; 6_400];
-        let mut encoder = dmesh_server::cbor::Encoder::new(&mut result);
-        encoder.map(2)?;
-        encoder.text_value(b"cursor")?;
-        encoder.uint(cursor)?;
-        encoder.text_value(b"records")?;
-        encoder.array(lines.len() as u64)?;
-        for (sequence, line) in lines {
-            encoder.map(2)?;
-            encoder.text_value(b"sequence")?;
-            encoder.uint(sequence)?;
-            encoder.text_value(b"line")?;
-            encoder.text_value(&line)?;
-        }
-        let result_len = encoder.len();
-        drop(encoder);
-        let mut response = alloc::vec![0u8; result_len.saturating_add(64)];
-        let response_len = dmesh_server::tagged::encode_numeric_response(
-            dmesh_server::services::DIAGNOSTIC_COMPONENT,
-            method,
-            id,
-            &result[..result_len],
-            &mut response,
-        )?;
-        response.truncate(response_len);
-        return Some(response);
-    }
     if method != dmesh_server::services::DIAGNOSTIC_STATUS_METHOD {
         return diagnostic_error(method, id, b"unsupported diagnostic method");
     }
@@ -4175,24 +4143,100 @@ pub(crate) fn receive_tagged_snapshot(
         )?;
         return Some(alloc::vec::Vec::from(&response[..used]));
     }
-    if method != RUNTIME_SNAPSHOT {
-        return None;
+    None
+}
+
+/// `telemetry.bearers`: one row per bearer that keeps submission and receive
+/// counters. Main reports ESP-NOW (`now`) and raw IPv6/UDP (`udp6`); fields a
+/// bearer does not count are omitted from its row. Row fields are numbered as
+/// in `API.md`: `1` name, `3..=6` tx submitted/accepted/failed/busy,
+/// `7..=9` rx accepted/rejected/dropped.
+pub(crate) fn receive_tagged_bearers(
+    record: dmesh_server::tagged::Record<'_>,
+) -> Option<alloc::vec::Vec<u8>> {
+    use dmesh_server::cbor::Encoder;
+    let id = record.id?;
+    let counters = crate::wifi_radio_control_esp::snapshot().counters;
+    let (now_attempted, now_accepted, now_failed, now_busy) =
+        crate::wifi_espnow_esp::now_tx_metrics();
+    let now = [
+        (3u64, u64::from(now_attempted)),
+        (4, u64::from(now_accepted)),
+        (5, u64::from(now_failed)),
+        (6, u64::from(now_busy)),
+        (7, u64::from(counters.rx_parser_accepted)),
+        (8, u64::from(counters.rx_parser_rejected)),
+        (9, u64::from(counters.rx_dropped)),
+    ];
+    let udp6 = [
+        (4u64, u64::from(counters.udp6_raw_tx_completions)),
+        (5, u64::from(counters.udp6_tx_failures)),
+        (7, u64::from(counters.udp6_udp_delivered)),
+        (8, u64::from(counters.udp6_rx_invalid)),
+        (9, u64::from(counters.udp6_rx_queue_drops)),
+    ];
+    let mut result = [0u8; 256];
+    let mut encoder = Encoder::new(&mut result);
+    encoder.map(1)?;
+    encoder.uint(1)?;
+    encoder.array(2)?;
+    for (name, row) in [(&b"now"[..], &now[..]), (&b"udp6"[..], &udp6[..])] {
+        encoder.map(1 + row.len() as u64)?;
+        encoder.uint(1)?;
+        encoder.text_value(name)?;
+        for (tag, value) in row {
+            encoder.uint(*tag)?;
+            encoder.uint(*value)?;
+        }
     }
+    let used = encoder.len();
+    drop(encoder);
+    let mut response = [0u8; 320];
+    let used = dmesh_server::tagged::encode_numeric_response(
+        dmesh_server::telemetry::TELEMETRY_COMPONENT,
+        dmesh_server::telemetry::BEARERS_METHOD,
+        id,
+        &result[..used],
+        &mut response,
+    )?;
+    Some(alloc::vec::Vec::from(&response[..used]))
+}
+
+/// `telemetry.runtime`: the radio lifecycle and sleep state the Main owner
+/// last published. Fields are numbered from 1 as in `API.md`: `1..=3` desired
+/// mode/generation/request, `4` sleepy, `5..=7` applied radio lifecycle,
+/// generation and power lifecycle, `8..=9` sleep blockers and last error,
+/// `10..=12` stale-completion, queue-overflow and wake-cause counters, and
+/// `13` the reason the last stale event was rejected. The CPU and light-sleep
+/// measurements that older snapshots carried are `telemetry.power`.
+pub(crate) fn receive_tagged_runtime(
+    record: dmesh_server::tagged::Record<'_>,
+) -> Option<alloc::vec::Vec<u8>> {
+    let id = record.id?;
     let snapshot = published_snapshot();
-    let fields = snapshot_words(snapshot);
+    let words = snapshot_words(snapshot);
+    let mut values = [0u32; 13];
+    values[..12].copy_from_slice(&words[..12]);
+    values[12] = words[22];
+    encode_state_snapshot(id, dmesh_server::telemetry::RUNTIME_METHOD, &values)
+}
+
+/// Encode a snapshot of numbered `u32` fields (field `n` is `values[n - 1]`)
+/// as a `telemetry` result.
+fn encode_state_snapshot(id: u64, method: u64, values: &[u32]) -> Option<alloc::vec::Vec<u8>> {
     let mut result = [0u8; 224];
     let mut encoder = dmesh_server::cbor::Encoder::new(&mut result);
-    encoder.map(fields.len() as u64)?;
-    for (index, value) in fields.iter().enumerate() {
-        encoder.uint(index as u64)?;
+    encoder.map(values.len() as u64)?;
+    for (index, value) in values.iter().enumerate() {
+        encoder.uint(index as u64 + 1)?;
         encoder.uint(u64::from(*value))?;
     }
     let used = encoder.len();
     drop(encoder);
     let mut response = [0u8; 288];
     let used = dmesh_server::tagged::encode_numeric_response(
-        RUNTIME_COMPONENT,
-        RUNTIME_SNAPSHOT,
+        dmesh_server::telemetry::TELEMETRY_COMPONENT,
+        method,
         id,
         &result[..used],
         &mut response,
@@ -4206,12 +4250,6 @@ pub(crate) fn receive_tagged_power_snapshot(
     record: dmesh_server::tagged::Record<'_>,
 ) -> Option<alloc::vec::Vec<u8>> {
     let id = record.id?;
-    let dmesh_server::tagged::Name::Tag(method) = record.method? else {
-        return None;
-    };
-    if method != POWER_SNAPSHOT {
-        return None;
-    }
     let power = crate::power_esp::status();
     let values = [
         u32::from(power.cpu_mhz),
@@ -4225,24 +4263,7 @@ pub(crate) fn receive_tagged_power_snapshot(
         power.last_sleep_requested_us,
         power.last_sleep_duration_us,
     ];
-    let mut result = [0u8; 96];
-    let mut encoder = dmesh_server::cbor::Encoder::new(&mut result);
-    encoder.map(values.len() as u64)?;
-    for (index, value) in values.iter().enumerate() {
-        encoder.uint(index as u64)?;
-        encoder.uint(u64::from(*value))?;
-    }
-    let used = encoder.len();
-    drop(encoder);
-    let mut response = [0u8; 160];
-    let used = dmesh_server::tagged::encode_numeric_response(
-        POWER_COMPONENT,
-        POWER_SNAPSHOT,
-        id,
-        &result[..used],
-        &mut response,
-    )?;
-    Some(alloc::vec::Vec::from(&response[..used]))
+    encode_state_snapshot(id, dmesh_server::telemetry::POWER_METHOD, &values)
 }
 
 /// Serve the common packet-ingress memory watermark over any tagged bearer.
@@ -4250,27 +4271,23 @@ pub(crate) fn receive_tagged_power_snapshot(
 /// allocates a packet slot nor waits on the worker queue, so querying memory
 /// cannot perturb the watermark being observed.
 ///
-/// Result fields: `0` packet-pool slots, `1` free packet-pool slots, `2`
-/// bounded admission drops, `3` worker stack bytes, `4` worker running, `5`
-/// starts, `6` creation failures, `7` minimum remaining stack words, `8`
-/// current internal 8-bit heap bytes, `9` minimum internal heap bytes, and
-/// `10` the current largest internal free block. The minimums are monotonic
+/// Result fields (`telemetry.memory` in `API.md`, numbered from 1): `1`
+/// packet-pool slots, `2` free packet-pool slots, `3` admission drops, `4`
+/// worker stack bytes, `5` worker running, `6` starts, `7` creation failures,
+/// `8` minimum remaining stack words, `9` current internal 8-bit heap bytes,
+/// `10` minimum internal heap bytes, and `11` the current largest internal
+/// free block. The minimums are monotonic
 /// since boot and make an actual heap/stack or packet-pool limit visible
 /// before changing a bearer-specific policy.
 pub(crate) fn receive_tagged_memory_snapshot(
     record: dmesh_server::tagged::Record<'_>,
 ) -> Option<alloc::vec::Vec<u8>> {
     let id = record.id?;
-    let dmesh_server::tagged::Name::Tag(method) = record.method? else {
-        return None;
-    };
-    if method != MEMORY_SNAPSHOT {
-        return None;
-    }
     let memory = crate::shared_ingress_esp::memory_stats();
+    let (packet_slots, packet_slots_available) = crate::quic_node_esp::packet_pool_snapshot();
     let values = [
-        memory.packet_slots,
-        memory.packet_slots_available,
+        packet_slots,
+        packet_slots_available,
         memory.packet_drops,
         memory.worker_stack_bytes,
         u32::from(memory.worker_running),
@@ -4281,22 +4298,5 @@ pub(crate) fn receive_tagged_memory_snapshot(
         memory.min_free_internal_bytes,
         memory.largest_internal_block_bytes,
     ];
-    let mut result = [0u8; 96];
-    let mut encoder = dmesh_server::cbor::Encoder::new(&mut result);
-    encoder.map(values.len() as u64)?;
-    for (index, value) in values.iter().enumerate() {
-        encoder.uint(index as u64)?;
-        encoder.uint(u64::from(*value))?;
-    }
-    let used = encoder.len();
-    drop(encoder);
-    let mut response = [0u8; 160];
-    let used = dmesh_server::tagged::encode_numeric_response(
-        MEMORY_COMPONENT,
-        MEMORY_SNAPSHOT,
-        id,
-        &result[..used],
-        &mut response,
-    )?;
-    Some(alloc::vec::Vec::from(&response[..used]))
+    encode_state_snapshot(id, dmesh_server::telemetry::MEMORY_METHOD, &values)
 }

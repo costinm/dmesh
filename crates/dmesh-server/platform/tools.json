@@ -170,114 +170,6 @@
     "x-ui-visibility": "default"
   },
   {
-    "description": "Return local ESP-NOW submission, receive, admission, dispatch, drop, and error counters",
-    "inputSchema": {
-      "properties": {},
-      "required": [],
-      "type": "object"
-    },
-    "name": "telemetry.now_metrics",
-    "outputSchema": {
-      "properties": {},
-      "required": [],
-      "type": "object"
-    },
-    "x-component-index": 7,
-    "x-method-index": 2,
-    "x-standard-errors": [
-      "unauthenticated",
-      "permission_denied",
-      "timeout",
-      "remote_exception",
-      "invalid_argument",
-      "not_found",
-      "conflict",
-      "unavailable",
-      "internal"
-    ]
-  },
-  {
-    "description": "Return local NAN beacon, SDF, Service Info, Follow-up, dispatch, drop, and error counters",
-    "inputSchema": {
-      "properties": {},
-      "required": [],
-      "type": "object"
-    },
-    "name": "telemetry.nan_metrics",
-    "outputSchema": {
-      "properties": {},
-      "required": [],
-      "type": "object"
-    },
-    "x-component-index": 7,
-    "x-method-index": 3,
-    "x-standard-errors": [
-      "unauthenticated",
-      "permission_denied",
-      "timeout",
-      "remote_exception",
-      "invalid_argument",
-      "not_found",
-      "conflict",
-      "unavailable",
-      "internal"
-    ]
-  },
-  {
-    "description": "Return local raw IPv6 validation, UDP delivery, NDP, transmit, and failure counters",
-    "inputSchema": {
-      "properties": {},
-      "required": [],
-      "type": "object"
-    },
-    "name": "telemetry.udp6_metrics",
-    "outputSchema": {
-      "properties": {},
-      "required": [],
-      "type": "object"
-    },
-    "x-component-index": 7,
-    "x-method-index": 4,
-    "x-standard-errors": [
-      "unauthenticated",
-      "permission_denied",
-      "timeout",
-      "remote_exception",
-      "invalid_argument",
-      "not_found",
-      "conflict",
-      "unavailable",
-      "internal"
-    ]
-  },
-  {
-    "description": "Return common optional per-peer Wi-Fi link observations",
-    "inputSchema": {
-      "properties": {},
-      "required": [],
-      "type": "object"
-    },
-    "name": "telemetry.wifi_link_metrics",
-    "outputSchema": {
-      "properties": {},
-      "required": [],
-      "type": "object"
-    },
-    "x-component-index": 7,
-    "x-method-index": 5,
-    "x-standard-errors": [
-      "unauthenticated",
-      "permission_denied",
-      "timeout",
-      "remote_exception",
-      "invalid_argument",
-      "not_found",
-      "conflict",
-      "unavailable",
-      "internal"
-    ]
-  },
-  {
     "description": "Return the latest portable battery and power snapshot",
     "inputSchema": {
       "properties": {},
@@ -328,6 +220,113 @@
     },
     "x-component-index": 7,
     "x-method-index": 6,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
+  },
+  {
+    "description": "Return aggregate QUIC counters for live associations",
+    "inputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "name": "telemetry.quic",
+    "outputSchema": {
+      "properties": {
+        "duplicate_packets": {
+          "type": "integer",
+          "x-protobuf-index": 8,
+          "x-protobuf-type": "u64"
+        },
+        "inferred_missing_packets": {
+          "type": "integer",
+          "x-protobuf-index": 10,
+          "x-protobuf-type": "u64"
+        },
+        "live_associations": {
+          "type": "integer",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "u64"
+        },
+        "loss_events": {
+          "type": "integer",
+          "x-protobuf-index": 12,
+          "x-protobuf-type": "u64"
+        },
+        "out_of_order_packets": {
+          "type": "integer",
+          "x-protobuf-index": 9,
+          "x-protobuf-type": "u64"
+        },
+        "received_control_packets": {
+          "type": "integer",
+          "x-protobuf-index": 5,
+          "x-protobuf-type": "u64"
+        },
+        "received_packets": {
+          "type": "integer",
+          "x-protobuf-index": 2,
+          "x-protobuf-type": "u64"
+        },
+        "received_stream_packets": {
+          "type": "integer",
+          "x-protobuf-index": 4,
+          "x-protobuf-type": "u64"
+        },
+        "retransmitted_packets": {
+          "type": "integer",
+          "x-protobuf-index": 11,
+          "x-protobuf-type": "u64"
+        },
+        "sent_control_packets": {
+          "type": "integer",
+          "x-protobuf-index": 7,
+          "x-protobuf-type": "u64"
+        },
+        "sent_packets": {
+          "type": "integer",
+          "x-protobuf-index": 3,
+          "x-protobuf-type": "u64"
+        },
+        "sent_stream_packets": {
+          "type": "integer",
+          "x-protobuf-index": 6,
+          "x-protobuf-type": "u64"
+        },
+        "submission_failures": {
+          "type": "integer",
+          "x-protobuf-index": 13,
+          "x-protobuf-type": "u64"
+        }
+      },
+      "required": [
+        "live_associations",
+        "received_packets",
+        "sent_packets",
+        "received_stream_packets",
+        "received_control_packets",
+        "sent_stream_packets",
+        "sent_control_packets",
+        "duplicate_packets",
+        "out_of_order_packets",
+        "inferred_missing_packets",
+        "retransmitted_packets",
+        "loss_events",
+        "submission_failures"
+      ],
+      "type": "object"
+    },
+    "x-component-index": 7,
+    "x-method-index": 7,
     "x-standard-errors": [
       "unauthenticated",
       "permission_denied",
@@ -475,59 +474,6 @@
     "x-ui-visibility": "default"
   },
   {
-    "description": "Replace volatile QUIC-lite association defaults",
-    "inputSchema": {
-      "properties": {
-        "ack_delay_ms": {
-          "type": "integer",
-          "x-protobuf-index": 3,
-          "x-protobuf-type": "u8"
-        },
-        "ack_frequency": {
-          "type": "integer",
-          "x-protobuf-index": 2,
-          "x-protobuf-type": "u8"
-        },
-        "path_policy": {
-          "type": "integer",
-          "x-protobuf-index": 11,
-          "x-protobuf-type": "u8"
-        },
-        "timeout_ms": {
-          "type": "integer",
-          "x-protobuf-index": 12,
-          "x-protobuf-type": "u32"
-        },
-        "tx_burst_packets": {
-          "type": "integer",
-          "x-protobuf-index": 4,
-          "x-protobuf-type": "u8"
-        }
-      },
-      "required": [],
-      "type": "object"
-    },
-    "name": "connection.configure",
-    "outputSchema": {
-      "properties": {},
-      "required": [],
-      "type": "object"
-    },
-    "x-component-index": 3,
-    "x-method-index": 1,
-    "x-standard-errors": [
-      "unauthenticated",
-      "permission_denied",
-      "timeout",
-      "remote_exception",
-      "invalid_argument",
-      "not_found",
-      "conflict",
-      "unavailable",
-      "internal"
-    ]
-  },
-  {
     "description": "Provision an unpaired companion",
     "inputSchema": {
       "properties": {
@@ -627,6 +573,201 @@
       "unavailable",
       "internal"
     ]
+  },
+  {
+    "description": "Ask a node to run a probe against a peer",
+    "inputSchema": {
+      "properties": {
+        "ack_delay_ms": {
+          "type": "integer",
+          "x-protobuf-index": 7,
+          "x-protobuf-type": "u8"
+        },
+        "ack_frequency": {
+          "type": "integer",
+          "x-protobuf-index": 6,
+          "x-protobuf-type": "u8"
+        },
+        "bytes": {
+          "type": "integer",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "u64"
+        },
+        "consume_delay_ms": {
+          "type": "integer",
+          "x-protobuf-index": 12,
+          "x-protobuf-type": "u32"
+        },
+        "high_priority_bytes": {
+          "type": "integer",
+          "x-protobuf-index": 9,
+          "x-protobuf-type": "u32"
+        },
+        "initial_consume_delay_ms": {
+          "type": "integer",
+          "x-protobuf-index": 11,
+          "x-protobuf-type": "u32"
+        },
+        "low_priority_bytes": {
+          "type": "integer",
+          "x-protobuf-index": 8,
+          "x-protobuf-type": "u32"
+        },
+        "packet_size": {
+          "type": "integer",
+          "x-protobuf-index": 2,
+          "x-protobuf-type": "u16"
+        },
+        "parallel_streams": {
+          "type": "integer",
+          "x-protobuf-index": 10,
+          "x-protobuf-type": "u8"
+        },
+        "peer": {
+          "type": "string",
+          "x-protobuf-index": 13,
+          "x-protobuf-type": "string"
+        },
+        "to": {
+          "type": "string",
+          "x-protobuf-index": 15,
+          "x-protobuf-type": "string"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "name": "probe.start",
+    "outputSchema": {
+      "properties": {
+        "elapsed_us": {
+          "type": "integer",
+          "x-protobuf-index": 5,
+          "x-protobuf-type": "u64"
+        },
+        "peer": {
+          "type": "string",
+          "x-protobuf-index": 2,
+          "x-protobuf-type": "string"
+        },
+        "received_bytes": {
+          "type": "integer",
+          "x-protobuf-index": 4,
+          "x-protobuf-type": "u64"
+        },
+        "requested_bytes": {
+          "type": "integer",
+          "x-protobuf-index": 3,
+          "x-protobuf-type": "u64"
+        },
+        "status": {
+          "type": "string",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "string"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 8,
+    "x-method-index": 1,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ],
+    "x-ui-visibility": "advanced"
+  },
+  {
+    "description": "Answer a probe with a header and then the probe payload",
+    "inputSchema": {
+      "properties": {
+        "ack_delay_ms": {
+          "type": "integer",
+          "x-protobuf-index": 7,
+          "x-protobuf-type": "u8"
+        },
+        "ack_frequency": {
+          "type": "integer",
+          "x-protobuf-index": 6,
+          "x-protobuf-type": "u8"
+        },
+        "bytes": {
+          "type": "integer",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "u64"
+        },
+        "consume_delay_ms": {
+          "type": "integer",
+          "x-protobuf-index": 12,
+          "x-protobuf-type": "u32"
+        },
+        "high_priority_bytes": {
+          "type": "integer",
+          "x-protobuf-index": 9,
+          "x-protobuf-type": "u32"
+        },
+        "initial_consume_delay_ms": {
+          "type": "integer",
+          "x-protobuf-index": 11,
+          "x-protobuf-type": "u32"
+        },
+        "low_priority_bytes": {
+          "type": "integer",
+          "x-protobuf-index": 8,
+          "x-protobuf-type": "u32"
+        },
+        "packet_size": {
+          "type": "integer",
+          "x-protobuf-index": 2,
+          "x-protobuf-type": "u16"
+        },
+        "parallel_streams": {
+          "type": "integer",
+          "x-protobuf-index": 10,
+          "x-protobuf-type": "u8"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "name": "probe.handler",
+    "outputSchema": {
+      "properties": {
+        "bytes": {
+          "type": "integer",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "u64"
+        },
+        "packet_size": {
+          "type": "integer",
+          "x-protobuf-index": 2,
+          "x-protobuf-type": "u64"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 8,
+    "x-method-index": 2,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ],
+    "x-ui-visibility": "advanced"
   },
   {
     "description": "Report local BLE adapter and bearer state",
@@ -799,7 +940,28 @@
     },
     "name": "radio.history",
     "outputSchema": {
-      "properties": {},
+      "properties": {
+        "ble_scan_results": {
+          "type": "object",
+          "x-protobuf-index": 3,
+          "x-protobuf-type": "object"
+        },
+        "count": {
+          "type": "integer",
+          "x-protobuf-index": 4,
+          "x-protobuf-type": "u64"
+        },
+        "events": {
+          "type": "array",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "array"
+        },
+        "followups": {
+          "type": "array",
+          "x-protobuf-index": 2,
+          "x-protobuf-type": "array"
+        }
+      },
       "required": [],
       "type": "object"
     },
@@ -1017,6 +1179,40 @@
     },
     "x-component-index": 205,
     "x-method-index": 2,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ],
+    "x-ui-visibility": "default"
+  },
+  {
+    "description": "Return the Rust-generated local status table",
+    "inputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "name": "status.text",
+    "outputSchema": {
+      "properties": {
+        "status_text": {
+          "type": "string",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "string"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 203,
+    "x-method-index": 1,
     "x-standard-errors": [
       "unauthenticated",
       "permission_denied",

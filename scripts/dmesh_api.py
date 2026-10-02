@@ -6,12 +6,25 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-def extract(group: str) -> str:
+def extract(group: str, platform: str | None = None) -> str:
     source = (ROOT / 'API.md').read_text()
     start = f'<!-- dmesh-api:{group} -->\n'
     if source.count(start) != 1:
         raise ValueError(f'expected one {group} API section')
     body = source.split(start, 1)[1].split('<!-- dmesh-api:end -->', 1)[0]
+    if platform is not None:
+        methods = re.split(r'(?=^#{1,2} )', body, flags=re.M)
+        kept = []
+        for block in methods:
+            if not re.match(r'^## \d+\. ', block):
+                kept.append(block)
+                continue
+            marker = re.search(r'^\*\*Platforms:\*\*\s+(.+)$', block, re.M)
+            if marker is None:
+                raise ValueError('API method is missing its Platforms marker')
+            if platform in marker.group(1).split():
+                kept.append(block)
+        body = ''.join(kept)
     return body.strip() + '\n'
 
 def check_additional_device_methods(catalog: dict) -> None:
@@ -57,6 +70,9 @@ def check_additional_device_methods(catalog: dict) -> None:
                 raise ValueError(f'root API field values differ for {name}.{field}')
 
 if __name__ == '__main__':
-    if len(sys.argv) != 3:
-        raise SystemExit('usage: scripts/dmesh_api.py GROUP OUTPUT')
-    Path(sys.argv[2]).write_text('\n'.join(extract(group) for group in sys.argv[1].split('+')))
+    if len(sys.argv) not in (3, 4):
+        raise SystemExit('usage: scripts/dmesh_api.py GROUP OUTPUT [PLATFORM]')
+    platform = sys.argv[3] if len(sys.argv) == 4 else None
+    Path(sys.argv[2]).write_text(
+        '\n'.join(extract(group, platform) for group in sys.argv[1].split('+'))
+    )

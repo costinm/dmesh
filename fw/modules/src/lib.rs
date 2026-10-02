@@ -15,7 +15,6 @@ use alloc::vec;
 use alloc::vec::Vec;
 use dmesh_server::{
     cbor::{Decoder, Encoder},
-    services,
     tagged::{self, Name, Record},
 };
 
@@ -176,21 +175,26 @@ pub unsafe extern "C" fn dmesh_module_call_service(
 /// Register the module components with `dmesh-server` before a connection is
 /// accepted. This does not initialize, map, or execute a module.
 pub fn register_tagged_handlers() {
-    assert!(services::register_tagged_component(
-        MODULE_COMPONENT,
-        handle_module
+    use dmesh_server::registry::{Method, SyncFn, register, register_all};
+    assert!(register_all(
+        &[
+            Method::new(MODULE_COMPONENT, "module", MODULE_STATUS, "status"),
+            Method::new(MODULE_COMPONENT, "module", MODULE_INIT, "init"),
+            Method::new(MODULE_COMPONENT, "module", MODULE_STOP, "stop"),
+        ],
+        SyncFn(handle_module),
     ));
-    assert!(services::register_tagged_component(
-        HELLO_COMPONENT,
-        handle_hello
+    assert!(register(
+        Method::new(HELLO_COMPONENT, "hello", MODULE_RUN, "run"),
+        SyncFn(handle_hello),
     ));
-    assert!(services::register_tagged_component(
-        LORA_COMPONENT,
-        handle_lora
+    assert!(register(
+        Method::new(LORA_COMPONENT, "lora", MODULE_RUN, "run"),
+        SyncFn(handle_lora),
     ));
-    assert!(services::register_tagged_component(
-        HARDWARE_COMPONENT,
-        handle_hardware
+    assert!(register(
+        Method::new(HARDWARE_COMPONENT, "hardware", MODULE_RUN, "run"),
+        SyncFn(handle_hardware),
     ));
 }
 

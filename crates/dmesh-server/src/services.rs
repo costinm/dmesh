@@ -4,9 +4,7 @@
 //! stream packet and passes the complete request to the shared tagged
 //! dispatcher. Bearers do not select application handlers.
 
-use alloc::format;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
 
 const MAX_EVENT_RESPONSE_BYTES: usize = 1200;
 /// A retained binary event must fit in one bounded direct-record response.
@@ -183,43 +181,6 @@ pub const BLE_COC_SEND_METHOD: u64 = 86;
 /// Loadable-firmware-module control component.
 pub const MODULE_COMPONENT: u64 = 1000;
 
-const BUILTIN_TAGGED_SERVICES: &[(u64, u64, &[u8])] = &[
-    (DIAGNOSTIC_COMPONENT, DIAGNOSTIC_STATUS_METHOD, b"status"),
-    (
-        DIAGNOSTIC_COMPONENT,
-        DIAGNOSTIC_SERVICES_METHOD,
-        b"services",
-    ),
-    (DIAGNOSTIC_COMPONENT, DIAGNOSTIC_METRICS_METHOD, b"metrics"),
-    (DIAGNOSTIC_COMPONENT, DIAGNOSTIC_EVENTS_METHOD, b"events"),
-    (
-        DIAGNOSTIC_COMPONENT,
-        DIAGNOSTIC_LOG_WATCH_METHOD,
-        b"log-watch",
-    ),
-    (
-        crate::probe::PROBE_COMPONENT,
-        crate::probe::PROBE_RUN,
-        b"probe",
-    ),
-    (
-        crate::verified_object::OBJECT_COMPONENT,
-        crate::verified_object::OBJECT_GET_METHOD,
-        b"object.get",
-    ),
-    (
-        crate::verified_object::OBJECT_COMPONENT,
-        crate::verified_object::OBJECT_FLASH_METHOD,
-        b"object.flash",
-    ),
-    (BOOT_COMPONENT, BOOT_RECOVERY_METHOD, b"boot.recovery"),
-    (
-        FIRMWARE_COMPONENT,
-        FIRMWARE_IDENTITY_METHOD,
-        b"firmware.identity",
-    ),
-];
-
 /// Encode the one running-image identity string supplied by a firmware
 /// platform. The portable service owns validation and the tagged response;
 /// ESP-IDF only supplies its ELF SHA-256 bytes.
@@ -254,187 +215,20 @@ pub fn encode_firmware_identity_response(
     response.truncate(used);
     Some(response)
 }
-/// Encode the built-in tagged QUIC handler catalog as
-/// `[[component, method, "service"], ...]`.
+/// Encode the registered tagged handlers as
+/// `[[component, method, "name"], ...]`. The registry is the only source:
+/// a method that is not registered is not reported.
 ///
 /// Compatibility stream selectors are intentionally excluded: they are
 /// framing for object transfer and connection migration, not application
 /// handler identities.
 pub fn encode_tagged_service_catalog() -> Vec<u8> {
-    let mut output = alloc::vec![0; 192];
-    let mut encoder = crate::cbor::Encoder::new(&mut output);
-    encoder
-        .array(BUILTIN_TAGGED_SERVICES.len() as u64)
-        .expect("fixed service catalog capacity");
-    for (component, method, name) in BUILTIN_TAGGED_SERVICES {
-        encoder.array(3).expect("fixed service catalog capacity");
-        encoder
-            .uint(*component)
-            .expect("fixed service catalog capacity");
-        encoder
-            .uint(*method)
-            .expect("fixed service catalog capacity");
-        encoder
-            .text_value(name)
-            .expect("fixed service catalog capacity");
-    }
-    let used = encoder.len();
-    output.truncate(used);
-    output
+    crate::registry::REGISTRY.encode_service_catalog()
 }
 
-/// Platform extension for tagged-CBOR requests carried directly in an
-/// application stream. Component IDs remain `u64` inside the envelope, so
-/// board modules can use the 1000+ range without colliding with legacy
-/// one-byte stream-service selectors. Handlers are registered per component
-/// by an application (Main, Recovery, or a host server); the bearer runtime
-/// remains unaware of them.
-pub type TaggedComponentHandler = fn(crate::tagged::Record<'_>) -> Option<Vec<u8>>;
-
-// Main registers its built-in handlers alongside optional module, BLE, and
-// provisioning handlers. Keep headroom so a newly added built-in does not
-// silently disappear when the fixed table fills.
-const TAGGED_COMPONENT_CAPACITY: usize = 24;
-// Each slot is published handler-first, component-second. A reader that sees
-// the component with Acquire ordering therefore sees the matching function.
-// Components use small numeric IDs today (1000+) and fit `usize` on every
-// ESP target; the decoded `u64` is checked before the cast.
-static TAGGED_COMPONENT_IDS: [AtomicUsize; TAGGED_COMPONENT_CAPACITY] =
-    [const { AtomicUsize::new(0) }; TAGGED_COMPONENT_CAPACITY];
-static TAGGED_COMPONENT_HANDLERS: [AtomicUsize; TAGGED_COMPONENT_CAPACITY] =
-    [const { AtomicUsize::new(0) }; TAGGED_COMPONENT_CAPACITY];
-
-/// Register one tagged-CBOR component. It is called at application startup,
-/// before transports accept traffic; duplicate component IDs are rejected.
-/// The fixed table bounds the handler surface without heap allocations.
-pub fn register_tagged_component(component: u64, handler: TaggedComponentHandler) -> bool {
-    let Ok(component) = usize::try_from(component) else {
-        return false;
-    };
-    if component == 0 {
-        return false;
-    }
-    for index in 0..TAGGED_COMPONENT_CAPACITY {
-        let existing = TAGGED_COMPONENT_IDS[index].load(Ordering::Acquire);
-        if existing == component {
-            return false;
-        }
-        if existing == 0
-            && TAGGED_COMPONENT_IDS[index]
-                .compare_exchange(0, usize::MAX, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        {
-            TAGGED_COMPONENT_HANDLERS[index].store(handler as usize, Ordering::Release);
-            TAGGED_COMPONENT_IDS[index].store(component, Ordering::Release);
-            return true;
-        }
-    }
-    false
-}
-
-/// Dispatch a complete tagged-CBOR stream request.
-///
-/// A stream is an HTTP-like request channel, not a handler identity: each
-/// stream may carry any component and multiple streams may concurrently call
-/// the same component.
-pub fn dispatch_tagged_stream(data: &[u8]) -> Option<Vec<u8>> {
-    let record = crate::tagged::decode(data)?;
-    if let Some(response) = dispatch_tagged_record(record) {
-        return Some(response);
-    }
-
-    // A complete, correlated request on a stream must not be left open just
-    // because its component is absent or the registered handler declined the
-    // method. In particular this makes adapter/API mismatches observable as a
-    // normal tagged error instead of an application timeout. Malformed,
-    // uncorrelated, and directed records remain unhandled.
-    if record.to.is_some() {
-        return None;
-    }
-    let crate::tagged::Name::Tag(component) = record.component? else {
-        return None;
-    };
-    let crate::tagged::Name::Tag(method) = record.method? else {
-        return None;
-    };
-    let id = record.id?;
-    let mut response = [0u8; 96];
-    let used = crate::tagged::encode_numeric_error(
-        component,
-        method,
-        id,
-        b"unsupported or invalid stream request",
-        &mut response,
-    )?;
-    Some(Vec::from(&response[..used]))
-}
-
-/// Dispatch an already-decoded tagged record from a canonical stream handler.
-/// This registry is deliberately not a direct-message allowlist: connectionless
-/// ingress must apply its explicit policy before invoking any operation.
-pub fn dispatch_tagged_record(record: crate::tagged::Record<'_>) -> Option<Vec<u8>> {
-    let crate::tagged::Name::Tag(component) = record.component? else {
-        return None;
-    };
-    let component = usize::try_from(component).ok()?;
-    for index in 0..TAGGED_COMPONENT_CAPACITY {
-        if TAGGED_COMPONENT_IDS[index].load(Ordering::Acquire) == component {
-            let handler = TAGGED_COMPONENT_HANDLERS[index].load(Ordering::Acquire);
-            let handler: TaggedComponentHandler =
-                (handler != 0).then(|| unsafe { core::mem::transmute(handler) })?;
-            return handler(record);
-        }
-    }
-    None
-}
-
-#[cfg(test)]
-mod tagged_stream_dispatch_tests {
-    use super::dispatch_tagged_stream;
-
-    #[test]
-    fn unknown_correlated_component_returns_an_error_record() {
-        let mut request = [0u8; 32];
-        let request_len =
-            crate::tagged::encode_numeric_empty_request(u64::MAX - 2, 7, 0x1234, &mut request)
-                .unwrap();
-
-        let response = dispatch_tagged_stream(&request[..request_len]).unwrap();
-        let record = crate::tagged::decode(&response).unwrap();
-        assert_eq!(
-            record.component,
-            Some(crate::tagged::Name::Tag(u64::MAX - 2))
-        );
-        assert_eq!(record.method, Some(crate::tagged::Name::Tag(7)));
-        assert_eq!(record.id, Some(0x1234));
-        let mut error = crate::cbor::Decoder::new(record.error.unwrap());
-        assert_eq!(
-            error.text_ref(),
-            Some(b"unsupported or invalid stream request".as_slice())
-        );
-        assert!(error.is_finished());
-    }
-
-    #[test]
-    fn malformed_and_directed_stream_records_remain_unhandled() {
-        assert_eq!(dispatch_tagged_stream(&[0xff]), None);
-
-        let mut request = [0u8; 64];
-        let mut encoder = crate::cbor::Encoder::new(&mut request);
-        encoder.map(4).unwrap();
-        encoder.uint(1).unwrap();
-        encoder.uint(u64::MAX - 2).unwrap();
-        encoder.uint(2).unwrap();
-        encoder.uint(7).unwrap();
-        encoder.uint(3).unwrap();
-        encoder.uint(0x1234).unwrap();
-        encoder.uint(9).unwrap();
-        encoder.text_value(b"peer").unwrap();
-        let len = encoder.len();
-        drop(encoder);
-        assert_eq!(dispatch_tagged_stream(&request[..len]), None);
-    }
-}
+/// Association identity for handlers that bind follow-on streams or state to
+/// a peer. Kept under its historical name; the type lives with the registry.
+pub use crate::registry::CallContext as TaggedRequestContext;
 
 /// Decode `{1: since?, 2: records?}` without allowing unknown or duplicate
 /// fields. An omitted fields map is the same as an empty map.

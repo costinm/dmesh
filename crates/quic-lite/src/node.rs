@@ -539,6 +539,12 @@ impl QuicStream {
         self.id
     }
 
+    /// Opaque identity of the association which owns this stream. The handle
+    /// is generation checked and reveals no wire connection identifier.
+    pub const fn association_id(&self) -> Option<QuicAssociation> {
+        self.association()
+    }
+
     /// Mark this stream as latency-sensitive control traffic. Accepted data
     /// packets on a priority stream may be duplicated over an alternate path
     /// when the association's duplication budget allows it.
@@ -1604,7 +1610,7 @@ where
     ) -> Result<(), QuicNodeEgressError> {
         match self.submit_pending_control(association) {
             Ok(()) => Ok(()),
-            Err(QuicNodeEgressError::PoolUnavailable | QuicNodeEgressError::BearerBusy) => {
+            Err(error) if error.is_retryable() => {
                 if !self.pending_controls.contains(&association) {
                     if self.pending_controls.len() >= self.node_limits.max_associations
                         || self.pending_controls.try_reserve(1).is_err()
@@ -1630,7 +1636,7 @@ where
         };
         match self.submit_pending_control(association) {
             Ok(()) => Ok(true),
-            Err(QuicNodeEgressError::PoolUnavailable | QuicNodeEgressError::BearerBusy) => {
+            Err(error) if error.is_retryable() => {
                 self.pending_controls.push_front(association);
                 Ok(false)
             }
@@ -2213,6 +2219,71 @@ impl<P: PacketPool, const PACKET: usize> QuicNode<P, PACKET> {
     /// Return the live growth policy for one association.
     pub fn association_limits(&self, association: QuicAssociation) -> Option<AssociationLimits> {
         Some(self.slot(association)?.limits)
+    }
+
+    /// Return read-only transport counters and send state for one live association.
+    ///
+    /// ACK and packet counters are transport evidence only; they do not imply
+    /// that the peer application consumed or committed stream data.
+    pub fn association_telemetry(
+        &self,
+        association: QuicAssociation,
+    ) -> Option<crate::AssociationTelemetry> {
+        let slot = self.slot(association)?;
+        match &slot.state {
+            Association::Client(client) => client
+                .connection()
+                .endpoint()
+                .map(crate::EndpointState::telemetry),
+            Association::Server(server) => Some(server.mux.endpoint.telemetry()),
+        }
+    }
+
+    /// Aggregate QUIC counters over associations currently live on this node.
+    pub fn telemetry(&self) -> crate::NodeTelemetry {
+        let mut result = crate::NodeTelemetry::default();
+        for slot in self.associations.iter().filter_map(Option::as_ref) {
+            let endpoint = match &slot.state {
+                Association::Client(client) => client.connection().endpoint(),
+                Association::Server(server) => Some(&server.mux.endpoint),
+            };
+            let Some(endpoint) = endpoint else { continue };
+            let stats = endpoint.stats();
+            result.live_associations = result.live_associations.saturating_add(1);
+            result.received_packets = result
+                .received_packets
+                .saturating_add(stats.received_packets);
+            result.sent_packets = result.sent_packets.saturating_add(stats.sent_packets);
+            result.received_stream_packets = result
+                .received_stream_packets
+                .saturating_add(stats.stream_packets);
+            result.received_control_packets = result
+                .received_control_packets
+                .saturating_add(stats.control_packets);
+            result.sent_stream_packets = result
+                .sent_stream_packets
+                .saturating_add(stats.sent_stream_packets);
+            result.sent_control_packets = result
+                .sent_control_packets
+                .saturating_add(stats.sent_control_packets);
+            result.duplicate_packets = result
+                .duplicate_packets
+                .saturating_add(stats.duplicate_packets);
+            result.out_of_order_packets = result
+                .out_of_order_packets
+                .saturating_add(stats.out_of_order_packets);
+            result.inferred_missing_packets = result
+                .inferred_missing_packets
+                .saturating_add(stats.inferred_missing_packets);
+            result.retransmitted_packets = result
+                .retransmitted_packets
+                .saturating_add(stats.retransmitted_packets);
+            result.loss_events = result.loss_events.saturating_add(stats.loss_events);
+            result.submission_failures = result
+                .submission_failures
+                .saturating_add(stats.submission_failures);
+        }
+        result
     }
 
     #[cfg(feature = "tokio")]
@@ -4414,7 +4485,6 @@ where
                 };
                 if !path.is_usable_for_data()
                     || slot.close_code.is_some()
-                    || path.congestion.bytes_in_flight >= path.congestion.congestion_window
                 {
                     continue;
                 }
@@ -4435,6 +4505,12 @@ where
                     }
                     None => 1,
                 };
+                // Congestion does not invalidate an address or make a ready
+                // bearer busy. Record both before filtering this candidate,
+                // so a full window yields retryable stream backpressure.
+                if path.congestion.bytes_in_flight >= path.congestion.congestion_window {
+                    continue;
+                }
                 let (_, _, _, _, sent, ..) = path.circuit_telemetry();
                 let key = (
                     ready,
@@ -4655,7 +4731,7 @@ where
             };
             endpoint
                 .pending_path_status(self.clock_us())
-                .and_then(|(_, key, sequence, status)| {
+                .and_then(|(status_path, key, sequence, status)| {
                     let egress_path = endpoint.status_egress_path()?;
                     let path = endpoint.path_state(egress_path)?;
                     let (bearer, peer_l2_address) = path.active_address().or_else(|| {
@@ -4665,6 +4741,7 @@ where
                     })?;
                     let destination = endpoint.peer_connection_id_on_path(egress_path)?;
                     Some((
+                        status_path,
                         egress_path,
                         key,
                         sequence,
@@ -4675,7 +4752,7 @@ where
                     ))
                 })
         };
-        if let Some((egress_path, key, sequence, status, destination, bearer, peer_l2_address)) =
+        if let Some((status_path, egress_path, key, sequence, status, destination, bearer, peer_l2_address)) =
             status_output
         {
             let now = self.clock_us();
@@ -4696,13 +4773,24 @@ where
                     },
                     output,
                 )
-            })?;
-            return Ok(Some(NodeEgress {
-                association,
-                bearer,
-                peer_l2_address,
-                packet,
-            }));
+            });
+            match packet {
+                Ok(packet) => return Ok(Some(NodeEgress {
+                    association, bearer, peer_l2_address, packet,
+                })),
+                Err(QuicNodeEgressError::Transport(Error::Blocked | Error::HistoryFull)) => {
+                    let slot = self.slot_mut(association).ok_or(QuicNodeError::MissingAssociation)?;
+                    let endpoint = match &mut slot.state {
+                        Association::Client(client) => client.connection_mut().endpoint_mut()
+                            .map_err(QuicNodeEgressError::Transport)?,
+                        Association::Server(server) => &mut server.mux.endpoint,
+                    };
+                    endpoint.defer_path_status(status_path, egress_path);
+                    // Normal ACK/credit output and loss recovery must not be
+                    // starved by a congestion-limited path-status record.
+                }
+                Err(error) => return Err(error),
+            }
         }
         let slot = self
             .slot(association)
@@ -4823,6 +4911,14 @@ where
             slot.close_code = Some(code);
             Self::slot_active_address(slot).ok_or(QuicNodeEgressError::MissingEgressAddress)?
         };
+
+        // CLOSE retires the association, so it cannot be regenerated after
+        // submission refuses a second lease. Wait before preparing it when
+        // this bearer already retains an unsubmitted packet.
+        #[cfg(feature = "tokio")]
+        if self.bearers.get_mut(bearer).is_some_and(|bearer| !bearer.can_submit()) {
+            return Err(QuicNodeEgressError::BearerBusy);
+        }
 
         let control = {
             let slot = self
@@ -7782,6 +7878,95 @@ mod tests {
         ConnectionId::new(value).unwrap()
     }
 
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn addressed_congestion_full_path_blocks_and_resumes_without_losing_route() {
+        use crate::{bearer::BearerName, fake::FakePacketBearer};
+        type Pool = crate::packet_pool::PacketPool<4, DEFAULT_PACKET_POOL_SLOT_SIZE>;
+        static POOL: Pool = Pool::new();
+        let mut client = QuicNode::<Pool>::new(&POOL);
+        let bearer = client
+            .add_bearer(FakePacketBearer::<Pool>::new(
+                BearerName::new("congestion-test").unwrap(),
+            ))
+            .unwrap();
+        let meta = PacketMeta {
+            bearer,
+            peer_l2_address: PeerL2Address::new(11).unwrap(),
+            received_at_us: 1,
+        };
+        let open = client.start_association(cid(0x71), meta, 0).unwrap();
+        let association = open.association;
+        let mut server = QuicNode::<Pool>::new(&POOL);
+        let NodeIngress::Initial { response, .. } = server
+            .receive_packet(
+                meta,
+                open.packet,
+                |_| Some(InitialAdmission { local_limits: ConnectionLimits::default() }),
+                |_, _, _, _, bytes| Ok(bytes.len()),
+            )
+            .unwrap()
+        else {
+            panic!("initial admission");
+        };
+        client
+            .receive_packet(meta, response.packet, |_| None, |_, _, _, _, bytes| Ok(bytes.len()))
+            .unwrap();
+        let stream = client.allocate_stream(association).unwrap();
+        let Association::Client(state) = &mut client.slot_mut(association).unwrap().state else {
+            panic!("client association");
+        };
+        let endpoint = state.connection_mut().endpoint_mut().unwrap();
+        let next_packet = endpoint.next_packet_number;
+        endpoint.paths[0].congestion.congestion_window = 1200;
+        endpoint.paths[0].congestion.bytes_in_flight = 1200;
+        let address = endpoint.paths[0].active_address();
+
+        assert!(matches!(
+            client.send_stream(association, stream, 0, true, b"body"),
+            Err(QuicNodeEgressError::Transport(Error::Blocked))
+        ));
+
+        // A timer-driven path-control packet obeys the same congestion
+        // limit, but must not kill the runtime or leave an immediately due
+        // deadline spinning while ACK/loss progress can free capacity.
+        let Association::Client(state) = &mut client.slot_mut(association).unwrap().state else {
+            unreachable!();
+        };
+        let endpoint = state.connection_mut().endpoint_mut().unwrap();
+        endpoint.set_base_circuit_key();
+        endpoint.queue_path_status(0, crate::PathStatusKind::Available).unwrap();
+        let now = client.clock_us();
+        assert!(matches!(client.timer_expired(now), Ok(None)));
+        let status_retry = client.next_deadline().unwrap();
+        assert!(status_retry > now);
+
+        let Association::Client(state) = &mut client.slot_mut(association).unwrap().state else {
+            panic!("client association");
+        };
+        let endpoint = state.connection_mut().endpoint_mut().unwrap();
+        assert_eq!(endpoint.next_packet_number, next_packet);
+        assert_eq!(endpoint.paths[0].active_address(), address);
+        // Model ACK progress releasing congestion capacity. Retry the same
+        // bytes and FIN; the failed attempt must not advance the stream.
+        endpoint.paths[0].congestion.bytes_in_flight = 0;
+        let sent = client.send_stream(association, stream, 0, true, b"body").unwrap();
+        assert_eq!(
+            (sent.bearer, sent.peer_l2_address),
+            (meta.bearer, meta.peer_l2_address)
+        );
+        drop(sent);
+        client.advance_clock(status_retry);
+        assert!(client.poll_association_control(association).unwrap().is_some());
+        // Genuine route loss must retain its non-retryable classification.
+        assert!(client.remove_bearer(bearer));
+        let next_stream = client.allocate_stream(association).unwrap();
+        assert!(matches!(
+            client.send_stream(association, next_stream, 0, true, b"body"),
+            Err(QuicNodeEgressError::MissingEgressAddress)
+        ));
+    }
+
     #[test]
     fn path_open_forwards_by_local_resolver_and_replays_downstream_reply() {
         use crate::relay::{
@@ -7790,8 +7975,10 @@ mod tests {
             decode_setup_request_packet,
         };
 
-        let mut node: QuicNode<TestPool, { crate::DEFAULT_MAX_PACKET_SIZE }> =
-            QuicNode::new(&TEST_POOL);
+        type PathOpenPool = crate::packet_pool::PacketPool<2, DEFAULT_PACKET_POOL_SLOT_SIZE>;
+        static PATH_OPEN_POOL: PathOpenPool = PathOpenPool::new();
+        let mut node: QuicNode<PathOpenPool, { crate::DEFAULT_MAX_PACKET_SIZE }> =
+            QuicNode::new(&PATH_OPEN_POOL);
         let destination_vip = 0x0102_0304_0506_0708;
         node.set_vip_path_open_resolver(move |kind, address, vip| {
             (kind == 3 && address == [9, 8, 7, 6, 5, 4] && vip == destination_vip).then_some(
@@ -7849,7 +8036,7 @@ mod tests {
         };
 
         let receive =
-            |node: &mut QuicNode<TestPool, { crate::DEFAULT_MAX_PACKET_SIZE }>, meta, bytes| {
+            |node: &mut QuicNode<PathOpenPool, { crate::DEFAULT_MAX_PACKET_SIZE }>, meta, bytes| {
                 node.receive_packet(
                     meta,
                     OwnedPacket::new(bytes, 0..input_len).unwrap(),
@@ -7929,7 +8116,7 @@ mod tests {
             .relay_cids
             .first()
             .expect("successful relay setup returns its local forward CID");
-        let route = |node: &QuicNode<TestPool, { crate::DEFAULT_MAX_PACKET_SIZE }>, dcid| {
+        let route = |node: &QuicNode<PathOpenPool, { crate::DEFAULT_MAX_PACKET_SIZE }>, dcid| {
             let mut bytes = [0u8; 16];
             let used = ShortHeader {
                 flags: FLAG_FIXED,
@@ -7977,8 +8164,10 @@ mod tests {
             SetupHopInstruction, SetupMode, SetupRequest, SetupResult,
         };
 
-        let mut node: QuicNode<TestPool, { crate::DEFAULT_MAX_PACKET_SIZE }> =
-            QuicNode::new(&TEST_POOL);
+        type RejectionPool = crate::packet_pool::PacketPool<2, DEFAULT_PACKET_POOL_SLOT_SIZE>;
+        static REJECTION_POOL: RejectionPool = RejectionPool::new();
+        let mut node: QuicNode<RejectionPool, { crate::DEFAULT_MAX_PACKET_SIZE }> =
+            QuicNode::new(&REJECTION_POOL);
         let vip = 0x0102_0304_0506_0708;
         let next_hop = CircuitNextHop {
             bearer: BearerId::new(2).unwrap(),
@@ -8951,8 +9140,10 @@ mod tests {
             SetupResult, decode_setup_reply_packet,
         };
 
-        let mut node: QuicNode<TestPool, { crate::DEFAULT_MAX_PACKET_SIZE }> =
-            QuicNode::new(&TEST_POOL);
+        type EndpointPool = crate::packet_pool::PacketPool<2, DEFAULT_PACKET_POOL_SLOT_SIZE>;
+        static ENDPOINT_POOL: EndpointPool = EndpointPool::new();
+        let mut node: QuicNode<EndpointPool, { crate::DEFAULT_MAX_PACKET_SIZE }> =
+            QuicNode::new(&ENDPOINT_POOL);
         let client_cid = cid(0x1234);
         let reverse_alias = cid(0x777);
         let mut initial = [0u8; crate::DEFAULT_MAX_PACKET_SIZE];
@@ -8982,7 +9173,8 @@ mod tests {
             peer_l2_address: PeerL2Address::new(9).unwrap(),
             received_at_us: 10,
         };
-        let receive = |node: &mut QuicNode<TestPool, { crate::DEFAULT_MAX_PACKET_SIZE }>, input| {
+        let receive = |node: &mut QuicNode<EndpointPool, { crate::DEFAULT_MAX_PACKET_SIZE }>,
+                       input| {
             node.receive_packet(
                 meta,
                 OwnedPacket::new(input, 0..request_len).unwrap(),
@@ -9184,6 +9376,7 @@ mod tests {
             4,
         );
         assert!(sent.same_stream(&received));
+        assert_eq!(received.association_id(), Some(association));
         assert!(!sent.same_stream(&other_association));
     }
 

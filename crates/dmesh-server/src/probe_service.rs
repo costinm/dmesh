@@ -1,6 +1,6 @@
 //! Bearer-neutral PROBE stream request layout.
 //!
-//! `probe.run` uses the same tagged-CBOR envelope as every other callable
+//! `probe.start` uses the same tagged-CBOR envelope as every other callable
 //! operation.
 
 use crate::{
@@ -14,9 +14,24 @@ pub use quic_lite::probe::{
 };
 
 pub const PROBE_COMPONENT: u64 = 8;
-pub const PROBE_RUN: u64 = 1;
-/// Bounded storage for one complete canonical `probe.run` request.
-pub const PROBE_RUN_REQUEST_MAX: usize = 160;
+/// `probe.start`: ask a node to run a probe against `peer`. Header only, in both
+/// directions; the response header reports the outcome.
+pub const PROBE_START: u64 = 1;
+/// `probe.handler`: the probed node's handler. The response header announces
+/// the exchange and the response body is the probe payload.
+pub const PROBE_HANDLER: u64 = 2;
+/// Bounded storage for one complete canonical `probe.start` request.
+pub const PROBE_REQUEST_MAX: usize = 160;
+
+/// How long a `probe.start` job may run, in milliseconds: the caller's
+/// `timeout` envelope field when given, else a default that grows with the
+/// transfer (30 s up to 300 s, assuming at least 8 KiB/s).
+pub fn probe_timeout_ms(requested: Option<u64>, bytes: u64) -> u64 {
+    match requested {
+        Some(timeout) => timeout,
+        None => (bytes / 8_192).clamp(30, 300) * 1000,
+    }
+}
 const FIELD_BYTES: u64 = 1;
 const FIELD_PACKET_SIZE: u64 = 2;
 const FIELD_ACK_FREQUENCY: u64 = 6;
@@ -147,8 +162,26 @@ impl ProbeServiceRequest {
     }
 }
 
-/// Encode the canonical correlated `probe.run` request.
-pub fn encode_probe_run_request(
+/// Encode the canonical correlated `probe.start` request.
+pub fn encode_probe_start_request(
+    request: ProbeServiceRequest,
+    id: u64,
+    output: &mut [u8],
+) -> Option<usize> {
+    encode_probe_request(PROBE_START, request, id, output)
+}
+
+/// Encode the correlated `probe.handler` request sent to the probed node.
+pub fn encode_probe_handler_request(
+    request: ProbeServiceRequest,
+    id: u64,
+    output: &mut [u8],
+) -> Option<usize> {
+    encode_probe_request(PROBE_HANDLER, request, id, output)
+}
+
+fn encode_probe_request(
+    method: u64,
     request: ProbeServiceRequest,
     id: u64,
     output: &mut [u8],
@@ -166,7 +199,7 @@ pub fn encode_probe_run_request(
     e.uint(1)?;
     e.uint(PROBE_COMPONENT)?;
     e.uint(2)?;
-    e.uint(PROBE_RUN)?;
+    e.uint(method)?;
     e.uint(3)?;
     e.uint(id)?;
     e.uint(5)?;
@@ -211,11 +244,20 @@ pub fn encode_probe_run_request(
     Some(e.len())
 }
 
-/// Decode a canonical `probe.run` request already extracted from a QUIC
+/// Decode a canonical `probe.start` request already extracted from a QUIC
 /// stream. Directed records are routing input and are never executed locally.
-pub fn decode_probe_run_record(record: Record<'_>) -> Option<(u64, ProbeServiceRequest)> {
+pub fn decode_probe_start_record(record: Record<'_>) -> Option<(u64, ProbeServiceRequest)> {
+    decode_probe_record(record, PROBE_START)
+}
+
+/// Decode a `probe.handler` request.
+pub fn decode_probe_handler_record(record: Record<'_>) -> Option<(u64, ProbeServiceRequest)> {
+    decode_probe_record(record, PROBE_HANDLER)
+}
+
+fn decode_probe_record(record: Record<'_>, method: u64) -> Option<(u64, ProbeServiceRequest)> {
     if record.component != Some(Name::Tag(PROBE_COMPONENT))
-        || record.method != Some(Name::Tag(PROBE_RUN))
+        || record.method != Some(Name::Tag(method))
         || record.params.is_some()
     {
         return None;
@@ -307,11 +349,183 @@ pub fn encode_probe_result_response(
     let value_len = e.len();
     crate::tagged::encode_numeric_response(
         PROBE_COMPONENT,
-        PROBE_RUN,
+        PROBE_START,
         id,
         &value[..value_len],
         output,
     )
+}
+
+/// The response header of `probe.handler`: the length of the payload that
+/// follows and the packet size it is built from.
+pub fn encode_probe_handler_response(
+    id: u64,
+    bytes: u64,
+    packet_size: usize,
+    output: &mut [u8],
+) -> Option<usize> {
+    let mut value = [0u8; 32];
+    let mut e = Encoder::new(&mut value);
+    e.map(2)?;
+    e.uint(1)?;
+    e.uint(bytes)?;
+    e.uint(2)?;
+    e.uint(packet_size as u64)?;
+    let value_len = e.len();
+    crate::tagged::encode_numeric_response(
+        PROBE_COMPONENT,
+        PROBE_HANDLER,
+        id,
+        &value[..value_len],
+        output,
+    )
+}
+
+/// The probed node's end of a probe: answer with a header, then stream the
+/// probe payload as the response body. It wraps the transport-neutral
+/// `quic_lite::probe` workload; the request header is the only CBOR involved.
+pub struct ProbeHandler;
+
+struct ProbeBody(quic_lite::probe::ProbePayload);
+
+impl crate::stream::BodySource for ProbeBody {
+    fn read(&mut self, out: &mut [u8]) -> (usize, bool) {
+        let count = self.0.fill(out);
+        (count, self.0.is_complete())
+    }
+}
+
+impl ProbeHandler {
+    /// The request limits shared by every platform.
+    fn accept(request: &ProbeServiceRequest) -> bool {
+        request.bytes != 0
+            && request.bytes <= PROBE_MAX_BYTES
+            && request.peer.is_none()
+            && request.parallel_streams.is_none_or(|streams| streams == 1)
+            && request.high_priority_bytes.is_none_or(|bytes| bytes == 0)
+            && request.low_priority_bytes.is_none_or(|bytes| bytes == 0)
+            && request.ack_frequency.is_none()
+            && request.ack_delay_ms.is_none()
+    }
+}
+
+impl crate::stream::StreamHandler for ProbeHandler {
+    fn open<'a>(&'a self, request: crate::stream::Request<'a>) -> crate::stream::OpenFuture<'a> {
+        let outcome = (|| {
+            let (id, probe) = decode_probe_handler_record(request.record)?;
+            if !Self::accept(&probe) {
+                return None;
+            }
+            let plan = ProbeServicePlan::from_request(
+                probe.workload(),
+                quic_lite::DEFAULT_MAX_STREAM_PAYLOAD,
+            );
+            let payload = quic_lite::probe::ProbePayload::new(probe.bytes, plan.packet_size)?;
+            let mut header = alloc::vec![0u8; 64];
+            let used = encode_probe_handler_response(id, probe.bytes, plan.packet_size, &mut header)?;
+            header.truncate(used);
+            Some(crate::stream::Outcome::Respond(
+                crate::stream::Response::with_body(header, ProbeBody(payload)),
+            ))
+        })();
+        alloc::boxed::Box::pin(core::future::ready(outcome))
+    }
+}
+
+/// Why a probe response was not a valid probe.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProbeClientError {
+    /// The response header was malformed or not a `probe.handler` result.
+    Header,
+    /// The peer answered with an error header.
+    Rejected,
+    /// A payload byte differs from the probe pattern, or there are too many.
+    Payload,
+}
+
+/// The caller's end of a probe: feeds the bytes of the response stream (header,
+/// then payload) and validates the payload, however the transport chunks it.
+pub struct ProbeResponseReader {
+    buffer: alloc::vec::Vec<u8>,
+    payload: Option<quic_lite::probe::ProbePayload>,
+    expected: u64,
+}
+
+impl ProbeResponseReader {
+    /// `expected` is the byte count that was requested.
+    pub fn new(expected: u64) -> Self {
+        Self {
+            buffer: alloc::vec::Vec::new(),
+            payload: None,
+            expected,
+        }
+    }
+
+    /// Feed the next ordered response bytes.
+    pub fn push(&mut self, bytes: &[u8]) -> Result<(), ProbeClientError> {
+        let mut bytes = bytes;
+        if self.payload.is_none() {
+            self.buffer.extend_from_slice(bytes);
+            match crate::stream::scan_header(&self.buffer) {
+                crate::stream::Header::NeedMore => return Ok(()),
+                crate::stream::Header::Invalid => return Err(ProbeClientError::Header),
+                crate::stream::Header::Complete(length) => {
+                    let record = crate::tagged::decode(&self.buffer[..length])
+                        .ok_or(ProbeClientError::Header)?;
+                    if record.error.is_some() {
+                        return Err(ProbeClientError::Rejected);
+                    }
+                    let mut d = Decoder::new(record.result.ok_or(ProbeClientError::Header)?);
+                    let (major, count) = d.head().ok_or(ProbeClientError::Header)?;
+                    if major != 5 || count != 2 {
+                        return Err(ProbeClientError::Header);
+                    }
+                    let (mut length_field, mut packet_size) = (None, None);
+                    for _ in 0..count {
+                        match d.uint().ok_or(ProbeClientError::Header)? {
+                            1 => length_field = d.uint(),
+                            2 => packet_size = d.uint(),
+                            _ => return Err(ProbeClientError::Header),
+                        }
+                    }
+                    let announced = length_field.ok_or(ProbeClientError::Header)?;
+                    if announced != self.expected {
+                        return Err(ProbeClientError::Header);
+                    }
+                    let packet_size = usize::try_from(packet_size.ok_or(ProbeClientError::Header)?)
+                        .map_err(|_| ProbeClientError::Header)?;
+                    self.payload = Some(
+                        quic_lite::probe::ProbePayload::new(announced, packet_size)
+                            .ok_or(ProbeClientError::Header)?,
+                    );
+                    let body = self.buffer.split_off(length);
+                    self.buffer.clear();
+                    return self.check(&body);
+                }
+            }
+        }
+        let _ = &mut bytes;
+        self.check(bytes)
+    }
+
+    fn check(&mut self, bytes: &[u8]) -> Result<(), ProbeClientError> {
+        match self.payload.as_mut() {
+            Some(payload) => payload
+                .check(bytes)
+                .map_err(|_| ProbeClientError::Payload),
+            None => Ok(()),
+        }
+    }
+
+    /// Payload bytes validated so far.
+    pub fn bytes(&self) -> u64 {
+        self.payload.as_ref().map_or(0, |payload| payload.offset())
+    }
+
+    /// Whether the whole payload arrived and was valid.
+    pub fn is_complete(&self) -> bool {
+        self.payload.as_ref().is_some_and(|payload| payload.is_complete())
+    }
 }
 
 fn parse_mac(value: &[u8]) -> Option<[u8; 6]> {
@@ -343,7 +557,7 @@ fn hex_nibble(value: u8) -> Option<u8> {
 mod tests {
     use super::{
         PROBE_MAX_NORMAL_STREAMS, ProbeDestination, ProbeServicePlan, ProbeServiceRequest,
-        decode_probe_run_record, encode_probe_run_request,
+        decode_probe_start_record, encode_probe_start_request,
     };
 
     #[test]
@@ -361,9 +575,9 @@ mod tests {
             peer: Some(ProbeDestination::parse("espnow://20:6e:f1:13:b1:70").unwrap()),
         };
         let mut wire = [0u8; 128];
-        let used = encode_probe_run_request(request, 42, &mut wire).unwrap();
+        let used = encode_probe_start_request(request, 42, &mut wire).unwrap();
         let record = crate::tagged::decode(&wire[..used]).unwrap();
-        assert_eq!(decode_probe_run_record(record), Some((42, request)));
+        assert_eq!(decode_probe_start_record(record), Some((42, request)));
     }
 
     #[test]
@@ -401,5 +615,106 @@ mod tests {
         assert_eq!(plan.ack_frequency, 8);
         assert_eq!(plan.ack_delay_ms, 1);
         assert_eq!(plan.total_bytes(), 20);
+    }
+
+    #[test]
+    fn the_probed_node_answers_with_a_header_then_a_validated_payload() {
+        use crate::registry::{CallContext, Method, Registry};
+        use crate::stream::{Outcome, Request};
+        let registry = Registry::new();
+        assert!(registry.register_stream(
+            Method::new(super::PROBE_COMPONENT, "probe", super::PROBE_HANDLER, "source"),
+            super::ProbeHandler
+        ));
+        let request = ProbeServiceRequest::new(5000, 512);
+        let mut wire = [0u8; 128];
+        let used = super::encode_probe_handler_request(request, 8, &mut wire).unwrap();
+        let record = crate::tagged::decode(&wire[..used]).unwrap();
+        let Some(Outcome::Respond(response)) = registry.open_now(Request {
+            record,
+            header: &wire[..used],
+            context: CallContext::default(),
+        }) else {
+            panic!("probe.handler must answer")
+        };
+        let mut reader = response.into_reader();
+        let mut client = super::ProbeResponseReader::new(5000);
+        let mut chunk = [0u8; 333];
+        loop {
+            let (count, done) = reader.read(&mut chunk);
+            client.push(&chunk[..count]).unwrap();
+            if done {
+                break;
+            }
+        }
+        assert!(client.is_complete());
+        assert_eq!(client.bytes(), 5000);
+    }
+
+    #[test]
+    fn the_client_accepts_the_header_and_payload_in_one_chunk() {
+        use crate::registry::{CallContext, Method, Registry};
+        use crate::stream::{Outcome, Request};
+        let registry = Registry::new();
+        assert!(registry.register_stream(
+            Method::new(super::PROBE_COMPONENT, "probe", super::PROBE_HANDLER, "source"),
+            super::ProbeHandler
+        ));
+        let request = ProbeServiceRequest::new(700, 100);
+        let mut wire = [0u8; 128];
+        let used = super::encode_probe_handler_request(request, 3, &mut wire).unwrap();
+        let record = crate::tagged::decode(&wire[..used]).unwrap();
+        let Some(Outcome::Respond(response)) = registry.open_now(Request {
+            record,
+            header: &wire[..used],
+            context: CallContext::default(),
+        }) else {
+            panic!("probe.handler must answer")
+        };
+        let mut reader = response.into_reader();
+        let mut all = std::vec::Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let (count, done) = reader.read(&mut chunk);
+            all.extend_from_slice(&chunk[..count]);
+            if done {
+                break;
+            }
+        }
+        let mut client = super::ProbeResponseReader::new(700);
+        client.push(&all).unwrap();
+        assert!(client.is_complete());
+    }
+
+    #[test]
+    fn a_rejected_probe_is_an_error_header_not_payload() {
+        use crate::registry::{CallContext, Method, Registry};
+        use crate::stream::{Outcome, Request};
+        let registry = Registry::new();
+        assert!(registry.register_stream(
+            Method::new(super::PROBE_COMPONENT, "probe", super::PROBE_HANDLER, "source"),
+            super::ProbeHandler
+        ));
+        let mut request = ProbeServiceRequest::new(100, 512);
+        request.ack_frequency = Some(2); // unsupported by the source
+        let mut wire = [0u8; 128];
+        let used = super::encode_probe_handler_request(request, 9, &mut wire).unwrap();
+        let record = crate::tagged::decode(&wire[..used]).unwrap();
+        let Some(Outcome::Respond(response)) = registry.open_now(Request {
+            record,
+            header: &wire[..used],
+            context: CallContext::default(),
+        }) else {
+            panic!("a rejection is still an answer")
+        };
+        let mut reader = response.into_reader();
+        let mut bytes = [0u8; 128];
+        let (count, done) = reader.read(&mut bytes);
+        assert!(done);
+        let mut client = super::ProbeResponseReader::new(100);
+        assert_eq!(
+            client.push(&bytes[..count]),
+            Err(super::ProbeClientError::Rejected)
+        );
     }
 }

@@ -89,7 +89,6 @@ pub const fn bounded_storage_slots(
     .slots_for(available_bytes)
 }
 
-
 /// Credit return after one verified object record. This policy is independent
 /// of UDP/UART/radio: a persistent sink returns blob credit only when it has
 /// reclaimed storage, while a benchmark/fake sink can reuse it immediately.
@@ -296,7 +295,6 @@ impl ObjectBodyStream {
         self.advance(chunk).then_some(chunk)
     }
 }
-
 
 /// Byte-record extraction over an already ordered transport stream. The
 /// transport owns packet reassembly and flow control; this only handles the
@@ -613,11 +611,19 @@ pub struct FlashRequest<'a> {
 
 /// Platform effects required by the common `object.flash` handler.
 ///
-/// Implementations copy any borrowed request fields they retain. They own
-/// partition selection, erase/write calls and reboot integration, but never
-/// decode tagged CBOR or inspect QUIC/bearer state.
-pub trait FlashPlatform {
-    fn start(&mut self, request: FlashRequest<'_>) -> Result<(), FlashStartError>;
+/// `start` validates the request and, when the platform can write it, returns
+/// the sink that receives the request body (the manifest-length prefix,
+/// manifest and object records) and produces the terminal response. The
+/// platform owns partition selection, erase/write calls and reboot
+/// integration; it never decodes tagged CBOR or inspects QUIC/bearer state.
+/// Implementations copy any borrowed request fields they retain.
+pub trait FlashPlatform: Send + Sync + 'static {
+    fn start(
+        &self,
+        request: FlashRequest<'_>,
+        id: u64,
+        context: crate::registry::CallContext,
+    ) -> Result<alloc::boxed::Box<dyn crate::stream::BodySink>, FlashStartError>;
 }
 
 /// Stable application errors returned by the common flash handler.
@@ -628,51 +634,54 @@ pub enum FlashStartError {
     InvalidTarget,
 }
 
-/// Decode and execute one correlated `object.flash` request.
+/// The `object.flash` handler: a request header, then the object as the
+/// request body, then FIN, answered with a terminal response header. It is
+/// registered like every other method; the platform supplies the sink.
 ///
-/// The response is an application result only. Durable completion and reboot
-/// remain separate platform events and must not be inferred from stream ACKs.
-pub fn handle_flash_record<P: FlashPlatform>(
-    record: crate::tagged::Record<'_>,
-    platform: &mut P,
-) -> Option<alloc::vec::Vec<u8>> {
-    if record.component != Some(crate::tagged::Name::Tag(OBJECT_COMPONENT))
-        || record.method != Some(crate::tagged::Name::Tag(OBJECT_FLASH_METHOD))
-        || record.to.is_some()
-        || record.params.is_some()
-        || record.data.is_some()
-        || record.result.is_some()
-        || record.error.is_some()
-    {
-        return None;
+/// The response to the header is not an acknowledgement of durable completion:
+/// the terminal response comes only after the body has been written and
+/// verified, and reboot remains a separate platform event.
+pub struct FlashHandler<P: FlashPlatform>(pub P);
+
+impl<P: FlashPlatform> crate::stream::StreamHandler for FlashHandler<P> {
+    fn open<'a>(&'a self, request: crate::stream::Request<'a>) -> crate::stream::OpenFuture<'a> {
+        use crate::stream::{Outcome, Response};
+        let outcome = (|| {
+            let record = request.record;
+            if record.component != Some(crate::tagged::Name::Tag(OBJECT_COMPONENT))
+                || record.method != Some(crate::tagged::Name::Tag(OBJECT_FLASH_METHOD))
+                || record.to.is_some()
+                || record.params.is_some()
+                || record.data.is_some()
+                || record.result.is_some()
+                || record.error.is_some()
+            {
+                return None;
+            }
+            let id = record.id?;
+            let flash = decode_flash_request(record.fields?)?;
+            Some(match self.0.start(flash, id, request.context) {
+                Ok(sink) => Outcome::Receive(sink),
+                Err(error) => {
+                    let message: &[u8] = match error {
+                        FlashStartError::Busy => FLASH_BUSY_ERROR,
+                        FlashStartError::Unsupported => b"flash unavailable",
+                        FlashStartError::InvalidTarget => b"invalid flash target",
+                    };
+                    let mut response = [0u8; REQUEST_MAX];
+                    let used = crate::tagged::encode_numeric_error(
+                        OBJECT_COMPONENT,
+                        OBJECT_FLASH_METHOD,
+                        id,
+                        message,
+                        &mut response,
+                    )?;
+                    Outcome::Respond(Response::header(alloc::vec::Vec::from(&response[..used])))
+                }
+            })
+        })();
+        alloc::boxed::Box::pin(core::future::ready(outcome))
     }
-    let id = record.id?;
-    let request = decode_flash_request(record.fields?)?;
-    let mut response = [0u8; REQUEST_MAX];
-    let used = match platform.start(request) {
-        Ok(()) => crate::tagged::encode_numeric_response(
-            OBJECT_COMPONENT,
-            OBJECT_FLASH_METHOD,
-            id,
-            &[0xa0],
-            &mut response,
-        )?,
-        Err(error) => {
-            let message: &[u8] = match error {
-                FlashStartError::Busy => FLASH_BUSY_ERROR,
-                FlashStartError::Unsupported => b"flash unavailable",
-                FlashStartError::InvalidTarget => b"invalid flash target",
-            };
-            crate::tagged::encode_numeric_error(
-                OBJECT_COMPONENT,
-                OBJECT_FLASH_METHOD,
-                id,
-                message,
-                &mut response,
-            )?
-        }
-    };
-    Some(alloc::vec::Vec::from(&response[..used]))
 }
 
 /// Canonically encode the `flash` handler body.  Field keys are shared by
@@ -2110,7 +2119,6 @@ mod tests {
         assert!(matches!(result, Err(BoxedReceiverError::Sink(7))));
     }
 
-
     #[test]
     fn verified_object_credit_is_storage_not_bearer_policy() {
         assert_eq!(
@@ -2457,18 +2465,22 @@ mod tests {
             .push_stream_chunks([manifest[..3].to_vec()])
             .unwrap();
         assert!(received);
-        assert!(receiver
-            .push_stream_chunks([manifest[3..].to_vec()])
-            .unwrap());
+        assert!(
+            receiver
+                .push_stream_chunks([manifest[3..].to_vec()])
+                .unwrap()
+        );
 
         let first = b"1234";
         assert!(receiver.push_stream_chunks([first[..2].to_vec()]).unwrap());
         assert!(receiver.push_stream_chunks([first[2..].to_vec()]).unwrap());
 
         assert!(receiver.push_stream_chunks([b"5678"]).unwrap());
-        assert!(!receiver
-            .push_stream_chunks(core::iter::empty::<Vec<u8>>())
-            .unwrap());
+        assert!(
+            !receiver
+                .push_stream_chunks(core::iter::empty::<Vec<u8>>())
+                .unwrap()
+        );
 
         receiver.finish_ordered().unwrap_or_else(|error| {
             panic!(
@@ -2675,6 +2687,15 @@ mod tests {
             Some((42, flash))
         );
 
+        // The header carries no body length: the object follows it as raw
+        // bytes and ends with FIN.
+        assert!(
+            crate::tagged::decode(&wire[..used])
+                .unwrap()
+                .data
+                .is_none()
+        );
+
         let used = crate::tagged::encode_numeric_error(
             OBJECT_COMPONENT,
             OBJECT_FLASH_METHOD,
@@ -2805,11 +2826,40 @@ mod tests {
 
     #[test]
     fn common_flash_handler_decodes_before_calling_platform() {
-        struct Platform(Option<(u8, u8, bool)>);
+        use crate::registry::{CallContext, Method, Registry};
+        use crate::stream::{BodySink, Outcome, Request, Response};
+        use std::sync::{Arc, Mutex};
+
+        struct Sink(u64, Arc<Mutex<Vec<u8>>>);
+        impl BodySink for Sink {
+            fn write(&mut self, chunk: &[u8], _fin: bool) -> Result<usize, Vec<u8>> {
+                self.1.lock().unwrap().extend_from_slice(chunk);
+                Ok(chunk.len())
+            }
+            fn finish(self: Box<Self>) -> Response {
+                let mut out = [0u8; 48];
+                let used = crate::tagged::encode_numeric_response(
+                    OBJECT_COMPONENT,
+                    OBJECT_FLASH_METHOD,
+                    self.0,
+                    &[0xa0],
+                    &mut out,
+                )
+                .unwrap();
+                Response::header(out[..used].to_vec())
+            }
+        }
+        struct Platform(Arc<Mutex<Option<(u8, u8, bool)>>>, Arc<Mutex<Vec<u8>>>);
         impl FlashPlatform for Platform {
-            fn start(&mut self, request: FlashRequest<'_>) -> Result<(), FlashStartError> {
-                self.0 = Some((request.object.cpu, request.object.target, request.dry_run));
-                Ok(())
+            fn start(
+                &self,
+                request: FlashRequest<'_>,
+                id: u64,
+                _context: CallContext,
+            ) -> Result<Box<dyn BodySink>, FlashStartError> {
+                *self.0.lock().unwrap() =
+                    Some((request.object.cpu, request.object.target, request.dry_run));
+                Ok(Box::new(Sink(id, self.1.clone())))
             }
         }
 
@@ -2823,13 +2873,29 @@ mod tests {
             transport: 0,
             dry_run: true,
         };
+        let started = Arc::new(Mutex::new(None));
+        let body = Arc::new(Mutex::new(Vec::new()));
+        let registry = Registry::new();
+        assert!(registry.register_stream(
+            Method::new(OBJECT_COMPONENT, "object", OBJECT_FLASH_METHOD, "flash"),
+            FlashHandler(Platform(started.clone(), body.clone())),
+        ));
         let mut wire = [0u8; REQUEST_MAX];
         let used = encode_flash_handler_request(request, 77, &mut wire).unwrap();
         let record = crate::tagged::decode(&wire[..used]).unwrap();
-        let mut platform = Platform(None);
-        let response = handle_flash_record(record, &mut platform).unwrap();
-
-        assert_eq!(platform.0, Some((13, 2, true)));
+        let outcome = registry.open_now(Request {
+            record,
+            header: &wire[..used],
+            context: CallContext::default(),
+        });
+        // The platform ran before any body byte arrived, and chose a sink.
+        assert_eq!(*started.lock().unwrap(), Some((13, 2, true)));
+        let Some(Outcome::Receive(mut sink)) = outcome else {
+            panic!("a flash request takes its body")
+        };
+        assert_eq!(sink.write(b"raw object bytes", true), Ok(16));
+        assert_eq!(body.lock().unwrap().as_slice(), b"raw object bytes");
+        let response = sink.finish().header;
         let decoded = crate::tagged::decode(&response).unwrap();
         assert_eq!(decoded.id, Some(77));
         assert_eq!(decoded.result, Some([0xa0].as_slice()));

@@ -41,6 +41,9 @@ pub struct Record<'a> {
     /// component schemas decide the typed error representation.
     pub error: Option<&'a [u8]>,
     pub to: Option<Name<'a>>,
+    /// Milliseconds the caller allows for the request, counted from receipt
+    /// (envelope key 8; requests only). `None` leaves the handler's default.
+    pub timeout: Option<u64>,
     pub data: Option<&'a [u8]>,
     /// Unsigned, bearer-local observation facts paired with an otherwise
     /// signed record.  Discovery uses this for volatile radio state (for
@@ -62,6 +65,14 @@ fn name<'a>(decoder: &mut Decoder<'a>) -> Option<Name<'a>> {
 }
 
 pub fn decode(packet: &[u8]) -> Option<Record<'_>> {
+    let (record, consumed) = decode_prefix(packet)?;
+    (consumed == packet.len()).then_some(record)
+}
+
+/// Decode one complete tagged-CBOR envelope at the start of a stream buffer.
+/// Bytes following the envelope are returned to the caller as its streamed
+/// body; this is used by POST-like handlers that must not buffer file data.
+pub fn decode_prefix(packet: &[u8]) -> Option<(Record<'_>, usize)> {
     let mut d = Decoder::new(packet);
     let (major, count) = d.head()?;
     if major != 5 || count == u64::MAX {
@@ -93,6 +104,7 @@ pub fn decode(packet: &[u8]) -> Option<Record<'_>> {
                 d.skip()?;
                 record.error = Some(&packet[start..d.position()]);
             }
+            8 => record.timeout = Some(d.uint()?),
             9 => record.to = Some(name(&mut d)?),
             10 => record.data = Some(d.bytes_ref()?),
             11 => {
@@ -103,7 +115,7 @@ pub fn decode(packet: &[u8]) -> Option<Record<'_>> {
             _ => d.skip()?,
         }
     }
-    (d.is_finished() && record.method.is_some()).then_some(record)
+    record.method.map(|_| (record, d.position()))
 }
 
 /// Read only the optional destination from a top-level envelope map.

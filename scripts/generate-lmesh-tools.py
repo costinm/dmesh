@@ -19,7 +19,9 @@ else:
     upstream = Path(os.environ.get('DMESH_SSH_MESH_DIR', '/ws/rust/ssh-mesh'))
     with tempfile.NamedTemporaryFile(suffix='.json') as output:
         with tempfile.NamedTemporaryFile(suffix='.md') as api:
-            Path(api.name).write_text(extract('portable') + '\n' + extract('linux'))
+            Path(api.name).write_text(
+                extract('portable', 'L') + '\n' + extract('linux')
+            )
             upstream_env = os.environ.copy()
             upstream_env.pop('CARGO_TARGET_DIR', None)
             subprocess.run([
@@ -29,6 +31,33 @@ else:
         local = json.loads(Path(output.name).read_text())
 device = [tool for tool in catalog['tools'] if tool.get('x-dmesh-device')]
 seen = {tool['name'] for tool in device}
+# A device entry keeps its hand-maintained check flags, but its response schema
+# comes from the API.md table so the UI and CLI name the response tags.
+generated = {tool['name']: tool for tool in local}
+# Methods that only a device registers are not in the Linux catalog above, so
+# take their schemas from every portable method.
+if '--local-tools' not in sys.argv:
+    with tempfile.NamedTemporaryFile(suffix='.json') as output:
+        with tempfile.NamedTemporaryFile(suffix='.md') as api:
+            Path(api.name).write_text(extract('portable'))
+            upstream_env = os.environ.copy()
+            upstream_env.pop('CARGO_TARGET_DIR', None)
+            subprocess.run([
+                'cargo', 'run', '-p', 'mesh-api-gen', '--',
+                '--api', api.name, '--out-tools', output.name,
+            ], cwd=upstream, env=upstream_env, check=True)
+        for tool in json.loads(Path(output.name).read_text()):
+            generated.setdefault(tool['name'], tool)
+for tool in device:
+    source = generated.get(tool['name'], {})
+    schema = source.get('outputSchema', {})
+    if schema.get('properties'):
+        tool['outputSchema'] = schema
+    # A request schema is taken only where the entry has none of its own, so
+    # the hand-checked request tables of the older methods stay authoritative.
+    request = source.get('inputSchema', {})
+    if request.get('properties') and not tool['inputSchema'].get('properties'):
+        tool['inputSchema'] = request
 catalog['tools'] = device + [tool for tool in local if tool['name'] not in seen]
 generated = json.dumps(catalog, indent=2) + '\n'
 if '--check' in sys.argv:
