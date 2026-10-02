@@ -51,6 +51,11 @@ pub struct TaggedRecord {
     /// forwards the request to this destination instead of executing the
     /// method locally. It is envelope routing metadata, not a handler field.
     pub to: Option<Value>,
+    /// Time the caller allows for the whole request, in milliseconds,
+    /// counted from when the receiver reads it (a duration, not a deadline:
+    /// devices share no clock). A forwarder sends on what remains. Absent
+    /// means the handler's default. Envelope key 8; request only.
+    pub timeout: Option<u64>,
     /// Opaque binary payload outside `env`. Keeping this borrowed/owned byte
     /// lane distinct from normal typed fields lets proxy stubs forward large
     /// records without base64 or an intermediate JSON value.
@@ -313,6 +318,15 @@ impl TaggedSchema {
                 "to" if !schema.is_some_and(|schema| schema.fields.contains_key("to")) => {
                     record.to = Some(value.clone())
                 }
+                "timeout"
+                    if !schema.is_some_and(|schema| schema.fields.contains_key("timeout")) =>
+                {
+                    record.timeout = Some(
+                        value
+                            .as_u64()
+                            .ok_or_else(|| anyhow!("timeout is a number of milliseconds"))?,
+                    )
+                }
                 // `data` is deliberately a CBOR byte field in the envelope.
                 // The Rust wire adapter accepts an array of octets here so
                 // binary data does not cross a base64/text conversion.
@@ -370,6 +384,16 @@ impl TaggedSchema {
                     record.to = Some(text_value(value));
                     continue;
                 }
+                if name == "timeout"
+                    && !schema.is_some_and(|schema| schema.fields.contains_key("timeout"))
+                {
+                    record.timeout = Some(
+                        value
+                            .parse()
+                            .map_err(|_| anyhow!("timeout is a number of milliseconds"))?,
+                    );
+                    continue;
+                }
                 let key = field_key(schema, name);
                 record
                     .env
@@ -379,6 +403,16 @@ impl TaggedSchema {
             {
                 if name == "to" && !schema.is_some_and(|schema| schema.fields.contains_key("to")) {
                     record.to = Some(text_value(value));
+                    continue;
+                }
+                if name == "timeout"
+                    && !schema.is_some_and(|schema| schema.fields.contains_key("timeout"))
+                {
+                    record.timeout = Some(
+                        value
+                            .parse()
+                            .map_err(|_| anyhow!("timeout is a number of milliseconds"))?,
+                    );
                     continue;
                 }
                 let key = field_key(schema, name);
@@ -438,6 +472,9 @@ impl TaggedSchema {
         }
         if let Some(to) = &record.to {
             value.insert("to".to_owned(), to.clone());
+        }
+        if let Some(timeout) = record.timeout {
+            value.insert("timeout".to_owned(), timeout.into());
         }
         if let Some(data) = &record.data {
             value.insert(
@@ -513,6 +550,8 @@ fn field_text_value(schema: Option<&MethodSchema>, name: &str, value: &str) -> R
                 .map(Ok)
                 .unwrap_or_else(|| value.parse::<u64>())?,
         )),
+        // A declared string stays text, whatever it looks like (`ssid=123`).
+        Some("string") => Ok(Value::String(value.to_owned())),
         Some("mac") => Ok(Value::String(value.to_ascii_lowercase())),
         Some("hex") => Ok(Value::String(format!(
             "hex:{}",
@@ -597,11 +636,13 @@ pub fn record_from_argv(
         .ok_or_else(|| anyhow!("RPC endpoints require COMPONENT METHOD [options/parameters]"))?;
     let (method_name, invocation_args) = if component.contains('.') {
         (component.clone(), arguments[1..].to_vec())
-    } else {
-        let method = arguments.get(1).ok_or_else(|| {
-            anyhow!("RPC endpoints require COMPONENT METHOD [options/parameters]")
-        })?;
+    } else if let Some(method) = arguments.get(1) {
         (format!("{component}.{method}"), arguments[2..].to_vec())
+    } else {
+        // A single bare token is a component-less documented method such as
+        // `status`; the installed catalog decides whether it is real. The
+        // no-catalog fallback below keeps the previous requirement.
+        (component.clone(), Vec::new())
     };
     if let Some(catalog) = catalog {
         return catalog.parse_argv(&method_name, &invocation_args);
@@ -680,6 +721,9 @@ pub fn to_json(record: &TaggedRecord, catalog: Option<&TaggedCatalog>) -> Value 
     if let Some(to) = &record.to {
         value.insert("to".to_owned(), to.clone());
     }
+    if let Some(timeout) = record.timeout {
+        value.insert("timeout".to_owned(), timeout.into());
+    }
     if let Some(data) = &record.data {
         value.insert(
             "data".to_owned(),
@@ -755,6 +799,7 @@ pub fn record_from_json(value: &Value) -> Result<TaggedRecord> {
         result: object.get("result").cloned(),
         error: object.get("error").cloned(),
         to: object.get("to").cloned(),
+        timeout: object.get("timeout").and_then(Value::as_u64),
         data,
     };
     record.kind()?;
@@ -794,7 +839,9 @@ pub fn to_text(record: &TaggedRecord) -> String {
 fn text_value(value: &str) -> Value {
     if let Ok(value) = value.parse::<i64>() {
         Value::from(value)
-    } else if let Ok(value) = value.parse::<f64>() {
+    } else if let Some(value) = value.parse::<f64>().ok().filter(|value| value.is_finite()) {
+        // `nan` and `inf` parse as floats but have no JSON form (they would
+        // become null); they are ordinary words here.
         Value::from(value)
     } else if matches!(value, "true" | "false") {
         Value::Bool(value == "true")
@@ -821,6 +868,83 @@ fn text_tokens(line: &str) -> Result<Vec<&str>> {
         bail!("quote values in the shell before passing a mesh invocation");
     }
     Ok(tokens)
+}
+
+/// A request or response type whose serde fields carry the numeric tags of
+/// its `API.md`. `mesh-api-gen --rust-tags` implements this for every
+/// generated struct, so the same serde type serves JSON/HTML callers and the
+/// tag-keyed CBOR that crosses a socket, JNI or Binder boundary; no catalog is
+/// consulted at runtime.
+pub trait TaggedFields: serde::Serialize + serde::de::DeserializeOwned {
+    /// `(serde field name, API.md tag)`.
+    const FIELDS: &'static [(&'static str, u32)];
+}
+
+/// The in-memory form of a tag-keyed map: an object whose keys are decimal
+/// tags. The CBOR encoder writes such a key as an unsigned integer.
+pub fn to_tagged_value<T: TaggedFields>(value: &T) -> Result<Value> {
+    let Value::Object(fields) = serde_json::to_value(value)? else {
+        // A unit struct (no fields) is an empty map.
+        return Ok(Value::Object(Map::new()));
+    };
+    let mut tagged = Map::with_capacity(fields.len());
+    for (name, value) in fields {
+        let tag = T::FIELDS
+            .iter()
+            .find(|(field, _)| *field == name)
+            .map(|(_, tag)| *tag)
+            .ok_or_else(|| anyhow!("field {name} has no API tag"))?;
+        tagged.insert(tag.to_string(), value);
+    }
+    Ok(Value::Object(tagged))
+}
+
+/// Decode a tag-keyed map (keys are decimal tags or field names) into `T`.
+/// Unknown tags are ignored, so a newer peer's extra fields do not break an
+/// older one.
+pub fn from_tagged_value<T: TaggedFields>(value: &Value) -> Result<T> {
+    let Value::Object(fields) = value else {
+        bail!("tagged fields must be a map");
+    };
+    // A type with no fields is a unit struct, which serde reads from null.
+    if T::FIELDS.is_empty() {
+        return Ok(serde_json::from_value(Value::Null)?);
+    }
+    let mut named = Map::with_capacity(fields.len());
+    for (key, value) in fields {
+        let name = key
+            .parse::<u32>()
+            .ok()
+            .and_then(|tag| T::FIELDS.iter().find(|(_, t)| *t == tag).map(|(n, _)| *n))
+            .map(str::to_owned)
+            .unwrap_or_else(|| key.clone());
+        if T::FIELDS.iter().any(|(field, _)| *field == name) {
+            named.insert(name, value.clone());
+        }
+    }
+    Ok(serde_json::from_value(Value::Object(named))?)
+}
+
+/// Decode a request record's fields (`env`, tag or name keyed) into `T`.
+pub fn request_fields<T: TaggedFields>(record: &TaggedRecord) -> Result<T> {
+    let mut fields = Map::new();
+    for (key, value) in &record.env {
+        let key = match key {
+            NameOrTag::Tag(tag) => tag.to_string(),
+            NameOrTag::Name(name) => name.clone(),
+        };
+        fields.insert(key, value.clone());
+    }
+    from_tagged_value(&Value::Object(fields))
+}
+
+/// A correlated success response carrying `value` as its tag-keyed result.
+pub fn response_record<T: TaggedFields>(id: Value, value: &T) -> Result<TaggedRecord> {
+    Ok(TaggedRecord {
+        id: Some(id),
+        result: Some(to_tagged_value(value)?),
+        ..Default::default()
+    })
 }
 
 #[cfg(test)]
@@ -1064,4 +1188,77 @@ mod tests {
                 .is_err()
         );
     }
+    #[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+    struct Sample {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u64>,
+        label: String,
+        r#type: Option<String>,
+    }
+
+    impl TaggedFields for Sample {
+        const FIELDS: &'static [(&'static str, u32)] = &[("limit", 1), ("label", 2), ("type", 3)];
+    }
+
+    #[test]
+    fn serde_structs_round_trip_as_tag_keyed_cbor() {
+        let value = Sample {
+            limit: Some(5),
+            label: "x".to_owned(),
+            r#type: None,
+        };
+        let record = response_record(json!(7), &value).unwrap();
+        // Keys are tags, not names, on the wire.
+        let bytes = crate::cbor::encode_record(&record).unwrap();
+        let decoded = crate::cbor::decode_record(&bytes).unwrap();
+        let result = decoded.result.unwrap();
+        assert_eq!(result["1"], 5);
+        assert_eq!(result["2"], "x");
+        assert!(result.get("limit").is_none());
+        assert_eq!(from_tagged_value::<Sample>(&result).unwrap(), value);
+    }
+
+    #[test]
+    fn request_fields_accept_tags_and_names_and_ignore_unknown_tags() {
+        let record = TaggedRecord {
+            env: [
+                (NameOrTag::Tag(1), json!(3)),
+                (NameOrTag::Name("label".to_owned()), json!("y")),
+                (NameOrTag::Tag(99), json!("future")),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let sample = request_fields::<Sample>(&record).unwrap();
+        assert_eq!(sample.limit, Some(3));
+        assert_eq!(sample.label, "y");
+    }
+
+    #[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+    struct Nothing;
+
+    impl TaggedFields for Nothing {
+        const FIELDS: &'static [(&'static str, u32)] = &[];
+    }
+
+    #[test]
+    fn words_that_parse_as_non_finite_floats_stay_text() {
+        assert_eq!(text_value("nan"), Value::String("nan".into()));
+        assert_eq!(text_value("inf"), Value::String("inf".into()));
+        assert_eq!(text_value("1.5"), Value::from(1.5));
+        assert_eq!(text_value("42"), Value::from(42));
+    }
+
+    #[test]
+    fn a_unit_struct_is_an_empty_map() {
+        let value = to_tagged_value(&Nothing).unwrap();
+        assert_eq!(value, json!({}));
+        assert_eq!(from_tagged_value::<Nothing>(&value).unwrap(), Nothing);
+        assert_eq!(
+            request_fields::<Nothing>(&TaggedRecord::default()).unwrap(),
+            Nothing
+        );
+    }
+
 }

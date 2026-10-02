@@ -3,7 +3,8 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use mesh_api_gen::{
     api_markdown_from_tools_json_for_component, java::java_api, json_schema, merge_tools_json,
-    parse_api_markdown, parse_required_path, rust_api, rust_ids, tools_json,
+    parse_api_markdown, parse_required_path, rust_api, rust_api_tagged, rust_cbor_api, rust_ids,
+    tools_json,
 };
 
 fn main() -> Result<()> {
@@ -15,11 +16,14 @@ fn main() -> Result<()> {
     let mut out_schema = None;
     let mut out_ids = None;
     let mut out_rust = None;
+    let mut out_rust_cbor = None;
+    let mut selected_method = None;
     let mut out_java = None;
     let mut java_package = None;
     let mut base_tools = None;
     let mut component = None;
     let mut check = false;
+    let mut rust_tags = false;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--api" => api = Some(args.next().context("--api requires a path")?),
@@ -31,6 +35,10 @@ fn main() -> Result<()> {
             }
             "--out-ids" => out_ids = Some(args.next().context("--out-ids requires a path")?),
             "--out-rust" => out_rust = Some(args.next().context("--out-rust requires a path")?),
+            "--out-rust-cbor" => {
+                out_rust_cbor = Some(args.next().context("--out-rust-cbor requires a path")?)
+            }
+            "--method" => selected_method = Some(args.next().context("--method requires a name")?),
             "--out-java" => out_java = Some(args.next().context("--out-java requires a path")?),
             "--java-package" => {
                 java_package = Some(args.next().context("--java-package requires a name")?)
@@ -40,9 +48,10 @@ fn main() -> Result<()> {
             }
             "--component" => component = Some(args.next().context("--component requires a name")?),
             "--check" => check = true,
+            "--rust-tags" => rust_tags = true,
             "--help" | "-h" => {
                 println!(
-                    "mesh-api-gen --api API.md [--base-tools tools.json] --out-tools tools.json --out-schema schema.json --out-ids ids.rs --out-rust src/api.rs [--java-package p] --out-java MeshApi.java [--check]\nmesh-api-gen --tools tools.json --component service --out-api migration.md"
+                    "mesh-api-gen --api API.md [--base-tools tools.json] --out-tools tools.json --out-schema schema.json --out-ids ids.rs --out-rust src/api.rs [--rust-tags] [--java-package p] --out-java MeshApi.java [--check]\nmesh-api-gen --tools tools.json --component service --out-api migration.md"
                 );
                 return Ok(());
             }
@@ -63,7 +72,13 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let api = parse_required_path(api, "--api")?;
-    let methods = parse_api_markdown(&std::fs::read_to_string(&api)?)?;
+    let mut methods = parse_api_markdown(&std::fs::read_to_string(&api)?)?;
+    if let Some(selected) = selected_method {
+        methods.retain(|method| method.id == selected);
+        if methods.is_empty() {
+            bail!("API method not found: {selected}");
+        }
+    }
     if let Some(path) = out_tools {
         let generated = if let Some(base_tools) = base_tools {
             merge_tools_json(
@@ -93,7 +108,15 @@ fn main() -> Result<()> {
         write_or_check(&path, &rust_ids(&methods), check)?;
     }
     if let Some(path) = out_rust {
-        write_or_check(&path, &rust_api(&methods), check)?;
+        let generated = if rust_tags {
+            rust_api_tagged(&methods)
+        } else {
+            rust_api(&methods)
+        };
+        write_or_check(&path, &generated, check)?;
+    }
+    if let Some(path) = out_rust_cbor {
+        write_or_check(&path, &rust_cbor_api(&methods), check)?;
     }
     if let Some(path) = out_java {
         let class_name = java_class_name(&path)?;

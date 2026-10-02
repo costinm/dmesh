@@ -15,6 +15,7 @@
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::io::Write as _;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -843,11 +844,16 @@ pub fn default_trace_socket_path(app_name: &str) -> Option<std::path::PathBuf> {
 /// A non-blocking JSON `fmt`
 /// layer is also installed that writes every event (subject to the same
 /// `EnvFilter`) to a file. `MESH_LOG_FILE` is an exact file path; otherwise,
-/// logs rotate daily in `MESH_LOG_DIR`, or in `./logs` beneath the process
-/// working directory when that variable is unset. Parent
-/// directories are created if missing. The returned `WorkerGuard` must be kept alive for the lifetime of
-/// the process (dropping it stops the background writer thread and flushes
-/// pending events); bind it to a named variable in `main` to be safe.
+/// logs go to `<service>.log` in `MESH_LOG_DIR`, or in `./logs` beneath the
+/// process working directory when that variable is unset. Regular files
+/// rotate by size: when the active file reaches `MESH_LOG_FILE_MAX_BYTES`
+/// it is renamed to `<file>.1`, existing backups are shifted, and the
+/// oldest backups are removed so rotated files stay within
+/// `MESH_LOG_MAX_TOTAL_BYTES`. Special files such as `/dev/stderr` never
+/// rotate. Parent directories are created if missing. The returned
+/// `WorkerGuard` must be kept alive for the lifetime of the process
+/// (dropping it stops the background writer thread and flushes pending
+/// events); bind it to a named variable in `main` to be safe.
 ///
 /// This calls `tracing_subscriber`'s global `.init()`, so it can only be
 /// called once per process.
@@ -944,10 +950,11 @@ fn build_file_writer(
         dir.join(format!("{service}.log"))
     };
 
-    let parent = log_path
+    let parent: std::path::PathBuf = log_path
         .parent()
-        .unwrap_or_else(|| std::path::Path::new("."));
-    if let Err(e) = std::fs::create_dir_all(parent) {
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+    if let Err(e) = std::fs::create_dir_all(&parent) {
         tracing::warn!(
             path = ?parent,
             error = %e,
@@ -956,22 +963,196 @@ fn build_file_writer(
         return None;
     }
 
-    let dir = parent;
-    let file_name = log_path.file_name()?.to_string_lossy();
-    prune_log_files(dir, &file_name, 512 * 1024 * 1024);
-    // `MESH_LOG_FILE` is an exact path: open it as-is without rotation so
-    // special files such as /dev/stderr keep working. All directory logs get
-    // one current file per day, which bounds each file without requiring a
-    // second logging process and works for mesh-init and child apps.
-    let appender = if std::env::var_os("MESH_LOG_FILE").is_some_and(|s| !s.is_empty()) {
-        tracing_appender::rolling::never(dir, file_name.as_ref())
+    let limits = LogRotationLimits::from_env();
+    let file_name = log_path.file_name()?.to_string_lossy().to_string();
+    prune_log_files(&parent, &file_name, limits.max_total_bytes);
+    // Regular files rotate by size so a single noisy event (or one day of
+    // steady traffic) cannot grow without bound. Special files such as
+    // /dev/stderr keep working through `never`.
+    let writer: Box<dyn std::io::Write + Send> = if is_special_log_path(&log_path) {
+        Box::new(tracing_appender::rolling::never(
+            &parent,
+            file_name.as_str(),
+        ))
     } else {
-        tracing_appender::rolling::daily(dir, file_name.as_ref())
+        match SizeRotatingWriter::open(log_path, limits) {
+            Ok(writer) => Box::new(writer),
+            Err(e) => {
+                tracing::warn!(
+                    path = ?parent.join(file_name.as_str()),
+                    error = %e,
+                    "log file could not be opened; file logging disabled"
+                );
+                return None;
+            }
+        }
     };
-    Some(tracing_appender::non_blocking(appender))
+    Some(tracing_appender::non_blocking(writer))
 }
 
-/// Keep historical per-app logs bounded. The active daily file is retained;
+/// Size limits for log file rotation, read from the environment.
+struct LogRotationLimits {
+    max_file_bytes: u64,
+    max_total_bytes: u64,
+}
+
+impl LogRotationLimits {
+    fn from_env() -> Self {
+        Self {
+            max_file_bytes: parse_size_env("MESH_LOG_FILE_MAX_BYTES", 8 * 1024 * 1024),
+            max_total_bytes: parse_size_env("MESH_LOG_MAX_TOTAL_BYTES", 64 * 1024 * 1024),
+        }
+    }
+}
+
+/// Parse a byte-count environment variable with optional k/m/g suffixes.
+/// Invalid or missing values fall back to `default`.
+fn parse_size_env(key: &str, default: u64) -> u64 {
+    let Ok(raw) = std::env::var(key) else {
+        return default;
+    };
+    let raw = raw.trim().to_ascii_lowercase();
+    let (num, multiplier): (&str, u64) = if raw.ends_with("kib") {
+        (raw.strip_suffix("kib").unwrap(), 1024)
+    } else if raw.ends_with("mib") {
+        (raw.strip_suffix("mib").unwrap(), 1024 * 1024)
+    } else if raw.ends_with("gib") {
+        (raw.strip_suffix("gib").unwrap(), 1024 * 1024 * 1024)
+    } else if raw.ends_with('k') {
+        (raw.strip_suffix('k').unwrap(), 1024)
+    } else if raw.ends_with('m') {
+        (raw.strip_suffix('m').unwrap(), 1024 * 1024)
+    } else if raw.ends_with('g') {
+        (raw.strip_suffix('g').unwrap(), 1024 * 1024 * 1024)
+    } else {
+        (raw.as_str(), 1)
+    };
+    num.trim()
+        .parse::<u64>()
+        .map(|value| value.saturating_mul(multiplier))
+        .unwrap_or(default)
+}
+
+/// True for paths that must be opened exactly as-is without rotation,
+/// such as `/dev/stderr`, `/dev/null`, or `/dev/console`.
+fn is_special_log_path(path: &std::path::Path) -> bool {
+    if path.parent() == Some(std::path::Path::new("/dev")) {
+        return true;
+    }
+    match path.metadata() {
+        Ok(metadata) => !metadata.file_type().is_file(),
+        Err(_) => false,
+    }
+}
+
+/// File writer that rotates by size.
+///
+/// The active file stays under `limits.max_file_bytes`. When it is
+/// reached, the active file is renamed to `<file>.1` and existing backups
+/// are shifted (`.1` to `.2`, and so on). The oldest backups are removed
+/// first so the combined size of the active file and all backups fits in
+/// `limits.max_total_bytes` at each rotation. Rotation runs on the
+/// non-blocking writer's background thread, so logging never stalls the
+/// caller.
+struct SizeRotatingWriter {
+    path: std::path::PathBuf,
+    limits: LogRotationLimits,
+    file: Option<std::fs::File>,
+    size: u64,
+}
+
+impl SizeRotatingWriter {
+    fn open(path: std::path::PathBuf, limits: LogRotationLimits) -> std::io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        let size = file.metadata()?.len();
+        let mut writer = Self {
+            path,
+            limits,
+            file: Some(file),
+            size,
+        };
+        if writer.limits.max_file_bytes > 0 && writer.size >= writer.limits.max_file_bytes {
+            // Already at or over the cap from a previous run; start fresh.
+            writer.rotate()?;
+        }
+        Ok(writer)
+    }
+
+    fn backup_path(&self, index: usize) -> std::path::PathBuf {
+        let name = self.path.file_name().unwrap_or_default().to_string_lossy();
+        self.path.with_file_name(format!("{name}.{index}"))
+    }
+
+    fn rotate(&mut self) -> std::io::Result<()> {
+        if let Some(mut file) = self.file.take() {
+            file.flush()?;
+        }
+        let mut oldest = 0usize;
+        let mut total = 0u64;
+        for index in 1.. {
+            let backup = self.backup_path(index);
+            match backup.metadata() {
+                Ok(metadata) => {
+                    total += metadata.len();
+                    oldest = index;
+                }
+                Err(_) => break,
+            }
+        }
+        // The active file becomes the newest backup, so bound the combined
+        // size of all log files at each rotation.
+        while oldest > 0 && total + self.size > self.limits.max_total_bytes {
+            let path = self.backup_path(oldest);
+            let size = path.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+            if std::fs::remove_file(&path).is_ok() {
+                total = total.saturating_sub(size);
+            }
+            oldest -= 1;
+        }
+        for index in (1..=oldest).rev() {
+            let _ = std::fs::rename(self.backup_path(index), self.backup_path(index + 1));
+        }
+        if self.path.exists() {
+            std::fs::rename(&self.path, self.backup_path(1))?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        self.file = Some(file);
+        self.size = 0;
+        Ok(())
+    }
+}
+
+impl std::io::Write for SizeRotatingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let Some(file) = self.file.as_mut() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "log file is closed",
+            ));
+        };
+        file.write_all(buf)?;
+        self.size += buf.len() as u64;
+        if self.limits.max_file_bytes > 0 && self.size >= self.limits.max_file_bytes {
+            self.rotate()?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.file.as_mut() {
+            Some(file) => file.flush(),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Keep historical per-app logs bounded. The active file is retained;
 /// oldest rotated files are removed first. Failure is deliberately best
 /// effort because logging must never prevent the service from starting.
 fn prune_log_files(dir: &std::path::Path, basename: &str, max_bytes: u64) {
@@ -1227,6 +1408,74 @@ mod tests {
             "log file missing level: {}",
             contents
         );
+    }
+
+    #[test]
+    fn size_rotating_writer_rotates_and_binds_total_size() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rotate.log");
+        let limits = LogRotationLimits {
+            max_file_bytes: 64,
+            max_total_bytes: 128,
+        };
+        let mut writer = SizeRotatingWriter::open(path.clone(), limits).expect("open");
+        let chunk = vec![b'x'; 64];
+        writer.write_all(&chunk).expect("write");
+        // The first write reached the cap: the active file is fresh and the
+        // previous content moved to `.1`.
+        assert_eq!(file_len(&path), 0);
+        assert_eq!(file_len(&dir.path().join("rotate.log.1")), 64);
+        writer.write_all(&chunk).expect("write");
+        assert_eq!(file_len(&dir.path().join("rotate.log.2")), 64);
+        writer.write_all(&chunk).expect("write");
+        // The third rotation must drop the oldest backup: 128 of backups plus
+        // 64 of active exceeds the 128 cap.
+        assert!(!dir.path().join("rotate.log.3").exists());
+        let total: u64 = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().is_file())
+            .map(|entry| file_len(&entry.path()))
+            .sum();
+        assert!(total <= 128, "total {total} exceeds the cap");
+        drop(writer);
+    }
+
+    #[test]
+    fn size_rotating_writer_rotates_over_sized_existing_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rotate.log");
+        std::fs::write(&path, vec![b'z'; 128]).expect("seed");
+        let limits = LogRotationLimits {
+            max_file_bytes: 64,
+            max_total_bytes: 128,
+        };
+        let writer = SizeRotatingWriter::open(path.clone(), limits).expect("open");
+        assert_eq!(file_len(&path), 0);
+        assert_eq!(file_len(&dir.path().join("rotate.log.1")), 128);
+        drop(writer);
+    }
+
+    #[test]
+    fn parse_size_env_handles_suffixes_and_falls_back() {
+        // SAFETY: this test owns `MESH_LOG_TEST_SIZE` for its duration and no
+        // other thread reads it.
+        unsafe {
+            std::env::set_var("MESH_LOG_TEST_SIZE", "10k");
+            assert_eq!(parse_size_env("MESH_LOG_TEST_SIZE", 1), 10 * 1024);
+            std::env::set_var("MESH_LOG_TEST_SIZE", "2mib");
+            assert_eq!(parse_size_env("MESH_LOG_TEST_SIZE", 1), 2 * 1024 * 1024);
+            std::env::set_var("MESH_LOG_TEST_SIZE", "not-a-size");
+            assert_eq!(parse_size_env("MESH_LOG_TEST_SIZE", 7), 7);
+            std::env::remove_var("MESH_LOG_TEST_SIZE");
+        }
+        assert_eq!(parse_size_env("MESH_LOG_TEST_SIZE_UNSET", 9), 9);
+    }
+
+    fn file_len(path: &std::path::Path) -> u64 {
+        std::fs::metadata(path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0)
     }
 
     #[test]
