@@ -81,6 +81,7 @@ pub fn encode_record(record: &TaggedRecord) -> Result<Vec<u8>> {
         + usize::from(record.result.is_some())
         + usize::from(record.error.is_some())
         + usize::from(record.to.is_some())
+        + usize::from(record.timeout.is_some())
         + usize::from(record.data.is_some());
     encoder.map(fields as u64)?;
     encoder.u8(1)?;
@@ -112,6 +113,9 @@ pub fn encode_record(record: &TaggedRecord) -> Result<Vec<u8>> {
         encoder.u8(7)?;
         encode_value(&mut encoder, error)?;
     }
+    if let Some(timeout) = record.timeout {
+        encoder.u8(8)?.u64(timeout)?;
+    }
     if let Some(to) = &record.to {
         encoder.u8(9)?;
         encode_value(&mut encoder, to)?;
@@ -137,6 +141,7 @@ pub fn decode_record(bytes: &[u8]) -> Result<TaggedRecord> {
     let mut result = None;
     let mut error = None;
     let mut to = None;
+    let mut timeout = None;
     let mut data = None;
 
     for _ in 0..fields {
@@ -169,6 +174,7 @@ pub fn decode_record(bytes: &[u8]) -> Result<TaggedRecord> {
             }
             6 => result = Some(decode_value(&mut decoder)?),
             7 => error = Some(decode_value(&mut decoder)?),
+            8 => timeout = Some(decoder.u64()?),
             9 => to = Some(decode_value(&mut decoder)?),
             // Unlike ordinary handler fields, data is never materialized as
             // the `base64:` JSON compatibility value. This is the one owned
@@ -190,6 +196,7 @@ pub fn decode_record(bytes: &[u8]) -> Result<TaggedRecord> {
         result,
         error,
         to,
+        timeout,
         data,
     };
     // DMesh tagged-CBOR responses retain the numeric component and method

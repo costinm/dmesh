@@ -64,6 +64,47 @@ service boundaries. Stream transports add a four-byte big-endian frame length;
 seqpacket transports preserve each encoded record as one packet and do not need
 an additional framing boundary.
 
+#### Envelope keys
+
+| Key | Name | Meaning |
+|---:|---|---|
+| 1 | `component` | Component number or name. |
+| 2 | `method` | Method number or name. |
+| 3 | `id` | Correlation id; a response carries the request's id. |
+| 4 | `params` | Positional parameters. |
+| 5 | `fields` | Named request fields, keyed by catalog tag. |
+| 6 | `result` | Successful response value. |
+| 7 | `error` | Failure response value. |
+| 8 | `timeout` | Request only: milliseconds the caller allows. |
+| 9 | `to` | Destination node; a forwarder consumes it. |
+| 10 | `data` | Opaque binary payload. |
+| 11 | `extensions` | Receiver-local facts beside a signed record. |
+
+A response carries only `id` plus `result` or `error`.
+
+#### Timeout
+
+`timeout` is the time, in **milliseconds**, the caller allows for the whole
+request, counted from when the receiver reads it. It is a duration, not a
+deadline, because devices share no clock (as with gRPC's `grpc-timeout`).
+
+- Absent means the handler's own default. A receiver may apply a lower limit of
+  its own; it never extends the caller's.
+- A node that forwards because of `to` sends on what remains after its own
+  work, so a chain never allows more than the original request.
+- When it runs out, the receiver abandons the handler (releasing any deferred
+  job or body sink) and answers with the `timeout` error. The caller also stops
+  waiting at that point. A synchronous handler cannot be interrupted; it is only
+  refused if the time is already gone before it starts. Resetting the stream
+  still cancels a request.
+- Handlers read the allowance from their call context and may use it to size
+  their own work: `probe.start` runs for the caller's `timeout`, else a default
+  that grows with the transfer size.
+- It applies to streams. A datagram has no response to time out; for a
+  connectionless message it is currently unspecified.
+- HTTP/JSON and the text forms spell it `timeout` (`timeout=2500`), unless the
+  method declares a field of that name, which wins.
+
 ### JSON-RPC
 
 JSON-RPC 2.0 is the human-facing and compatibility gateway: a request carries
@@ -143,6 +184,46 @@ header and the stream; a method with no body simply never reads or writes
 one. There is no second kind of handler for long-running or data-moving
 methods, and no ingress may dispatch a method itself instead of calling the
 registry.
+
+## Delivery forms of one handler
+
+A handler is registered once, by component and method, and the same
+registration is reached by three delivery forms. The form is a property of how
+the request arrived, not a kind of handler; no ingress dispatches a method
+itself. QUIC is one transport that can carry all three; none of this is specific
+to it or to DMesh.
+
+| Form | Carried by | Association | Reliability | Response |
+|---|---|---|---|---|
+| Stream | a bidirectional stream (header, then body, FIN after the body) | required | reliable, ordered, flow controlled | header, then optional body |
+| Message | one packet that is sent without an association | none | one packet, no retransmission by the transport | at most one response message |
+| Datagram | a datagram on an established association | required | unreliable, may be dropped | none |
+
+- **Stream.** As defined above. It is the only form with a body longer than a
+  packet, multiplexing, or flow control per stream.
+- **Message (connectionless).** An association is expensive and is needed only
+  to multiplex streams, so a rare, small request can be sent without one. It is
+  a variant of a versioned long-header packet that can be sent before the
+  handshake: the packet carries one header (the same tagged-CBOR map) and, in
+  field `10`, any small binary value, and nothing else. It is not a separate
+  kind of handler and has no registration of its own: the receiver applies an
+  **allow-list** of methods that may be invoked this way (an ingress policy,
+  because there is no authenticated association), then dispatches through the
+  registry like any other call. A handler that must not be reachable without an
+  association is simply absent from the allow-list. Duplicates are expected
+  (the sender may repeat) and a handler that is not idempotent must say so in its
+  `API.md`.
+- **Datagram.** Standard QUIC datagram semantics on an established
+  association: a datagram may be dropped, is counted against the connection's
+  flow control, and carries one complete header (and any small body) in the
+  datagram itself, so every datagram is its own end of stream. The handler
+  returns nothing. Only the send side differs from a stream call; the handler
+  is registered the same way, and an `API.md` marks a method as usable as a
+  datagram when it is one-way and safe to lose.
+
+A handler may be reachable by several forms; its `API.md` entry lists which.
+The registry gives the handler the form in the call context, so a handler that
+should only run as a stream can decline the others.
 
 A transport crate's own tests do not need any of this: they may attach the
 protocol under test directly as the only handler on the far side, with no

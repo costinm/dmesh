@@ -52,19 +52,46 @@ where
         .to
         .as_ref()
         .and_then(serde_json::Value::as_str)
-        .context("MeshClient request is missing a string destination")?;
+        .context("MeshClient request is missing a string destination")?
+        .to_owned();
+    let destination = destination.as_str();
     let request_id = request.id.clone().expect("validated request ID");
     let target = MeshTarget::node(destination);
-    let mut stream = client.open_stream(&target).await?;
+    let started = std::time::Instant::now();
+    let allowance = request.timeout.map(std::time::Duration::from_millis);
+    let expired = || {
+        crate::wire::response_error(
+            request_id.clone(),
+            serde_json::json!({"error": "timeout", "to": destination}),
+        )
+    };
     // `to` selected this outgoing stream. Leaving it in the peer-facing
     // envelope would make a remote gateway interpret the request as another
     // forwarding hop instead of invoking its local registered handler.
     let mut request = request;
     request.to = None;
-    write_cbor_record(&mut stream, &request).await?;
-    let response = read_cbor_record(&mut stream)
-        .await?
-        .context("mesh peer closed stream without a response")?;
+    let exchange = async {
+        let mut stream = client.open_stream(&target).await?;
+        // The peer gets what remains of the caller's time, so a chain of
+        // forwarders never allows more than the original request did.
+        if let Some(allowance) = allowance {
+            request.timeout = Some(
+                u64::try_from(allowance.saturating_sub(started.elapsed()).as_millis())
+                    .unwrap_or(u64::MAX),
+            );
+        }
+        write_cbor_record(&mut stream, &request).await?;
+        read_cbor_record(&mut stream)
+            .await?
+            .context("mesh peer closed stream without a response")
+    };
+    let response = match allowance {
+        None => exchange.await?,
+        Some(allowance) => match tokio::time::timeout(allowance, exchange).await {
+            Ok(response) => response?,
+            Err(_) => return Ok(expired()),
+        },
+    };
     if response.id != Some(request_id)
         || !matches!(response.kind()?, RecordKind::Response | RecordKind::Error)
     {
@@ -129,6 +156,61 @@ mod tests {
         .expect("correlated response");
         peer.await.expect("peer task").expect("peer response");
         assert_eq!(response.result, Some(json!({"ok": true})));
+    }
+
+    #[tokio::test]
+    async fn the_peer_gets_the_remaining_time_and_a_silent_peer_times_out() {
+        let request = |timeout| TaggedRecord {
+            component: NameOrTag::Name("telemetry".to_owned()),
+            method: NameOrTag::Name("status".to_owned()),
+            id: Some(json!(7)),
+            to: Some(json!("e7")),
+            timeout,
+            ..Default::default()
+        };
+        // The peer sees the allowance, minus the time already used.
+        let (client_stream, mut peer_stream) = tokio::io::duplex(2048);
+        let peer = tokio::spawn(async move {
+            let request = read_cbor_record(&mut peer_stream).await?.expect("request");
+            let remaining = request.timeout.expect("timeout is forwarded");
+            assert!(remaining <= 5_000 && remaining > 0, "{remaining}");
+            write_cbor_record(
+                &mut peer_stream,
+                &response_ok(request.id.expect("request id"), json!({"ok": true})),
+            )
+            .await
+        });
+        let client = InMemoryClient(Mutex::new(Some(client_stream)));
+        call_record(&client, request(Some(5_000))).await.expect("response");
+        peer.await.expect("peer task").expect("peer response");
+
+        // A peer that never answers is abandoned when the allowance ends.
+        let (client_stream, _silent_peer) = tokio::io::duplex(2048);
+        let client = InMemoryClient(Mutex::new(Some(client_stream)));
+        let response = call_record(&client, request(Some(30))).await.expect("timeout reply");
+        assert_eq!(response.error.as_ref().unwrap()["error"], "timeout");
+        assert_eq!(response.id, Some(json!(7)));
+    }
+
+    #[test]
+    fn timeout_is_envelope_key_8_in_cbor_and_a_json_field() {
+        let record = TaggedRecord {
+            component: NameOrTag::Name("telemetry".to_owned()),
+            method: NameOrTag::Name("status".to_owned()),
+            id: Some(json!(1)),
+            timeout: Some(2500),
+            ..Default::default()
+        };
+        let wire = crate::cbor::encode_record(&record).unwrap();
+        // 8 then 2500 (0x19 0x09c4) appears in the map.
+        assert!(wire.windows(4).any(|w| w == [8, 0x19, 0x09, 0xc4]));
+        assert_eq!(crate::cbor::decode_record(&wire).unwrap().timeout, Some(2500));
+        assert_eq!(crate::tagged::to_json(&record, None)["timeout"], 2500);
+        let parsed = crate::tagged::record_from_json(
+            &json!({"component": "telemetry", "method": "status", "id": 1, "timeout": 2500}),
+        )
+        .unwrap();
+        assert_eq!(parsed.timeout, Some(2500));
     }
 
     #[test]

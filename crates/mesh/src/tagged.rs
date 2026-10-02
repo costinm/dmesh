@@ -51,6 +51,11 @@ pub struct TaggedRecord {
     /// forwards the request to this destination instead of executing the
     /// method locally. It is envelope routing metadata, not a handler field.
     pub to: Option<Value>,
+    /// Time the caller allows for the whole request, in milliseconds,
+    /// counted from when the receiver reads it (a duration, not a deadline:
+    /// devices share no clock). A forwarder sends on what remains. Absent
+    /// means the handler's default. Envelope key 8; request only.
+    pub timeout: Option<u64>,
     /// Opaque binary payload outside `env`. Keeping this borrowed/owned byte
     /// lane distinct from normal typed fields lets proxy stubs forward large
     /// records without base64 or an intermediate JSON value.
@@ -313,6 +318,15 @@ impl TaggedSchema {
                 "to" if !schema.is_some_and(|schema| schema.fields.contains_key("to")) => {
                     record.to = Some(value.clone())
                 }
+                "timeout"
+                    if !schema.is_some_and(|schema| schema.fields.contains_key("timeout")) =>
+                {
+                    record.timeout = Some(
+                        value
+                            .as_u64()
+                            .ok_or_else(|| anyhow!("timeout is a number of milliseconds"))?,
+                    )
+                }
                 // `data` is deliberately a CBOR byte field in the envelope.
                 // The Rust wire adapter accepts an array of octets here so
                 // binary data does not cross a base64/text conversion.
@@ -370,6 +384,16 @@ impl TaggedSchema {
                     record.to = Some(text_value(value));
                     continue;
                 }
+                if name == "timeout"
+                    && !schema.is_some_and(|schema| schema.fields.contains_key("timeout"))
+                {
+                    record.timeout = Some(
+                        value
+                            .parse()
+                            .map_err(|_| anyhow!("timeout is a number of milliseconds"))?,
+                    );
+                    continue;
+                }
                 let key = field_key(schema, name);
                 record
                     .env
@@ -379,6 +403,16 @@ impl TaggedSchema {
             {
                 if name == "to" && !schema.is_some_and(|schema| schema.fields.contains_key("to")) {
                     record.to = Some(text_value(value));
+                    continue;
+                }
+                if name == "timeout"
+                    && !schema.is_some_and(|schema| schema.fields.contains_key("timeout"))
+                {
+                    record.timeout = Some(
+                        value
+                            .parse()
+                            .map_err(|_| anyhow!("timeout is a number of milliseconds"))?,
+                    );
                     continue;
                 }
                 let key = field_key(schema, name);
@@ -438,6 +472,9 @@ impl TaggedSchema {
         }
         if let Some(to) = &record.to {
             value.insert("to".to_owned(), to.clone());
+        }
+        if let Some(timeout) = record.timeout {
+            value.insert("timeout".to_owned(), timeout.into());
         }
         if let Some(data) = &record.data {
             value.insert(
@@ -513,6 +550,8 @@ fn field_text_value(schema: Option<&MethodSchema>, name: &str, value: &str) -> R
                 .map(Ok)
                 .unwrap_or_else(|| value.parse::<u64>())?,
         )),
+        // A declared string stays text, whatever it looks like (`ssid=123`).
+        Some("string") => Ok(Value::String(value.to_owned())),
         Some("mac") => Ok(Value::String(value.to_ascii_lowercase())),
         Some("hex") => Ok(Value::String(format!(
             "hex:{}",
@@ -682,6 +721,9 @@ pub fn to_json(record: &TaggedRecord, catalog: Option<&TaggedCatalog>) -> Value 
     if let Some(to) = &record.to {
         value.insert("to".to_owned(), to.clone());
     }
+    if let Some(timeout) = record.timeout {
+        value.insert("timeout".to_owned(), timeout.into());
+    }
     if let Some(data) = &record.data {
         value.insert(
             "data".to_owned(),
@@ -757,6 +799,7 @@ pub fn record_from_json(value: &Value) -> Result<TaggedRecord> {
         result: object.get("result").cloned(),
         error: object.get("error").cloned(),
         to: object.get("to").cloned(),
+        timeout: object.get("timeout").and_then(Value::as_u64),
         data,
     };
     record.kind()?;
@@ -796,7 +839,9 @@ pub fn to_text(record: &TaggedRecord) -> String {
 fn text_value(value: &str) -> Value {
     if let Ok(value) = value.parse::<i64>() {
         Value::from(value)
-    } else if let Ok(value) = value.parse::<f64>() {
+    } else if let Some(value) = value.parse::<f64>().ok().filter(|value| value.is_finite()) {
+        // `nan` and `inf` parse as floats but have no JSON form (they would
+        // become null); they are ordinary words here.
         Value::from(value)
     } else if matches!(value, "true" | "false") {
         Value::Bool(value == "true")
@@ -1195,6 +1240,14 @@ mod tests {
 
     impl TaggedFields for Nothing {
         const FIELDS: &'static [(&'static str, u32)] = &[];
+    }
+
+    #[test]
+    fn words_that_parse_as_non_finite_floats_stay_text() {
+        assert_eq!(text_value("nan"), Value::String("nan".into()));
+        assert_eq!(text_value("inf"), Value::String("inf".into()));
+        assert_eq!(text_value("1.5"), Value::from(1.5));
+        assert_eq!(text_value("42"), Value::from(42));
     }
 
     #[test]
