@@ -237,6 +237,18 @@ pub struct SshRouteConfig {
     pub client: SshClientConfig,
 }
 
+/// Static directory routing rule for HTTP endpoints.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct StaticRouteConfig {
+    /// Optional HTTP Host header to match (e.g. "service.localhost" or "service.m").
+    #[serde(default)]
+    pub host: Option<String>,
+    /// Path prefix to match (e.g. "/assets" or "/").
+    pub path_prefix: String,
+    /// Local filesystem directory to serve.
+    pub dir: PathBuf,
+}
+
 /// Configurable fields for MeshNode, loadable from JSON or YAML.
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct MeshNodeConfig {
@@ -308,6 +320,10 @@ pub struct MeshNodeConfig {
     /// trusted, isolated networks.
     #[serde(default)]
     pub allow_direct_tcpip: bool,
+
+    /// Static HTTP directory routing rules.
+    #[serde(default)]
+    pub static_routes: Vec<StaticRouteConfig>,
 }
 
 pub trait MeshListener: Send + Sync {

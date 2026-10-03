@@ -269,7 +269,7 @@ pub fn start_mock_mesh_init(
                     if let Some(env) = record
                         .env
                         .iter()
-                        .find(|(key, _)| key.text() == "env")
+                        .find(|(key, _)| field_name(key) == "env")
                         .and_then(|(_key, value)| value.as_object())
                     {
                         for (key, value) in env {

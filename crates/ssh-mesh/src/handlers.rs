@@ -821,8 +821,18 @@ pub async fn handle_proxy_request(
     State(state): State<AppState>,
     req: axum::extract::Request,
 ) -> impl IntoResponse {
+    let host_header = req
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|h| h.to_str().ok());
+    let path = req.uri().path();
+
+    if let Some(response) = handle_static_routes(&state, host_header, path) {
+        return response;
+    }
+
     if let Some(response) =
-        prefixed_admin_response(req.uri().path(), state.web_root.as_deref()).await
+        prefixed_admin_response(path, state.web_root.as_deref()).await
     {
         return response;
     }
@@ -830,7 +840,7 @@ pub async fn handle_proxy_request(
     let target_addr = match &state.target_http_address {
         Some(addr) => addr,
         None => {
-            if let Some(location) = prefixed_admin_location(req.uri().path()) {
+            if let Some(location) = prefixed_admin_location(path) {
                 return Redirect::temporary(&location).into_response();
             }
             return (StatusCode::NOT_FOUND, "Not Found").into_response();
@@ -917,6 +927,113 @@ fn prefixed_admin_location(path: &str) -> Option<String> {
     None
 }
 
+fn normalize_host(host_header: Option<&str>) -> Option<&str> {
+    let host = host_header?.trim();
+    if host.is_empty() {
+        return None;
+    }
+    // Strip port if present (handling both IPv4/names and bracketed IPv6)
+    if let Some(rest) = host.strip_prefix('[') {
+        if let Some((ipv6, _)) = rest.split_once(']') {
+            return Some(ipv6);
+        }
+    }
+    Some(host.split(':').next().unwrap_or(host))
+}
+
+fn extract_service_name<'a>(host: &'a str, domain: &str) -> Option<&'a str> {
+    let suffix = format!(".{}", domain.trim_start_matches('.'));
+    if host.len() > suffix.len() && host.ends_with(&suffix) {
+        let service = &host[..host.len() - suffix.len()];
+        if !service.is_empty() && !service.contains('.') {
+            return Some(service);
+        }
+    }
+    None
+}
+
+fn serve_directory_asset(root: &std::path::Path, relative_path: &str) -> Option<Response> {
+    let rel = relative_path.trim_start_matches('/');
+    let target_file = if rel.is_empty() || rel.ends_with('/') {
+        let index = if rel.is_empty() {
+            "index.html".to_string()
+        } else {
+            format!("{rel}index.html")
+        };
+        confine_to_web_dir(root, &index)?
+    } else {
+        match confine_to_web_dir(root, rel) {
+            Some(p) if p.is_file() => p,
+            Some(p) if p.is_dir() => {
+                let index = format!("{rel}/index.html");
+                confine_to_web_dir(root, &index)?
+            }
+            _ => return None,
+        }
+    };
+
+    if !target_file.is_file() {
+        return None;
+    }
+
+    let content = std::fs::read(&target_file).ok()?;
+    let mime = mime_for_path(&target_file.to_string_lossy());
+    Some(
+        (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, mime)],
+            content,
+        )
+            .into_response(),
+    )
+}
+
+fn handle_static_routes(
+    state: &AppState,
+    host_header: Option<&str>,
+    path: &str,
+) -> Option<Response> {
+    let host = normalize_host(host_header);
+
+    // 1. Check explicit static_routes configured in TOML
+    for route in &state.ssh_server.cfg.static_routes {
+        if let Some(ref required_host) = route.host {
+            let req_host = normalize_host(Some(required_host.as_str()));
+            if req_host != host {
+                continue;
+            }
+        }
+
+        let prefix = route.path_prefix.as_str();
+        if path == prefix {
+            if let Some(resp) = serve_directory_asset(&route.dir, "") {
+                return Some(resp);
+            }
+        } else if let Some(suffix) = path.strip_prefix(prefix) {
+            if prefix.ends_with('/') || suffix.starts_with('/') {
+                if let Some(resp) = serve_directory_asset(&route.dir, suffix) {
+                    return Some(resp);
+                }
+            }
+        }
+    }
+
+    // 2. Check automatic SERVICE.[domain] -> /home/SERVICE/www mapping
+    let domain = std::env::var("MESH_DOMAIN").unwrap_or_else(|_| "localhost".to_string());
+    if let Some(host_str) = host {
+        if let Some(service) = extract_service_name(host_str, &domain) {
+            let service_www = std::path::PathBuf::from(format!("/home/{service}/www"));
+            if service_www.is_dir() {
+                if let Some(resp) = serve_directory_asset(&service_www, path) {
+                    return Some(resp);
+                }
+            }
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -962,5 +1079,48 @@ mod tests {
         let cgroups = std::str::from_utf8(&cgroups.data).expect("cgroups is UTF-8");
         assert!(cgroups.contains("escapeHtml(p.cmdline"));
         assert!(!cgroups.contains("fonts.googleapis.com"));
+    }
+
+    #[test]
+    fn test_normalize_host() {
+        assert_eq!(normalize_host(Some("example.com")), Some("example.com"));
+        assert_eq!(normalize_host(Some("example.com:8080")), Some("example.com"));
+        assert_eq!(normalize_host(Some("[::1]:8080")), Some("::1"));
+        assert_eq!(normalize_host(Some("  localhost:3000  ")), Some("localhost"));
+        assert_eq!(normalize_host(None), None);
+        assert_eq!(normalize_host(Some("   ")), None);
+    }
+
+    #[test]
+    fn test_extract_service_name() {
+        assert_eq!(extract_service_name("lmesh.localhost", "localhost"), Some("lmesh"));
+        assert_eq!(extract_service_name("lmesh.test.m", "test.m"), Some("lmesh"));
+        assert_eq!(extract_service_name("lmesh.test.m", ".test.m"), Some("lmesh"));
+        assert_eq!(extract_service_name("sub.lmesh.localhost", "localhost"), None);
+        assert_eq!(extract_service_name("localhost", "localhost"), None);
+        assert_eq!(extract_service_name("other.org", "localhost"), None);
+    }
+
+    #[tokio::test]
+    async fn test_serve_directory_asset_and_static_routes() {
+        let temp = tempfile::tempdir().unwrap();
+        let www_dir = temp.path().join("www");
+        std::fs::create_dir_all(&www_dir).unwrap();
+        std::fs::write(www_dir.join("index.html"), "<h1>Home</h1>").unwrap();
+        std::fs::write(www_dir.join("hello.txt"), "world").unwrap();
+
+        // 1. Direct serve_directory_asset
+        let resp = serve_directory_asset(&www_dir, "/").expect("serve root");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = serve_directory_asset(&www_dir, "/hello.txt").expect("serve hello.txt");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp_missing = serve_directory_asset(&www_dir, "/missing.txt");
+        assert!(resp_missing.is_none());
+
+        // Traversal attempt should fail
+        let resp_traversal = serve_directory_asset(&www_dir, "../outside.txt");
+        assert!(resp_traversal.is_none());
     }
 }

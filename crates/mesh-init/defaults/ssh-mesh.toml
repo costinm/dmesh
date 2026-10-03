@@ -50,3 +50,5 @@ MESH_HOME_BASE = "/home"
 MESH_OPT_BASE = "/opt"
 MESH_RUN_BASE = "/run/mesh"
 MESH_INIT_SOCK = "/run/mesh/mesh-init/mesh.sock"
+# Optional static web directory (e.g. Android app assets directory or custom web root)
+# MESH_HTTP_WEB_DIR = "/storage/emulated/10/ws/dmesh/android/app-dmesh/src/main/assets"
