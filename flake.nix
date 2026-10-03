@@ -157,7 +157,12 @@
           mkDmesh = firmwareRoot: sourceRoot: sshMeshRoot: pkgs.rustPlatform.buildRustPackage {
             pname = "dmesh";
             version = "0.1.0";
-            src = sourceRoot;
+            src = pkgs.lib.cleanSourceWith {
+              src = sourceRoot;
+              filter = path: type:
+                let name = builtins.baseNameOf (toString path);
+                in !(builtins.elem name [ ".git" "target" "result" ".vscode" ".agents" "android" ]);
+            };
             nativeBuildInputs = [ pkgs.makeWrapper ];
             cargoLock = {
               lockFile = ./Cargo.lock;
@@ -231,7 +236,7 @@
                 name = "dmesh-source";
                 filter = path: type:
                   let name = builtins.baseNameOf (toString path);
-                  in !(builtins.elem name [ ".git" "target" "result" ".vscode" ".agents" ]);
+                  in !(builtins.elem name [ ".git" "target" "result" ".vscode" ".agents" "android" ]);
               };
           sshMeshSource =
             if sshMeshSourceRoot == "" then null else
@@ -277,11 +282,14 @@
           inherit deps musl-toolchain wpa-supplicant-nan dmesh;
           dmesh-with-firmware =
             if firmwareRoot == "" then
-              throw "Set DMESH_FIRMWARE_ROOT to the flash directory with all three CPUs and 4mb/8mb Stage2 variants, then use nix build --impure .#dmesh-with-firmware"
+              pkgs.runCommand "dmesh-with-firmware-unset" {} ''
+                echo "Set DMESH_FIRMWARE_ROOT to the flash directory with all three CPUs and 4mb/8mb Stage2 variants, then use nix build --impure .#dmesh-with-firmware" >&2
+                exit 1
+              ''
             else
               mkDmesh (builtins.path { path = firmwareRoot; name = "dmesh-firmware"; }) localSource sshMeshSource;
           musl-deps = muslDeps;
-          default = deps;
+          default = dmesh;
         }
       );
 
