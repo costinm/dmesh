@@ -8,7 +8,6 @@ use anyhow::{Context, Result};
 
 use p256::SecretKey;
 use p256::ecdsa::signature::{Signer, Verifier};
-use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use p256::elliptic_curve::Generate;
 use p256::elliptic_curve::sec1::ToSec1Point;
 use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey};
@@ -16,26 +15,23 @@ use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::ffi::CStr;
-use std::fs::{self, OpenOptions};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use tokio::net::UdpSocket;
-use tokio::sync::{Mutex, RwLock, oneshot};
+use tokio::sync::RwLock;
 
-use tracing::{debug, error, info, instrument, trace, warn};
+use tracing::instrument;
 
 const STABLE_WIFI_UDP_PORT: u16 = 3336;
-const RAW_UDP6_PORT: u16 = 3339;
 
 /// Datagrams on the discovery socket that matched neither the common
 /// tagged-CBOR announce nor the legacy JSON envelope. Old firmware and
@@ -69,9 +65,6 @@ pub fn announce_parse_errors() -> u64 {
 /// it into its inventory without coupling the multicast receive loop to a
 /// particular Wi-Fi implementation.
 type AnnounceObserver = Arc<dyn Fn(SocketAddr, dmesh_server::announce::Announce) + Send + Sync>;
-type DirectedDiscoveryWaiters = Arc<
-    std::sync::Mutex<HashMap<u64, oneshot::Sender<(SocketAddr, dmesh_server::announce::Announce)>>>,
->;
 
 /// Optional discovery-only host label. Stable key material remains the
 /// identity; this short presentation value will later be superseded by a
@@ -117,85 +110,7 @@ pub const DISCOVERY_MULTICAST_IPV6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0,
 /// Optional display/routing metadata for a LAN that is reachable through more
 /// than one local link. Example: `costin=wlan1,br-lan`.
 const UDP6_NETWORKS_ENV: &str = "LMESH_UDP6_NETWORKS";
-const MAX_STORED_ANNOUNCES: usize = 16;
-/// Bind an IPv4 multicast receiver so the independently supervised host
-/// services both receive each multicast datagram. `SO_REUSEADDR` is required
-/// on every participant before binding the shared wildcard endpoint.
-fn bind_shared_multicast_v4(port: u16) -> Result<UdpSocket> {
-    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error()).context("create IPv4 multicast socket");
-    }
-    let socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
-    let enabled: libc::c_int = 1;
-    let option_len = std::mem::size_of_val(&enabled) as libc::socklen_t;
-    let reuse = unsafe {
-        libc::setsockopt(
-            socket.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_REUSEADDR,
-            (&enabled as *const libc::c_int).cast(),
-            option_len,
-        )
-    };
-    if reuse != 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("make IPv4 multicast socket shareable");
-    }
-    let address = libc::sockaddr_in {
-        sin_family: libc::AF_INET as libc::sa_family_t,
-        sin_port: port.to_be(),
-        sin_addr: libc::in_addr { s_addr: 0 },
-        sin_zero: [0; 8],
-    };
-    let result = unsafe {
-        libc::bind(
-            socket.as_raw_fd(),
-            (&address as *const libc::sockaddr_in).cast(),
-            std::mem::size_of_val(&address) as libc::socklen_t,
-        )
-    };
-    if result != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("bind IPv4 multicast port {port}"));
-    }
-    socket
-        .set_nonblocking(true)
-        .context("make IPv4 multicast socket nonblocking")?;
-    UdpSocket::from_std(socket).context("adopt IPv4 multicast socket")
-}
 
-/// IPv6 link-local multicast needs a concrete interface scope.  Index `0`
-/// does not mean "every interface" for `ff02::/16`, so discover each live
-/// non-loopback IPv6 link and join/send on all of them.
-fn multicast_v6_interface_indices() -> Vec<u32> {
-    let mut result = BTreeSet::new();
-    unsafe {
-        let mut head = std::ptr::null_mut();
-        if libc::getifaddrs(&mut head) != 0 {
-            return Vec::new();
-        }
-        let mut current = head;
-        while !current.is_null() {
-            let entry = &*current;
-            let up = entry.ifa_flags & (libc::IFF_UP as u32) != 0;
-            let loopback = entry.ifa_flags & (libc::IFF_LOOPBACK as u32) != 0;
-            if up
-                && !loopback
-                && !entry.ifa_addr.is_null()
-                && (*entry.ifa_addr).sa_family as i32 == libc::AF_INET6
-            {
-                let index = libc::if_nametoindex(CStr::from_ptr(entry.ifa_name).as_ptr());
-                if index != 0 {
-                    result.insert(index);
-                }
-            }
-            current = entry.ifa_next;
-        }
-        libc::freeifaddrs(head);
-    }
-    result.into_iter().collect()
-}
 
 /// Configuration is intentionally only a network label: it never changes a
 /// route, bridge, or interface state. It lets the status/API tell callers that
@@ -410,80 +325,14 @@ fn require_live_udp6_scope(peer: SocketAddr) -> Result<SocketAddr> {
 /// precise NOW-not-yet-installed error instead of a misleading
 /// unknown-discovery-node result.
 fn explicit_udp_endpoint(destination: &str) -> Result<Option<SocketAddr>> {
-    let value = destination.trim();
-    if value.is_empty() {
-        return Ok(None);
-    }
-    let value = value.strip_prefix("udp://").unwrap_or(value);
-    if let Ok(mut endpoint) = value.parse::<SocketAddr>() {
-        if let SocketAddr::V6(address) = &mut endpoint
-            && address.ip().is_unicast_link_local()
-            && address.scope_id() == 0
-        {
-            address.set_scope_id(configured_udp6_scope_id().unwrap_or(0));
-        }
-        return Ok(Some(endpoint));
-    }
-    // A port is noise when the peer uses the normal DMesh UDP listener.
-    // Preserve the bracketed IPv6 spelling so a `%iface` scope can still be
-    // resolved below without ever serializing that local interface name.
-    if let Some(bracketed_address) = value.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
-        let (address, scope) = bracketed_address
-            .rsplit_once('%')
-            .map_or((bracketed_address, None), |(address, scope)| {
-                (address, Some(scope))
-            });
-        if let Ok(address) = address.parse::<Ipv6Addr>() {
-            let scope_id = scope.map_or_else(
-                || configured_udp6_scope_id().unwrap_or(0),
-                |scope| {
-                    scope
-                        .parse::<u32>()
-                        .ok()
-                        .or_else(|| {
-                            std::fs::read_to_string(format!("/sys/class/net/{scope}/ifindex"))
-                                .ok()
-                                .and_then(|value| value.trim().parse::<u32>().ok())
-                        })
-                        .unwrap_or(0)
-                },
-            );
-            if scope.is_some() && scope_id == 0 {
-                anyhow::bail!("unknown IPv6 scope interface {:?}", scope.unwrap());
-            }
-            return Ok(Some(SocketAddr::V6(std::net::SocketAddrV6::new(
-                address,
-                STABLE_WIFI_UDP_PORT,
-                0,
-                scope_id,
-            ))));
-        }
-    }
-    if let Ok(address) = value.parse::<std::net::IpAddr>() {
-        return Ok(Some(SocketAddr::new(address, STABLE_WIFI_UDP_PORT)));
-    }
-    // Rust's SocketAddr parser deliberately does not accept the `%iface`
-    // spelling used for IPv6 link-local literals. The HTTP dashboard and
-    // dmesh-cli also needs that spelling to select a directly reachable peer;
-    // resolve its scope locally and never put the interface name on the wire.
-    if let Some((bracketed_address, port)) = value.rsplit_once("]:")
-        && let Some(scoped_address) = bracketed_address.strip_prefix('[')
-        && let Some((address, scope)) = scoped_address.rsplit_once('%')
-        && let (Ok(address), Ok(port)) = (address.parse::<Ipv6Addr>(), port.parse::<u16>())
-    {
-        let scope_id = scope.parse::<u32>().ok().or_else(|| {
-            std::fs::read_to_string(format!("/sys/class/net/{scope}/ifindex"))
-                .ok()
-                .and_then(|value| value.trim().parse::<u32>().ok())
-        });
-        if let Some(scope_id) = scope_id {
-            return Ok(Some(SocketAddr::V6(std::net::SocketAddrV6::new(
-                address, port, 0, scope_id,
-            ))));
-        }
-        anyhow::bail!("unknown IPv6 scope interface {scope:?}");
-    }
-    Ok(None)
+    dmesh_discovery::endpoint::parse_udp_endpoint(
+        destination,
+        &dmesh_discovery::endpoint::EndpointDefaults {
+            port: STABLE_WIFI_UDP_PORT,
+            scope: configured_udp6_scope_id(),
+        },
+    )
+    .map_err(anyhow::Error::from)
 }
 
 /// Resolve a normal UDP path from the common semantic discovery inventory.
@@ -563,56 +412,6 @@ fn semantic_inventory_udp_peer_for_device(device: &serde_json::Value) -> Option<
     )))
 }
 
-/// Return the one stable device key for either its public discovery name or
-/// a concrete receiver-reachable UDP address. An announce `route_key` is the
-/// authenticated public identity; configured names remain the stable fallback
-/// for devices that do not yet advertise one.
-fn semantic_inventory_device_key(
-    inventory: &serde_json::Value,
-    destination: &str,
-) -> Option<String> {
-    let explicit = explicit_udp_endpoint(destination).ok().flatten();
-    inventory
-        .get("devices")?
-        .as_array()?
-        .iter()
-        .find_map(|device| {
-            let identity = device.get("identity")?.as_str()?;
-            let announce = device.get("announce");
-            let vip = announce
-                .and_then(|announce| announce.get("vip6"))
-                .and_then(serde_json::Value::as_str);
-            let observed_path = device
-                .get("observations")
-                .and_then(serde_json::Value::as_object)
-                .is_some_and(|observations| {
-                    observations.values().any(|observation| {
-                        observation
-                            .get("last_peer")
-                            .and_then(serde_json::Value::as_str)
-                            == Some(destination)
-                    })
-                });
-            let matches = identity == destination
-                || vip == Some(destination)
-                || observed_path
-                || explicit.is_some_and(|peer| {
-                    semantic_inventory_udp_peer_for_device(device) == Some(peer)
-                });
-            if !matches {
-                return None;
-            }
-            let route_key = device
-                .get("announce")
-                .and_then(|announce| announce.get("route_key"))
-                .and_then(serde_json::Value::as_str)
-                .filter(|key| !key.is_empty());
-            Some(format!(
-                "identity:{}",
-                route_key.or(vip).unwrap_or(identity)
-            ))
-        })
-}
 
 /// The dashboard and report use the same presentation inventory as routing.
 /// Hide a stale receiver-local UDP observation rather than turning it into a
@@ -644,17 +443,6 @@ fn presentation_radio_devices(radio: &lmesh_wifi::RadioService) -> serde_json::V
     inventory
 }
 
-/// A directed NOW destination is an ordinary colon-separated hardware
-/// address. Keep it separate from discovery identity lookup: raw NOW peers do
-/// not need a synthetic signed UDP announcement before a stream can open.
-fn is_now_mac(destination: &str) -> bool {
-    let mut octets = destination.trim().split(':');
-    (0..6).all(|_| {
-        octets
-            .next()
-            .is_some_and(|part| part.len() == 2 && u8::from_str_radix(part, 16).is_ok())
-    }) && octets.next().is_none()
-}
 
 fn parse_unicast_mac(value: &str) -> Option<[u8; 6]> {
     let mut mac = [0u8; 6];
@@ -704,721 +492,197 @@ pub fn nan_object_dry_run(_image_size: usize, _mtu: usize) -> serde_json::Value 
     })
 }
 
-/// Announcement message sent over multicast
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Announce {
-    /// Base64url encoded public key (P256)
-    pub public_key: String,
-    /// Optional node metadata
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<HashMap<String, String>>,
+/// What this Linux host says about itself in its announce, beyond the identity:
+/// its name and domain, its measured radio capabilities (so a pair probe may
+/// select it as an endpoint, while the executor still promises never to
+/// reconfigure this host as part of the probe), and the UDP endpoint of the
+/// configured shared network. The receiver records its own ingress
+/// interface/scope; a sender never serializes a receiver's interface.
+struct LinuxFacts {
+    network: std::sync::Mutex<Option<String>>,
+    udp_port: std::sync::atomic::AtomicU16,
 }
 
-/// Represents a discovered node
-#[derive(Debug, Clone)]
-pub struct Node {
-    /// Base64url encoded public key
-    pub public_key: String,
-    /// Last seen address
-    pub address: SocketAddr,
-    /// Last announcement received
-    pub last_seen: std::time::Instant,
-    /// Optional metadata from the announcement
-    pub metadata: Option<HashMap<String, String>>,
-    /// Typed common announce fields. Legacy JSON peers leave these absent.
-    pub announce: Option<ObservedAnnounce>,
+impl dmesh_discovery::LocalFacts for LinuxFacts {
+    fn describe(&self, announce: &mut dmesh_server::announce::Announce) {
+        if let Some(name) = discovery_device_name() {
+            let _ = announce.set_device_name(&name);
+        }
+        if let Some(domain) = discovery_device_domain() {
+            let _ = announce.set_device_domain(&domain);
+        }
+        let port = self.udp_port.load(Ordering::Relaxed);
+        let network = self.network.lock().ok().and_then(|network| network.clone());
+        if let Some(network) = network
+            && port != 0
+            && let Some(address) = local_network_link_local_v6(&network)
+        {
+            announce.set_udp_port(port);
+            announce.set_udp_link_local_v6(address);
+        }
+        announce.set_probe_descriptor(
+            dmesh_server::announce::DEVICE_CLASS_HOST,
+            dmesh_server::probe::PROBE_CAP_NAN
+                | dmesh_server::probe::PROBE_CAP_NOW
+                | dmesh_server::probe::PROBE_CAP_STA
+                | dmesh_server::probe::PROBE_CAP_AP
+                | dmesh_server::probe::PROBE_CAP_UDP6,
+        );
+    }
 }
 
-/// Bounded, bearer-neutral announce information retained for one observed
-/// peer.  It is intentionally a schema, not a map of stringly typed tags.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ObservedAnnounce {
-    pub device_id: String,
-    pub kind: u64,
-    pub uptime_secs: u32,
-    /// Sender class selects documented defaults such as the normal UDP/QUIC
-    /// listener when the signed announce intentionally omits a port override.
-    pub device_class: u8,
-    /// Current sender Wi-Fi channel, or zero when the sender cannot report it.
-    pub wifi_channel: u8,
-    pub authenticated: bool,
-    /// Advertised normal UDP/QUIC port; zero is a legacy peer without an
-    /// explicit endpoint.
-    pub udp_port: u16,
-    /// Advertised link-local address. The receiving socket's scope remains in
-    /// the enclosing `Node.address`, not in this sender-provided value.
-    pub udp_link_local_v6: Option<[u8; 16]>,
-}
-
-/// Link-local discovery service
+/// Link-local discovery: the shared `dmesh-discovery` engine and UDP6/UDP4
+/// multicast transport (the same ones Android uses), behind the small surface
+/// this service needs. A NAN/NOW observation reaches the same engine through
+/// [`LocalDiscovery::engine`].
 pub struct LocalDiscovery {
-    /// EC P256 private key (DER encoded)
-    #[allow(dead_code)]
-    private_key: Vec<u8>,
-    /// EC P256 public key (DER encoded)
-    #[allow(dead_code)]
-    public_key: Vec<u8>,
-    /// Base64url encoded public key for announcements
-    public_key_b64: String,
-    /// Map of discovered nodes, keyed by base64url encoded public key
-    nodes: Arc<RwLock<HashMap<String, Node>>>,
-    /// Directory where per-node discovery files are written.
-    node_store_dir: Arc<PathBuf>,
-    /// IPv4 UDP socket
-    /// IPv6 UDP socket
-    socket_v4: Option<Arc<UdpSocket>>,
-    socket_v6: Option<Arc<UdpSocket>>,
-    /// The process's normal QUIC listener. lmesh wires this after starting
-    /// `dmesh-server::udp`; directed discovery and multicast sends use this
-    /// normal source port, while 5227 remains receive-only multicast ingress.
-    shared_udp_socket: Arc<std::sync::Mutex<Option<Arc<UdpSocket>>>>,
-    direct_waiters: DirectedDiscoveryWaiters,
-    /// Optional semantic sink for signed/validated common CBOR announces.
-    /// The node map remains the compatibility view; this lets the owning
-    /// host radio expose one device inventory across UDP and NAN.
+    identity: Arc<dmesh_discovery::P256Identity>,
+    facts: Arc<LinuxFacts>,
+    engine: Arc<dmesh_discovery::Engine>,
+    udp: std::sync::Mutex<Option<Arc<dmesh_discovery::udp::UdpDiscovery>>>,
+    /// Optional semantic sink for validated common announces, so the owning
+    /// host radio can expose one device inventory across UDP and NAN.
     announce_observer: Arc<RwLock<Option<AnnounceObserver>>>,
-    /// Local routing metadata included in the common announce. The receiver
-    /// already knows its interface scope from the received UDP6 datagram, so
-    /// this deliberately contains only the shared network label and service
-    /// port, never a host interface name.
-    announce_network_name: Option<String>,
-    announce_udp_port: u16,
+    public_key_b64: String,
 }
 
 impl LocalDiscovery {
-    /// Create a new LocalDiscovery instance with an optional EC P256 private key
-    /// If no key is provided, attempts to load from $HOME/.ssh/key.pem or generates a new one
+    /// Create the discovery service. With no key, `$HOME/.ssh/key.pem` is
+    /// loaded or generated (mode 0600).
     #[instrument(skip(key))]
     pub async fn new(key: Option<SecretKey>) -> Result<Self> {
-        // Get the private key either from parameter or by loading/generating
-        let private_key_ec = match key {
-            Some(key) => key,
+        let identity = Arc::new(match key {
+            Some(key) => dmesh_discovery::P256Identity::from_secret(key),
             None => {
-                debug!("No key provided, loading or generating new key");
-                Self::load_or_generate_key()?
+                let home = std::env::var("HOME").context("HOME environment variable not set")?;
+                dmesh_discovery::P256Identity::load_or_generate(
+                    &Path::new(&home).join(".ssh").join("key.pem"),
+                )
+                .context("load or generate the node key")?
             }
-        };
-
-        // Serialize the private key to DER format
-        let secret_key_der = private_key_ec
-            .to_pkcs8_der()
-            .context("Failed to serialize private key")?;
-        let private_key = secret_key_der.to_bytes().to_vec();
-
-        // The common discovery wire uses SEC1 compressed P-256 points (33
-        // bytes), not the larger DER/SPKI wrapper.
-        let public_key_ec = private_key_ec.public_key();
-        let public_key = public_key_ec.to_sec1_point(true).as_bytes().to_vec();
-
-        let public_key_b64 = base64_url_encode(&public_key);
-
+        });
+        let facts = Arc::new(LinuxFacts {
+            network: std::sync::Mutex::new(None),
+            udp_port: std::sync::atomic::AtomicU16::new(0),
+        });
+        let engine = Arc::new(dmesh_discovery::Engine::new(identity.clone(), facts.clone()));
+        let public_key_b64 = base64_url_encode(identity.public_key());
         Ok(Self {
-            private_key,
-            public_key,
-            public_key_b64,
-            nodes: Arc::new(RwLock::new(HashMap::new())),
-            node_store_dir: Arc::new(Self::default_node_store_dir()?),
-            socket_v4: None,
-            socket_v6: None,
-            shared_udp_socket: Arc::new(std::sync::Mutex::new(None)),
-            direct_waiters: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            identity,
+            facts,
+            engine,
+            udp: std::sync::Mutex::new(None),
             announce_observer: Arc::new(RwLock::new(None)),
-            announce_network_name: None,
-            announce_udp_port: 0,
+            public_key_b64,
         })
     }
 
     /// Configure the endpoint advertised by this local service. `network` is
     /// the bearer-neutral LAN label (for example `costin`); the current
-    /// link-local address is resolved when an announce is emitted, while the
-    /// receiver retains its own ingress interface/scope.
+    /// link-local address is resolved when an announce is emitted.
     pub fn configure_announce_udp6(&mut self, network: impl Into<String>, port: u16) {
-        self.announce_network_name = Some(network.into());
-        self.announce_udp_port = port;
+        if let Ok(mut label) = self.facts.network.lock() {
+            *label = Some(network.into());
+        }
+        self.facts.udp_port.store(port, Ordering::Relaxed);
     }
 
-    /// Install the local semantic sink for common tagged-CBOR announces.
-    ///
-    /// This is deliberately a host-local integration point, not a network
-    /// control handler: UDP validation remains here, and the receiver owns
-    /// the ingress buffer before the bounded device registry is updated.
+    /// Install the local semantic sink for common tagged-CBOR announces: a
+    /// host-local integration point, not a network control handler.
     pub async fn set_announce_observer(&self, observer: AnnounceObserver) {
         *self.announce_observer.write().await = Some(observer);
     }
 
-    /// Attach the process-owned normal UDP listener. The listener's receive
-    /// loop performs QUIC/direct classification; discovery only uses this
-    /// clone to send multicast announces on the same local port.
-    pub fn set_shared_udp_socket(&self, socket: Arc<UdpSocket>) {
-        if let Ok(mut shared) = self.shared_udp_socket.lock() {
-            *shared = Some(socket);
-        }
+    /// The shared engine, for bearers that feed it (NAN, NOW) and for queries.
+    pub fn engine(&self) -> &Arc<dmesh_discovery::Engine> {
+        &self.engine
     }
 
-    fn shared_udp_socket(&self) -> Option<Arc<UdpSocket>> {
-        self.shared_udp_socket
+    fn udp(&self) -> Result<Arc<dmesh_discovery::udp::UdpDiscovery>> {
+        self.udp
             .lock()
-            .ok()
-            .and_then(|socket| socket.clone())
+            .map_err(|_| anyhow::anyhow!("discovery transport lock poisoned"))?
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("UDP discovery is not started"))
     }
 
-    /// Load key from file or generate a new one
-    fn load_or_generate_key() -> Result<SecretKey> {
-        // Try to load key from file
-        let home_dir = std::env::var("HOME").context("HOME environment variable not set")?;
-        let key_path = Path::new(&home_dir).join(".ssh").join("key.pem");
-
-        if key_path.exists() {
-            // Load key from file
-            let key_data = fs::read_to_string(&key_path).context("Failed to read key file")?;
-            // Check if the file is not empty before trying to parse it
-            if !key_data.is_empty() {
-                if let Ok(key) = SecretKey::from_pkcs8_pem(&key_data) {
-                    return Ok(key);
-                }
-            }
-        }
-
-        // Generate new keypair
-        let key = SecretKey::generate();
-
-        // Save the generated key to file
-        if let Some(parent) = key_path.parent() {
-            std::fs::create_dir_all(parent).context("Failed to create .ssh directory")?;
-        }
-        let key_pem = key
-            .to_pkcs8_pem(Default::default())
-            .context("Failed to serialize private key to PEM")?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(&key_path)
-            .context("Failed to write key to file")?;
-        std::io::Write::write_all(&mut file, key_pem.as_bytes())
-            .context("Failed to write key to file")?;
-
-        Ok(key)
-    }
-
-    /// Start the UDP multicast listeners
+    /// Join the shared multicast groups and start receiving.
     #[instrument(skip(self))]
     pub async fn start(&mut self) -> Result<()> {
-        // IPv4 remains a best-effort compatibility listener. Discovery's
-        // primary path is the explicitly scoped IPv6 multicast below.
-        match Self::setup_multicast_v4().await {
-            Ok(socket) => self.socket_v4 = Some(Arc::new(socket)),
-            Err(error) => warn!(%error, "mcast_v4_listener_unavailable"),
-        }
-        // Setup IPv6 multicast socket
-        match Self::setup_multicast_v6().await {
-            Ok(socket) => {
-                self.socket_v6 = Some(Arc::new(socket));
-                debug!(
-                    multicast_ip = %DISCOVERY_MULTICAST_IPV6,
-                    multicast_port = DISCOVERY_MULTICAST_PORT,
-                    "mcast_v6"
-                );
-            }
-            Err(e) => {
-                warn!("Failed to setup IPv6 multicast: {}", e);
-            }
-        }
-
-        if self.socket_v4.is_none() && self.socket_v6.is_none() {
-            debug!("mcast_none");
-        }
-
-        // Start receiver tasks
-        if let Some(socket) = &self.socket_v4 {
-            let nodes = self.nodes.clone();
-            let socket = socket.clone();
-            let local_public_key = self.public_key_b64.clone();
-            let node_store_dir = self.node_store_dir.clone();
-            let announce_observer = self.announce_observer.clone();
-            tokio::spawn(async move {
-                if let Err(error) = Self::receive_loop(
-                    socket,
-                    nodes,
-                    local_public_key,
-                    node_store_dir,
-                    announce_observer,
-                )
-                .await
-                {
-                    error!(%error, "mcast_v4_receive_failed");
+        // IPv4 is a best-effort compatibility listener; IPv6, scoped per link,
+        // is the discovery path.
+        let udp = dmesh_discovery::udp::UdpDiscovery::bind_multicast(self.engine.clone())
+            .await
+            .context("start UDP discovery")?;
+        let observer = self.announce_observer.clone();
+        udp.set_observer(Arc::new(move |sender, bytes, received| {
+            use dmesh_discovery::Received;
+            match received {
+                Received::Announce { .. } | Received::Response { .. } => {
+                    if let Some(announce) = dmesh_server::announce::decode_announce(bytes)
+                        && let Ok(observer) = observer.try_read()
+                        && let Some(observer) = observer.clone()
+                    {
+                        observer(sender, announce);
+                    }
                 }
-            });
-        }
-        if let Some(socket) = &self.socket_v6 {
-            let nodes = self.nodes.clone();
-            let socket = socket.clone();
-            let local_public_key = self.public_key_b64.clone();
-            let node_store_dir = self.node_store_dir.clone();
-            let announce_observer = self.announce_observer.clone();
-            tokio::spawn(async move {
-                if let Err(e) = Self::receive_loop(
-                    socket,
-                    nodes,
-                    local_public_key,
-                    node_store_dir,
-                    announce_observer,
-                )
-                .await
-                {
-                    error!("IPv6 receive loop error: {}", e);
+                // Datagrams that are not discovery records: steady background
+                // traffic from peers still emitting the retired envelope.
+                Received::Ignored => {
+                    ANNOUNCE_PARSE_ERRORS.fetch_add(1, Ordering::Relaxed);
                 }
-            });
-        }
-
+                Received::Rejected | Received::Request { .. } | Received::Own => {}
+            }
+        }));
+        udp.spawn();
+        *self
+            .udp
+            .lock()
+            .map_err(|_| anyhow::anyhow!("discovery transport lock poisoned"))? = Some(udp);
         Ok(())
     }
 
-    async fn setup_multicast_v4() -> Result<UdpSocket> {
-        let socket = bind_shared_multicast_v4(DISCOVERY_MULTICAST_PORT)?;
-        socket
-            .join_multicast_v4(DISCOVERY_MULTICAST_IPV4, Ipv4Addr::UNSPECIFIED)
-            .context("Failed to join IPv4 multicast group")?;
-        Ok(socket)
-    }
-
-    /// Setup IPv6 multicast socket
-    async fn setup_multicast_v6() -> Result<UdpSocket> {
-        // Linux normally creates a dual-stack IPv6 UDP socket.  lmesh also
-        // owns the IPv4 compatibility listener on this port, so explicitly
-        // make this IPv6-only *before* bind.  Otherwise the v4 listener wins
-        // and IPv6 multicast is silently unavailable.
-        let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error()).context("Failed to create IPv6 socket");
-        }
-        let socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
-        let enabled: libc::c_int = 1;
-        let option_len = std::mem::size_of_val(&enabled) as libc::socklen_t;
-        let reuse = unsafe {
-            libc::setsockopt(
-                socket.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_REUSEADDR,
-                (&enabled as *const libc::c_int).cast(),
-                option_len,
-            )
-        };
-        if reuse != 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("Failed to make IPv6 multicast socket shareable");
-        }
-        let result = unsafe {
-            libc::setsockopt(
-                socket.as_raw_fd(),
-                libc::IPPROTO_IPV6,
-                libc::IPV6_V6ONLY,
-                (&enabled as *const libc::c_int).cast(),
-                option_len,
-            )
-        };
-        if result != 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("Failed to make IPv6 multicast socket IPv6-only");
-        }
-        let address = libc::sockaddr_in6 {
-            sin6_family: libc::AF_INET6 as libc::sa_family_t,
-            sin6_port: DISCOVERY_MULTICAST_PORT.to_be(),
-            sin6_flowinfo: 0,
-            sin6_addr: libc::in6_addr {
-                s6_addr: Ipv6Addr::UNSPECIFIED.octets(),
-            },
-            sin6_scope_id: 0,
-        };
-        let result = unsafe {
-            libc::bind(
-                socket.as_raw_fd(),
-                (&address as *const libc::sockaddr_in6).cast(),
-                std::mem::size_of_val(&address) as libc::socklen_t,
-            )
-        };
-        if result != 0 {
-            return Err(std::io::Error::last_os_error()).context("Failed to bind IPv6 socket");
-        }
-        socket
-            .set_nonblocking(true)
-            .context("Failed to make IPv6 multicast socket nonblocking")?;
-        let socket = UdpSocket::from_std(socket).context("Failed to adopt IPv6 socket")?;
-
-        let interfaces = multicast_v6_interface_indices();
-        if interfaces.is_empty() {
-            anyhow::bail!("no active IPv6 multicast interface");
-        }
-        for index in interfaces {
-            socket
-                .join_multicast_v6(&DISCOVERY_MULTICAST_IPV6, index)
-                .with_context(|| {
-                    format!("Failed to join IPv6 multicast group on interface {index}")
-                })?;
-        }
-
-        Ok(socket)
-    }
-
-    /// Receive and process announcements
-    #[instrument(
-        skip(socket, nodes, local_public_key, node_store_dir, announce_observer),
-        fields(buf_size = 65536)
-    )]
-    async fn receive_loop(
-        socket: Arc<UdpSocket>,
-        nodes: Arc<RwLock<HashMap<String, Node>>>,
-        local_public_key: String,
-        node_store_dir: Arc<PathBuf>,
-        announce_observer: Arc<RwLock<Option<AnnounceObserver>>>,
-    ) -> Result<()> {
-        let mut buf = vec![0u8; 65536];
-
-        loop {
-            let (len, addr) = socket
-                .recv_from(&mut buf)
-                .await
-                .context("Failed to receive from socket")?;
-
-            let data = &buf[..len];
-
-            // New common presence wire. It deliberately shares the old
-            // local-link multicast socket but not its JSON envelope, so
-            // UART/NOW/NAN/UDP observe one bounded CBOR record.
-            // Discovery is a raw tagged-CBOR datagram. QUIC is not involved in
-            // multicast discovery on UDP, NAN, BLE, or ESP-NOW.
-            if let Some(announce) = dmesh_server::announce::decode_announce(data) {
-                // A sender that supplies an identity must prove it: the key
-                // hash is its stable device id and the signature covers the
-                // canonical tagged-CBOR fields. Unsigned records are accepted
-                // only as a temporary compatibility form for older devices.
-                let public_key = if announce.has_identity() {
-                    let digest = Sha256::digest(announce.public_key());
-                    let signature = Signature::from_slice(announce.signature()).ok();
-                    let verifying_key = VerifyingKey::from_sec1_bytes(announce.public_key()).ok();
-                    let mut signed = [0u8; 384];
-                    let valid = signature.zip(verifying_key).and_then(|(signature, key)| {
-                        dmesh_server::announce::signing_bytes(announce, &mut signed)
-                            .map(|used| key.verify(&signed[..used], &signature).is_ok())
-                    }) == Some(true);
-                    if !valid || announce.device_id() != &digest[..announce.device_id().len()] {
-                        warn!(address = %addr, "dropping announce with invalid identity");
-                        continue;
-                    }
-                    base64_url_encode(announce.public_key())
-                } else {
-                    hex_encode(announce.device_id())
-                };
-                if public_key == local_public_key {
-                    continue;
-                }
-                // The validation above is authoritative. Forward only the
-                // validated semantic record, never an untrusted UDP frame,
-                // so NAN and UDP use one device-inventory schema.
-                Self::notify_announce_observer(&announce_observer, addr, announce).await;
-                let announce_info = ObservedAnnounce {
-                    device_id: hex_encode(announce.device_id()),
-                    kind: announce.kind,
-                    uptime_secs: announce.uptime_secs,
-                    device_class: announce.device_class,
-                    wifi_channel: announce.wifi_channel,
-                    authenticated: announce.has_identity(),
-                    udp_port: announce.udp_port,
-                    udp_link_local_v6: announce.udp_link_local_v6(),
-                };
-                let node = Node {
-                    public_key: public_key.clone(),
-                    address: addr,
-                    last_seen: std::time::Instant::now(),
-                    metadata: None,
-                    announce: Some(announce_info.clone()),
-                };
-                let is_new = {
-                    let mut nodes_map = nodes.write().await;
-                    let is_new = !nodes_map.contains_key(&public_key);
-                    nodes_map.insert(public_key.clone(), node);
-                    is_new
-                };
-                info!(public_key = %public_key, address = %addr, announce = ?announce_info,
-                    event = if is_new { "node_seen" } else { "node_updated" },
-                    "announce_rx");
-                continue;
-            }
-
-            // Parse the announcement
-            match serde_json::from_slice::<Announce>(data) {
-                Ok(announce) => {
-                    // Check if this is our own announcement and skip processing if so
-                    if announce.public_key == local_public_key {
-                        continue;
-                    }
-                    debug!(
-                        "Received valid announcement from {}: {}",
-                        addr, announce.public_key
-                    );
-
-                    let node = Node {
-                        public_key: announce.public_key.clone(),
-                        address: addr,
-                        last_seen: std::time::Instant::now(),
-                        metadata: announce.metadata.clone(),
-                        announce: None,
-                    };
-
-                    let public_key = node.public_key.clone();
-                    let address = node.address;
-                    let metadata = node.metadata.clone();
-                    let is_new = {
-                        let mut nodes_map = nodes.write().await;
-                        let is_new = !nodes_map.contains_key(&announce.public_key);
-                        nodes_map.insert(announce.public_key.clone(), node);
-                        is_new
-                    };
-
-                    if let Err(e) = persist_announcement(&node_store_dir, &announce, addr) {
-                        warn!(
-                            public_key = %public_key,
-                            address = %address,
-                            error = %e,
-                            "persist_fail"
-                        );
-                    }
-
-                    if is_new {
-                        info!(
-                            public_key = %public_key,
-                            address = %address,
-                            metadata = ?metadata,
-                            "node_seen"
-                        );
-                    } else {
-                        info!(
-                            public_key = %public_key,
-                            address = %address,
-                            metadata = ?metadata,
-                            "node_updated"
-                        );
-                    }
-                }
-                Err(e) => {
-                    ANNOUNCE_PARSE_ERRORS.fetch_add(1, Ordering::Relaxed);
-                    trace!(sender = %addr, error = %e, bytes = data.len(),
-                        hex = %base64_url_encode(data),
-                        "announce_parse_error");
-                }
-            }
-        }
-    }
-
-    async fn notify_announce_observer(
-        announce_observer: &Arc<RwLock<Option<AnnounceObserver>>>,
-        peer: SocketAddr,
-        announce: dmesh_server::announce::Announce,
-    ) {
-        if let Some(observer) = announce_observer.read().await.clone() {
-            observer(peer, announce);
-        }
-    }
-
-    /// Admit one common announce from the normal QUIC listener's direct
-    /// long-header branch.  The listener owns framing and socket I/O; this
-    /// method owns only signature validation and the semantic inventory.
-    async fn observe_signed_announce(
-        &self,
-        addr: SocketAddr,
-        announce: dmesh_server::announce::Announce,
-    ) -> bool {
-        let public_key = if announce.has_identity() {
-            let digest = Sha256::digest(announce.public_key());
-            let signature = Signature::from_slice(announce.signature()).ok();
-            let verifying_key = VerifyingKey::from_sec1_bytes(announce.public_key()).ok();
-            let mut signed = [0u8; 384];
-            let valid = signature.zip(verifying_key).and_then(|(signature, key)| {
-                dmesh_server::announce::signing_bytes(announce, &mut signed)
-                    .map(|used| key.verify(&signed[..used], &signature).is_ok())
-            }) == Some(true);
-            if !valid || announce.device_id() != &digest[..announce.device_id().len()] {
-                warn!(address = %addr, "dropping announce with invalid identity");
-                return false;
-            }
-            base64_url_encode(announce.public_key())
-        } else {
-            hex_encode(announce.device_id())
-        };
-        if public_key == self.public_key_b64 {
-            return false;
-        }
-        Self::notify_announce_observer(&self.announce_observer, addr, announce).await;
-        let announce_info = ObservedAnnounce {
-            device_id: hex_encode(announce.device_id()),
-            kind: announce.kind,
-            uptime_secs: announce.uptime_secs,
-            device_class: announce.device_class,
-            wifi_channel: announce.wifi_channel,
-            authenticated: announce.has_identity(),
-            udp_port: announce.udp_port,
-            udp_link_local_v6: announce.udp_link_local_v6(),
-        };
-        let node = Node {
-            public_key: public_key.clone(),
-            address: addr,
-            last_seen: std::time::Instant::now(),
-            metadata: None,
-            announce: Some(announce_info.clone()),
-        };
-        let is_new = {
-            let mut nodes = self.nodes.write().await;
-            let is_new = !nodes.contains_key(&public_key);
-            nodes.insert(public_key.clone(), node);
-            is_new
-        };
-        info!(public_key = %public_key, address = %addr, announce = ?announce_info,
-            event = if is_new { "node_seen" } else { "node_updated" }, "announce_rx");
-        true
-    }
-
-    fn complete_directed_discovery(
-        &self,
-        request_id: u64,
-        peer: SocketAddr,
-        announce: dmesh_server::announce::Announce,
-    ) {
-        if let Ok(mut waiters) = self.direct_waiters.lock()
-            && let Some(waiter) = waiters.remove(&request_id)
-        {
-            let _ = waiter.send((peer, announce));
-        }
-    }
-
-    /// Send an announcement to the multicast group
+    /// Announce ourselves on every live IPv6 link (and IPv4, for older peers).
     #[instrument(skip(self))]
     pub async fn announce(&self) -> Result<serde_json::Value> {
-        self.announce_with_metadata(None).await
+        let sent = self.udp()?.announce().await?;
+        Ok(serde_json::json!({
+            "accepted": sent > 0,
+            "transmissions": sent,
+            "note": "local socket acceptance only; peer receipt is reported by per-node observed transports",
+        }))
     }
 
     /// Actively ask every peer on every live UDP multicast scope to emit its
-    /// current signed `announce.discovery`. This uses the same tagged request
-    /// as directed `check`; multicast addressing is the only distinction.
+    /// current signed `announce.discovery`.
     pub async fn broadcast_request(&self) -> Result<serde_json::Value> {
-        let request_id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let mut record = [0u8; 96];
-        let record_len = dmesh_server::announce::encode_discovery_request(request_id, &mut record)
-            .context("Failed to encode broadcast announce.discovery request")?;
-        let wire = &record[..record_len];
-        let mut transmissions = Vec::new();
-        if let Some(socket) = self.shared_udp_socket().or_else(|| self.socket_v4.clone()) {
-            let destination = SocketAddr::new(
-                IpAddr::V4(DISCOVERY_MULTICAST_IPV4),
-                DISCOVERY_MULTICAST_PORT,
-            );
-            socket.send_to(wire, destination).await?;
-            transmissions.push(serde_json::json!({
-                "transport": "udp4_multicast_compat",
-                "destination": destination.to_string(),
-                "source": socket.local_addr().ok().map(|source| source.to_string()),
-                "bytes": wire.len(),
-                "accepted": true,
-            }));
-        }
-        if let Some(socket) = self.shared_udp_socket().or_else(|| self.socket_v6.clone()) {
-            for interface_index in multicast_v6_interface_indices() {
-                let destination = SocketAddr::V6(std::net::SocketAddrV6::new(
-                    DISCOVERY_MULTICAST_IPV6,
-                    DISCOVERY_MULTICAST_PORT,
-                    0,
-                    interface_index,
-                ));
-                match socket.send_to(wire, destination).await {
-                    Ok(_) => transmissions.push(serde_json::json!({
-                        "transport": "udp6_multicast",
-                        "destination": destination.to_string(),
-                        "source": socket.local_addr().ok().map(|source| source.to_string()),
-                        "interface_index": interface_index,
-                        "bytes": wire.len(),
-                        "accepted": true,
-                    })),
-                    Err(error) => warn!(
-                        %error,
-                        interface_index,
-                        "udp6_multicast_discovery_request_skipped"
-                    ),
-                }
-            }
-        }
+        let sent = self.udp()?.solicit().await;
         Ok(serde_json::json!({
-            "accepted": !transmissions.is_empty(),
-            "request_id": request_id,
+            "accepted": sent > 0,
             "record": "announce.discovery",
             "mode": "broadcast",
-            "transmissions": transmissions,
+            "transmissions": sent,
         }))
     }
 
     /// Send active discovery to one explicit UDP address. The address is the
-    /// path under test; this function deliberately performs no node lookup or
+    /// path under test; this deliberately performs no node lookup or
     /// alternate-path fallback.
     pub async fn directed_request(&self, destination: &str) -> Result<serde_json::Value> {
         let peer = explicit_udp_endpoint(destination)?
             .ok_or_else(|| anyhow::anyhow!("directed UDP discovery needs udp://HOST"))?;
         let peer = require_live_udp6_scope(peer)?;
-        let request_id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let mut record = [0u8; 96];
-        let record_len = dmesh_server::announce::encode_discovery_request(request_id, &mut record)
-            .context("Failed to encode directed announce.discovery request")?;
-        let wire = &record[..record_len];
-        // Directed discovery shares the normal listener and its CID/direct
-        // ingress routing. Never create an ephemeral socket here: a reply
-        // must be received through the same fixed service port as every QUIC
-        // association and other direct discovery response.
-        let socket = self
-            .shared_udp_socket()
-            .ok_or_else(|| anyhow::anyhow!("normal UDP listener is not running"))?;
-        let (sender, receiver) = oneshot::channel();
-        self.direct_waiters
-            .lock()
-            .map_err(|_| anyhow::anyhow!("directed discovery waiters poisoned"))?
-            .insert(request_id, sender);
-        if let Err(error) = socket.send_to(wire, peer).await {
-            if let Ok(mut waiters) = self.direct_waiters.lock() {
-                waiters.remove(&request_id);
-            }
-            return Err(error.into());
-        }
-        let (source, announce) =
-            match tokio::time::timeout(std::time::Duration::from_secs(3), receiver).await {
-                Ok(Ok(reply)) => reply,
-                Ok(Err(_)) => anyhow::bail!("directed discovery listener stopped"),
-                Err(_) => {
-                    if let Ok(mut waiters) = self.direct_waiters.lock() {
-                        waiters.remove(&request_id);
-                    }
-                    anyhow::bail!("directed discovery response timed out")
-                }
-            };
-        let signature = Signature::from_slice(announce.signature()).ok();
-        let verifying_key = VerifyingKey::from_sec1_bytes(announce.public_key()).ok();
-        let mut signed = [0u8; 384];
-        let valid = signature.zip(verifying_key).and_then(|(signature, key)| {
-            dmesh_server::announce::signing_bytes(announce, &mut signed)
-                .map(|used| key.verify(&signed[..used], &signature).is_ok())
-        }) == Some(true);
-        if !announce.has_identity() || !valid {
-            anyhow::bail!("discovery response is not signed by its announced identity");
-        }
+        let device = self
+            .udp()?
+            .directed(peer, std::time::Duration::from_secs(3))
+            .await?;
+        let announce = device.announce.context("discovery reply carried no announce")?;
         Ok(serde_json::json!({
             "ok": true,
             "record": "announce.discovery",
             "mode": "directed",
             "to": destination,
-            "source": source.to_string(),
-            "request_id": request_id,
+            "source": peer.to_string(),
             "announce": {
                 "device_id": hex_encode(announce.device_id()),
                 "device_name": announce.device_name(),
@@ -1431,11 +695,11 @@ impl LocalDiscovery {
     }
 
     /// Build the compact common presence record used as NAN Publish Service
-    /// Info and directed Follow-up data. Host/Android use the same complete
-    /// signed record as UDP, now compact enough because the public key is a
-    /// 33-byte compressed SEC1 point rather than DER/SPKI.
+    /// Info and directed Follow-up data: the same signed record as UDP, with
+    /// the 8-byte identity hint as device id so it fits the 24-byte DMesh
+    /// Follow-up envelope.
     pub fn nan_announce_service_info(&self, uptime_secs: u64) -> Result<Vec<u8>> {
-        let identity_hint = dmesh_server::announce::identity_hint(&self.public_key)
+        let identity_hint = dmesh_server::announce::identity_hint(self.identity.public_key())
             .context("missing local public-key identity hint")?;
         let mut device_id = [0; 16];
         device_id[..identity_hint.len()].copy_from_slice(&identity_hint);
@@ -1444,46 +708,9 @@ impl LocalDiscovery {
             identity_hint.len() as u8,
             uptime_secs.min(u64::from(u32::MAX)) as u32,
         );
-        if let Some(name) = discovery_device_name() {
-            let _ = announce.set_device_name(&name);
-        }
-        if let Some(domain) = discovery_device_domain() {
-            let _ = announce.set_device_domain(&domain);
-        }
-        if let Some(network) = self.announce_network_name.as_deref() {
-            if self.announce_udp_port != 0 {
-                if let Some(address) = local_network_link_local_v6(network) {
-                    announce.set_udp_port(self.announce_udp_port);
-                    announce.set_udp_link_local_v6(address);
-                }
-            }
-        }
-        // This is the stable host control-plane identity.  It advertises its
-        // measured radio capabilities so a pair probe may select it as an
-        // endpoint, while the executor still promises never to reconfigure
-        // this host as part of the probe.
-        announce.set_probe_descriptor(
-            dmesh_server::announce::DEVICE_CLASS_HOST,
-            dmesh_server::probe::PROBE_CAP_NAN
-                | dmesh_server::probe::PROBE_CAP_NOW
-                | dmesh_server::probe::PROBE_CAP_STA
-                | dmesh_server::probe::PROBE_CAP_AP
-                | dmesh_server::probe::PROBE_CAP_UDP6,
-        );
-        if !announce.set_public_key(&self.public_key) {
-            anyhow::bail!("local public key exceeds announce bound");
-        }
-        let signing_key = SigningKey::from(
-            SecretKey::from_pkcs8_der(&self.private_key)
-                .context("Failed to decode local NAN signing key")?,
-        );
-        let mut signing_wire = [0u8; 384];
-        let signing_len = dmesh_server::announce::signing_bytes(announce, &mut signing_wire)
-            .context("Failed to encode local NAN signing bytes")?;
-        let signature: Signature = signing_key.sign(&signing_wire[..signing_len]);
-        if !announce.set_signature(signature.to_bytes().as_ref()) {
-            anyhow::bail!("local NAN announce signature has invalid length");
-        }
+        dmesh_discovery::LocalFacts::describe(self.facts.as_ref(), &mut announce);
+        dmesh_discovery::Identity::sign(self.identity.as_ref(), &mut announce)
+            .context("sign the NAN Service Info announce")?;
         let mut wire = [0; 384];
         let used = dmesh_server::announce::encode(announce, &mut wire)
             .context("Failed to encode compact NAN Service Info announce")?;
@@ -1501,268 +728,23 @@ impl LocalDiscovery {
         Ok(wire[..used].to_vec())
     }
 
-    /// Build the current signed announce for unsolicited presence and for a
-    /// directed discovery reply.  The transport binding supplies neither
-    /// identities nor a second encoder.
+    /// The current signed announce, for unsolicited presence and directed replies.
     pub fn signed_discovery_announce(
         &self,
-        uptime_secs: u64,
+        _uptime_secs: u64,
     ) -> Result<dmesh_server::announce::Announce> {
-        // Keep the radio record identical across UDP/NOW/NAN/UART. Unlike an
-        // ESP32 presence hint, a host carries its P-256 identity and signs the
-        // canonical fields. Receivers accept unsigned records only when no
-        // public key is present.
-        let digest = Sha256::digest(&self.public_key);
-        let mut device_id = [0; 16];
-        device_id.copy_from_slice(&digest[..16]);
-        let mut announce = dmesh_server::announce::Announce::discovery(
-            device_id,
-            device_id.len() as u8,
-            uptime_secs.min(u64::from(u32::MAX)) as u32,
-        );
-        if let Some(name) = discovery_device_name() {
-            let _ = announce.set_device_name(&name);
-        }
-        if let Some(domain) = discovery_device_domain() {
-            let _ = announce.set_device_domain(&domain);
-        }
-        if let Some(network) = self.announce_network_name.as_deref() {
-            if self.announce_udp_port != 0 {
-                if let Some(address) = local_network_link_local_v6(network) {
-                    announce.set_udp_port(self.announce_udp_port);
-                    announce.set_udp_link_local_v6(address);
-                }
-            }
-        }
-        announce.set_probe_descriptor(
-            dmesh_server::announce::DEVICE_CLASS_HOST,
-            dmesh_server::probe::PROBE_CAP_NAN
-                | dmesh_server::probe::PROBE_CAP_NOW
-                | dmesh_server::probe::PROBE_CAP_STA
-                | dmesh_server::probe::PROBE_CAP_AP
-                | dmesh_server::probe::PROBE_CAP_UDP6,
-        );
-        if !announce.set_public_key(&self.public_key) {
-            anyhow::bail!("local public key exceeds announce bound");
-        }
-        let signing_key = SigningKey::from(
-            SecretKey::from_pkcs8_der(&self.private_key)
-                .context("Failed to decode local announce signing key")?,
-        );
-        // A signed host record contains the public-key DER in addition to
-        // the common announce fields. Keep this host-only scratch larger than
-        // the ESP/NAN unsigned wire; 256 bytes can reject valid P-256 keys
-        // before the service has opened its control socket.
-        let mut signing_wire = [0u8; 384];
-        let signing_len = dmesh_server::announce::signing_bytes(announce, &mut signing_wire)
-            .context("Failed to encode local announce signing bytes")?;
-        let signature: Signature = signing_key.sign(&signing_wire[..signing_len]);
-        if !announce.set_signature(signature.to_bytes().as_ref()) {
-            anyhow::bail!("local announce signature has invalid length");
-        }
-        Ok(announce)
+        self.engine
+            .local_announce()
+            .context("sign the local announce")
     }
 
-    /// Send an announcement with optional metadata
-    #[instrument(skip(self, _metadata))]
-    pub async fn announce_with_metadata(
-        &self,
-        _metadata: Option<HashMap<String, String>>,
-    ) -> Result<serde_json::Value> {
-        let announce = self.signed_discovery_announce(0)?;
-        let mut announce_wire = [0; 384];
-        let announce_used = dmesh_server::announce::encode(announce, &mut announce_wire)
-            .context("Failed to encode local announce")?;
-        let wire = &announce_wire[..announce_used];
-
-        let mut transmissions = Vec::new();
-        // Best-effort compatibility for older IPv4-only local peers. IPv6
-        // below is the explicit per-link discovery transport.
-        if let Some(socket) = self.shared_udp_socket().or_else(|| self.socket_v4.clone()) {
-            let addr = SocketAddr::new(
-                IpAddr::V4(DISCOVERY_MULTICAST_IPV4),
-                DISCOVERY_MULTICAST_PORT,
-            );
-            socket
-                .send_to(wire, addr)
-                .await
-                .context("Failed to send IPv4 announcement")?;
-            transmissions.push(serde_json::json!({
-                "transport": "udp4_multicast_compat",
-                "destination": addr.to_string(),
-                "source": socket.local_addr().ok().map(|source| source.to_string()),
-                "bytes": wire.len(),
-                "accepted": true,
-                "egress": "kernel_route",
-            }));
-        }
-        // Send on every active IPv6 link. Link-local multicast is scoped, so
-        // this explicitly includes br-lan, associated STA/AP links, and P2P
-        // links rather than relying on a single kernel-selected default route.
-        if let Some(socket) = self.shared_udp_socket().or_else(|| self.socket_v6.clone()) {
-            for index in multicast_v6_interface_indices() {
-                let addr = SocketAddr::V6(std::net::SocketAddrV6::new(
-                    DISCOVERY_MULTICAST_IPV6,
-                    DISCOVERY_MULTICAST_PORT,
-                    0,
-                    index,
-                ));
-                if let Err(error) = socket.send_to(wire, addr).await {
-                    // Interfaces can disappear between enumeration and send
-                    // (especially transient P2P groups). Discovery is soft
-                    // state, so one stale scope must not terminate either
-                    // supervised mesh process.
-                    warn!(%error, interface_index = index, "udp6_multicast_announce_skipped");
-                    continue;
-                }
-                let mut name = [0 as libc::c_char; libc::IF_NAMESIZE];
-                let interface = unsafe {
-                    (!libc::if_indextoname(index, name.as_mut_ptr()).is_null())
-                        .then(|| CStr::from_ptr(name.as_ptr()).to_string_lossy().into_owned())
-                };
-                transmissions.push(serde_json::json!({
-                    "transport": "udp6_multicast",
-                    "destination": addr.to_string(),
-                    "source": socket.local_addr().ok().map(|source| source.to_string()),
-                    "interface_index": index,
-                    "interface": interface,
-                    "bytes": wire.len(),
-                    "accepted": true,
-                }));
-            }
-        }
-
-        // IPv6 link multicast is the discovery contract.  IPv4 is only a
-        // compatibility copy, so its successful kernel submission must not
-        // make a missing IPv6 multicast path look healthy to the dashboard.
-        let udp6_accepted = transmissions.iter().any(|transmission| {
-            transmission
-                .get("transport")
-                .and_then(serde_json::Value::as_str)
-                == Some("udp6_multicast")
-        });
-        Ok(serde_json::json!({
-            "accepted": udp6_accepted,
-            "compat_accepted": !transmissions.is_empty(),
-            "transmissions": transmissions,
-            "note": "local socket acceptance only; peer receipt is reported by per-node observed transports",
-        }))
-    }
-
-    /// Get the public key in base64url encoding
     pub fn public_key_b64(&self) -> &str {
         &self.public_key_b64
     }
 
     pub fn public_key_bytes(&self) -> &[u8] {
-        &self.public_key
+        self.identity.public_key()
     }
-
-    /// Get a snapshot of currently discovered nodes
-    #[instrument(skip(self))]
-    pub async fn get_nodes(&self) -> HashMap<String, Node> {
-        self.prune_expired_nodes().await;
-        self.nodes.read().await.clone()
-    }
-
-    /// Get a specific node by its public key
-    #[instrument(skip(self), fields(public_key = %public_key))]
-    pub async fn get_node(&self, public_key: &str) -> Option<Node> {
-        debug!("Getting node by public key");
-        self.prune_expired_nodes().await;
-        let nodes = self.nodes.read().await;
-        let result = nodes.get(public_key).cloned();
-        debug!("Node {}found", if result.is_some() { "" } else { "not " });
-        result
-    }
-
-    /// Discovery records are soft state. Keep the host inventory useful after
-    /// a peer disappears rather than presenting stale unsigned announcements
-    /// indefinitely.
-    async fn prune_expired_nodes(&self) {
-        const NODE_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
-        let now = std::time::Instant::now();
-        self.nodes
-            .write()
-            .await
-            .retain(|_, node| now.duration_since(node.last_seen) <= NODE_TTL);
-    }
-
-    fn default_node_store_dir() -> Result<PathBuf> {
-        Ok(std::env::current_dir()
-            .context("failed to resolve current working directory")?
-            .join("lmesh")
-            .join("nodes"))
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StoredNode {
-    public_key: String,
-    address: String,
-    announces: Vec<serde_json::Value>,
-}
-
-fn persist_announcement(dir: &Path, announce: &Announce, addr: SocketAddr) -> Result<()> {
-    fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
-
-    let path = node_record_path(dir, &announce.public_key);
-    let mut record = if path.exists() {
-        let data = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        serde_json::from_str::<StoredNode>(&data).unwrap_or_else(|e| {
-            warn!(
-                path = %path.display(),
-                error = %e,
-                "replacing invalid lmesh node record"
-            );
-            StoredNode::new(&announce.public_key, addr)
-        })
-    } else {
-        StoredNode::new(&announce.public_key, addr)
-    };
-
-    record.public_key = announce.public_key.clone();
-    record.address = addr.to_string();
-    record.announces.push(serde_json::json!([
-        current_timestamp_millis(),
-        announce.public_key.clone(),
-        addr.to_string(),
-        announce.clone()
-    ]));
-
-    if record.announces.len() > MAX_STORED_ANNOUNCES {
-        let overflow = record.announces.len() - MAX_STORED_ANNOUNCES;
-        record.announces.drain(0..overflow);
-    }
-
-    let data = serde_json::to_vec_pretty(&record).context("failed to serialize node record")?;
-    let temp_path = path.with_extension("json.tmp");
-    fs::write(&temp_path, data)
-        .with_context(|| format!("failed to write {}", temp_path.display()))?;
-    fs::rename(&temp_path, &path).with_context(|| {
-        format!(
-            "failed to move {} to {}",
-            temp_path.display(),
-            path.display()
-        )
-    })?;
-
-    Ok(())
-}
-
-impl StoredNode {
-    fn new(public_key: &str, addr: SocketAddr) -> Self {
-        Self {
-            public_key: public_key.to_string(),
-            address: addr.to_string(),
-            announces: Vec::new(),
-        }
-    }
-}
-
-fn node_record_path(dir: &Path, public_key: &str) -> PathBuf {
-    dir.join(format!("{}.json", public_key_sha(public_key)))
 }
 
 /// Stable compact identifier used by mesh persistence and the optional BLE
@@ -1782,38 +764,11 @@ fn hex_encode(data: &[u8]) -> String {
     encoded
 }
 
-fn current_timestamp_millis() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-}
 
-/// JSON-lines request methods for lmesh.
-fn default_rate_profile() -> String {
-    "auto".to_owned()
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method")]
 pub enum Request {
-    #[serde(rename = "companion.pair")]
-    Pair {
-        kind: String,
-        id: String,
-        #[serde(default)]
-        vip6: Option<Ipv6Addr>,
-        #[serde(default)]
-        baud: Option<u32>,
-        #[serde(default)]
-        psm: Option<u16>,
-        #[serde(default)]
-        name: Option<String>,
-        #[serde(default)]
-        root_public_key_b64: Option<String>,
-    },
-    #[serde(rename = "companion.unpair")]
-    Unpair { kind: String, id: String },
     /// Send a mesh payload over the selected radio.
     #[serde(rename = "send")]
     Send {
@@ -1868,32 +823,6 @@ pub enum Request {
         iface: Option<String>,
         channel: u8,
     },
-    /// Replace the owned interface with an OCB (outside-context-of-a-BSS)
-    /// link. This disconnects any AP/STA session on that interface.
-    #[serde(rename = "wifi.ocb.start")]
-    WifiOcbStart {
-        #[serde(default)]
-        iface: Option<String>,
-        #[serde(default)]
-        freq: Option<u32>,
-        #[serde(default)]
-        bandwidth: Option<String>,
-    },
-    /// Set or restore the fixed Linux 2.4 GHz rate profile for experiments.
-    #[serde(rename = "wifi.rate.profile")]
-    WifiRateProfile {
-        #[serde(default)]
-        iface: Option<String>,
-        #[serde(default = "default_rate_profile")]
-        profile: String,
-        #[serde(default)]
-        disable_80211b: bool,
-    },
-    /// Presentation-safe common discovery inventory. Native radio peers stay
-    /// in adapter diagnostics; this response exposes only semantic IDs and
-    /// shared observation facts.
-    #[serde(rename = "discovery.nodes")]
-    RadioDevices,
     /// Common discovery state and this node's local bearer/address projection.
     #[serde(rename = "discovery.status")]
     DiscoveryStatus,
@@ -1901,21 +830,6 @@ pub enum Request {
     /// only through `discovery.nodes`.
     #[serde(rename = "telemetry.nan_status")]
     NanStatus,
-    /// Local ESP-NOW/action transport counters. Missing facts are omitted.
-    #[serde(rename = "telemetry.now")]
-    NowMetrics,
-    /// Local NAN capture and semantic dispatch counters.
-    #[serde(rename = "telemetry.nan")]
-    NanMetrics,
-    /// Local raw IPv6, UDP, and NDP counters.
-    #[serde(rename = "telemetry.udp6")]
-    Udp6Metrics,
-    /// Common optional per-peer Wi-Fi link observations.
-    #[serde(rename = "telemetry.wifi_link")]
-    WifiLinkMetrics,
-    /// QUIC transport counters for this node's live associations.
-    #[serde(rename = "telemetry.quic")]
-    QuicMetrics,
     /// Size a NAN object transfer without opening an IP socket or touching a
     /// device. The same envelope is used by data frames and action diagnostics.
     #[serde(rename = "object.nan.dry_run")]
@@ -1923,37 +837,6 @@ pub enum Request {
         image_size: usize,
         #[serde(default)]
         mtu: Option<usize>,
-    },
-    /// Listen for DMesh Ethernet frames on the normal AP/STA netdev path.
-    #[serde(rename = "wifi.data.listen")]
-    WifiDataListen {
-        #[serde(default)]
-        iface: Option<String>,
-        #[serde(default)]
-        listen_sec: Option<u64>,
-    },
-    /// Send a DMesh Ethernet frame on the normal AP/STA netdev path.
-    #[serde(rename = "wifi.data.send")]
-    WifiDataSend {
-        #[serde(default)]
-        iface: Option<String>,
-        #[serde(default)]
-        destination: Option<String>,
-        payload: String,
-    },
-    /// Capture Wi-Fi management frames from a monitor interface.
-    #[serde(rename = "wifi.mgmt.capture")]
-    WifiMgmtCapture {
-        #[serde(default)]
-        iface: Option<String>,
-        #[serde(default)]
-        channel: Option<u8>,
-        #[serde(default)]
-        capture_ms: Option<u64>,
-        #[serde(default)]
-        max_frames: Option<usize>,
-        #[serde(default)]
-        active: Option<bool>,
     },
     /// Start an open AP on the shared DMesh channel.
     #[serde(rename = "wifi.ap.start_open")]
@@ -1976,33 +859,6 @@ pub enum Request {
     WifiApStop {
         #[serde(default)]
         iface: Option<String>,
-    },
-    /// Experimentally add a station without a normal auth/assoc exchange.
-    #[serde(rename = "wifi.ap.station.add")]
-    WifiApStationAdd {
-        #[serde(default)]
-        iface: Option<String>,
-        mac: String,
-        #[serde(default)]
-        aid: Option<u16>,
-    },
-    /// Scan for nearby Wi-Fi BSS entries.
-    #[serde(rename = "wifi.scan")]
-    WifiScan {
-        #[serde(default)]
-        iface: Option<String>,
-        #[serde(default)]
-        ssid: Option<String>,
-        #[serde(default)]
-        channel: Option<u8>,
-        #[serde(default)]
-        passive: Option<bool>,
-        /// Shared schema spelling for a bounded cached scan result.  Linux
-        /// implements that cache with its passive monitor observations; it
-        /// must not reinterpret this read-only request as an active nl80211
-        /// scan on an owned AP.
-        #[serde(default)]
-        last_results: Option<bool>,
     },
     /// Join an open AP on the shared DMesh channel.
     #[serde(rename = "wifi.sta.join_open")]
@@ -2094,7 +950,6 @@ impl TransportFlagRequest {
 
 pub struct LmeshService {
     discovery: Arc<LocalDiscovery>,
-    wifi_companion: Arc<std::sync::Mutex<Option<(String, Ipv6Addr)>>>,
     /// Optional embedded Wi-Fi instance. It is constructed through the same
     /// reusable library object as the standalone lmesh-wifi launcher, but an
     /// empty `LMESH_INTERFACES` makes this process UDP-only. When non-empty,
@@ -2305,12 +1160,29 @@ impl LmeshService {
         );
         let radio = wifi_service.radio().clone();
         let wifi = wifi_service.netd().clone();
+        // What the NAN/NOW monitor admits also goes to the shared discovery
+        // engine, so one inventory serves every bearer. UDP announces already
+        // reach the engine through its own receive path.
+        let engine = discovery.engine().clone();
+        radio.set_announce_sink(Arc::new(move |source, peer, announce| {
+            use dmesh_server::discovery::DiscoveryPacketKind;
+            let (bearer, kind) = match source {
+                "udp_multicast" => return,
+                source if source.starts_with("nan") => ("nan", DiscoveryPacketKind::ActivePublish),
+                "espnow" | "raw_action" | "now" => ("now", DiscoveryPacketKind::Other),
+                other => (other, DiscoveryPacketKind::Other),
+            };
+            engine.observe_announce(
+                &dmesh_discovery::Carrier::radio(bearer, peer, kind),
+                announce,
+                &[],
+            );
+        }));
         // Construction is deliberately radio-neutral. A lmesh restart must
         // not retune, create a monitor, or change link state; each
         // transport/AP operation owns its own explicit transition.
         Self {
             discovery,
-            wifi_companion: Arc::new(std::sync::Mutex::new(None)),
             wifi_service,
             radio,
             wifi,
@@ -2487,6 +1359,11 @@ impl LmeshService {
     }
 
     /// Return the local public key used for announcements.
+    /// The shared discovery engine: the one device inventory.
+    pub fn discovery_engine(&self) -> &Arc<dmesh_discovery::Engine> {
+        self.discovery.engine()
+    }
+
     pub fn public_key_b64(&self) -> &str {
         self.discovery.public_key_b64()
     }
@@ -2514,60 +1391,28 @@ impl LmeshService {
             return require_live_udp6_scope(peer);
         }
         let discovery_key = mesh_discovery_key(destination);
-        let destination = discovery_key.as_deref().unwrap_or(destination);
-        let node = if let Some(node) = self.discovery.get_node(destination).await {
-            node
-        } else if let Some(peer) =
-            semantic_inventory_udp_peer(&presentation_radio_devices(&self.radio), destination)
-        {
-            return Ok(peer);
-        } else {
-            anyhow::bail!("unsupported/no_quic_route: destination is not discovered");
-        };
-        let announce = node.announce.as_ref();
-        let port = announce
-            .map(|announce| announce.udp_port)
-            .filter(|port| *port != 0)
-            // A missing port is the receiver-selected default. ESP Main's
-            // raw UDP6 bearer uses 3339; host/Android listeners retain their
-            // configured service-port defaults. The sending device never
-            // carries an interface scope in its signed announce.
-            .or_else(|| {
-                announce
-                    .filter(|announce| {
-                        dmesh_server::announce::is_esp_device_class(announce.device_class)
-                    })
-                    .map(|_| RAW_UDP6_PORT)
-            })
-            .or_else(|| {
-                std::env::var("LMESH_OBJECT_SERVER_PORT")
-                    .ok()
-                    .and_then(|value| value.parse::<u16>().ok())
-            })
+        let target = discovery_key.as_deref().unwrap_or(destination);
+        // The service's own default port, for a peer that advertises none (an
+        // ESP uses its raw UDP6 listener port).
+        let default_port = std::env::var("LMESH_OBJECT_SERVER_PORT")
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
             .unwrap_or(STABLE_WIFI_UDP_PORT);
-        let advertised_udp6 = announce
-            .as_ref()
-            .and_then(|announce| announce.udp_link_local_v6)
-            .map(Ipv6Addr::from);
-        require_live_udp6_scope(if let Some(ip) = advertised_udp6 {
-            let (flowinfo, scope_id) = match node.address {
-                SocketAddr::V6(address) => (address.flowinfo(), address.scope_id()),
-                SocketAddr::V4(_) => (0, configured_udp6_scope_id().unwrap_or(0)),
-            };
-            SocketAddr::V6(std::net::SocketAddrV6::new(ip, port, flowinfo, scope_id))
-        } else {
-            match node.address {
-                SocketAddr::V4(address) => {
-                    SocketAddr::V4(std::net::SocketAddrV4::new(*address.ip(), port))
-                }
-                SocketAddr::V6(address) => SocketAddr::V6(std::net::SocketAddrV6::new(
-                    *address.ip(),
-                    port,
-                    address.flowinfo(),
-                    address.scope_id(),
-                )),
+        match self.discovery.engine().resolve_udp_in(
+            target,
+            default_port,
+            configured_udp6_scope_id(),
+        ) {
+            Ok(peer) => require_live_udp6_scope(peer),
+            Err(dmesh_discovery::NoRoute::NotDiscovered) => {
+                // Not seen over UDP: the radio inventory may still know it.
+                semantic_inventory_udp_peer(&presentation_radio_devices(&self.radio), destination)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("unsupported/no_quic_route: destination is not discovered")
+                    })
             }
-        })
+            Err(error) => Err(anyhow::Error::from(error)),
+        }
     }
 
     /// A host without an owned Wi-Fi interface cannot route a NOW request.
@@ -2618,49 +1463,120 @@ impl LmeshService {
         decode_stream_response(&response).context("decode directed QUIC tagged response")
     }
 
+    /// `telemetry.now`: the monitor events this process retains, as the
+    /// documented ESP-NOW counters it can supply (`rx_dispatched`, `rx_accepted`
+    /// = action frames seen, `rx_rejected` = dispatch errors). Counters Linux does
+    /// not keep are omitted.
+    pub fn telemetry_now(&self) -> std::result::Result<TelemetryNowResponse, String> {
+        let iface = self
+            .owned_wifi_iface(None, lmesh_wifi::Operation::Nan)
+            .map_err(|error| error.to_string())?;
+        let counts = self.radio.now_counts(Some(iface));
+        Ok(TelemetryNowResponse {
+            rx_dispatched: Some(counts.dispatch),
+            rx_accepted: Some(counts.action_seen),
+            rx_rejected: Some(counts.dispatch_errors),
+            ..Default::default()
+        })
+    }
+
+    /// `telemetry.nan`: the beacons the raw-NAN monitor captured.
+    pub fn telemetry_nan(&self) -> std::result::Result<TelemetryNanResponse, String> {
+        self.owned_wifi_iface(None, lmesh_wifi::Operation::Nan)
+            .map_err(|error| error.to_string())?;
+        Ok(TelemetryNanResponse {
+            beacons: Some(self.radio.nan_beacons()),
+            ..Default::default()
+        })
+    }
+
+    /// `telemetry.udp6`: discovery datagrams that failed validation.
+    pub fn telemetry_udp6(&self) -> std::result::Result<TelemetryUdp6Response, String> {
+        Ok(TelemetryUdp6Response {
+            rx_invalid: Some(announce_parse_errors()),
+            ..Default::default()
+        })
+    }
+
+    /// `telemetry.wifi_link`: one row per AP station, in `links`. A row is the
+    /// same field set as the top-level record, keyed by tag; its `peer_mac` is a
+    /// byte string (the `_hex` key suffix makes the encoder write bytes).
+    pub fn telemetry_wifi_link(&self) -> std::result::Result<TelemetryWifiLinkResponse, String> {
+        let stations = self
+            .radio
+            .wifi_link_stations(None)
+            .map_err(|error| format!("{error:#}"))?;
+        let rows = stations
+            .iter()
+            .map(dmesh_server::platform_api::WifiLink::from)
+            .collect();
+        Ok(TelemetryWifiLinkResponse {
+            links: Some(rows),
+            ..Default::default()
+        })
+    }
+
+    /// `telemetry.quic`: aggregate QUIC counters of this node's associations.
+    pub async fn telemetry_quic(&self) -> std::result::Result<TelemetryQuicResponse, String> {
+        let node = self
+            .now_quic_client
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|(node, _)| node.clone());
+        match node {
+            Some(node) => node
+                .telemetry()
+                .await
+                .map(TelemetryQuicResponse::from)
+                .ok_or_else(|| "QUIC telemetry is unavailable".to_owned()),
+            None => Err("the QUIC node is not running".to_owned()),
+        }
+    }
+
+    async fn node_rows(
+        &self,
+    ) -> std::result::Result<(Vec<quic_lite::AssociationRow>, Vec<quic_lite::BearerRow>), String> {
+        let node = self
+            .now_quic_client
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|(node, _)| node.clone())
+            .ok_or_else(|| "the QUIC node is not running".to_owned())?;
+        node.rows()
+            .await
+            .ok_or_else(|| "QUIC telemetry is unavailable".to_owned())
+    }
+
+    /// `telemetry.quic_associations`: one row per live association.
+    pub async fn telemetry_quic_associations(
+        &self,
+    ) -> std::result::Result<dmesh_server::platform_api::TelemetryQuicAssociationsResponse, String>
+    {
+        let (associations, bearers) = self.node_rows().await?;
+        Ok(dmesh_server::telemetry::quic_associations_response(&associations, &bearers))
+    }
+
+    /// `telemetry.bearers`: one row per bearer the node runs.
+    pub async fn telemetry_bearers(
+        &self,
+    ) -> std::result::Result<dmesh_server::platform_api::TelemetryBearersResponse, String> {
+        let (_, bearers) = self.node_rows().await?;
+        Ok(dmesh_server::telemetry::bearers_response(&bearers))
+    }
+
+    /// `telemetry.memory`: the resident size of this process.
+    pub fn telemetry_memory(&self) -> std::result::Result<TelemetryMemoryResponse, String> {
+        Ok(TelemetryMemoryResponse {
+            process_rss_bytes: Some(dmesh_server::telemetry::process_rss_bytes()?),
+            ..Default::default()
+        })
+    }
+
     /// Handle a single JSON-lines request.
     pub async fn handle_request(&self, request: Request) -> mesh::protocol::Response {
         match request {
-            Request::Pair { kind, .. } => {
-                let result = match kind.as_str() {
-                    "wifi" => Err(anyhow::anyhow!(
-                        "Wi-Fi companion provisioning is not implemented"
-                    )),
-                    _ => Err(anyhow::anyhow!("unsupported companion kind: {kind}")),
-                };
-                match result {
-                    Ok(value) => mesh::protocol::Response::ok_with_data(value),
-                    Err(error) => mesh::protocol::Response::err(error.to_string()),
-                }
-            }
-            Request::Unpair { kind, id } => {
-                // TODO(pairing): This only releases a local bearer. The
-                // device secret and BLE bonds remain. Authenticated unpair
-                // over any transport, and credential-free UART unlock, need
-                // device-side handling before this fulfills the API.
-                let result = match kind.as_str() {
-                    "wifi" => {
-                        let mut paired = self
-                            .wifi_companion
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        match paired.as_ref() {
-                            Some((current, _)) if current == &id => {
-                                *paired = None;
-                                Ok(
-                                    serde_json::json!({"paired": false, "kind": "wifi", "released": id}),
-                                )
-                            }
-                            _ => Err(anyhow::anyhow!("Wi-Fi companion ID is not locally paired")),
-                        }
-                    }
-                    _ => Err(anyhow::anyhow!("unsupported companion kind: {kind}")),
-                };
-                match result {
-                    Ok(value) => mesh::protocol::Response::ok_with_data(value),
-                    Err(error) => mesh::protocol::Response::err(error.to_string()),
-                }
-            }
             Request::Send {
                 radio,
                 destination,
@@ -2681,10 +1597,13 @@ impl LmeshService {
                             Err(error) => mesh::protocol::Response::err(error.to_string()),
                         };
                     }
-                    return match self.radio.directed_now_discovery(medium, destination).await {
-                        Ok(value) => mesh::protocol::Response::ok_with_data(value),
-                        Err(error) => mesh::protocol::Response::err(error.to_string()),
-                    };
+                    // NOW has no directed discovery of its own: its discovery is the
+                    // broadcast announce in each discovery window, and anything
+                    // directed is QUIC (`probe`) over the NOW bearer.
+                    let _ = medium;
+                    return mesh::protocol::Response::err(format!(
+                        "discovery.active to={destination}: only udp://HOST is supported; NOW discovery is broadcast and directed checks are QUIC probes"
+                    ));
                 }
                 let all_available = medium.is_none();
                 let wants_multicast = all_available
@@ -2741,33 +1660,6 @@ impl LmeshService {
                     Err(error) => mesh::protocol::Response::err(error.to_string()),
                 }
             }
-            Request::WifiOcbStart {
-                iface,
-                freq,
-                bandwidth,
-            } => match self.owned_wifi_iface(iface, lmesh_wifi::Operation::Nan) {
-                Ok(iface) => mesh::protocol::Response::ok_with_data(self.radio.wifi_ocb_start(
-                    Some(iface),
-                    freq,
-                    bandwidth,
-                )),
-                Err(error) => mesh::protocol::Response::err(error.to_string()),
-            },
-            Request::WifiRateProfile {
-                iface,
-                profile,
-                disable_80211b,
-            } => match self.owned_wifi_iface(iface, lmesh_wifi::Operation::Nan) {
-                Ok(iface) => mesh::protocol::Response::ok_with_data(self.radio.wifi_rate_profile(
-                    Some(iface),
-                    profile,
-                    disable_80211b,
-                )),
-                Err(error) => mesh::protocol::Response::err(error.to_string()),
-            },
-            Request::RadioDevices => {
-                mesh::protocol::Response::ok_with_data(presentation_radio_devices(&self.radio))
-            }
             Request::DiscoveryStatus => {
                 mesh::protocol::Response::ok_with_data(common_discovery_status(&self.radio))
             }
@@ -2777,86 +1669,9 @@ impl LmeshService {
                 }
                 Err(error) => mesh::protocol::Response::err(error.to_string()),
             },
-            Request::NowMetrics => match self.owned_wifi_iface(None, lmesh_wifi::Operation::Nan) {
-                Ok(iface) => {
-                    mesh::protocol::Response::ok_with_data(self.radio.now_metrics(Some(iface)))
-                }
-                Err(error) => mesh::protocol::Response::err(error.to_string()),
-            },
-            Request::NanMetrics => match self.owned_wifi_iface(None, lmesh_wifi::Operation::Nan) {
-                Ok(iface) => {
-                    mesh::protocol::Response::ok_with_data(self.radio.nan_metrics(Some(iface)))
-                }
-                Err(error) => mesh::protocol::Response::err(error.to_string()),
-            },
-            Request::Udp6Metrics => {
-                mesh::protocol::Response::ok_with_data(self.radio.udp6_metrics())
-            }
-            Request::WifiLinkMetrics => {
-                mesh::protocol::Response::ok_with_data(self.radio.wifi_link_metrics(None))
-            }
-            Request::QuicMetrics => {
-                let node = self
-                    .now_quic_client
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .as_ref()
-                    .map(|(node, _)| node.clone());
-                let stats = match node {
-                    Some(node) => node.telemetry().await,
-                    None => None,
-                };
-                match stats {
-                    Some(stats) => mesh::protocol::Response::ok_with_data(serde_json::json!({
-                        "live_associations": stats.live_associations,
-                        "received_packets": stats.received_packets,
-                        "sent_packets": stats.sent_packets,
-                        "received_stream_packets": stats.received_stream_packets,
-                        "received_control_packets": stats.received_control_packets,
-                        "sent_stream_packets": stats.sent_stream_packets,
-                        "sent_control_packets": stats.sent_control_packets,
-                        "duplicate_packets": stats.duplicate_packets,
-                        "out_of_order_packets": stats.out_of_order_packets,
-                        "inferred_missing_packets": stats.inferred_missing_packets,
-                        "retransmitted_packets": stats.retransmitted_packets,
-                        "loss_events": stats.loss_events,
-                        "submission_failures": stats.submission_failures,
-                    })),
-                    None => mesh::protocol::Response::err("QUIC node telemetry unavailable"),
-                }
-            }
             Request::ObjectNanDryRun { image_size, mtu } => mesh::protocol::Response::ok_with_data(
                 nan_object_dry_run(image_size, mtu.unwrap_or(1_200)),
             ),
-            Request::WifiDataListen { iface, listen_sec } => {
-                mesh::protocol::Response::ok_with_data(
-                    self.radio.wifi_data_listen(iface, listen_sec),
-                )
-            }
-            Request::WifiDataSend {
-                iface,
-                destination,
-                payload,
-            } => mesh::protocol::Response::ok_with_data(self.radio.wifi_data_send(
-                iface,
-                destination,
-                payload,
-            )),
-            Request::WifiMgmtCapture {
-                iface,
-                channel,
-                capture_ms,
-                max_frames,
-                active,
-            } => match self
-                .radio
-                .wifi_mgmt_capture(iface, channel, capture_ms, max_frames, active)
-            {
-                Ok(value) => mesh::protocol::Response::ok_with_data(value),
-                Err(error) => {
-                    mesh::protocol::Response::err(format!("wifi.mgmt.capture failed: {error:#}"))
-                }
-            },
             Request::WifiApStartOpen {
                 iface,
                 ssid,
@@ -2889,26 +1704,6 @@ impl LmeshService {
                     Err(error) => mesh::protocol::Response::err(error),
                 }
             }
-            Request::WifiApStationAdd { iface, mac, aid } => {
-                match self.owned_wifi_iface(iface, lmesh_wifi::Operation::Ap) {
-                    Ok(iface) => mesh::protocol::Response::ok_with_data(
-                        self.radio.wifi_ap_station_add(Some(iface), mac, aid),
-                    ),
-                    Err(error) => mesh::protocol::Response::err(error),
-                }
-            }
-            Request::WifiScan {
-                iface,
-                ssid,
-                channel,
-                passive,
-                last_results,
-            } => mesh::protocol::Response::ok_with_data(self.radio.wifi_scan(
-                iface,
-                ssid,
-                channel,
-                passive.unwrap_or_else(|| last_results.unwrap_or(false)),
-            )),
             Request::WifiStaJoinOpen { iface, ssid } => mesh::protocol::Response::ok_with_data(
                 self.radio.wifi_sta_join_open(iface, ssid, None, None),
             ),
@@ -2970,64 +1765,6 @@ impl LmeshService {
             serde_json::json!(service_uptime_secs()),
         );
         mesh::protocol::Response::ok_with_data(serde_json::Value::Object(status))
-    }
-
-    /// Combined transport counters for the shared `metrics` method.
-    pub fn host_metrics(&self) -> mesh::protocol::Response {
-        mesh::protocol::Response::ok_with_data(serde_json::json!({
-            "now": self.radio.now_metrics(None),
-            "nan": self.radio.nan_metrics(None),
-            "udp6": self.radio.udp6_metrics(),
-            "wifi_link": self.radio.wifi_link_metrics(None),
-        }))
-    }
-
-    /// Shared component-9 event history: `{cursor, events}` with the same
-    /// bounded retention as `messages.history`.
-    pub fn host_events(
-        &self,
-        since_ms: Option<u64>,
-        records: Option<u64>,
-    ) -> mesh::protocol::Response {
-        mesh::protocol::Response::ok_with_data(
-            self.radio
-                .diagnostic_events(since_ms, records.map(|value| value as usize)),
-        )
-    }
-
-    /// Shared component-9 log-watch: the same bounded history rendered as
-    /// `{cursor, records: [{sequence, line}]}` with the firmware shape.
-    pub fn host_log_watch(
-        &self,
-        since_ms: Option<u64>,
-        records: Option<u64>,
-    ) -> mesh::protocol::Response {
-        let events = self
-            .radio
-            .diagnostic_events(since_ms, records.map(|value| value as usize));
-        let rendered = events["events"]
-            .as_array()
-            .map(|events| {
-                events
-                    .iter()
-                    .map(|event| {
-                        serde_json::json!({
-                            "sequence": event["ts_millis"],
-                            "line": format!(
-                                "{} {} {}",
-                                event["ts_millis"],
-                                event["key"].as_str().unwrap_or("?"),
-                                event["value"]
-                            ),
-                        })
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        mesh::protocol::Response::ok_with_data(serde_json::json!({
-            "cursor": events["cursor"],
-            "records": rendered,
-        }))
     }
 
     /// Local undirected `radio.tx`: transmit the decoded 802.11 frame on an
@@ -3172,9 +1909,30 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn wifi_link_rows_are_typed_and_carry_a_byte_string_peer() {
+        use dmesh_server::registry_bridge::TaggedCbor;
+        let mut link = dmesh_server::raw_wifi::WifiLinkMetrics::new();
+        link.peer_mac = Some([0x02, 0, 0, 0, 0, 0x2a]);
+        link.rx_bytes = Some(1_000);
+        link.signal_dbm = Some(-50);
+        let response = TelemetryWifiLinkResponse {
+            links: Some(vec![dmesh_server::platform_api::WifiLink::from(&link)]),
+            ..Default::default()
+        };
+        // Through the generated marshalling, on the wire.
+        let wire = response.encode_cbor();
+        // CBOR: key 3 (peer_mac) followed by a 6-byte string (0x46).
+        assert!(wire.windows(8).any(|w| w == [0x03, 0x46, 0x02, 0, 0, 0, 0, 0x2a]));
+        let back = TelemetryWifiLinkResponse::decode_cbor(&wire).unwrap();
+        let row = &back.links.unwrap()[0];
+        assert_eq!(row.rx_bytes, Some(1_000));
+        assert_eq!(row.signal_dbm, Some(-50));
+        assert_eq!(row.peer_mac.as_deref(), Some(&[0x02, 0, 0, 0, 0, 0x2a][..]));
+    }
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn compact_dmesh_stream_response_normalizes_for_mesh_http_and_ssh() {
@@ -3295,50 +2053,6 @@ mod tests {
             if to == "d8:a0:1d:4c:5e:1c"));
     }
 
-    #[test]
-    fn wifi_scan_last_results_is_a_shared_read_only_request_field() {
-        let request = serde_json::from_value::<Request>(serde_json::json!({
-            "method": "wifi.scan",
-            "last_results": true
-        }))
-        .unwrap();
-        assert!(matches!(
-            request,
-            Request::WifiScan {
-                passive: None,
-                last_results: Some(true),
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn explicit_udp_target_and_now_mac_route_are_distinct() {
-        assert_eq!(
-            explicit_udp_endpoint("udp://[2001:db8::44]:3336")
-                .unwrap()
-                .unwrap(),
-            "[2001:db8::44]:3336".parse::<SocketAddr>().unwrap()
-        );
-        assert_eq!(
-            explicit_udp_endpoint("192.0.2.44:3336").unwrap().unwrap(),
-            "192.0.2.44:3336".parse::<SocketAddr>().unwrap()
-        );
-        assert_eq!(
-            explicit_udp_endpoint("udp://[2001:db8::44]")
-                .unwrap()
-                .unwrap(),
-            "[2001:db8::44]:3336".parse::<SocketAddr>().unwrap()
-        );
-        assert_eq!(
-            explicit_udp_endpoint("192.0.2.44").unwrap().unwrap(),
-            "192.0.2.44:3336".parse::<SocketAddr>().unwrap()
-        );
-        assert_eq!(explicit_udp_endpoint("02:00:00:00:00:44").unwrap(), None);
-        assert!(is_now_mac("02:00:00:00:00:44"));
-        assert!(!is_now_mac("02:00:00:00:00:444"));
-        assert!(!is_now_mac("not-a-mac"));
-    }
 
     #[test]
     fn explicit_udp_target_accepts_numeric_link_local_scope() {
@@ -3413,43 +2127,6 @@ mod tests {
         assert_eq!(semantic_inventory_udp_peer(&inventory, "unknown"), None);
     }
 
-    #[test]
-    fn semantic_inventory_uses_one_association_key_for_name_and_udp_path() {
-        let inventory = serde_json::json!({
-            "devices": [{
-                "identity": "e7",
-                "announce": {
-                    "route_key": "stable-e7-key",
-                    "vip6": "fd00::e7",
-                    "udp_link_local_v6": "fe80::16c1:9fff:fee4:5d48",
-                    "udp_port": 3339,
-                },
-                "observations": {
-                    "udp_multicast": {
-                        "last_peer": "[fe80::16c1:9fff:fee4:5d48%5]:3339",
-                    },
-                    "now": {"last_peer": "14:c1:9f:e4:5d:48"},
-                },
-            }],
-        });
-        assert_eq!(
-            semantic_inventory_device_key(&inventory, "e7").as_deref(),
-            Some("identity:stable-e7-key")
-        );
-        assert_eq!(
-            semantic_inventory_device_key(&inventory, "fd00::e7").as_deref(),
-            Some("identity:stable-e7-key")
-        );
-        assert_eq!(
-            semantic_inventory_device_key(&inventory, "14:c1:9f:e4:5d:48").as_deref(),
-            Some("identity:stable-e7-key")
-        );
-        assert_eq!(
-            semantic_inventory_device_key(&inventory, "udp://[fe80::16c1:9fff:fee4:5d48%5]:3339",)
-                .as_deref(),
-            Some("identity:stable-e7-key")
-        );
-    }
 
     #[test]
     fn semantic_inventory_uses_observed_ipv6_path_when_legacy_announce_omits_it() {
@@ -3588,33 +2265,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_persist_announcement_caps_history_and_updates_address() {
-        let dir = unique_test_dir();
-        let announce = Announce {
-            public_key: "test_key_12345".to_string(),
-            metadata: Some(HashMap::from([(
-                "version".to_string(),
-                "1.0.0".to_string(),
-            )])),
-        };
-
-        for port in 10_000..10_017 {
-            let addr = SocketAddr::from(([127, 0, 0, 1], port));
-            persist_announcement(&dir, &announce, addr).unwrap();
-        }
-
-        let path = node_record_path(&dir, &announce.public_key);
-        let record: StoredNode = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
-        assert_eq!(record.public_key, announce.public_key);
-        assert_eq!(record.address, "127.0.0.1:10016");
-        assert_eq!(record.announces.len(), MAX_STORED_ANNOUNCES);
-        assert_eq!(record.announces[0][2], "127.0.0.1:10001");
-        assert_eq!(record.announces[15][2], "127.0.0.1:10016");
-
-        fs::remove_dir_all(dir).unwrap();
-    }
-
     #[tokio::test]
     async fn test_local_discovery_creation() {
         let discovery = LocalDiscovery::new(None).await.unwrap();
@@ -3631,68 +2281,30 @@ mod tests {
         assert_eq!(announce.uptime_secs, 17);
         assert_eq!(
             announce.device_id(),
-            dmesh_server::announce::identity_hint(&discovery.public_key).unwrap()
+            dmesh_server::announce::identity_hint(discovery.public_key_bytes()).unwrap()
         );
         assert_eq!(
-            &dmesh_server::announce::virtual_ip6(&discovery.public_key).unwrap()[8..],
+            &dmesh_server::announce::virtual_ip6(discovery.public_key_bytes()).unwrap()[8..],
             announce.device_id()
         );
         assert!(announce.has_identity());
-        assert_eq!(announce.public_key(), discovery.public_key.as_slice());
+        assert_eq!(announce.public_key(), discovery.public_key_bytes());
     }
 
     #[tokio::test]
-    async fn test_announce_serialization() {
-        let mut metadata = HashMap::new();
-        metadata.insert("version".to_string(), "1.0.0".to_string());
-
-        let announce = Announce {
-            public_key: "test_key_12345".to_string(),
-            metadata: Some(metadata),
-        };
-
-        let json = serde_json::to_string(&announce).unwrap();
-        assert!(json.contains("test_key_12345"));
-        assert!(json.contains("version"));
-        assert!(json.contains("1.0.0"));
-
-        // Test deserialization
-        let parsed: Announce = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.public_key, "test_key_12345");
-        assert!(parsed.metadata.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_local_discovery_node_management() {
-        let discovery = LocalDiscovery::new(None).await.unwrap();
-
-        // Initially, no nodes should be discovered
-        let nodes = discovery.get_nodes().await;
-        assert_eq!(nodes.len(), 0);
-
-        // Get a non-existent node
-        let node = discovery.get_node("non_existent_key").await;
-        assert!(node.is_none());
-    }
-
-    #[tokio::test]
-    async fn common_multicast_announce_notifies_the_radio_inventory_sink() {
-        let discovery = LocalDiscovery::new(None).await.unwrap();
-        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let received_by_sink = received.clone();
-        discovery
-            .set_announce_observer(Arc::new(move |peer, announce| {
-                received_by_sink.lock().unwrap().push((peer, announce));
-            }))
-            .await;
-
-        let peer = SocketAddr::from(([192, 0, 2, 24], 5_227));
-        let announce = dmesh_server::announce::Announce::discovery([0xA5; 16], 16, 42);
-        LocalDiscovery::notify_announce_observer(&discovery.announce_observer, peer, announce)
-            .await;
-
-        let received = received.lock().unwrap();
-        assert_eq!(received.as_slice(), &[(peer, announce)]);
+    async fn the_signed_announce_is_a_verifiable_host_record_with_the_configured_endpoint() {
+        let mut discovery = LocalDiscovery::new(None).await.unwrap();
+        discovery.configure_announce_udp6("nonexistent-lan", 3337);
+        let announce = discovery.signed_discovery_announce(0).unwrap();
+        assert!(announce.has_identity());
+        assert!(dmesh_server::announce::verify_identity(announce));
+        assert_eq!(announce.device_class, dmesh_server::announce::DEVICE_CLASS_HOST);
+        assert!(announce.probe_capabilities & dmesh_server::probe::PROBE_CAP_NOW != 0);
+        // No interface belongs to that label, so no endpoint is advertised
+        // rather than a guessed one.
+        assert_eq!(announce.udp_link_local_v6(), None);
+        // The engine never lists itself.
+        assert!(discovery.engine().devices().is_empty());
     }
 
     #[tokio::test]
@@ -3725,7 +2337,7 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
         // Check if we received our own announcement (multicast loopback)
-        let nodes = discovery.get_nodes().await;
+        let nodes = discovery.engine().devices();
         tracing::info!("Discovery received {} nodes", nodes.len());
 
         // In some systems, multicast loopback is enabled and we'll receive our own announcement
@@ -3733,17 +2345,10 @@ mod tests {
         // So we don't assert a specific count, just that the test completes successfully
     }
 
-    fn unique_test_dir() -> PathBuf {
-        let counter = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("lmesh-test-{}-{}", std::process::id(), counter))
-    }
-
-    #[test]
-    fn default_node_store_dir_is_cwd_relative() {
-        let cwd = std::env::current_dir().unwrap();
-        assert_eq!(
-            LocalDiscovery::default_node_store_dir().unwrap(),
-            cwd.join("lmesh").join("nodes")
-        );
-    }
 }
+
+use dmesh_server::platform_api::{
+    TelemetryMemoryResponse, TelemetryNanResponse, TelemetryNowResponse, TelemetryQuicResponse,
+    TelemetryUdp6Response, TelemetryWifiLinkResponse,
+};
+

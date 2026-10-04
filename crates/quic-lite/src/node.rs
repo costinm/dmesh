@@ -268,6 +268,44 @@ pub struct QuicAssociation {
     generation: u64,
 }
 
+/// One live association: who it runs over and its QUIC transport state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AssociationRow {
+    /// Identifier local to this node (the association's slot).
+    pub id: u64,
+    /// Bearer and bearer-local peer of the association's first path, when known.
+    pub bearer: Option<BearerId>,
+    /// Bearer-local peer address of that path.
+    pub peer: Option<PeerL2Address>,
+    /// Transport counters and send state.
+    pub telemetry: crate::AssociationTelemetry,
+}
+
+/// One registered bearer: its state and the node's counters for it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BearerRow {
+    /// Node-local handle.
+    pub id: BearerId,
+    /// Registered bearer name.
+    pub name: crate::BearerName,
+    /// Whether the bearer is eligible for new sends and receives.
+    pub enabled: bool,
+    /// Packets accepted by the bearer and not yet reported complete.
+    pub in_flight_packets: u64,
+    /// Packets received from the bearer.
+    pub received_packets: u64,
+    /// Received packets dropped for lack of a packet slot or queue room.
+    pub ingress_drops: u64,
+    /// Packets handed to the bearer.
+    pub submitted_packets: u64,
+    /// Packets the bearer reported complete.
+    pub completed_packets: u64,
+    /// Submissions refused as temporarily busy.
+    pub send_would_block: u64,
+    /// Submissions that failed.
+    pub send_failures: u64,
+}
+
 /// Opaque handle for one direct circuit within a locally owned association.
 ///
 /// The local identifier is generation-checked through the owning association;
@@ -2237,6 +2275,69 @@ impl<P: PacketPool, const PACKET: usize> QuicNode<P, PACKET> {
                 .map(crate::EndpointState::telemetry),
             Association::Server(server) => Some(server.mux.endpoint.telemetry()),
         }
+    }
+
+    /// One row per live association, with its first path's bearer and peer.
+    pub fn association_rows(&self) -> Vec<AssociationRow> {
+        self.associations
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| {
+                let slot = slot.as_ref()?;
+                let telemetry = match &slot.state {
+                    Association::Client(client) => client
+                        .connection()
+                        .endpoint()
+                        .map(crate::EndpointState::telemetry),
+                    Association::Server(server) => Some(server.mux.endpoint.telemetry()),
+                }?;
+                let hop = Self::slot_path_state(slot, 0)
+                    .and_then(|path| path.active_address())
+                    .or(slot.bootstrap_address);
+                Some(AssociationRow {
+                    id: index as u64,
+                    bearer: hop.map(|(bearer, _)| bearer),
+                    peer: hop.map(|(_, peer)| peer),
+                    telemetry,
+                })
+            })
+            .collect()
+    }
+
+    /// The name of the bearer an association's first path runs over (`uart0`, `udp6`, ...),
+    /// when it is known. A handler uses it as provenance: it is the node's own fact about
+    /// where the request arrived, not anything the request says about itself.
+    pub fn association_bearer_name(&self, id: QuicAssociation) -> Option<crate::BearerName> {
+        let slot = self.slot(id)?;
+        let (bearer, _) = Self::slot_path_state(slot, 0)
+            .and_then(|path| path.active_address())
+            .or(slot.bootstrap_address)?;
+        self.bearer_rows()
+            .into_iter()
+            .find(|row| row.id == bearer)
+            .map(|row| row.name)
+    }
+
+    /// One row per registered bearer.
+    pub fn bearer_rows(&self) -> Vec<BearerRow> {
+        self.bearers
+            .iter()
+            .map(|bearer| {
+                let (state, stats) = (bearer.state(), bearer.stats());
+                BearerRow {
+                    id: bearer.id(),
+                    name: bearer.info().name,
+                    enabled: state.enabled,
+                    in_flight_packets: state.in_flight_packets as u64,
+                    received_packets: stats.received_packets,
+                    ingress_drops: stats.ingress_drops,
+                    submitted_packets: stats.submitted_packets,
+                    completed_packets: stats.completed_packets,
+                    send_would_block: stats.send_would_block,
+                    send_failures: stats.send_failures,
+                }
+            })
+            .collect()
     }
 
     /// Aggregate QUIC counters over associations currently live on this node.

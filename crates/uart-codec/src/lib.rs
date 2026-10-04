@@ -89,6 +89,8 @@ pub fn encode_datagram(packet: &[u8]) -> codec::Result<codec::Encoder<'_>> {
 /// runtime-neutral codec, marker envelope, and pool-backed decoder above.
 #[cfg(all(feature = "host", target_os = "linux"))]
 pub mod host;
+#[cfg(feature = "pair")]
+pub mod host_pair;
 
 #[cfg(test)]
 mod datagram_tests {

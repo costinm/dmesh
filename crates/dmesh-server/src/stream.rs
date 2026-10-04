@@ -238,12 +238,15 @@ pub trait BodySource: Send {
 pub struct Response {
     pub header: Vec<u8>,
     pub body: Option<Box<dyn BodySource>>,
+    /// Local work to schedule after the ordinary response stream is finished.
+    /// Dropping/aborting a response never invokes it. This is not a peer ACK.
+    pub after_finish: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl Response {
     /// A header-only response.
     pub fn header(header: Vec<u8>) -> Self {
-        Self { header, body: None }
+        Self { header, body: None, after_finish: None }
     }
 
     /// A response whose body is produced by `body`.
@@ -251,7 +254,15 @@ impl Response {
         Self {
             header,
             body: Some(Box::new(body)),
+            after_finish: None,
         }
+    }
+
+    /// Schedule an application action only after a successful response write
+    /// and end-of-stream, equally for TCP and QUIC stream adapters.
+    pub fn after_finish(mut self, action: impl FnOnce() + Send + 'static) -> Self {
+        self.after_finish = Some(Box::new(action));
+        self
     }
 
     /// Read the response as the bytes to put on the stream.
@@ -260,6 +271,7 @@ impl Response {
             header: self.header,
             position: 0,
             body: self.body,
+            after_finish: self.after_finish,
         }
     }
 }
@@ -269,9 +281,17 @@ pub struct ResponseReader {
     header: Vec<u8>,
     position: usize,
     body: Option<Box<dyn BodySource>>,
+    after_finish: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl ResponseReader {
+    /// Called by the stream adapter after writing all bytes and successfully
+    /// finishing the response direction. Never call this on a failed write.
+    pub fn finish_response(&mut self) {
+        if let Some(action) = self.after_finish.take() {
+            action();
+        }
+    }
     /// Fill `out` with the next response bytes. The second value is true when
     /// the last byte is included, so the sender should end its direction (FIN)
     /// after writing `count` bytes. `(0, false)` means the body has nothing

@@ -84,7 +84,7 @@
     function nodeList(value) { const data = value?.result ?? value ?? {}; return data.devices || data.nodes || data.discovered_devices || []; }
     function nodeAddress(node) { const announce = node.announce || node; return announce.udp_link_local_v6 || announce.sta_link_local_v6 || announce.ap_link_local_v6; }
     function nodeName(node) { const announce = node.announce || node; return announce.device_name || node.device_name || node.name || node.id || node.device_id || 'Unnamed node'; }
-    function nodeTarget(node) { const announce = node.announce || node; const address = nodeAddress(node); const port = announce.udp_port || (node.platform === 'esp32' ? 3339 : 3336); return address ? {value:`udp://${address.includes(':') ? `[${address}]` : address}:${port}`} : undefined; }
+    function nodeTarget(node) { const announce = node.announce || node; const address = nodeAddress(node); const port = announce.udp_port || 3339; return address ? {value:`udp://${address.includes(':') ? `[${address}]` : address}:${port}`} : undefined; }
     async function loadTargets() {
       try {
         const inventory = catalog.find(tool => tool.name === 'discovery.nodes');

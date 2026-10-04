@@ -293,7 +293,15 @@ impl BearerRuntime {
     ) -> Result<quic_lite::probe::ProbeResult, String> {
         let (bearer_id, peer_l2_address) = match destination.scheme() {
             "udp" => {
-                let address = crate::mesh_jni::parse_udp_endpoint(destination.target())?;
+                let address = dmesh_discovery::endpoint::parse_udp_endpoint(
+                    destination.target(),
+                    &dmesh_discovery::endpoint::EndpointDefaults {
+                        port: dmesh_server::firmware_profile::DEFAULT_EVENT_PORT,
+                        scope: None,
+                    },
+                )
+                .map_err(|error| error.to_string())?
+                .ok_or("invalid udp probe destination")?;
                 let udp = self.udp.as_ref().ok_or("Android has no UDP bearer")?;
                 let peer = udp
                     .register_peer(address)
@@ -390,6 +398,11 @@ impl BearerRuntime {
 
     pub async fn telemetry(&self) -> Option<quic_lite::NodeTelemetry> {
         self.node.telemetry().await
+    }
+
+    /// Per-association and per-bearer rows of the node.
+    pub async fn rows(&self) -> Option<(Vec<quic_lite::AssociationRow>, Vec<quic_lite::BearerRow>)> {
+        self.node.rows().await
     }
 
     fn open(&self, bearer: &str, args: &str) -> bool {

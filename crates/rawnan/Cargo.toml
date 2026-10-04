@@ -1,7 +1,7 @@
 [package]
 name = "dmesh-rawnan"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 publish = false
 
 [lib]
@@ -10,6 +10,12 @@ crate-type = ["rlib"]
 [features]
 default = ["std"]
 std = ["anyhow/std"]
+# Linux backend: nl80211/rtnetlink, monitor interface, open AP, capture (Linux-only code).
+linux = ["std", "dep:libc", "dep:serde_json", "dep:quic-lite", "dep:tracing"]
 
 [dependencies]
 anyhow = { version = "1", default-features = false }
+libc = { version = "0.2", optional = true }
+serde_json = { version = "1", optional = true }
+quic-lite = { path = "../quic-lite", optional = true, features = ["tokio"] }
+tracing = { version = "0.1", optional = true }

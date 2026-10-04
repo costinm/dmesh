@@ -29,6 +29,7 @@ pub mod commands;
 pub mod core_runtime;
 pub mod crypto_esp;
 mod firmware_identity;
+mod device_telemetry;
 pub mod flash;
 /// Main-only retained firmware log lines used by the remote `log-watch`
 /// diagnostic stream.

@@ -4,6 +4,7 @@ members = [
     "crates/dmesh-store",
     "crates/dmesh-cli",
     "crates/dmesh-server",
+    "crates/dmesh-discovery",
     "crates/quic-lite",
     "crates/dmeshtui",
     "crates/dmeshtui-android",
@@ -14,6 +15,7 @@ members = [
     "crates/lmesh-wpa",
     "crates/rawnan",
     "crates/tun",
+    "crates/android-control",
 ]
 resolver = "2"
 

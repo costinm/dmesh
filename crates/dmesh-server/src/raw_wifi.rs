@@ -45,10 +45,12 @@ pub const RAW_WIFI_MAX_FRAME: usize = 1500;
 // Reserved monotonic NAN response counters keep a physical E2E row
 // diagnosable without retaining packet bytes. Leave headroom for optional
 // radio facts so a fully populated snapshot is still one bounded record.
-pub const RAW_WIFI_SNAPSHOT_MAX_BYTES: usize = 448;
+// Include live SDK configuration and full-width monotonic counters while
+// retaining one ordinary transport packet; this is not a private bearer queue.
+pub const RAW_WIFI_SNAPSHOT_MAX_BYTES: usize = 1024;
 /// `wifi.scan` carries a bounded list as well as aggregate facts.  Keep the
 /// response below the common bearer MTU while allowing ten visible DMesh APs.
-pub const RAW_WIFI_RESPONSE_MAX_BYTES: usize = 768;
+pub const RAW_WIFI_RESPONSE_MAX_BYTES: usize = RAW_WIFI_SNAPSHOT_MAX_BYTES;
 
 /// Common admission result for an ESP-NOW action payload. Synchronization and
 /// tagged connectionless records stay on discovery/control handling; only an
@@ -1132,6 +1134,25 @@ pub struct RawWifiSnapshot {
     /// ESP-IDF STA disconnect reason from the current radio epoch. `0` means
     /// no disconnect event was observed; it is not a success indication.
     pub sta_last_disconnect_reason: Option<u8>,
+    /// Cumulative ESP-IDF callbacks since boot, including intentional release.
+    pub sta_connections: Option<u32>,
+    pub sta_disconnections: Option<u32>,
+    /// All disconnect callbacks, including STA_LEAVING (unlike epoch failure).
+    pub sta_last_event_disconnect_reason: Option<u8>,
+    /// Structured STA records rejected by the UART egress queue since boot.
+    pub sta_diagnostic_log_drops: Option<u32>,
+    /// Live ESP-IDF STA configuration, not an associated-peer observation.
+    pub sta_scan_rssi_threshold_dbm: Option<i8>,
+    pub sta_scan_authmode_threshold: Option<u8>,
+    pub sta_config_channel: Option<u8>,
+    pub sta_config_bssid: Option<[u8; 6]>,
+    pub sta_config_bssid_set: Option<bool>,
+    pub sta_scan_method: Option<u8>,
+    pub sta_pmf_capable: Option<bool>,
+    pub sta_pmf_required: Option<bool>,
+    pub sta_sae_pwe_method: Option<u8>,
+    /// Raw SDK SSID array; trailing NUL bytes are retained for diagnosis.
+    pub sta_config_ssid: Option<[u8; 32]>,
     /// RSSI reported by the ESP STA for its associated AP. This is a
     /// best-effort local PHY observation; it is not association authority.
     pub sta_ap_rssi_dbm: Option<i8>,
@@ -1244,6 +1265,20 @@ pub fn encode_raw_wifi_snapshot(
         + usize::from(snapshot.sta_raw_rx_enabled.is_some())
         + usize::from(snapshot.sta_connect_to_associated_ms.is_some())
         + usize::from(snapshot.sta_last_disconnect_reason.is_some())
+        + usize::from(snapshot.sta_connections.is_some())
+        + usize::from(snapshot.sta_disconnections.is_some())
+        + usize::from(snapshot.sta_last_event_disconnect_reason.is_some())
+        + usize::from(snapshot.sta_diagnostic_log_drops.is_some())
+        + usize::from(snapshot.sta_scan_rssi_threshold_dbm.is_some())
+        + usize::from(snapshot.sta_scan_authmode_threshold.is_some())
+        + usize::from(snapshot.sta_config_channel.is_some())
+        + usize::from(snapshot.sta_config_bssid.is_some())
+        + usize::from(snapshot.sta_config_bssid_set.is_some())
+        + usize::from(snapshot.sta_scan_method.is_some())
+        + usize::from(snapshot.sta_pmf_capable.is_some())
+        + usize::from(snapshot.sta_pmf_required.is_some())
+        + usize::from(snapshot.sta_sae_pwe_method.is_some())
+        + usize::from(snapshot.sta_config_ssid.is_some())
         + usize::from(snapshot.sta_ap_rssi_dbm.is_some())
         + usize::from(snapshot.max_tx_power_qdbm.is_some())
         + usize::from(snapshot.udp6_tx_burst_packets.is_some())
@@ -1386,6 +1421,26 @@ pub fn encode_raw_wifi_snapshot(
         e.uint(95)?;
         e.uint(u64::from(value))?;
     }
+    for (tag, value) in [
+        (131, snapshot.sta_connections), (132, snapshot.sta_disconnections),
+        (133, snapshot.sta_last_event_disconnect_reason.map(u32::from)),
+        (134, snapshot.sta_diagnostic_log_drops),
+    ] {
+        if let Some(value) = value {
+            e.uint(tag)?;
+            e.uint(u64::from(value))?;
+        }
+    }
+    if let Some(value) = snapshot.sta_scan_rssi_threshold_dbm { e.uint(135)?; e.int(i64::from(value))?; }
+    for (tag, value) in [(136, snapshot.sta_scan_authmode_threshold), (137, snapshot.sta_config_channel),
+        (140, snapshot.sta_scan_method), (143, snapshot.sta_sae_pwe_method)] {
+        if let Some(value) = value { e.uint(tag)?; e.uint(u64::from(value))?; }
+    }
+    if let Some(value) = snapshot.sta_config_bssid { e.uint(138)?; e.bytes_value(&value)?; }
+    for (tag, value) in [(139, snapshot.sta_config_bssid_set), (141, snapshot.sta_pmf_capable), (142, snapshot.sta_pmf_required)] {
+        if let Some(value) = value { e.uint(tag)?; e.boolean(value)?; }
+    }
+    if let Some(value) = snapshot.sta_config_ssid { e.uint(144)?; e.bytes_value(&value)?; }
     if let Some(value) = snapshot.sta_ap_rssi_dbm {
         e.uint(86)?;
         e.int(i64::from(value))?;
@@ -1517,6 +1572,20 @@ pub fn decode_raw_wifi_snapshot(data: &[u8]) -> Result<(u64, RawWifiSnapshot), &
                 )
             }
             128 => snapshot.sta_enabled = Some(decoder.boolean().ok_or("radio STA enabled")?),
+            131 => snapshot.sta_connections = Some(u32::try_from(decoder.uint().ok_or("STA connections")?).map_err(|_| "STA connections")?),
+            132 => snapshot.sta_disconnections = Some(u32::try_from(decoder.uint().ok_or("STA disconnections")?).map_err(|_| "STA disconnections")?),
+            133 => snapshot.sta_last_event_disconnect_reason = Some(u8::try_from(decoder.uint().ok_or("STA disconnect reason")?).map_err(|_| "STA disconnect reason")?),
+            134 => snapshot.sta_diagnostic_log_drops = Some(u32::try_from(decoder.uint().ok_or("STA log drops")?).map_err(|_| "STA log drops")?),
+            135 => snapshot.sta_scan_rssi_threshold_dbm = Some(i8::try_from(decoder.int().ok_or("STA RSSI threshold")?).map_err(|_| "STA RSSI threshold")?),
+            136 => snapshot.sta_scan_authmode_threshold = Some(u8::try_from(decoder.uint().ok_or("STA auth threshold")?).map_err(|_| "STA auth threshold")?),
+            137 => snapshot.sta_config_channel = Some(u8::try_from(decoder.uint().ok_or("STA configured channel")?).map_err(|_| "STA configured channel")?),
+            138 => snapshot.sta_config_bssid = Some(decoder.bytes_ref().and_then(|v| v.try_into().ok()).ok_or("STA configured BSSID")?),
+            139 => snapshot.sta_config_bssid_set = Some(decoder.boolean().ok_or("STA BSSID pinned")?),
+            140 => snapshot.sta_scan_method = Some(u8::try_from(decoder.uint().ok_or("STA scan method")?).map_err(|_| "STA scan method")?),
+            141 => snapshot.sta_pmf_capable = Some(decoder.boolean().ok_or("STA PMF capable")?),
+            142 => snapshot.sta_pmf_required = Some(decoder.boolean().ok_or("STA PMF required")?),
+            143 => snapshot.sta_sae_pwe_method = Some(u8::try_from(decoder.uint().ok_or("STA SAE method")?).map_err(|_| "STA SAE method")?),
+            144 => snapshot.sta_config_ssid = Some(decoder.bytes_ref().and_then(|v| v.try_into().ok()).ok_or("STA configured SSID")?),
             22 => snapshot.sta_associated = Some(decoder.boolean().ok_or("radio STA")?),
             129 => {
                 snapshot.sta_bssid = Some(
@@ -2831,6 +2900,20 @@ mod tests {
             sta_mac: Some([0x10, 0, 0, 0, 0, 1]),
             ap_mac: Some([0x10, 0, 0, 0, 0, 2]),
             sta_connect_to_associated_ms: Some(487),
+            sta_connections: Some(3),
+            sta_disconnections: Some(2),
+            sta_last_event_disconnect_reason: Some(36),
+            sta_diagnostic_log_drops: Some(17),
+            sta_scan_rssi_threshold_dbm: Some(-127),
+            sta_scan_authmode_threshold: Some(7),
+            sta_config_channel: Some(6),
+            sta_config_bssid: Some([1, 2, 3, 4, 5, 6]),
+            sta_config_bssid_set: Some(true),
+            sta_scan_method: Some(0),
+            sta_pmf_capable: Some(true),
+            sta_pmf_required: Some(false),
+            sta_sae_pwe_method: Some(3),
+            sta_config_ssid: Some([0; 32]),
             sta_ap_rssi_dbm: Some(-42),
             counters: RawWifiCounters {
                 rx_parser_accepted: 7,
@@ -2865,5 +2948,131 @@ mod tests {
             decode_raw_wifi_snapshot(&wire[..used]),
             Ok((RAW_WIFI_METHOD_SNAPSHOT, expected))
         );
+    }
+
+    #[test]
+    fn fully_populated_snapshot_with_full_width_counters_fits_response_storage() {
+        let snapshot = RawWifiSnapshot {
+            epoch: u32::MAX,
+            channel: Some(u8::MAX),
+            sta_enabled: Some(true),
+            sta_associated: Some(true),
+            sta_bssid: Some([0xff; 6]),
+            sta_ipv4: Some([0xff; 4]),
+            promiscuous: Some(true),
+            dw_capturing: Some(true),
+            nan_dw_interval: Some(u8::MAX),
+            comparator_bssid: Some([0xff; 6]),
+            nan_active_subscribe_bssid: Some([0xff; 6]),
+            nan_last_sdf_source: Some([0xff; 6]),
+            nan_last_sdf_service_id: Some([0xff; 6]),
+            nan_last_sdf_after_beacon_us: Some(u32::MAX),
+            comparator_armed: Some(true),
+            comparator_errors: u32::MAX,
+            tx_interface: Some(RawWifiInterface::Nan),
+            tx_rate: Some(RawWifiRate::Mbps54),
+            ap_active: Some(true),
+            mac_ack: Some(true),
+            last_tx_error: Some(u32::MAX),
+            last_connection_error: Some(u32::MAX),
+            sta_mac: Some([0xff; 6]),
+            ap_mac: Some([0xff; 6]),
+            action_destination_broadcast: Some(true),
+            sta_driver_tx: Some(true),
+            sta_bssid_check_disabled: Some(true),
+            sta_ampdu_enabled: Some(true),
+            sta_11b_rates_disabled: Some(true),
+            sta_raw_rx_enabled: Some(true),
+            sta_connect_to_associated_ms: Some(u32::MAX),
+            sta_last_disconnect_reason: Some(u8::MAX),
+            sta_connections: Some(u32::MAX),
+            sta_disconnections: Some(u32::MAX),
+            sta_last_event_disconnect_reason: Some(u8::MAX),
+            sta_diagnostic_log_drops: Some(u32::MAX),
+            sta_scan_rssi_threshold_dbm: Some(i8::MIN),
+            sta_scan_authmode_threshold: Some(u8::MAX),
+            sta_config_channel: Some(u8::MAX),
+            sta_config_bssid: Some([0xff; 6]),
+            sta_config_bssid_set: Some(true),
+            sta_scan_method: Some(u8::MAX),
+            sta_pmf_capable: Some(true),
+            sta_pmf_required: Some(true),
+            sta_sae_pwe_method: Some(u8::MAX),
+            sta_config_ssid: Some([0xff; 32]),
+            sta_ap_rssi_dbm: Some(i8::MIN),
+            max_tx_power_qdbm: Some(i8::MIN),
+            udp6_tx_burst_packets: Some(u8::MAX),
+            udp6_tx_submit_calls: Some(u32::MAX),
+            udp6_tx_submit_us_total: Some(u32::MAX),
+            udp6_tx_submit_us_max: Some(u32::MAX),
+            counters: RawWifiCounters {
+                tx_attempted: u32::MAX,
+                tx_driver_accepted: u32::MAX,
+                tx_driver_failed: u32::MAX,
+                rx_driver_dispatch: u32::MAX,
+                rx_parser_accepted: u32::MAX,
+                rx_parser_rejected: u32::MAX,
+                rx_self_echo: u32::MAX,
+                rx_dropped: u32::MAX,
+                nan_beacons: u32::MAX,
+                nan_sdfs: u32::MAX,
+                nan_followups: u32::MAX,
+                nan_followup_queued: u32::MAX,
+                nan_followup_sent: u32::MAX,
+                nan_followup_dropped: u32::MAX,
+                nan_followup_pending: u32::MAX,
+                nan_active_publish_attempted: u32::MAX,
+                nan_active_publish_sent: u32::MAX,
+                nan_active_publish_dropped: u32::MAX,
+                nan_service_info_matched: u32::MAX,
+                nan_active_subscribe_descriptors: u32::MAX,
+                nan_active_subscribe_sdea_misses: u32::MAX,
+                nan_active_subscribe_sdea_header: u32::MAX,
+                nan_active_subscribe_sdea_info_len: u32::MAX,
+                nan_active_subscribes: u32::MAX,
+                nan_service_info_enqueued: u32::MAX,
+                nan_service_info_dropped: u32::MAX,
+                nan_service_info_dispatched: u32::MAX,
+                tx_duration_us_total: u32::MAX,
+                tx_duration_us_max: u32::MAX,
+                tx_duration_le_250us: u32::MAX,
+                tx_duration_le_750us: u32::MAX,
+                tx_duration_le_2ms: u32::MAX,
+                tx_duration_gt_2ms: u32::MAX,
+                roc_action_listen_requests: u32::MAX,
+                roc_action_listen_failures: u32::MAX,
+                roc_action_frames: u32::MAX,
+                vendor_beacon_ies: u32::MAX,
+                vendor_nan_beacon_ies: u32::MAX,
+                vendor_other_ies: u32::MAX,
+                roc_espnow_actions: u32::MAX,
+                roc_nan_actions: u32::MAX,
+                roc_other_actions: u32::MAX,
+                udp6_rx_frames: u32::MAX,
+                udp6_rx_queue_drops: u32::MAX,
+                udp6_rx_invalid: u32::MAX,
+                udp6_udp_delivered: u32::MAX,
+                udp6_ndp_advertisements: u32::MAX,
+                udp6_tx_failures: u32::MAX,
+                udp6_last_tx_result: u32::MAX,
+                udp6_raw_tx_completions: u32::MAX,
+                udp6_raw_tx_completion_failures: u32::MAX,
+                udp6_raw_tx_completion_rate: u32::MAX,
+                p2p_probe_requests: u32::MAX,
+                p2p_probe_responses: u32::MAX,
+                p2p_gas_requests: u32::MAX,
+                p2p_gas_responses: u32::MAX,
+                p2p_response_drops: u32::MAX,
+                registered_nan_actions: u32::MAX,
+                registered_now_actions: u32::MAX,
+                registered_p2p_actions: u32::MAX,
+                registered_action_drops: u32::MAX,
+            },
+        };
+        let mut out = [0; RAW_WIFI_RESPONSE_MAX_BYTES];
+        let used = encode_raw_wifi_snapshot(RAW_WIFI_METHOD_SNAPSHOT, snapshot, &mut out).unwrap();
+        assert!(used <= RAW_WIFI_SNAPSHOT_MAX_BYTES);
+        assert_eq!(decode_raw_wifi_snapshot(&out[..used]), Ok((RAW_WIFI_METHOD_SNAPSHOT, snapshot)));
+        assert!(encode_raw_wifi_snapshot(RAW_WIFI_METHOD_SNAPSHOT, snapshot, &mut [0; 448]).is_none());
     }
 }

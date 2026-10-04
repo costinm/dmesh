@@ -349,6 +349,9 @@ static STA_RECONNECT_TASK_STARTED: AtomicBool = AtomicBool::new(false);
 // the callback for the process lifetime and must never retain a Rust object.
 static STA_EVENT_HANDLER_REGISTERED: AtomicBool = AtomicBool::new(false);
 static STA_ASSOCIATED_EVENT: AtomicBool = AtomicBool::new(false);
+// A retained-driver replacement can report AUTH_LEAVE/ASSOC_LEAVE rather
+// than STA_LEAVING. Keep the owner's intent across the asynchronous callback.
+static STA_OWNER_DISCONNECT_PENDING: AtomicBool = AtomicBool::new(false);
 static STA_LAST_DISCONNECT_REASON: AtomicU8 = AtomicU8::new(0);
 // ESP-IDF `WIFI_REASON_STA_LEAVING`: emitted after our own
 // `esp_wifi_disconnect` during an intentional radio-epoch replacement.  It
@@ -356,6 +359,62 @@ static STA_LAST_DISCONNECT_REASON: AtomicU8 = AtomicU8::new(0);
 const WIFI_REASON_STA_LEAVING: u8 = 36;
 static STA_CONNECT_STARTED_MS: AtomicU32 = AtomicU32::new(0);
 static STA_CONNECT_TO_ASSOCIATED_MS: AtomicU32 = AtomicU32::new(0);
+static STA_CONNECTIONS: AtomicU32 = AtomicU32::new(0);
+static STA_DISCONNECTIONS: AtomicU32 = AtomicU32::new(0);
+static STA_LAST_EVENT_DISCONNECT_REASON: AtomicU8 = AtomicU8::new(0);
+static STA_DIAGNOSTIC_LOG_DROPS: AtomicU32 = AtomicU32::new(0);
+
+pub(crate) fn sta_diagnostic_counters() -> (u32, u32, u8, u32) {
+    (STA_CONNECTIONS.load(Ordering::Relaxed), STA_DISCONNECTIONS.load(Ordering::Relaxed),
+     STA_LAST_EVENT_DISCONNECT_REASON.load(Ordering::Relaxed), STA_DIAGNOSTIC_LOG_DROPS.load(Ordering::Relaxed))
+}
+
+/// Non-secret live driver facts for radio.snapshot. Never return passwords.
+pub(crate) struct StaDriverConfig {
+    pub ssid: [u8; 32],
+    pub channel: u8,
+    pub bssid: [u8; 6],
+    pub bssid_set: bool,
+    pub rssi_threshold: i8,
+    pub authmode_threshold: u8,
+    pub scan_method: u8,
+    pub pmf_capable: bool,
+    pub pmf_required: bool,
+    pub sae_pwe_method: u8,
+}
+
+pub(crate) fn sta_driver_config() -> Option<StaDriverConfig> {
+    if !STA_DRIVER_INITIALIZED.load(Ordering::Acquire) { return None; }
+    let mut config = esp_idf_sys::wifi_config_t::default();
+    if unsafe { esp_idf_sys::esp_wifi_get_config(esp_idf_sys::wifi_interface_t_WIFI_IF_STA, &mut config) } != esp_idf_sys::ESP_OK { return None; }
+    let sta = unsafe { config.sta };
+    Some(StaDriverConfig { ssid: sta.ssid, channel: sta.channel, bssid: sta.bssid, bssid_set: sta.bssid_set,
+        rssi_threshold: sta.threshold.rssi, authmode_threshold: sta.threshold.authmode as u8,
+        scan_method: sta.scan_method as u8, pmf_capable: sta.pmf_cfg.capable,
+        pmf_required: sta.pmf_cfg.required, sae_pwe_method: sta.sae_pwe_h2e as u8 })
+}
+
+pub(crate) fn sta_diagnostic(kind: &str, fields: &[(u64, dmesh_server::cbor::FieldValue<'_>)]) {
+    static SEQUENCE: AtomicU32 = AtomicU32::new(0);
+    // Called on ESP-IDF's small sys_evt stack. Numeric STA events fit in
+    // 256 bytes; encoding directly also avoids a second field-map buffer.
+    let mut out = [0u8; 256];
+    if let Some(used) = dmesh_server::log_watch::encode_event_into(
+        &mut out, u64::from(SEQUENCE.fetch_add(1, Ordering::Relaxed)) + 1,
+        unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) as u64 / 1000,
+        dmesh_server::log_watch::LEVEL_INFO, "wifi", kind, fields,
+    ) {
+        if !crate::uart_esp::send_log_record(&out[..used]) {
+            STA_DIAGNOSTIC_LOG_DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+    } else {
+        STA_DIAGNOSTIC_LOG_DROPS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn mac_number(mac: [u8; 6]) -> u64 {
+    u64::from_be_bytes([0, 0, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]])
+}
 /// Observe loss frequently enough to notice an AP restart promptly, but do
 /// not blindly call `esp_wifi_connect` on every observation.  Candidate scans
 /// and association requests happen only after a sustained loss.
@@ -372,12 +431,32 @@ pub fn reconnect_sta_once() -> bool {
     if STA_ASSOCIATED_EVENT.load(Ordering::Acquire) {
         return true;
     }
+    if STA_REUSED_TARGET.swap(false, Ordering::AcqRel) {
+        // A retained AP may have moved or disappeared. Fall back once to
+        // ordinary selection rather than retrying its stale channel forever.
+        unsafe {
+            let mut current = esp_idf_sys::wifi_config_t::default();
+            if esp_idf_sys::esp_wifi_get_config(esp_idf_sys::wifi_interface_t_WIFI_IF_STA, &mut current)
+                != esp_idf_sys::ESP_OK { return false; }
+            let sta = current.sta;
+            let len = sta.ssid.iter().position(|byte| *byte == 0).unwrap_or(sta.ssid.len());
+            let required = STA_REQUIRED_BSSID.load(Ordering::Acquire).then_some(sta.bssid);
+            let Some(candidate) = scan_dmesh_sta_candidate(&sta.ssid[..len], required) else { return false; };
+            if !apply_sta_candidate(&candidate, sta.password.iter().all(|byte| *byte == 0)) {
+                return false;
+            }
+        }
+    }
     STA_CONNECT_TO_ASSOCIATED_MS.store(0, Ordering::Release);
     STA_CONNECT_STARTED_MS.store(
         (unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) as u64 / 1_000) as u32,
         Ordering::Release,
     );
     let result = unsafe { esp_idf_sys::esp_wifi_connect() };
+    sta_diagnostic("wifi.sta_connect", &[
+        (1, dmesh_server::cbor::FieldValue::Unsigned(result as u32 as u64)),
+        (2, dmesh_server::cbor::FieldValue::Bool(true)),
+    ]);
     if result == esp_idf_sys::ESP_OK || result == esp_idf_sys::ESP_ERR_WIFI_CONN {
         uart::send_response(b"wifi STA reconnect requested");
         true
@@ -407,6 +486,7 @@ struct ScannedStaCandidate {
     channel: u8,
     authmode: esp_idf_sys::wifi_auth_mode_t,
     preferred: bool,
+    rssi_dbm: i8,
 }
 
 /// Apply one scan-selected AP to the already-started STA driver. The caller
@@ -463,8 +543,24 @@ unsafe fn apply_sta_candidate(selection: &ScannedStaCandidate, allow_open: bool)
         }
         _ => return false,
     }
-    esp_idf_sys::esp_wifi_set_config(esp_idf_sys::wifi_interface_t_WIFI_IF_STA, &mut wifi)
-        == esp_idf_sys::ESP_OK
+    let credential = wifi.sta.password;
+    let result = esp_idf_sys::esp_wifi_set_config(esp_idf_sys::wifi_interface_t_WIFI_IF_STA, &mut wifi);
+    let mut readback = esp_idf_sys::wifi_config_t::default();
+    let read_result = esp_idf_sys::esp_wifi_get_config(esp_idf_sys::wifi_interface_t_WIFI_IF_STA, &mut readback);
+    use dmesh_server::cbor::FieldValue::{Unsigned as U, Bool as B};
+    sta_diagnostic("wifi.sta_candidate", &[
+        (1, U(mac_number(selection.bssid))), (2, U(selection.channel as u64)),
+        (3, U(selection.authmode as u64)), (4, B(selection.preferred)),
+        (5, U(result as u32 as u64)), (6, U(read_result as u32 as u64)),
+        (7, B(read_result == esp_idf_sys::ESP_OK && readback.sta.password == credential)),
+        (8, B(credential.iter().any(|byte| *byte != 0))),
+        (9, dmesh_server::cbor::FieldValue::Signed(selection.rssi_dbm as i64)),
+        (10, U(readback.sta.channel as u64)),
+        (11, U(mac_number(readback.sta.bssid))),
+        (12, B(readback.sta.bssid_set)),
+        (13, B(readback.sta.pmf_cfg.capable)), (14, B(readback.sta.pmf_cfg.required)),
+    ]);
+    result == esp_idf_sys::ESP_OK
 }
 // Main may keep NAN/raw Wi-Fi initialized while the STA association retries.
 // The default STA netif is an ESP-IDF singleton: recreating it on a retry
@@ -472,6 +568,47 @@ unsafe fn apply_sta_candidate(selection: &ScannedStaCandidate, allow_open: bool)
 // handle for the lifetime of the firmware and reuse it after `stop_sta()`.
 static STA_NETIF: AtomicPtr<esp_idf_sys::esp_netif_t> = AtomicPtr::new(core::ptr::null_mut());
 static STA_DRIVER_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static STA_DRIVER_RUNNING: AtomicBool = AtomicBool::new(false);
+
+fn prepare_sta_driver_policy(params: &TransportProfile) {
+    if dmesh_server::firmware_profile::wifi_driver_policy_changed(
+        STA_DRIVER_INITIALIZED.load(Ordering::Acquire),
+        STA_AMPDU_ENABLED.load(Ordering::Acquire),
+        STA_11B_RATES_DISABLED.load(Ordering::Acquire),
+        params.sta_ampdu_enabled, params.sta_11b_rates_disabled,
+    ) {
+        stop_sta();
+        restart_sta_driver_runtime();
+    }
+}
+
+unsafe fn start_sta_driver_once() -> i32 {
+    if STA_DRIVER_RUNNING.load(Ordering::Acquire) {
+        return esp_idf_sys::ESP_OK;
+    }
+    let result = esp_idf_sys::esp_wifi_start();
+    if result == esp_idf_sys::ESP_OK {
+        STA_DRIVER_RUNNING.store(true, Ordering::Release);
+    }
+    result
+}
+
+/// Release association, not the driver/netif. NAN uses this same STA radio.
+pub fn disconnect_sta_retaining_driver() {
+    STA_OWNER_DISCONNECT_PENDING.store(
+        STA_ASSOCIATED_EVENT.load(Ordering::Acquire), Ordering::Release);
+    unsafe {
+        let result = esp_idf_sys::esp_wifi_disconnect();
+        if result != esp_idf_sys::ESP_OK {
+            STA_OWNER_DISCONNECT_PENDING.store(false, Ordering::Release);
+        }
+        sta_diagnostic("wifi.sta_release", &[
+            (1, dmesh_server::cbor::FieldValue::Unsigned(result as u32 as u64)),
+            (2, dmesh_server::cbor::FieldValue::Bool(STA_ASSOCIATED_EVENT.load(Ordering::Acquire))),
+        ]);
+    }
+    STA_ASSOCIATED_EVENT.store(false, Ordering::Release);
+}
 // An image that booted from a complete, provisioned WPA profile may connect
 // directly.  This is consumed by exactly one `init_sta` call: subsequent
 // explicit Main transport starts and bounded reconnects retain their normal
@@ -479,6 +616,9 @@ static STA_DRIVER_INITIALIZED: AtomicBool = AtomicBool::new(false);
 // Main and Recovery cannot differ merely because one rebuilt its BSSID from
 // an initial scan.
 static STA_SKIP_INITIAL_SCAN: AtomicBool = AtomicBool::new(false);
+static STA_TARGET_VERIFIED: AtomicBool = AtomicBool::new(false);
+static STA_REUSED_TARGET: AtomicBool = AtomicBool::new(false);
+static STA_REQUIRED_BSSID: AtomicBool = AtomicBool::new(false);
 static STA_AMPDU_ENABLED: AtomicBool = AtomicBool::new(true);
 static STA_11B_RATES_DISABLED: AtomicBool = AtomicBool::new(true);
 // `esp_wifi_init` may allocate part of its driver state before returning
@@ -528,6 +668,20 @@ unsafe extern "C" fn sta_event_handler(
             STA_CONNECT_TO_ASSOCIATED_MS.store(now_ms.wrapping_sub(started), Ordering::Release);
         }
         STA_ASSOCIATED_EVENT.store(true, Ordering::Release);
+        STA_TARGET_VERIFIED.store(true, Ordering::Release);
+        STA_REUSED_TARGET.store(false, Ordering::Release);
+        use dmesh_server::cbor::FieldValue::Unsigned as U;
+        let count = STA_CONNECTIONS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        if !event_data.is_null() {
+            let event = &*event_data.cast::<esp_idf_sys::wifi_event_sta_connected_t>();
+            sta_diagnostic("wifi.sta_connected", &[
+                (1, U(mac_number(event.bssid))), (2, U(event.channel as u64)),
+                (3, U(event.authmode as u64)), (4, U(event.aid as u64)),
+                (5, U(STA_CONNECT_TO_ASSOCIATED_MS.load(Ordering::Acquire) as u64)),
+                (6, U(count as u64)),
+                (7, U(STA_DISCONNECTIONS.load(Ordering::Relaxed) as u64)),
+            ]);
+        }
         log_sta_link(true, event_data);
         notify_sta_lifecycle(true, 0);
     } else if event_id == esp_idf_sys::wifi_event_t_WIFI_EVENT_STA_DISCONNECTED as i32 {
@@ -536,14 +690,61 @@ unsafe extern "C" fn sta_event_handler(
         } else {
             unsafe { (*(event_data.cast::<esp_idf_sys::wifi_event_sta_disconnected_t>())).reason }
         };
+        use dmesh_server::cbor::FieldValue::{Unsigned as U, Bool as B};
+        let count = STA_DISCONNECTIONS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        STA_LAST_EVENT_DISCONNECT_REASON.store(reason, Ordering::Relaxed);
+        let owner_leave = STA_OWNER_DISCONNECT_PENDING.swap(false, Ordering::AcqRel);
+        let intentional = reason == WIFI_REASON_STA_LEAVING
+            || (owner_leave && matches!(reason, 3 | 8));
+        let peer = if event_data.is_null() { 0 } else {
+            mac_number((*event_data.cast::<esp_idf_sys::wifi_event_sta_disconnected_t>()).bssid)
+        };
+        sta_diagnostic("wifi.sta_disconnected", &[
+            (1, U(reason as u64)), (2, U(peer)),
+            (3, B(STA_ASSOCIATED_EVENT.load(Ordering::Acquire))),
+            (4, U(scan_now_ms().wrapping_sub(STA_CONNECT_STARTED_MS.load(Ordering::Acquire)) as u64)),
+            (5, U(count as u64)), (6, B(intentional)),
+            (7, U(STA_CONNECTIONS.load(Ordering::Relaxed) as u64)),
+        ]);
         STA_ASSOCIATED_EVENT.store(false, Ordering::Release);
         STA_CONNECT_TO_ASSOCIATED_MS.store(0, Ordering::Release);
         log_sta_link(false, core::ptr::null_mut());
-        if reason != WIFI_REASON_STA_LEAVING {
+        if !intentional {
+            STA_TARGET_VERIFIED.store(false, Ordering::Release);
             STA_LAST_DISCONNECT_REASON.store(reason, Ordering::Release);
             notify_sta_lifecycle(false, reason);
         }
     }
+}
+
+/// Observe SDK lifecycle events without changing policy or taking owner locks.
+unsafe extern "C" fn wifi_diagnostic_event_handler(
+    _argument: *mut c_void, _base: esp_idf_sys::esp_event_base_t,
+    event_id: i32, _data: *mut c_void,
+) {
+    // NOW completion / discovery-window events can occur for every frame.
+    // Keep diagnostics about STA lifecycle, not a second packet trace.
+    if event_id == esp_idf_sys::wifi_event_t_WIFI_EVENT_ACTION_TX_STATUS as i32
+        || event_id == esp_idf_sys::wifi_event_t_WIFI_EVENT_ROC_DONE as i32
+        || event_id == esp_idf_sys::wifi_event_t_WIFI_EVENT_CONNECTIONLESS_MODULE_WAKE_INTERVAL_START as i32
+        || event_id == esp_idf_sys::wifi_event_t_WIFI_EVENT_AP_PROBEREQRECVED as i32
+    {
+        return;
+    }
+    use dmesh_server::cbor::FieldValue::{Unsigned as U, Bool as B};
+    let mut channel = 0;
+    let mut secondary = esp_idf_sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE;
+    let channel_result = esp_idf_sys::esp_wifi_get_channel(&mut channel, &mut secondary);
+    let mut ps = esp_idf_sys::wifi_ps_type_t_WIFI_PS_NONE;
+    let ps_result = esp_idf_sys::esp_wifi_get_ps(&mut ps);
+    sta_diagnostic("wifi.driver_event", &[
+        (1, U(event_id as u32 as u64)),
+        (2, B(STA_DRIVER_RUNNING.load(Ordering::Acquire))),
+        (3, B(STA_ASSOCIATED_EVENT.load(Ordering::Acquire))),
+        (4, U(channel as u64)), (5, U(secondary as u64)),
+        (6, U(channel_result as u32 as u64)),
+        (7, U(ps as u64)), (8, U(ps_result as u32 as u64)),
+    ]);
 }
 
 unsafe extern "C" fn sta_ip_event_handler(
@@ -680,9 +881,14 @@ unsafe fn register_sta_event_handlers() -> bool {
             core::ptr::null_mut(),
         )
     };
+    let diagnostics = esp_idf_sys::esp_event_handler_register(
+        esp_idf_sys::WIFI_EVENT, esp_idf_sys::ESP_EVENT_ANY_ID,
+        Some(wifi_diagnostic_event_handler), core::ptr::null_mut(),
+    );
     if connected == esp_idf_sys::ESP_OK
         && disconnected == esp_idf_sys::ESP_OK
         && ip == esp_idf_sys::ESP_OK
+        && diagnostics == esp_idf_sys::ESP_OK
     {
         STA_EVENT_HANDLER_REGISTERED.store(true, Ordering::Release);
         true
@@ -759,6 +965,7 @@ fn wifi_init_config(params: &TransportProfile) -> esp_idf_sys::wifi_init_config_
 /// DHCP client, IPv4 profile, or transport endpoint. The raw adapter
 /// registers its own single RX callback after this bounded association wait.
 pub fn init_sta(params: &TransportProfile) {
+    prepare_sta_driver_policy(params);
     unsafe {
         // `transport.start {mode: Sta}` is the only transition that permits
         // association.  Clear the unassociated epoch guard before starting
@@ -878,6 +1085,31 @@ pub fn init_sta(params: &TransportProfile) {
             sta.pmf_cfg.capable = false;
             sta.pmf_cfg.required = false;
         }
+        let mut previous = esp_idf_sys::wifi_config_t::default();
+        let previous_ok = esp_idf_sys::esp_wifi_get_config(
+            esp_idf_sys::wifi_interface_t_WIFI_IF_STA, &mut previous,
+        ) == esp_idf_sys::ESP_OK;
+        let old = previous.sta;
+        let old_len = old.ssid.iter().position(|byte| *byte == 0).unwrap_or(old.ssid.len());
+        let reuse_target = previous_ok && old.bssid_set && old.password == sta.password
+            && dmesh_server::sta_selection::reusable_sta_target(
+                STA_TARGET_VERIFIED.load(Ordering::Acquire), &old.ssid[..old_len], ssid,
+                old.bssid, old.channel, params.sta_bssid_set.then_some(params.sta_bssid),
+                params.sta_channel,
+            );
+        if reuse_target {
+            // Preserve scan-derived RSN/PMF settings and the credential, not
+            // just the address. No NVS write or driver restart is needed.
+            sta = old;
+        }
+        STA_REQUIRED_BSSID.store(params.sta_bssid_set, Ordering::Release);
+        STA_REUSED_TARGET.store(reuse_target, Ordering::Release);
+        STA_TARGET_VERIFIED.store(false, Ordering::Release);
+        sta_diagnostic("wifi.sta_target_reuse", &[
+            (1, dmesh_server::cbor::FieldValue::Bool(reuse_target)),
+            (2, dmesh_server::cbor::FieldValue::Unsigned(mac_number(sta.bssid))),
+            (3, dmesh_server::cbor::FieldValue::Unsigned(sta.channel as u64)),
+        ]);
         let mut config = esp_idf_sys::wifi_config_t { sta };
         // `transport.start { mode=sta, ap=1 }` is a complete APSTA epoch,
         // not an after-the-fact lab toggle.  Configure both personalities
@@ -944,16 +1176,16 @@ pub fn init_sta(params: &TransportProfile) {
         // This must happen after init and before start. Its effect includes
         // the negotiated legacy/basic-rate set, so the direct profile applies
         // it through the full driver reinit used by AMPDU, never live.
-        let legacy_rate = esp_wifi_config_11b_rate(
+        let legacy_rate = if STA_DRIVER_RUNNING.load(Ordering::Acquire) { esp_idf_sys::ESP_OK } else { esp_wifi_config_11b_rate(
             esp_idf_sys::wifi_interface_t_WIFI_IF_STA,
             params.sta_11b_rates_disabled,
-        );
+        ) };
         if legacy_rate != esp_idf_sys::ESP_OK {
             uart::send_stat(b"wifi STA 11b policy result=", legacy_rate as u32 as u64);
             return;
         }
         STA_ASSOCIATED_EVENT.store(false, Ordering::Release);
-        let started = esp_idf_sys::esp_wifi_start();
+        let started = start_sta_driver_once();
         if started != esp_idf_sys::ESP_OK && started != esp_idf_sys::ESP_ERR_INVALID_STATE {
             uart::send_response(b"wifi STA start failed");
             return;
@@ -965,7 +1197,8 @@ pub fn init_sta(params: &TransportProfile) {
         }
         uart::send_stat(b"wifi raw sta started_ms=", elapsed_ms(init_started_us));
         let _ = esp_idf_sys::esp_wifi_set_ps(esp_idf_sys::wifi_ps_type_t_WIFI_PS_NONE);
-        let mut association_candidate_ready = STA_SKIP_INITIAL_SCAN.swap(false, Ordering::AcqRel);
+        let skip_initial_scan = STA_SKIP_INITIAL_SCAN.swap(false, Ordering::AcqRel);
+        let mut association_candidate_ready = reuse_target || skip_initial_scan;
         if !association_candidate_ready {
             if let Some(selection) = scan_dmesh_sta_candidate(
                 &params.ssid[..params.ssid_len],
@@ -1013,6 +1246,10 @@ pub fn init_sta(params: &TransportProfile) {
             Ordering::Release,
         );
         let connect = esp_idf_sys::esp_wifi_connect();
+        sta_diagnostic("wifi.sta_connect", &[
+            (1, dmesh_server::cbor::FieldValue::Unsigned(connect as u32 as u64)),
+            (2, dmesh_server::cbor::FieldValue::Bool(false)),
+        ]);
         uart::send_stat(b"wifi raw sta connect_ms=", elapsed_ms(init_started_us));
         if connect != esp_idf_sys::ESP_OK && connect != esp_idf_sys::ESP_ERR_WIFI_CONN {
             uart::send_stat(b"wifi raw sta connect_result=", connect as u32 as u64);
@@ -1055,6 +1292,7 @@ pub fn init_nan_now(
     params: &TransportProfile,
     handler: crate::wifi_espnow_esp::EspNowHandler,
 ) -> bool {
+    prepare_sta_driver_policy(params);
     unsafe {
         // An unassociated NAN+NOW epoch must remain unassociated. A prior
         // STA epoch may have left the bounded reconnect observer alive; stop
@@ -1159,10 +1397,10 @@ pub fn init_nan_now(
             esp_idf_sys::wifi_interface_t_WIFI_IF_STA,
             bandwidth,
         );
-        let rate_result = esp_wifi_config_11b_rate(
+        let rate_result = if STA_DRIVER_RUNNING.load(Ordering::Acquire) { esp_idf_sys::ESP_OK } else { esp_wifi_config_11b_rate(
             esp_idf_sys::wifi_interface_t_WIFI_IF_STA,
             params.sta_11b_rates_disabled,
-        );
+        ) };
         if bandwidth_result != esp_idf_sys::ESP_OK || rate_result != esp_idf_sys::ESP_OK {
             uart::send_stat(
                 b"wifi NAN/NOW bandwidth result=",
@@ -1174,7 +1412,7 @@ pub fn init_nan_now(
             return false;
         }
         STA_ASSOCIATED_EVENT.store(false, Ordering::Release);
-        let started = esp_idf_sys::esp_wifi_start();
+        let started = start_sta_driver_once();
         if started != esp_idf_sys::ESP_OK && started != esp_idf_sys::ESP_ERR_INVALID_STATE {
             uart::send_stat(b"wifi NAN/NOW start result=", started as u32 as u64);
             uart::send_response(b"wifi NAN/NOW driver start failed");
@@ -1231,23 +1469,20 @@ pub fn init_nan_now(
     enabled
 }
 
-/// Restore the classic ESP32 sleepy NAN/NOW radio after explicit light sleep.
+/// Restore the sleepy NAN/NOW radio after explicit light sleep.
 ///
 /// Unlike `init_nan_now`, this path owns no IP STA and therefore does not
 /// create an esp-netif, register association handlers, disconnect, or wait for
 /// an association transition.  The first prototype used this exact lifecycle:
 /// fully deinitialize classic ESP32 before sleep, then rebuild only the raw
-/// STA radio, pin its channel, and attach the NAN/NOW callbacks.
+/// STA radio, pin its channel, and attach the NAN/NOW callbacks. All variants
+/// use this same raw resume: recreating an IP netif and
+/// its default handlers on every DW is unnecessary allocation churn, and
+/// disconnecting an already-unassociated station adds five RTOS ticks.
 pub fn resume_sleepy_nan_now(
     params: &TransportProfile,
     handler: crate::wifi_espnow_esp::EspNowHandler,
 ) -> bool {
-    #[cfg(any(target_arch = "riscv32", target_feature = "esp32s3ops"))]
-    {
-        return init_nan_now(params, handler);
-    }
-
-    #[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
     unsafe {
         let started_us = esp_idf_sys::esp_timer_get_time();
         LAB_FORCE_UNASSOCIATED.store(true, Ordering::Release);
@@ -1257,15 +1492,16 @@ pub fn resume_sleepy_nan_now(
 
         STA_AMPDU_ENABLED.store(params.sta_ampdu_enabled, Ordering::Release);
         STA_11B_RATES_DISABLED.store(params.sta_11b_rates_disabled, Ordering::Release);
-        let mut init = wifi_init_config(params);
-        let initialized = esp_idf_sys::esp_wifi_init(&mut init);
-        if initialized != esp_idf_sys::ESP_OK && initialized != esp_idf_sys::ESP_ERR_INVALID_STATE {
-            STA_DRIVER_INITIALIZED.store(false, Ordering::Release);
-            STA_DRIVER_INIT_FAILED.store(true, Ordering::Release);
-            leave_radio_mode(RadioMode::StaRawUdp6);
-            return false;
+        if !STA_DRIVER_INITIALIZED.load(Ordering::Acquire) {
+            let mut init = wifi_init_config(params);
+            let initialized = esp_idf_sys::esp_wifi_init(&mut init);
+            if initialized != esp_idf_sys::ESP_OK && initialized != esp_idf_sys::ESP_ERR_INVALID_STATE {
+                STA_DRIVER_INIT_FAILED.store(true, Ordering::Release);
+                leave_radio_mode(RadioMode::StaRawUdp6);
+                return false;
+            }
+            STA_DRIVER_INITIALIZED.store(true, Ordering::Release);
         }
-        STA_DRIVER_INITIALIZED.store(true, Ordering::Release);
         let driver_init_us = (esp_idf_sys::esp_timer_get_time() - started_us).max(0) as u64;
 
         let _ = esp_idf_sys::esp_wifi_set_storage(esp_idf_sys::wifi_storage_t_WIFI_STORAGE_RAM);
@@ -1295,7 +1531,7 @@ pub fn resume_sleepy_nan_now(
             leave_radio_mode(RadioMode::StaRawUdp6);
             return false;
         }
-        let started = esp_idf_sys::esp_wifi_start();
+        let started = start_sta_driver_once();
         if started != esp_idf_sys::ESP_OK && started != esp_idf_sys::ESP_ERR_INVALID_STATE {
             leave_radio_mode(RadioMode::StaRawUdp6);
             return false;
@@ -1785,6 +2021,7 @@ pub fn stop_sta_extensions() {
 /// this adapter only releases the ESP-IDF STA bearer so the normal light-sleep
 /// scheduler can resume. Infrastructure callers intentionally never use it.
 fn stop_sta_with_leave_grace(leave_grace_ms: u32) {
+    STA_DRIVER_RUNNING.store(false, Ordering::Release);
     stop_sta_extensions();
     crate::wifi_raw_udp6_esp::stop();
     unsafe {
@@ -1849,16 +2086,10 @@ pub fn deinit_for_light_sleep() {
     STA_DRIVER_INITIALIZED.store(false, Ordering::Release);
 }
 
-/// Replace an already selected STA radio epoch. This is the sole Wi-Fi-owner
-/// transition used by `transport.start`: it unregisters the prior raw/NOW
-/// ingress, recreates the STA driver, then initializes the supplied immutable
-/// profile. A stop/start alone retains `wifi_init_config_t` values such as
-/// AMPDU and the 11b policy, which violates the radio-epoch contract.
-/// Runtime policy code never manipulates callbacks, promiscuous mode, ESP
-/// buffers, or ESP-IDF radio functions itself.
+/// Replace association settings while retaining the driver and netif.
+/// `init_sta` reinitializes only when the pre-start driver policy changed.
 pub fn replace_sta(params: &TransportProfile) {
-    stop_sta();
-    restart_sta_driver_runtime();
+    disconnect_sta_retaining_driver();
     init_sta(params);
 }
 
@@ -1867,6 +2098,7 @@ pub fn replace_sta(params: &TransportProfile) {
 /// bearer shutdown and immediately reinitializes the same radio mode; this is
 /// a controlled Wi-Fi restart, not a device reboot or a second Wi-Fi owner.
 pub fn restart_sta_runtime() {
+    STA_DRIVER_RUNNING.store(false, Ordering::Release);
     STA_ASSOCIATED_EVENT.store(false, Ordering::Release);
     unsafe {
         let _ = esp_idf_sys::esp_wifi_disconnect();
@@ -1880,6 +2112,7 @@ pub fn restart_sta_runtime() {
 /// The default netif is also released, avoiding a second persistent adapter
 /// or a stale binding across the driver epoch.
 pub fn restart_sta_driver_runtime() {
+    STA_DRIVER_RUNNING.store(false, Ordering::Release);
     STA_ASSOCIATED_EVENT.store(false, Ordering::Release);
     unsafe {
         let _ = esp_idf_sys::esp_wifi_disconnect();
@@ -1994,6 +2227,7 @@ pub fn lab_force_unassociated() -> bool {
 pub fn set_lab_open_ap(enabled: bool, channel: u8, beacon_tu: u16) -> bool {
     let channel = channel.clamp(1, 13);
     unsafe {
+        STA_DRIVER_RUNNING.store(false, Ordering::Release);
         let _ = esp_idf_sys::esp_wifi_stop();
         let _ = esp_idf_sys::esp_wifi_set_promiscuous(false);
         let mode = if enabled {
@@ -2012,7 +2246,7 @@ pub fn set_lab_open_ap(enabled: bool, channel: u8, beacon_tu: u16) -> bool {
                 return false;
             }
         }
-        if esp_idf_sys::esp_wifi_start() != esp_idf_sys::ESP_OK {
+        if start_sta_driver_once() != esp_idf_sys::ESP_OK {
             return false;
         }
         // `esp_wifi_stop()` drops raw Ethernet/TX-completion callbacks even
@@ -2092,7 +2326,7 @@ pub fn ensure_lab_main_style_raw_sta(channel: u8) -> bool {
         {
             return false;
         }
-        let started = esp_idf_sys::esp_wifi_start();
+        let started = start_sta_driver_once();
         if started != esp_idf_sys::ESP_OK && started != esp_idf_sys::ESP_ERR_INVALID_STATE {
             return false;
         }
@@ -2311,7 +2545,14 @@ unsafe fn scan_dmesh_sta_candidate(
     preferred_ssid: &[u8],
     required_bssid: Option<[u8; 6]>,
 ) -> Option<ScannedStaCandidate> {
+    let scan_started_ms = scan_now_ms();
     let scan = esp_idf_sys::esp_wifi_scan_start(core::ptr::null(), true);
+    use dmesh_server::cbor::FieldValue::Unsigned as U;
+    sta_diagnostic("wifi.sta_scan", &[
+        (1, U(scan as u32 as u64)),
+        (2, U(scan_now_ms().wrapping_sub(scan_started_ms) as u64)),
+        (3, U(required_bssid.map(mac_number).unwrap_or(0))),
+    ]);
     if scan != esp_idf_sys::ESP_OK {
         uart::send_stat(b"wifi reconnect scan_result=", scan as u32 as u64);
         return None;
@@ -2384,6 +2625,7 @@ unsafe fn scan_dmesh_sta_candidate(
             .find(|record| record.bssid == selection.candidate.bssid)
             .map(|record| record.authmode)?,
         preferred: selection.preferred,
+        rssi_dbm: selection.candidate.rssi_dbm,
     })
 }
 

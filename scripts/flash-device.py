@@ -509,6 +509,24 @@ def nvs_boot_target_image(
 
 def write_verified(port: str, chip: str, pairs: list[tuple[str, Path]], baud: int,
                    reset_after: bool = False) -> None:
+    import tempfile
+
+    # Builds publish to shared artifact paths. Freeze every requested region
+    # before the first write so readback and retry always refer to the exact
+    # bytes submitted, even if another build replaces the original image.
+    with tempfile.TemporaryDirectory(prefix="dmesh-espflash-images-") as temporary:
+        snapshots = []
+        for index, (offset, image) in enumerate(pairs):
+            if not image.is_file():
+                raise RuntimeError(f"missing flash artifact: {image}")
+            snapshot = Path(temporary) / f"{index}-{image.name}"
+            shutil.copyfile(image, snapshot)
+            snapshots.append((offset, snapshot))
+        _write_verified_snapshot(port, chip, snapshots, baud, reset_after)
+
+
+def _write_verified_snapshot(port: str, chip: str, pairs: list[tuple[str, Path]], baud: int,
+                             reset_after: bool = False) -> None:
     import hashlib
     import tempfile
 

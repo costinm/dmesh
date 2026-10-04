@@ -175,6 +175,19 @@ fn encode_schema_fields_with_id(
     direct: bool,
 ) -> Result<Vec<u8>> {
     let mut request_fields = fields.clone();
+    // The catalog declares CBOR text fields. Numeric-looking settings (and
+    // SSIDs/names) must not become integer CBOR merely through CLI parsing.
+    if let Some(entry) = schema.method(method) {
+        for (name, value) in &mut request_fields {
+            let field = entry.fields.get(name).or_else(|| name.parse::<u32>().ok()
+                .and_then(|tag| entry.fields.values().find(|field| field.tag == tag)));
+            if field.is_some_and(|field| matches!(field.kind.as_deref(), Some("text" | "string")))
+                && (value.is_number() || value.is_boolean())
+            {
+                *value = Value::String(value.to_string());
+            }
+        }
+    }
     // `timeout=MS` is the envelope's allowance for the request, unless the
     // method declares a field of that name itself.
     let envelope_timeout = request_fields.remove("timeout");
@@ -343,8 +356,8 @@ mod tests {
 
         let mut wire = [0u8; 400];
         let used = dmesh_server::tagged::encode_numeric_response(
-            dmesh_server::services::DIAGNOSTIC_COMPONENT,
-            dmesh_server::services::DIAGNOSTIC_LOG_WATCH_METHOD,
+            208,
+            2,
             8,
             &result[..result_len],
             &mut wire,
@@ -352,7 +365,7 @@ mod tests {
         .unwrap();
         let rendered = render_device_record(&schema, &wire[..used]);
         assert!(!rendered.contains("kind=text"), "{rendered}");
-        assert!(rendered.contains("log-watch"), "{rendered}");
+        assert!(rendered.contains("log.watch"), "{rendered}");
         assert!(rendered.contains("remote diagnostic line"), "{rendered}");
     }
     use super::{
@@ -526,6 +539,13 @@ mod tests {
     }
 
     #[test]
+    fn numeric_looking_settings_values_remain_cbor_text() {
+        let wire = encode_stream_command_with_id("settings.set key=nan_dw_interval value=1", 42).unwrap();
+        assert_eq!(dmesh_server::control::decode_request(&wire),
+            Some(dmesh_server::control::Request::SettingsSet { key: b"nan_dw_interval", value: b"1" }));
+    }
+
+    #[test]
     fn probe_is_a_schema_driven_bearer_neutral_stream() {
         let named = encode_stream_command_with_id("settings.set key=name value=demo", 77)
             .expect("named fields");
@@ -662,6 +682,18 @@ mod tests {
     }
 
     #[test]
+    fn module_inventory_and_init_are_advertised_device_stream_methods() {
+        for (name, method) in [("module.status", 1), ("module.init", 2)] {
+            assert!(super::is_stream_command_name(name));
+            let command = encode_stream_command_with_id(name, 48).unwrap();
+            let record = dmesh_server::tagged::decode(&command).unwrap();
+            assert_eq!(record.component, Some(dmesh_server::tagged::Name::Tag(1000)));
+            assert_eq!(record.method, Some(dmesh_server::tagged::Name::Tag(method)));
+            assert_eq!(record.id, Some(48));
+        }
+    }
+
+    #[test]
     fn boot_recovery_is_an_empty_tagged_stream_request() {
         assert!(encode_direct_command("boot.recovery").is_err());
         let command =
@@ -689,21 +721,21 @@ mod tests {
     }
 
     #[test]
-    fn firmware_identity_is_a_read_only_tagged_stream_request() {
-        assert!(encode_direct_command("firmware.identity").is_err());
-        let command = encode_stream_command_with_id("firmware.identity", 47)
-            .expect("stream firmware identity request");
+    fn device_telemetry_is_a_read_only_tagged_stream_request() {
+        assert!(encode_direct_command("telemetry.device").is_err());
+        let command = encode_stream_command_with_id("telemetry.device", 47)
+            .expect("stream device telemetry request");
         let record = dmesh_server::tagged::decode(&command).expect("tagged identity request");
         assert_eq!(
             record.component,
             Some(dmesh_server::tagged::Name::Tag(
-                dmesh_server::services::FIRMWARE_COMPONENT,
+                dmesh_server::telemetry::TELEMETRY_COMPONENT,
             ))
         );
         assert_eq!(
             record.method,
             Some(dmesh_server::tagged::Name::Tag(
-                dmesh_server::services::FIRMWARE_IDENTITY_METHOD,
+                dmesh_server::telemetry::DEVICE_METHOD,
             ))
         );
         assert_eq!(record.id, Some(47));
@@ -842,9 +874,6 @@ mod tests {
         for (name, method) in [
             ("status", 1),
             ("services", 2),
-            ("metrics", 3),
-            ("events since=4", 4),
-            ("log-watch since=4 records=8", 5),
         ] {
             let wire = encode_stream_command_with_id(name, 91).unwrap();
             let record = dmesh_server::tagged::decode(&wire).unwrap();

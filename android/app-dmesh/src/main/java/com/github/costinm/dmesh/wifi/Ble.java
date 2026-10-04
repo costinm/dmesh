@@ -143,8 +143,10 @@ public final class Ble {
     public boolean connect(String address, int psm) {
         return connectChannel(address, psm, false);
     }
+    /** Pairing is a plain, unencrypted CoC like any other: no bond and no prompt. The shared secret
+     *  the device installs, not the BLE link, authenticates and encrypts everything after. */
     public boolean pair(String address, int psm) {
-        return connectChannel(address, psm, true);
+        return connectChannel(address, psm, false);
     }
     private boolean connectChannel(String address, int psm, boolean requireBond) {
         if (address == null || address.isEmpty()) { emit("coc_connect_invalid", new byte[0]); return false; }
@@ -153,7 +155,13 @@ public final class Ble {
         BluetoothAdapter adapter = manager == null ? null : manager.getAdapter();
         if (adapter == null || !adapter.isEnabled()) { emit("coc_unavailable", new byte[0]); return false; }
         final BluetoothDevice device;
-        try { device = adapter.getRemoteDevice(address); } catch (Exception exception) {
+        // A DMesh companion is an LE-only peripheral. Say so: a device the stack has not seen as LE
+        // is bonded over classic BR/EDR (a page timeout, then no bond at all).
+        try {
+            device = android.os.Build.VERSION.SDK_INT >= 33
+                    ? adapter.getRemoteLeDevice(address.toUpperCase(), BluetoothDevice.ADDRESS_TYPE_PUBLIC)
+                    : adapter.getRemoteDevice(address.toUpperCase());
+        } catch (Exception exception) {
             emit("coc_connect_invalid", new byte[0]);
             return false;
         }
@@ -184,18 +192,8 @@ public final class Ble {
     private void runCoc(BluetoothDevice device, String address, int channelPsm, boolean requireBond) {
         BluetoothSocket channel = null;
         try {
-            if (requireBond && device.getBondState() != BluetoothDevice.BOND_BONDED) {
-                if (!device.createBond()) { emit("coc_bond_rejected", new byte[0]); return; }
-                long deadline = android.os.SystemClock.elapsedRealtime() + 30_000;
-                while (!cocClosing && device.getBondState() != BluetoothDevice.BOND_BONDED
-                        && android.os.SystemClock.elapsedRealtime() < deadline) {
-                    Thread.sleep(250);
-                }
-                if (cocClosing || device.getBondState() != BluetoothDevice.BOND_BONDED) {
-                    emit("coc_bond_failed", new byte[0]); return;
-                }
-            }
             if (scanner != null && has(Manifest.permission.BLUETOOTH_SCAN)) {
+                // A scan hit first, so the stack knows the peer is an LE device before bonding.
                 // Dedicated callback: the persistent scan() callback may
                 // already be registered, and reusing it here would either
                 // fail startScan or make stopScan tear down the ongoing
@@ -209,6 +207,17 @@ public final class Ble {
                     Thread.sleep(1500);
                 } finally {
                     scanner.stopScan(prescan);
+                }
+            }
+            if (requireBond && device.getBondState() != BluetoothDevice.BOND_BONDED) {
+                if (!device.createBond()) { emit("coc_bond_rejected", new byte[0]); return; }
+                long deadline = android.os.SystemClock.elapsedRealtime() + 30_000;
+                while (!cocClosing && device.getBondState() != BluetoothDevice.BOND_BONDED
+                        && android.os.SystemClock.elapsedRealtime() < deadline) {
+                    Thread.sleep(250);
+                }
+                if (cocClosing || device.getBondState() != BluetoothDevice.BOND_BONDED) {
+                    emit("coc_bond_failed", new byte[0]); return;
                 }
             }
             if (cocClosing) { emit("coc_connect_aborted", new byte[0]); return; }

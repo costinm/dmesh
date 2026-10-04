@@ -13,8 +13,7 @@ use anyhow::Context;
 #[cfg(target_os = "android")]
 use async_trait::async_trait;
 use dmesh_server::discovery::{
-    DiscoveredDevice, DiscoveryObservation, DiscoveryPacketKind, OBSERVATION_PAYLOAD_FINGERPRINT,
-    OBSERVATION_PEER, OBSERVATION_RSSI,
+    DiscoveredDevice,
 };
 use dmesh_store::{FrameRecord, StoreCommand};
 use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JString};
@@ -23,8 +22,6 @@ use jni::sys::JNI_VERSION_1_6;
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong};
 use jni::{JNIEnv, JavaVM};
 use serde_json::{Value, json};
-#[cfg(target_os = "android")]
-use sha2::{Digest, Sha256};
 use ssh_mesh::MeshListener;
 use ssh_mesh::sshc::SshClientListener;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -59,11 +56,11 @@ const BRIDGE_PORT: u16 = 1;
 const MAX_BRIDGE_MESSAGE_BYTES: usize = 2 * 1024;
 static BRIDGE_SENDERS: OnceLock<Mutex<HashMap<u64, UnboundedSender<Vec<u8>>>>> = OnceLock::new();
 static STORE_SENDER: OnceLock<UnboundedSender<StoreCommand>> = OnceLock::new();
-/// Every discovery bearer updates this Rust-owned view before Java keeps any
-/// short-lived NAN `PeerHandle`. The inventory is advisory and unsigned;
-/// entries expire after one hour. NAN Service Info, UDP multicast announces,
-/// and future control-plane observations therefore share one device map.
-static DISCOVERED_DEVICES: OnceLock<Mutex<BTreeMap<String, DiscoveredDevice>>> = OnceLock::new();
+/// Discovered devices live in the shared `dmesh-discovery` engine inventory:
+/// UDP multicast, NAN Service Info and follow-ups, and future control-plane
+/// observations all update that one inventory, and short-lived NAN
+/// `PeerHandle`s are never kept by Java. The inventory is advisory and unsigned
+/// for peers that send no key; entries expire after one hour.
 /// Platform adapters report the device's current interface/address snapshot;
 /// Rust owns this table so routing and multicast discovery make the same
 /// decision on Android and Linux.  It is a replacement snapshot, not a Java
@@ -82,7 +79,6 @@ static NAN_FOLLOWUPS: OnceLock<Mutex<VecDeque<FrameRecord>>> = OnceLock::new();
 /// history distinct so `radio.nan.followups` has the same receipt semantics
 /// as the host and ESP handlers.
 static NAN_EVENTS: OnceLock<Mutex<VecDeque<FrameRecord>>> = OnceLock::new();
-const DISCOVERED_DEVICE_TTL_MS: i64 = 60 * 60 * 1000;
 const NAN_FOLLOWUP_HISTORY_LEN: usize = 32;
 const NAN_EVENT_HISTORY_LEN: usize = 64;
 const BLE_SCAN_RESULT_MAX: usize = 32;
@@ -123,6 +119,15 @@ pub(crate) fn record_ble_scan_result(event: &str, payload: &[u8]) {
     if address.is_empty() || !address.chars().all(|c| c.is_ascii_hexdigit() || c == ':') {
         return;
     }
+    tracing::info!(
+        target: "dmesh.event",
+        event_type = "ble.scan_result",
+        trace_prechecked = true,
+        address = %address,
+        mode = %mode,
+        rssi = %rssi.map_or_else(String::new, |value| value.to_string()),
+        message = "event"
+    );
     let mut results = match ble_scan_results_store().lock() {
         Ok(guard) => guard,
         Err(guard) => guard.into_inner(),
@@ -179,7 +184,26 @@ pub(crate) fn ble_scan_clear() -> Value {
     json!({"status": "cleared"})
 }
 
+/// Retain one NAN observation as a `log.watch` record: `kind` is the event
+/// type and the other fields describe the frame.
+fn trace_nan_frame(event_type: &str, frame: &FrameRecord) {
+    let msg_type = frame.msg_type.as_deref().unwrap_or("");
+    let target = frame.target_device.as_deref().unwrap_or("");
+    tracing::info!(
+        target: "dmesh.event",
+        event_type = %event_type,
+        trace_prechecked = true,
+        protocol = %frame.protocol,
+        event = %msg_type,
+        peer = %frame.src_device,
+        target_device = %target,
+        payload_hash = %frame.payload_hash,
+        message = "event"
+    );
+}
+
 fn record_nan_followup(frame: FrameRecord) {
+    trace_nan_frame("nan.followup", &frame);
     if let Ok(mut history) = nan_followups().lock() {
         if history.len() == NAN_FOLLOWUP_HISTORY_LEN {
             history.pop_front();
@@ -189,6 +213,7 @@ fn record_nan_followup(frame: FrameRecord) {
 }
 
 fn record_nan_event(frame: FrameRecord) {
+    trace_nan_frame("nan.event", &frame);
     if let Ok(mut history) = nan_events().lock() {
         // Lifecycle callbacks describe the state used by `telemetry.nan_status`.
         // Routine discovery callbacks can be arbitrarily frequent, so they must
@@ -277,8 +302,13 @@ fn store_sender() -> Option<&'static UnboundedSender<StoreCommand>> {
     STORE_SENDER.get()
 }
 
-fn discovered_devices() -> &'static Mutex<BTreeMap<String, DiscoveredDevice>> {
-    DISCOVERED_DEVICES.get_or_init(|| Mutex::new(BTreeMap::new()))
+/// The discovered devices in the shape the JSON-reading consumers (status
+/// text, the JSON bridge, companion lookup) read, from the engine inventory.
+/// Empty before the mesh has started and installed the engine.
+fn discovered_devices_view() -> BTreeMap<String, DiscoveredDevice> {
+    discovery_engine()
+        .map(|engine| engine.discovered_view())
+        .unwrap_or_default()
 }
 
 fn local_networks() -> &'static Mutex<dmesh_server::local_networks::LocalNetworkTable> {
@@ -362,6 +392,17 @@ pub(crate) fn android_telemetry_response(request: &[u8]) -> Option<Vec<u8>> {
         &mut response,
     )?;
     Some(response[..size].to_vec())
+}
+
+/// The running node's per-association and per-bearer rows.
+#[cfg(target_os = "android")]
+async fn android_node_rows(
+) -> Result<(Vec<quic_lite::AssociationRow>, Vec<quic_lite::BearerRow>), String> {
+    crate::bearer::current()
+        .ok_or_else(|| "the QUIC node is not running".to_owned())?
+        .rows()
+        .await
+        .ok_or_else(|| "QUIC telemetry is unavailable".to_owned())
 }
 
 #[cfg(target_os = "android")]
@@ -508,104 +549,20 @@ pub(crate) fn android_services_response(request: &[u8]) -> Option<Vec<u8>> {
     Some(response[..size].to_vec())
 }
 
-/// Shared component-9 `events` and `log-watch`, projected from the retained
-/// Android observation history.
-#[cfg(target_os = "android")]
-pub(crate) fn android_diag_events_response(request: &[u8], log_watch: bool) -> Option<Vec<u8>> {
-    let record = dmesh_server::tagged::decode(request)?;
-    let dmesh_server::tagged::Name::Tag(component) = record.component? else {
-        return None;
-    };
-    let dmesh_server::tagged::Name::Tag(method) = record.method? else {
-        return None;
-    };
-    let expected_method = if log_watch {
-        dmesh_server::services::DIAGNOSTIC_LOG_WATCH_METHOD
-    } else {
-        dmesh_server::services::DIAGNOSTIC_EVENTS_METHOD
-    };
-    if u64::from(component) != dmesh_server::services::DIAGNOSTIC_COMPONENT
-        || u64::from(method) != expected_method
-    {
-        return None;
-    }
-    let fields = dmesh_server::services::decode_diagnostic_fields(record.fields)?;
-    let (since, records) = fields;
-    let history = android_radio_history(records, since, None);
-    if !log_watch {
-        return android_json_response(
-            request,
-            dmesh_server::services::DIAGNOSTIC_COMPONENT,
-            method,
-            &history,
-        );
-    }
-    let cursor = history
-        .get("events")
-        .and_then(Value::as_array)
-        .and_then(|events| events.first())
-        .and_then(|event| event.get("last_seen_ms"))
-        .and_then(Value::as_u64)
-        .unwrap_or(since.unwrap_or(0));
-    let rendered = history
-        .get("events")
-        .and_then(Value::as_array)
-        .map(|events| {
-            events
-                .iter()
-                .map(|event| {
-                    serde_json::json!({
-                        "sequence": event.get("last_seen_ms"),
-                        "line": serde_json::to_string(event).unwrap_or_default(),
-                    })
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    android_json_response(
-        request,
-        dmesh_server::services::DIAGNOSTIC_COMPONENT,
-        method,
-        &serde_json::json!({"cursor": cursor, "records": rendered}),
-    )
-}
-
-/// Shared component-12 host identity for the Android adapter.
+/// `firmware.identity`: the running service's name, version and uptime.
 #[cfg(target_os = "android")]
 pub(crate) fn android_identity_response(request: &[u8]) -> Option<Vec<u8>> {
     android_json_response(
         request,
-        dmesh_server::services::FIRMWARE_COMPONENT,
-        dmesh_server::services::FIRMWARE_IDENTITY_METHOD,
+        dmesh_server::telemetry::TELEMETRY_COMPONENT,
+        dmesh_server::telemetry::DEVICE_METHOD,
         &serde_json::json!({
-            "name": "dmesh",
             "version": env!("CARGO_PKG_VERSION"),
+            "cpu_type": std::env::consts::ARCH,
             "role": "android",
-            "uptime_secs": android_uptime_secs(),
+            "total_ram_bytes": dmesh_server::telemetry::host_total_ram_bytes(),
         }),
     )
-}
-
-/// Shared runtime and power snapshots. Android reports its retained battery
-/// observation through the shared power state; it has no allocator or
-/// packet-pool telemetry, so `memory.snapshot` is not registered.
-#[cfg(target_os = "android")]
-pub(crate) fn android_snapshot_response(request: &[u8], component: u64) -> Option<Vec<u8>> {
-    let result = match component {
-        dmesh_server::services::RUNTIME_SNAPSHOT_COMPONENT => serde_json::json!({
-            "role": "android",
-            "version": env!("CARGO_PKG_VERSION"),
-            "uptime_secs": android_uptime_secs(),
-        }),
-        dmesh_server::services::POWER_SNAPSHOT_COMPONENT => {
-            let state = power_state().lock().ok()?.battery;
-            serde_json::json!({
-                "battery": dmesh_server::power::battery_json_status(state),
-            })
-        }
-        _ => return None,
-    };
-    android_json_response(request, component, 1, &result)
 }
 
 /// Shared BLE component surface for the Android stream path. The framework
@@ -695,7 +652,7 @@ fn update_local_networks(payload: &[u8]) -> anyhow::Result<usize> {
 /// lmesh. Android's JSON inventory remains useful to its UI, but a QUIC peer
 /// must receive this CBOR shape so controller-side discovery can merge
 /// observer provenance without a platform exception.
-#[cfg(target_os = "android")]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
 pub(crate) fn android_discovery_nodes_response(request: &[u8]) -> Option<Vec<u8>> {
     let record = dmesh_server::tagged::decode(request)?;
     if record.to.is_some()
@@ -704,73 +661,11 @@ pub(crate) fn android_discovery_nodes_response(request: &[u8]) -> Option<Vec<u8>
     {
         return None;
     }
-    let id = record.id?;
-    let devices = discovered_devices().lock().ok()?;
-    let mut ids = Vec::<[u8; 16]>::new();
-    let mut device_keys = Vec::<String>::new();
-    for (device_id, _) in devices.iter().take(8) {
-        let Ok(value) = hex_to_bytes(device_id) else {
-            continue;
-        };
-        if value.is_empty() || value.len() > 16 {
-            continue;
-        }
-        let mut stable_id = [0u8; 16];
-        stable_id[..value.len()].copy_from_slice(&value);
-        ids.push(stable_id);
-        device_keys.push(device_id.clone());
-    }
-    let mut metadata = Vec::<dmesh_server::announce::ObservedDevice>::new();
-    for (device_id, stable_id) in device_keys.iter().zip(ids.iter()) {
-        let device = devices.get(device_id)?;
-        let value = hex_to_bytes(device_id).ok()?;
-        let observation = device.observations.values().next();
-        let available_fields = observation
-            .map(|observation| observation.available_fields)
-            .unwrap_or(dmesh_server::discovery::OBSERVATION_PAYLOAD_FINGERPRINT);
-        metadata.push(dmesh_server::announce::ObservedDevice {
-            device_id: &stable_id[..value.len()],
-            // Android's PeerHandle is intentionally opaque. It is not a MAC
-            // and must not be serialized as one; a nonzero semantic id above
-            // is the cross-bearer merge key.
-            peer: [0; 6],
-            bssid: None,
-            channel: None,
-            available_fields,
-            first_seen_ms: observation
-                .map(|value| u32::try_from(value.first_seen_ms).unwrap_or(u32::MAX))
-                .unwrap_or(0),
-            last_seen_ms: observation
-                .map(|value| u32::try_from(value.last_seen_ms).unwrap_or(u32::MAX))
-                .unwrap_or(0),
-            packets: observation.map(|value| value.packets).unwrap_or(0),
-            active_publish_rx: observation
-                .map(|value| value.active_publish_rx)
-                .unwrap_or(0),
-            active_subscribe_rx: observation
-                .map(|value| value.active_subscribe_rx)
-                .unwrap_or(0),
-            followup_rx: observation.map(|value| value.followup_rx).unwrap_or(0),
-            last_kind: observation.map(|value| value.last_kind as u8).unwrap_or(0),
-            last_payload_len: observation.map(|value| value.last_payload_len).unwrap_or(0),
-            last_payload_hash: observation
-                .map(|value| value.last_payload_hash)
-                .unwrap_or(0),
-        });
-    }
-    let mut direct = [0u8; 1024];
-    let direct_len =
-        dmesh_server::announce::encode_devices_observed_response(&metadata, &mut direct)?;
-    let fields = dmesh_server::tagged::decode(&direct[..direct_len])?.fields?;
-    let mut response = [0u8; 1100];
-    let response_len = dmesh_server::tagged::encode_numeric_response(
-        dmesh_server::announce::ANNOUNCE_COMPONENT,
-        dmesh_server::announce::ANNOUNCE_DEVICES_OBSERVED,
-        id,
-        fields,
-        &mut response,
-    )?;
-    Some(response[..response_len].to_vec())
+    // One row per device and bearer, from the shared inventory.
+    let devices = discovery_engine()
+        .map(|engine| engine.devices())
+        .unwrap_or_default();
+    dmesh_discovery::nodes::response(&devices, record.id?, false)
 }
 
 /// Schedule Android's framework-owned NAN active-discovery operation from the
@@ -981,15 +876,36 @@ pub(crate) fn register_android_methods() {
     ) & register(
         methods::TELEMETRY_QUIC_METRICS,
         AsyncFn::new(android_quic_metrics_handler),
+    ) & register(
+        methods::TELEMETRY_QUIC_ASSOCIATIONS,
+        TypedHandler::new(
+            |_: dmesh_server::platform_api::TelemetryQuicAssociationsRequest, _: CallContext| async {
+                let (associations, bearers) = android_node_rows().await?;
+                Ok(dmesh_server::telemetry::quic_associations_response(&associations, &bearers))
+            },
+        ),
+    ) & register(
+        methods::TELEMETRY_BEARERS,
+        TypedHandler::new(
+            |_: dmesh_server::platform_api::TelemetryBearersRequest, _: CallContext| async {
+                let (_, bearers) = android_node_rows().await?;
+                Ok(dmesh_server::telemetry::bearers_response(&bearers))
+            },
+        ),
     ) & register(methods::STATUS, SyncBytesFn(android_diag_status_response))
         & register(methods::SERVICES, SyncBytesFn(android_services_response))
         & register(
-            methods::EVENTS,
-            SyncBytesFn(|request| android_diag_events_response(request, false)),
-        )
-        & register(
-            methods::LOG_WATCH,
-            SyncBytesFn(|request| android_diag_events_response(request, true)),
+            methods::TELEMETRY_MEMORY,
+            TypedHandler::new(
+                |_: dmesh_server::platform_api::TelemetryMemoryRequest, _: CallContext| async {
+                    dmesh_server::telemetry::process_rss_bytes().map(|rss| {
+                        dmesh_server::platform_api::TelemetryMemoryResponse {
+                            process_rss_bytes: Some(rss),
+                            ..Default::default()
+                        }
+                    })
+                },
+            ),
         )
         & register_all(
             &[
@@ -1031,26 +947,39 @@ pub(crate) fn register_android_methods() {
             dmesh_server::probe::ProbeHandler,
         )
         & register(
-            methods::FIRMWARE_IDENTITY,
+            methods::TELEMETRY_DEVICE,
             SyncBytesFn(android_identity_response),
-        )
-        & register(
-            methods::RUNTIME_SNAPSHOT,
-            SyncBytesFn(|request| {
-                android_snapshot_response(
-                    request,
-                    dmesh_server::services::RUNTIME_SNAPSHOT_COMPONENT,
-                )
-            }),
-        )
-        & register(
-            methods::POWER_SNAPSHOT,
-            SyncBytesFn(|request| {
-                android_snapshot_response(request, dmesh_server::services::POWER_SNAPSHOT_COMPONENT)
-            }),
         );
     if !registered {
         log::debug!("Android numbered methods were already registered");
+    }
+    register_android_log_watch();
+}
+
+/// `log.watch` over the process's `tracing` history. Periodic snapshots go
+/// through the process registry, so a snapshot is exactly the response of the
+/// telemetry method it names; `telemetry.quic` needs an async runtime and is
+/// reported as skipped.
+#[cfg(target_os = "android")]
+fn register_android_log_watch() {
+    let Some(buffer) = ANDROID_TELEMETRY.get().cloned() else {
+        return;
+    };
+    let dispatch: dmesh_server::log_watch::Dispatch = Arc::new(|request| {
+        dmesh_server::registry::dispatch_now(
+            request,
+            dmesh_server::registry::CallContext::local(),
+        )
+    });
+    let registered = dmesh_server::registry::register_stream(
+        dmesh_server::registry::methods::LOG_WATCH_RECORDS,
+        dmesh_server::log_watch::LogWatchHandler::new(
+            Arc::new(dmesh_server::log_watch::MeshLogSource(buffer)),
+            Some(dispatch),
+        ),
+    );
+    if !registered {
+        log::debug!("Android log.watch was already registered");
     }
 }
 
@@ -1077,8 +1006,6 @@ struct AndroidCompanionBackend;
 /// Android by `configure_android_mesh_paths`; host tests may set it to a
 /// temporary directory to exercise companion-aware surfaces.
 static ANDROID_OWNED_DEVICES_PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
-#[cfg(target_os = "android")]
-static ANDROID_WIFI_COMPANION: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 #[cfg(target_os = "android")]
 fn accepted_android_companion(value: Value) -> anyhow::Result<Value> {
@@ -1095,9 +1022,7 @@ fn android_require_owned_companion(
     id: &str,
     expected_vip6: Option<&str>,
 ) -> anyhow::Result<(String, String)> {
-    let devices = discovered_devices()
-        .lock()
-        .map_err(|_| anyhow::anyhow!("discovery inventory poisoned"))?;
+    let devices = discovered_devices_view();
     let (device_id, device) = devices
         .iter()
         .find(|(device_id, device)| {
@@ -1127,7 +1052,6 @@ fn android_require_owned_companion(
         .context("signed companion has no public key")?
         .to_owned();
     let device_id = device_id.clone();
-    drop(devices);
     let path = ANDROID_OWNED_DEVICES_PATH
         .get()
         .context("Android owned-device inventory path unavailable")?;
@@ -1178,9 +1102,6 @@ impl dmesh_server::companion_service::CompanionBackend for AndroidCompanionBacke
                 )
                 .context("Android BLE callback is unavailable")?,
             ),
-            "wifi" => anyhow::bail!(
-                "Wi-Fi companion provisioning is not implemented; use BLE or direct UART"
-            ),
             _ => anyhow::bail!("unsupported Android companion kind: {kind}"),
         }
     }
@@ -1195,17 +1116,6 @@ impl dmesh_server::companion_service::CompanionBackend for AndroidCompanionBacke
                     android_ble_command("companion.unpair", &json!({"kind": kind, "id": id}))
                         .context("Android BLE callback is unavailable")?,
                 )
-            }
-            "wifi" => {
-                let mut paired = ANDROID_WIFI_COMPANION
-                    .get_or_init(|| Mutex::new(None))
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("Wi-Fi companion state poisoned"))?;
-                if paired.as_deref() != Some(id.as_str()) {
-                    anyhow::bail!("Wi-Fi companion is not locally paired");
-                }
-                *paired = None;
-                Ok(json!({"paired": false, "kind": "wifi", "released": id}))
             }
             _ => anyhow::bail!("unsupported Android companion kind: {kind}"),
         }
@@ -1645,7 +1555,7 @@ fn bearer_letter(bearer: &str) -> char {
         "ble" => 'B',
         "now" | "espnow" | "raw_action" => 'N',
         "usb" => 'U',
-        "udp_multicast" => 'W',
+        "udp" | "udp_multicast" => 'W',
         other => other
             .chars()
             .next()
@@ -1752,13 +1662,7 @@ impl StatusRow {
 /// mesh service, so Java never formats discovery state itself.
 pub(crate) fn status_text() -> String {
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let devices = discovered_devices().lock().map_or_else(
-        |_| BTreeMap::new(),
-        |mut devices| {
-            prune_discovered_devices(&mut devices, now_ms);
-            devices.clone()
-        },
-    );
+    let devices = discovered_devices_view();
     let networks = local_networks()
         .lock()
         .map_or_else(|_| BTreeMap::new(), |table| table.networks.clone());
@@ -2020,34 +1924,64 @@ pub(crate) fn register_probe_service(services: &ssh_mesh::mesh_rest::MeshService
 }
 
 /// Route the HTTP `status` service to the registry.
+/// Route the HTTP `telemetry` and `log` services to the registry, so the web UI
+/// and any HTTP client reach `telemetry.*` and `log.watch` through the
+/// JSON-to-CBOR translator.
+#[cfg(target_os = "android")]
+pub(crate) fn register_telemetry_services(
+    services: &ssh_mesh::mesh_rest::MeshServiceRegistry,
+) -> bool {
+    register_gateway_route(services, "telemetry");
+    register_gateway_route(services, "log");
+    true
+}
+
 #[cfg(target_os = "android")]
 pub(crate) fn register_status_service(services: &ssh_mesh::mesh_rest::MeshServiceRegistry) -> bool {
     register_gateway_route(services, "status");
     true
 }
 
-/// Build Android's current bearer-neutral presence record from framework
-/// facts already retained by Rust.  Both UDP directed discovery and the
-/// Java NAN projection use this identity/routing shape: Android must not
-/// advertise a second, UDP-only identity or a synthetic endpoint.
-#[cfg(target_os = "android")]
-pub(crate) fn android_discovery_announce(
-    public_key: &str,
-    uptime_secs: u32,
-) -> dmesh_server::announce::Announce {
-    let digest = Sha256::digest(public_key.as_bytes());
-    let mut device_id = [0u8; 16];
-    device_id.copy_from_slice(&digest[..16]);
-    let mut announce =
-        dmesh_server::announce::Announce::discovery(device_id, device_id.len() as u8, uptime_secs);
-    announce.set_probe_descriptor(
-        dmesh_server::announce::DEVICE_CLASS_ANDROID,
-        dmesh_server::probe::PROBE_CAP_NAN
-            | dmesh_server::probe::PROBE_CAP_STA
-            | dmesh_server::probe::PROBE_CAP_AP
-            | dmesh_server::probe::PROBE_CAP_UDP6,
-    );
-    if let Ok(networks) = local_networks().lock() {
+/// The discovery engine for this process, installed when the mesh starts.
+static DISCOVERY_ENGINE: OnceLock<Arc<dmesh_discovery::Engine>> = OnceLock::new();
+
+pub(crate) fn discovery_engine() -> Option<&'static Arc<dmesh_discovery::Engine>> {
+    DISCOVERY_ENGINE.get()
+}
+
+/// Install (once) the engine whose device id is the hash of this node's SSH
+/// public key, as Android has always advertised it.
+pub(crate) fn install_discovery_engine(public_key: &str) -> Arc<dmesh_discovery::Engine> {
+    DISCOVERY_ENGINE
+        .get_or_init(|| {
+            Arc::new(dmesh_discovery::Engine::new(
+                Arc::new(dmesh_discovery::UnsignedIdentity::from_seed(
+                    public_key.as_bytes(),
+                )),
+                Arc::new(AndroidFacts),
+            ))
+        })
+        .clone()
+}
+
+/// What Android says about itself in its announce, from framework facts
+/// already retained by Rust. UDP directed discovery and the Java NAN
+/// projection use this one identity/routing shape: Android must not advertise
+/// a second, UDP-only identity or a synthetic endpoint.
+pub(crate) struct AndroidFacts;
+
+impl dmesh_discovery::LocalFacts for AndroidFacts {
+    fn describe(&self, announce: &mut dmesh_server::announce::Announce) {
+        announce.set_probe_descriptor(
+            dmesh_server::announce::DEVICE_CLASS_ANDROID,
+            dmesh_server::probe::PROBE_CAP_NAN
+                | dmesh_server::probe::PROBE_CAP_STA
+                | dmesh_server::probe::PROBE_CAP_AP
+                | dmesh_server::probe::PROBE_CAP_UDP6,
+        );
+        let Ok(networks) = local_networks().lock() else {
+            return;
+        };
         let Some(network) = networks.networks.values().find(|network| {
             network.active
                 && network
@@ -2055,7 +1989,7 @@ pub(crate) fn android_discovery_announce(
                     .iter()
                     .any(|transport| transport == "wifi")
         }) else {
-            return announce;
+            return;
         };
         if let Some(ssid) = network.ssid.as_deref().filter(|ssid| !ssid.is_empty()) {
             let _ = announce.set_network_name(ssid);
@@ -2071,85 +2005,28 @@ pub(crate) fn android_discovery_announce(
             announce.set_udp_port(dmesh_server::firmware_profile::DEFAULT_EVENT_PORT);
         }
     }
-    announce
-}
 
-/// Return the unsigned, receiver-side NAN facts carried beside Android's
-/// signed discovery record. Wi-Fi Aware does not expose a peer cluster/BSSID
-/// through its public API, so the cluster suffix stays absent; service receipt
-/// and visible-node counts come from the same bounded NAN observation cache
-/// returned by `discovery.nodes`.
-#[cfg(target_os = "android")]
-pub(crate) fn android_discovery_facts() -> dmesh_server::announce::DiscoveryFacts {
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    let Ok(mut devices) = discovered_devices().lock() else {
-        return dmesh_server::announce::DiscoveryFacts::default();
-    };
-    prune_discovered_devices(&mut devices, now_ms);
-    let mut services = 0u16;
-    let mut nodes = 0u16;
-    for device in devices.values() {
-        if let Some(observation) = device.observations.get("nan") {
-            nodes = nodes.saturating_add(1);
-            services =
-                services.saturating_add(u16::try_from(observation.packets).unwrap_or(u16::MAX));
+    /// The unsigned, receiver-side NAN facts carried beside Android's
+    /// discovery record. Wi-Fi Aware does not expose a peer cluster/BSSID
+    /// through its public API, so the cluster suffix stays absent; service
+    /// receipt and visible-node counts come from the NAN observation cache
+    /// returned by `discovery.nodes`.
+    fn radio_facts(&self) -> Option<dmesh_server::announce::DiscoveryFacts> {
+        let devices = discovery_engine()?.devices();
+        let mut services = 0u16;
+        let mut nodes = 0u16;
+        for device in &devices {
+            if let Some(observation) = device.observations.get("nan") {
+                nodes = nodes.saturating_add(1);
+                services = services
+                    .saturating_add(u16::try_from(observation.packets).unwrap_or(u16::MAX));
+            }
         }
-    }
-    dmesh_server::announce::DiscoveryFacts {
-        nan_cluster_suffix: None,
-        nan_service_observations: services,
-        nan_visible_nodes: nodes,
-    }
-}
-
-fn prune_discovered_devices(devices: &mut BTreeMap<String, DiscoveredDevice>, now_ms: i64) {
-    devices
-        .retain(|_, device| now_ms.saturating_sub(device.last_seen_ms) <= DISCOVERED_DEVICE_TTL_MS);
-}
-
-fn observe_packet(
-    device: &mut DiscoveredDevice,
-    bearer: &str,
-    kind: &str,
-    peer: &str,
-    payload: &[u8],
-    rssi_dbm: Option<i32>,
-    now_ms: i64,
-) {
-    let kind = match kind {
-        "active_publish" => DiscoveryPacketKind::ActivePublish,
-        "active_subscribe" => DiscoveryPacketKind::ActiveSubscribe,
-        "followup" => DiscoveryPacketKind::Followup,
-        _ => DiscoveryPacketKind::Other,
-    };
-    let available_fields = OBSERVATION_PEER
-        | OBSERVATION_PAYLOAD_FINGERPRINT
-        | if rssi_dbm.is_some() {
-            OBSERVATION_RSSI
-        } else {
-            0
-        };
-    let observation = device
-        .observations
-        .entry(bearer.to_owned())
-        .or_insert_with(|| DiscoveryObservation::new(now_ms, available_fields));
-    // A framework RSSI callback is an actual available fact; leave the bit
-    // clear when Android did not supply one rather than displaying a made-up
-    // zero. Keep earlier capability facts if a later callback omits RSSI.
-    observation.available_fields |= available_fields;
-    observation.observe(
-        now_ms,
-        kind,
-        peer,
-        None,
-        None,
-        rssi_dbm.and_then(|value| i16::try_from(value).ok()),
-        payload,
-    );
-    device.last_seen_ms = now_ms;
-    if !peer.is_empty() {
-        device.peer = peer.to_owned();
-        device.transports.insert(bearer.to_owned(), peer.to_owned());
+        Some(dmesh_server::announce::DiscoveryFacts {
+            nan_cluster_suffix: None,
+            nan_service_observations: services,
+            nan_visible_nodes: nodes,
+        })
     }
 }
 
@@ -2234,81 +2111,45 @@ fn observe_nan_followup_packet(
         }));
     }
     if !src_device.is_empty() {
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        if let Ok(mut devices) = discovered_devices().lock() {
-            prune_discovered_devices(&mut devices, now_ms);
-            let device = devices
-                .entry(src_device.to_ascii_lowercase())
-                .or_insert_with(|| DiscoveredDevice {
-                    last_seen_ms: now_ms,
-                    peer: String::new(),
-                    info: json!({"protocol": "dmesh_nan_followup"}),
-                    transports: BTreeMap::new(),
-                    observations: BTreeMap::new(),
-                });
-            observe_packet(device, "nan", "followup", peer, payload, rssi_dbm, now_ms);
+        if let Some(engine) = discovery_engine() {
+            let mut carrier = dmesh_discovery::Carrier::radio(
+                "nan",
+                peer,
+                dmesh_server::discovery::DiscoveryPacketKind::Followup,
+            );
+            carrier.rssi_dbm = rssi_dbm.and_then(|value| i16::try_from(value).ok());
+            engine.observe_provisional(&carrier, src_device, payload);
         }
     }
     Ok(json!({"status": "ok", "packet_kind": "followup", "source": src_device}))
 }
 
-/// Record a validated common announce from any Android discovery bearer.
-/// `source` is provenance only: boot and periodic presence records update one
-/// Rust-owned inventory whether UDP multicast, NAN Service Info, or a future
-/// control-plane adapter delivered them.
+/// Record a common announce from any Android discovery bearer.
+/// `source` is provenance only: boot and periodic presence records update the
+/// one inventory whether UDP multicast, NAN Service Info, or a future
+/// control-plane adapter delivered them. UDP datagrams the engine reads itself
+/// are recorded by its own receive path; this entry is for adapters (NAN) that
+/// decode the announce themselves.
 pub(crate) fn observe_announce(
     announce: dmesh_server::announce::Announce,
     peer: String,
     source: &str,
     payload: &[u8],
 ) {
-    if !dmesh_server::announce::verify_identity(announce) {
-        return;
-    }
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    let Ok(mut devices) = discovered_devices().lock() else {
+    use dmesh_server::discovery::DiscoveryPacketKind;
+    let Some(engine) = discovery_engine() else {
         return;
     };
-    prune_discovered_devices(&mut devices, now_ms);
-    let id = bytes_to_hex(announce.device_id());
-    let device = devices
-        .entry(id.clone())
-        .or_insert_with(|| DiscoveredDevice {
-            last_seen_ms: now_ms,
-            peer: String::new(),
-            info: Value::Null,
-            transports: BTreeMap::new(),
-            observations: BTreeMap::new(),
-        });
-    let bearer = if source.starts_with("nan") {
-        "nan"
-    } else {
-        source
+    let (bearer, kind) = match source {
+        "nan_followup" => ("nan", DiscoveryPacketKind::Followup),
+        source if source.starts_with("nan") => ("nan", DiscoveryPacketKind::ActivePublish),
+        other => (other, DiscoveryPacketKind::Other),
     };
-    let kind = match source {
-        "nan_followup" => "followup",
-        _ if bearer == "nan" => "active_publish",
-        _ => "announce",
-    };
-    observe_packet(device, bearer, kind, &peer, payload, None, now_ms);
-    device.info = json!({
-        "protocol": "dmesh_announce",
-        "device_id": id,
-        "signed": announce.has_identity(),
-        "public_key": announce.public_key().iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
-        "kind": announce.kind,
-        "uptime_secs": announce.uptime_secs,
-        "device_class": announce.device_class,
-        "probe_capabilities": announce.probe_capabilities,
-        "device_name": announce.device_name(),
-        "network_name": announce.network_name(),
-        "sta_link_local_v6": announce.sta_link_local_v6().map(std::net::Ipv6Addr::from).map(|address| address.to_string()),
-        "udp_link_local_v6": announce.udp_link_local_v6().map(std::net::Ipv6Addr::from).map(|address| address.to_string()),
-        "udp_port": announce.udp_port,
-        "vip6": dmesh_server::announce::virtual_ip6(announce.public_key())
-            .or_else(|| dmesh_server::announce::virtual_ip6_from_identity_hint(announce.device_id()))
-            .map(std::net::Ipv6Addr::from).map(|address| address.to_string()),
-    });
+    engine.observe_announce(
+        &dmesh_discovery::Carrier::radio(bearer, &peer, kind),
+        announce,
+        payload,
+    );
 }
 
 /// The Android settings file: app-private, next to the paired-device store.
@@ -2388,110 +2229,15 @@ fn android_settings_response(request: &[u8]) -> Option<Vec<u8>> {
     settings_response_for(&mut android_settings_store()?, request)
 }
 
-/// Parse `host:port`, `[v6]:port` or `[v6%scope]:port`, the last being what
-/// `SocketAddr`'s `Display` prints for a scoped IPv6 address and `FromStr`
-/// does not read back.
-pub(crate) fn parse_udp_endpoint(text: &str) -> Result<std::net::SocketAddr, String> {
-    use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
-    if let Ok(address) = text.parse::<SocketAddr>() {
-        return Ok(address);
-    }
-    let inner = text
-        .strip_prefix('[')
-        .and_then(|rest| rest.split_once("]:"))
-        .ok_or_else(|| format!("invalid UDP endpoint {text:?}"))?;
-    let (host, scope) = match inner.0.split_once('%') {
-        Some((host, scope)) => (host, scope.parse::<u32>().map_err(|_| format!("invalid scope in {text:?}"))?),
-        None => (inner.0, 0),
-    };
-    let ip: Ipv6Addr = host.parse().map_err(|_| format!("invalid address in {text:?}"))?;
-    let port: u16 = inner.1.parse().map_err(|_| format!("invalid port in {text:?}"))?;
-    Ok(SocketAddr::V6(SocketAddrV6::new(ip, port, 0, scope)))
-}
-
-/// Find where a discovered device accepts QUIC over UDP.
-///
-/// `key` is a mesh node identifier: a virtual IPv6 address (with or without a
-/// `mesh://` prefix) or the hex device identity (at least eight digits). The
-/// endpoint is what the device's own announce advertised (`udp_link_local_v6`
-/// and `udp_port`), with the interface scope of the multicast datagram that
-/// carried it. A device that was only seen over NAN or BLE has no UDP path
-/// that Android can open, so it is reported as unroutable instead of guessed.
+/// The UDP endpoint to use for a node identifier (`mesh://VIP`, a hex device id,
+/// or a name), from the shared discovery inventory: the address the device
+/// advertised with the interface scope of the datagram that carried it. A
+/// device seen only over NAN or BLE is reported as unroutable, not guessed.
 pub(crate) fn discovered_udp_endpoint(key: &str) -> Result<std::net::SocketAddr, String> {
-    let devices = discovered_devices()
-        .lock()
-        .map_err(|_| "discovery inventory poisoned".to_owned())?;
-    udp_endpoint_in(&devices, key)
-}
-
-fn udp_endpoint_in(
-    devices: &BTreeMap<String, DiscoveredDevice>,
-    key: &str,
-) -> Result<std::net::SocketAddr, String> {
-    use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
-    let key = key.strip_prefix("mesh://").unwrap_or(key).to_ascii_lowercase();
-    let vip: Option<Ipv6Addr> = key.parse().ok();
-    let device = devices
-        .iter()
-        .find(|(id, device)| {
-            let device_vip = device
-                .info
-                .get("vip6")
-                .and_then(Value::as_str)
-                .and_then(|text| text.parse::<Ipv6Addr>().ok());
-            match vip {
-                Some(vip) => device_vip == Some(vip),
-                None => key.len() >= 8 && id.starts_with(&key),
-            }
-        })
-        .map(|(_, device)| device)
-        .ok_or_else(|| "unsupported/no_quic_route: destination is not discovered".to_owned())?;
-    let sender = device
-        .transports
-        .get("udp_multicast")
-        .and_then(|peer| parse_udp_endpoint(peer).ok());
-    let advertised = device
-        .info
-        .get("udp_link_local_v6")
-        .and_then(Value::as_str)
-        .and_then(|text| text.parse::<Ipv6Addr>().ok());
-    let ip = match (advertised, sender) {
-        (Some(ip), _) => ip,
-        (None, Some(SocketAddr::V6(sender))) => *sender.ip(),
-        _ => {
-            return Err(
-                "unsupported/no_quic_route: device was seen only over NAN or BLE, which Android \
-                 cannot open as a QUIC path"
-                    .to_owned(),
-            );
-        }
-    };
-    let port = match device.info.get("udp_port").and_then(Value::as_u64) {
-        Some(port) if port != 0 => u16::try_from(port).map_err(|_| "invalid advertised udp port".to_owned())?,
-        _ => {
-            let class = device
-                .info
-                .get("device_class")
-                .and_then(Value::as_u64)
-                .and_then(|class| u8::try_from(class).ok());
-            if class.is_some_and(dmesh_server::announce::is_esp_device_class) {
-                3339
-            } else {
-                dmesh_server::firmware_profile::DEFAULT_EVENT_PORT
-            }
-        }
-    };
-    let scope = match sender {
-        Some(SocketAddr::V6(sender)) => sender.scope_id(),
-        _ => 0,
-    };
-    if ip.is_unicast_link_local() && scope == 0 {
-        return Err(
-            "unsupported/no_quic_route: no interface scope is known for the link-local address"
-                .to_owned(),
-        );
-    }
-    Ok(SocketAddr::V6(SocketAddrV6::new(ip, port, 0, scope)))
+    discovery_engine()
+        .ok_or_else(|| "discovery is not running".to_owned())?
+        .resolve_udp(key)
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(target_os = "android")]
@@ -2525,6 +2271,11 @@ fn configure_android_mesh_paths(base_dir: &str) {
         ("radio", dmesh_server::platform_catalog::tools_for("radio.")),
         ("status", status_tools_json()),
         ("probe", dmesh_server::platform_catalog::tools_for("probe.")),
+        (
+            "telemetry",
+            dmesh_server::platform_catalog::tools_for("telemetry."),
+        ),
+        ("log", dmesh_server::platform_catalog::tools_for("log.")),
     ] {
         let dir = schema_base.join(component);
         let result = (|| -> std::io::Result<()> {
@@ -2854,30 +2605,17 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
             // Non-announce NAN Service Info has its own wire schema but
             // still belongs in the same cross-bearer device inventory.
             if announce.is_none() && !device_id.is_empty() {
-                let now_ms = chrono::Utc::now().timestamp_millis();
-                let mut devices = discovered_devices()
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("discovered-device cache poisoned"))?;
-                prune_discovered_devices(&mut devices, now_ms);
-                let device = devices
-                    .entry(device_id.to_ascii_lowercase())
-                    .or_insert_with(|| DiscoveredDevice {
-                        last_seen_ms: now_ms,
-                        peer: String::new(),
-                        info: Value::Null,
-                        transports: BTreeMap::new(),
-                        observations: BTreeMap::new(),
-                    });
-                observe_packet(
-                    device,
-                    "nan",
-                    "active_publish",
-                    &peer,
-                    payload,
-                    None,
-                    now_ms,
-                );
-                device.info = parsed.clone();
+                if let Some(engine) = discovery_engine() {
+                    engine.observe_provisional(
+                        &dmesh_discovery::Carrier::radio(
+                            "nan",
+                            &peer,
+                            dmesh_server::discovery::DiscoveryPacketKind::ActivePublish,
+                        ),
+                        device_id,
+                        payload,
+                    );
+                }
             }
             parsed.to_string().into_bytes()
         }
@@ -2895,7 +2633,7 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                 .values()
                 .map(dmesh_server::local_networks::json_network)
                 .collect::<Vec<_>>();
-            json!({"networks": networks, "local_networks": networks, "stats": {"devices": discovered_devices().lock().map(|devices| devices.len()).unwrap_or(0)}}).to_string().into_bytes()
+            json!({"networks": networks, "local_networks": networks, "stats": {"devices": discovered_devices_view().len()}}).to_string().into_bytes()
         }
         "discovery.active" => {
             #[cfg(target_os = "android")]
@@ -2927,12 +2665,7 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
         .to_string()
         .into_bytes(),
         "discovery.nodes" | "radio.nan.known_devices" => {
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            let mut devices = discovered_devices()
-                .lock()
-                .map_err(|_| anyhow::anyhow!("discovered-device cache poisoned"))?;
-            prune_discovered_devices(&mut devices, now_ms);
-            dmesh_server::discovery::inventory_json(&devices)
+            dmesh_server::discovery::inventory_json(&discovered_devices_view())
                 .to_string()
                 .into_bytes()
         }
@@ -2945,11 +2678,7 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
             }
             let short_bytes = parse_u32(&cmd, "short_bytes", 4 * 1024)?;
             let long_bytes = parse_u32(&cmd, "long_bytes", 64 * 1024)?;
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            let mut devices = discovered_devices()
-                .lock()
-                .map_err(|_| anyhow::anyhow!("discovered-device cache poisoned"))?;
-            prune_discovered_devices(&mut devices, now_ms);
+            let devices = discovered_devices_view();
             let descriptor =
                 |id: &str| -> anyhow::Result<dmesh_server::probe::ProbeDeviceDescriptor> {
                     let device = devices
@@ -4641,6 +4370,16 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeStopTu
 mod tests {
     use super::*;
 
+    /// The shared engine, installed once per test process.
+    fn test_engine() -> Arc<dmesh_discovery::Engine> {
+        install_discovery_engine("test-android-key")
+    }
+
+    /// An empty device inventory, with the engine running.
+    fn reset_discovery() {
+        test_engine().clear_devices();
+    }
+
     // The JNI adapter deliberately owns process-wide bounded radio caches.
     // Tests which clear/inject those caches must not run concurrently.
     static RADIO_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -4727,7 +4466,7 @@ mod tests {
     #[test]
     fn status_text_orders_companions_marks_sleep_and_short_ids() {
         let _guard = RADIO_STATE_TEST_LOCK.lock().unwrap();
-        discovered_devices().lock().unwrap().clear();
+        reset_discovery();
         ble_scan_results_store().lock().unwrap().clear();
 
         let companion_vip6 = {
@@ -4762,21 +4501,13 @@ mod tests {
         id[..8].copy_from_slice(b"paired01");
         let mut companion = dmesh_server::announce::Announce::discovery(id, 8, 12);
         assert!(companion.set_device_name("tmp"));
-        observe_announce(companion, "aa:bb:cc:dd:ee:01".to_owned(), "nan_sd", b"p");
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        if let Ok(mut devices) = discovered_devices().lock() {
-            if let Some(device) = devices.get_mut(&bytes_to_hex(&id[..8])) {
-                observe_packet(
-                    device,
-                    "nan",
-                    "active_publish",
-                    "aa:bb:cc:dd:ee:01",
-                    b"p",
-                    Some(-70),
-                    now_ms,
-                );
-            }
-        }
+        let mut companion_carrier = dmesh_discovery::Carrier::radio(
+            "nan",
+            "aa:bb:cc:dd:ee:01",
+            dmesh_server::discovery::DiscoveryPacketKind::ActivePublish,
+        );
+        companion_carrier.rssi_dbm = Some(-70);
+        test_engine().observe_announce(&companion_carrier, companion, b"p");
 
         // Sleepy unnamed device seen by UDP multicast.
         let mut sleepy_id = [0_u8; 16];
@@ -5049,7 +4780,7 @@ mod tests {
     #[test]
     fn android_nan_followup_promotes_embedded_announce_identity() {
         let _guard = RADIO_STATE_TEST_LOCK.lock().unwrap();
-        discovered_devices().lock().unwrap().clear();
+        reset_discovery();
         nan_followups().lock().unwrap().clear();
         let mut id = [0_u8; 16];
         id.copy_from_slice(b"host-followup-id");
@@ -5094,7 +4825,7 @@ mod tests {
     #[test]
     fn android_device_inventory_unifies_udp_and_nan_discovery() {
         let _guard = RADIO_STATE_TEST_LOCK.lock().unwrap();
-        discovered_devices().lock().unwrap().clear();
+        reset_discovery();
         let mut id = [0_u8; 16];
         id[..6].copy_from_slice(b"udp-a1");
         observe_announce(
@@ -5235,82 +4966,6 @@ mod tests {
     }
 
     #[test]
-    fn a_discovered_device_resolves_to_its_advertised_udp_endpoint() {
-        let device = |vip: &str, class: u64, port: u64, udp: Option<&str>, sender: &str| {
-            let mut device = DiscoveredDevice {
-                last_seen_ms: 0,
-                peer: String::new(),
-                info: json!({
-                    "vip6": vip,
-                    "device_class": class,
-                    "udp_port": port,
-                    "udp_link_local_v6": udp,
-                }),
-                transports: BTreeMap::new(),
-                observations: BTreeMap::new(),
-            };
-            device
-                .transports
-                .insert("udp_multicast".to_owned(), sender.to_owned());
-            device
-        };
-        let mut devices = BTreeMap::new();
-        {
-            devices.insert(
-                "aabbccdd00112233aabbccdd00112233".to_owned(),
-                device("fd00::1", 1, 3337, Some("fe80::aa"), "[fe80::bb%7]:5227"),
-            );
-            // No advertised port: the scope still comes from the multicast sender.
-            devices.insert(
-                "11112222333344445555666677778888".to_owned(),
-                device(
-                    "fd00::2",
-                    u64::from(dmesh_server::announce::DEVICE_CLASS_ANDROID),
-                    0,
-                    None,
-                    "[fe80::cc%9]:5227",
-                ),
-            );
-            devices.insert(
-                "99990000999900009999000099990000".to_owned(),
-                DiscoveredDevice {
-                    last_seen_ms: 0,
-                    peer: String::new(),
-                    info: json!({"vip6": "fd00::3"}),
-                    transports: BTreeMap::new(),
-                    observations: BTreeMap::new(),
-                },
-            );
-        }
-        assert_eq!(
-            udp_endpoint_in(&devices, "mesh://fd00::1").unwrap().to_string(),
-            "[fe80::aa%7]:3337"
-        );
-        assert_eq!(
-            udp_endpoint_in(&devices, "aabbccdd").unwrap().to_string(),
-            "[fe80::aa%7]:3337"
-        );
-        assert_eq!(
-            udp_endpoint_in(&devices, "fd00::2").unwrap().to_string(),
-            format!(
-                "[fe80::cc%9]:{}",
-                dmesh_server::firmware_profile::DEFAULT_EVENT_PORT
-            )
-        );
-        // Seen only over NAN or BLE, or not at all: not routable, not guessed.
-        assert!(udp_endpoint_in(&devices, "fd00::3").unwrap_err().contains("no_quic_route"));
-        assert!(udp_endpoint_in(&devices, "fd00::99").unwrap_err().contains("not discovered"));
-    }
-
-    #[test]
-    fn scoped_udp_endpoints_round_trip() {
-        for text in ["192.0.2.1:3337", "[fd00::1]:3337", "[fe80::1%12]:3337"] {
-            assert_eq!(parse_udp_endpoint(text).unwrap().to_string(), text);
-        }
-        assert!(parse_udp_endpoint("fe80::1").is_err());
-    }
-
-    #[test]
     fn android_settings_use_the_shared_store_and_firmware_result_shape() {
         use dmesh_server::{control, tagged};
         let directory = std::env::temp_dir().join(format!("dmesh-settings-{}", std::process::id()));
@@ -5344,6 +4999,82 @@ mod tests {
             .is_none()
         );
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn a_nan_announce_reaches_the_shared_engine_and_is_not_a_udp_path() {
+        use dmesh_server::announce::{Announce, encode};
+        let _guard = RADIO_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_discovery();
+        let engine = test_engine();
+        // Android announces itself as an Android device with a stable id.
+        let own = engine.local_announce().unwrap();
+        assert_eq!(own.device_class, dmesh_server::announce::DEVICE_CLASS_ANDROID);
+        assert!(!own.has_identity());
+        // A peer seen only over NAN is in the same inventory the UDP path uses,
+        // but has no UDP address to route to.
+        let mut peer = Announce::discovery([0x5a; 16], 16, 3);
+        assert!(peer.set_device_name("nanpeer"));
+        let mut wire = [0u8; 256];
+        let used = encode(peer, &mut wire).unwrap();
+        observe_announce(peer, "aa:bb:cc:dd:ee:5a".to_owned(), "nan_sd", &wire[..used]);
+        let error = discovered_udp_endpoint("5a5a5a5a").unwrap_err();
+        assert!(error.contains("no_quic_route"), "{error}");
+        let found = engine.devices();
+        assert!(
+            found
+                .iter()
+                .any(|device| device.name() == Some("nanpeer")
+                    && device.observations.contains_key("nan"))
+        );
+    }
+
+    #[test]
+    fn discovery_nodes_rows_come_from_the_shared_inventory_one_per_bearer() {
+        use dmesh_server::announce::{Announce, decode_devices_observed_response, encode};
+        let _guard = RADIO_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_discovery();
+        let engine = test_engine();
+        let mut peer = Announce::discovery([0x77; 16], 16, 42);
+        assert!(peer.set_device_name("rowpeer"));
+        peer.set_probe_descriptor(dmesh_server::announce::DEVICE_CLASS_HOST, 0x0f);
+        peer.set_udp_link_local_v6("fe80::77".parse::<Ipv6Addr>().unwrap().octets());
+        peer.set_udp_port(3336);
+        let mut wire = [0u8; 256];
+        let used = encode(peer, &mut wire).unwrap();
+        // Seen on UDP (with a scoped sender) and on NAN (with a signal level).
+        let sender: std::net::SocketAddr = "[fe80::77%5]:5227".parse().unwrap();
+        engine.on_datagram(&dmesh_discovery::Carrier::udp("[fe80::77%5]:5227", sender), &wire[..used]);
+        let mut nan = dmesh_discovery::Carrier::radio(
+            "nan",
+            "aware:3",
+            dmesh_server::discovery::DiscoveryPacketKind::ActivePublish,
+        );
+        nan.rssi_dbm = Some(-58);
+        engine.on_datagram(&nan, &wire[..used]);
+
+        let mut request = [0u8; 32];
+        let used = dmesh_server::tagged::encode_numeric_empty_request(
+            dmesh_server::announce::ANNOUNCE_COMPONENT,
+            dmesh_server::announce::ANNOUNCE_DEVICES_OBSERVED,
+            9,
+            &mut request,
+        )
+        .unwrap();
+        let response = android_discovery_nodes_response(&request[..used]).expect("response");
+        let rows = decode_devices_observed_response(&response).expect("rows");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.device_id == vec![0x77; 16]));
+        let udp = rows.iter().find(|row| row.bearer.as_deref() == Some("udp_multicast")).unwrap();
+        let nan = rows.iter().find(|row| row.bearer.as_deref() == Some("nan")).unwrap();
+        assert_eq!(udp.name.as_deref(), Some("rowpeer"));
+        assert_eq!(udp.device_class, Some(dmesh_server::announce::DEVICE_CLASS_HOST));
+        assert_eq!(udp.uptime_secs, Some(42));
+        assert_eq!(udp.authenticated, Some(false));
+        // The endpoint is the advertised address with this receiver's scope.
+        assert_eq!(udp.udp_endpoint.as_deref(), Some("[fe80::77%5]:3336"));
+        assert_eq!(nan.rssi_dbm, Some(-58));
+        assert_eq!(rows[0].peer, None, "Android has no MAC for a NAN peer");
     }
 
     #[test]

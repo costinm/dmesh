@@ -16,9 +16,11 @@ const NAN_DW_PERIOD_MS: u32 = 512 * 1_024 / 1_000;
 const NAN_DW_PRE_BEACON_US: u64 = 8_000;
 /// A NAN DW is 16 TU (16.384 ms). Begin 8 ms before its selected beacon so
 /// callback/timer jitter cannot lose the synchronization frame; the capture
-/// itself therefore lasts 24 ms at the current millisecond timer resolution.
-const NAN_DW_DURATION_MS: u32 = 16;
-const NAN_DW_CAPTURE_MS: u32 = 24;
+/// itself therefore lasts 25 ms after rounding upward to milliseconds.
+const NAN_DW_DURATION_US: u32 = 16 * 1_024;
+// Round upward; rounding 16 TU down to 16 ms cuts off the window's tail.
+const NAN_DW_DURATION_MS: u32 = NAN_DW_DURATION_US.div_ceil(1_000);
+const NAN_DW_CAPTURE_MS: u32 = (NAN_DW_PRE_BEACON_US as u32 + NAN_DW_DURATION_US).div_ceil(1_000);
 /// ESP-NOW gets the immediately adjacent 16-TU window. It must not overlap
 /// NAN transmission contention in the preceding NAN DW.
 const NOW_DW_CAPTURE_MS: u32 = NAN_DW_DURATION_MS;
@@ -285,6 +287,9 @@ struct PendingSdf {
     len: AtomicU16,
     frame: [AtomicU8; PENDING_SDF_MAX_LEN],
     count_active_discovery: AtomicBool,
+    /// Also broadcast the request's service info on NOW with every send (the NOW twin of
+    /// a NAN request: same record, same windows).
+    now_twin: AtomicBool,
     remaining: AtomicU8,
     next_send_ms: AtomicU32,
 }
@@ -296,6 +301,7 @@ impl PendingSdf {
             len: AtomicU16::new(0),
             frame: [const { AtomicU8::new(0) }; PENDING_SDF_MAX_LEN],
             count_active_discovery: AtomicBool::new(false),
+            now_twin: AtomicBool::new(false),
             remaining: AtomicU8::new(0),
             next_send_ms: AtomicU32::new(0),
         }
@@ -423,6 +429,22 @@ static FILTER_ERRORS: AtomicU32 = AtomicU32::new(0);
 static SYNC_ANCHOR_PENDING: AtomicBool = AtomicBool::new(false);
 static SYNC_ANCHOR_LO: AtomicU32 = AtomicU32::new(0);
 static SYNC_ANCHOR_HI: AtomicU32 = AtomicU32::new(0);
+// Freshness follows actual reception, while scheduling follows the TSF DW
+// boundary. Keeping these separate avoids expiring sync one period early.
+static SYNC_RECEIVED_LO: AtomicU32 = AtomicU32::new(0);
+static SYNC_RECEIVED_HI: AtomicU32 = AtomicU32::new(0);
+// NOW cluster (see `dmesh_rawnan::now_sync`). A NOW sync record is a beacon-equivalent: it
+// selects the same cluster/anchor state a NAN beacon does, with the flags below telling
+// which kind of cluster that is. A real NAN beacon always replaces a NOW-only selection.
+static NOW_CLUSTER_ENABLED: AtomicBool = AtomicBool::new(false);
+static SELECTED_FROM_NOW: AtomicBool = AtomicBool::new(false);
+static NOW_MASTER: AtomicBool = AtomicBool::new(false);
+static SYNC_TSF_LO: AtomicU32 = AtomicU32::new(0);
+static SYNC_TSF_HI: AtomicU32 = AtomicU32::new(0);
+static LAST_NOW_SYNC_SENT_MS: AtomicU32 = AtomicU32::new(0);
+/// The NOW twin of the NAN active Publish: the same announce, broadcast on NOW in every
+/// burst window, after the immediate broadcast `main_runtime` makes.
+static ACTIVE_PUBLISH_NOW: AtomicBool = AtomicBool::new(false);
 static FILTER_BSSID: [AtomicU8; 6] = [
     AtomicU8::new(0),
     AtomicU8::new(0),
@@ -455,6 +477,8 @@ fn select_cluster_bssid(bssid: &[u8]) {
 /// receive-side NAN state; it never changes the associated STA/AP BSSID.
 fn clear_cluster_selection() {
     select_cluster_bssid(&[0; 6]);
+    SELECTED_FROM_NOW.store(false, Ordering::Release);
+    NOW_MASTER.store(false, Ordering::Release);
     store_sync_anchor_us(0);
     SYNC_ANCHOR_PENDING.store(false, Ordering::Release);
     FILTER_PENDING.store(true, Ordering::Release);
@@ -1024,6 +1048,9 @@ fn drain_active_publish() {
     ) {
         ACTIVE_PUBLISH_SENT.fetch_add(1, Ordering::Relaxed);
         ACTIVE_PUBLISH_LAST_SENT_MS.store(now, Ordering::Release);
+        if ACTIVE_PUBLISH_NOW.load(Ordering::Acquire) {
+            let _ = crate::wifi_espnow_esp::broadcast_raw(&service_info[..len]);
+        }
         let remaining = ACTIVE_PUBLISH_REMAINING
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                 value.checked_sub(1)
@@ -1090,6 +1117,11 @@ fn drain_pending_sdfs() {
         };
         if sent {
             PENDING_SDF_TX_ACCEPTED.fetch_add(1, Ordering::Relaxed);
+        }
+        if valid && slot.now_twin.load(Ordering::Relaxed) && NOW_CLUSTER_ENABLED.load(Ordering::Acquire) {
+            if let Some(payload) = now_twin_payload(&frame[..len]) {
+                let _ = crate::wifi_espnow_esp::broadcast_raw(payload);
+            }
         }
         let remaining = slot.remaining.load(Ordering::Relaxed);
         if remaining <= 1 || slot.next_send_ms.load(Ordering::Relaxed) == 0 {
@@ -1184,9 +1216,186 @@ fn now_us() -> u64 {
     unsafe { esp_idf_sys::esp_timer_get_time().max(0) as u64 }
 }
 
+fn store_sync_tsf(value: u64) {
+    SYNC_TSF_LO.store(value as u32, Ordering::Relaxed);
+    SYNC_TSF_HI.store((value >> 32) as u32, Ordering::Release);
+}
+
+fn sync_tsf() -> u64 {
+    let high = SYNC_TSF_HI.load(Ordering::Acquire);
+    (u64::from(high) << 32) | u64::from(SYNC_TSF_LO.load(Ordering::Relaxed))
+}
+
+/// Record one cluster timing observation: freshness, the cluster TSF at that moment and
+/// the discovery-window boundary derived from it. A NAN beacon and a NOW sync record
+/// both end here.
+fn apply_cluster_timing(received_us: u64, tsf_us: u64) {
+    SYNC_RECEIVED_LO.store(received_us as u32, Ordering::Relaxed);
+    SYNC_RECEIVED_HI.store((received_us >> 32) as u32, Ordering::Release);
+    store_sync_tsf(tsf_us);
+    store_sync_anchor_us(dmesh_rawnan::nan_dw_boundary_local_us(received_us, tsf_us));
+    SYNC_ANCHOR_PENDING.store(true, Ordering::Release);
+    FILTER_PENDING.store(true, Ordering::Release);
+}
+
+fn now_local_mac() -> Option<[u8; 6]> {
+    let interface = if crate::wifi_esp::sta_associated() || !crate::wifi_esp::lab_open_ap_active() {
+        crate::wifi_esp::RadioInterface::Sta
+    } else {
+        crate::wifi_esp::RadioInterface::Ap
+    };
+    crate::wifi_esp::interface_mac(interface)
+}
+
+/// Enable or disable NOW cluster formation and sync records with the NOW profile. Called
+/// by Main with the announce, which also sets whether the Publish is repeated on NOW.
+pub(crate) fn set_now_cluster(enabled: bool) {
+    NOW_CLUSTER_ENABLED.store(enabled, Ordering::Release);
+    ACTIVE_PUBLISH_NOW.store(enabled, Ordering::Release);
+}
+
+/// Observe a NOW sync record, the way a NAN beacon is observed. The decision is the shared
+/// `now_sync_decide`; a live NAN-beacon selection is never moved by a NOW-only record.
+pub(crate) fn observe_now_sync(source: [u8; 6], sync: &dmesh_rawnan::NowSyncFrame<'_>) {
+    if !NOW_CLUSTER_ENABLED.load(Ordering::Acquire) {
+        return;
+    }
+    let Some(local) = now_local_mac() else {
+        return;
+    };
+    if source == local {
+        return;
+    }
+    let selected = selected_bssid();
+    let from_now = SELECTED_FROM_NOW.load(Ordering::Acquire);
+    let received_us = now_us();
+    let decision = dmesh_rawnan::now_sync_decide(
+        dmesh_rawnan::NowSelection {
+            cluster: selected,
+            nan_cluster: !bssid_is_unset(selected) && !from_now,
+            master: NOW_MASTER.load(Ordering::Acquire),
+            last_local_us: sync_received_us(),
+        },
+        local,
+        sync.cluster_id,
+        sync.is_nan_aligned(),
+        received_us,
+    );
+    match decision {
+        dmesh_rawnan::NowSyncDecision::Join => {
+            select_cluster_bssid(&sync.cluster_id);
+            SELECTED_FROM_NOW.store(!sync.is_nan_aligned(), Ordering::Release);
+            NOW_MASTER.store(false, Ordering::Release);
+            apply_cluster_timing(received_us, sync.tsf_us);
+        }
+        dmesh_rawnan::NowSyncDecision::Refresh if from_now => {
+            if sync.is_nan_aligned() {
+                SELECTED_FROM_NOW.store(false, Ordering::Release);
+            }
+            apply_cluster_timing(received_us, sync.tsf_us);
+        }
+        _ => {}
+    }
+}
+
+/// Nothing was heard during acquisition: with NOW enabled, form a NOW-only cluster with this
+/// device as its anchor master, as a lone NAN device becomes its own anchor master. Its own
+/// clock is the cluster TSF, so its discovery windows are the 512-TU multiples of it.
+fn form_now_master() {
+    if !NOW_CLUSTER_ENABLED.load(Ordering::Acquire) || !bssid_is_unset(selected_bssid()) {
+        return;
+    }
+    let Some(local) = now_local_mac() else {
+        return;
+    };
+    let now = now_us();
+    select_cluster_bssid(&local);
+    SELECTED_FROM_NOW.store(true, Ordering::Release);
+    NOW_MASTER.store(true, Ordering::Release);
+    // The cluster TSF is the Unix time when the clock is set, so DW0 (slot a multiple of 8)
+    // is the same instant for every cluster on a synchronized clock; else the local time.
+    let mut tv = esp_idf_sys::timeval { tv_sec: 0, tv_usec: 0 };
+    let unix_us = (unsafe { esp_idf_sys::gettimeofday(&mut tv, core::ptr::null_mut()) } == 0)
+        .then(|| (tv.tv_sec.max(0) as u64) * 1_000_000 + tv.tv_usec.max(0) as u64);
+    apply_cluster_timing(now, dmesh_rawnan::now_master_tsf_us(unix_us, now));
+}
+
+/// Send this device's NOW sync record once per discovery window: the followed cluster (a
+/// NAN cluster's, when one is followed) with its TSF carried forward, and the local announce
+/// as service info, so NOW-only peers can follow the same cluster. A master refreshes its
+/// own timing by sending.
+fn drain_now_sync() {
+    if !CAPTURING.load(Ordering::Acquire)
+        || !NOW_CLUSTER_ENABLED.load(Ordering::Acquire)
+        || NAN_ACTION_TX_SUPPRESSED.load(Ordering::Acquire)
+    {
+        return;
+    }
+    let cluster = selected_bssid();
+    if bssid_is_unset(cluster) {
+        return;
+    }
+    let now_ms = now_ms();
+    if now_ms.wrapping_sub(LAST_NOW_SYNC_SENT_MS.load(Ordering::Relaxed)) < dw_period_ms() / 2 {
+        return;
+    }
+    let now = now_us();
+    let master = NOW_MASTER.load(Ordering::Acquire);
+    let tsf = sync_tsf().saturating_add(now.saturating_sub(sync_received_us()));
+    if master {
+        // Sending keeps the master's own sync fresh; its TSF is carried forward, so the
+        // phase is unchanged.
+        apply_cluster_timing(now, tsf);
+    }
+    let mut flags = 0;
+    if master {
+        flags |= dmesh_rawnan::NOW_SYNC_FLAG_MASTER;
+    }
+    if !SELECTED_FROM_NOW.load(Ordering::Acquire) {
+        flags |= dmesh_rawnan::NOW_SYNC_FLAG_NAN_ALIGNED;
+    }
+    let len = usize::from(ACTIVE_PUBLISH_LEN.load(Ordering::Acquire)).min(ACTIVE_PUBLISH_MAX_LEN);
+    let mut info = [0u8; ACTIVE_PUBLISH_MAX_LEN];
+    for (index, byte) in info[..len].iter_mut().enumerate() {
+        *byte = ACTIVE_PUBLISH_INFO[index].load(Ordering::Relaxed);
+    }
+    let Ok(body) = dmesh_rawnan::build_now_sync_body(
+        cluster,
+        cluster,
+        tsf,
+        dmesh_rawnan::NOW_SYNC_DEFAULT_INTERVAL_TU,
+        flags,
+        &info[..len],
+    ) else {
+        return;
+    };
+    LAST_NOW_SYNC_SENT_MS.store(now_ms, Ordering::Relaxed);
+    let _ = crate::wifi_espnow_esp::broadcast_raw(&body);
+}
+
+/// The next capture start for `interval`: the cluster's own DW0/DW8 pattern, by TSF slot,
+/// not a count of windows from whenever this device last heard a beacon. `anchor_us` is a
+/// DW boundary in the local clock and the stored TSF is that observation's, so its slot is
+/// `tsf / 512 TU`.
+fn capture_start_us(anchor_us: u64, not_before_us: u64, interval: u8) -> u64 {
+    dmesh_rawnan::next_nan_capture_slot_start_us(
+        anchor_us,
+        sync_tsf() / dmesh_rawnan::NAN_DISCOVERY_PERIOD_US,
+        not_before_us,
+        interval,
+        NAN_DW_PRE_BEACON_US,
+    )
+}
+
 fn store_sync_anchor_us(value: u64) {
     SYNC_ANCHOR_LO.store(value as u32, Ordering::Relaxed);
     SYNC_ANCHOR_HI.store((value >> 32) as u32, Ordering::Release);
+}
+
+fn sync_received_us() -> u64 {
+    let high = SYNC_RECEIVED_HI.load(Ordering::Acquire);
+    let low = SYNC_RECEIVED_LO.load(Ordering::Relaxed);
+    (u64::from(high) << 32) | u64::from(low)
 }
 
 fn take_sync_anchor_us() -> Option<u64> {
@@ -1476,10 +1685,25 @@ pub(crate) fn dispatch_deferred_service_info() {
 /// Each accepted request retains its own bounded intent; capacity exhaustion
 /// is reported to the caller and never replaces already accepted work.
 pub fn queue_sdf_frame(frame: &[u8]) -> bool {
-    queue_sdf_frame_kind(frame, false, 1)
+    queue_sdf_frame_kind(frame, false, false, 1)
 }
 
-fn queue_sdf_frame_kind(frame: &[u8], active_discovery: bool, attempts: u8) -> bool {
+/// The service info of a DMesh request frame: the active Subscribe's SDEA, or the
+/// descriptor payload. This is what the NOW twin of the request carries.
+fn now_twin_payload(frame: &[u8]) -> Option<&[u8]> {
+    dmesh_rawnan::active_subscribe_service_info(frame, dmesh_rawnan::DMESH_SERVICE_ID)
+        .map(|item| item.service_info)
+        .filter(|payload| !payload.is_empty())
+        .or_else(|| {
+            dmesh_rawnan::service_descriptors(frame)
+                .into_iter()
+                .find(|item| item.service_id == dmesh_rawnan::DMESH_SERVICE_ID)
+                .map(|item| item.descriptor.payload)
+                .filter(|payload| !payload.is_empty())
+        })
+}
+
+fn queue_sdf_frame_kind(frame: &[u8], active_discovery: bool, now_twin: bool, attempts: u8) -> bool {
     if !dmesh_rawnan::is_nan_sdf(frame)
         || frame.len() > PENDING_SDF_MAX_LEN
         || frame.len() < dmesh_rawnan::FRAME_BSSID + 6
@@ -1516,10 +1740,18 @@ fn queue_sdf_frame_kind(frame: &[u8], active_discovery: bool, attempts: u8) -> b
     slot.len.store(frame.len() as u16, Ordering::Relaxed);
     slot.count_active_discovery
         .store(active_discovery, Ordering::Relaxed);
+    slot.now_twin.store(now_twin, Ordering::Relaxed);
     slot.remaining.store(attempts.max(1), Ordering::Relaxed);
     slot.next_send_ms.store(0, Ordering::Relaxed);
     slot.state.store(PENDING_READY, Ordering::Release);
     PENDING_SDF_QUEUED.fetch_add(1, Ordering::Relaxed);
+    // NAN can only transmit in a discovery window, but NOW need not wait: send the twin now,
+    // then in every window of the burst (the first window and DW0/DW8 included).
+    if now_twin && NOW_CLUSTER_ENABLED.load(Ordering::Acquire) {
+        if let Some(payload) = now_twin_payload(frame) {
+            let _ = crate::wifi_espnow_esp::broadcast_raw(payload);
+        }
+    }
     // This direct control request runs on Main's normal worker, never a Wi-Fi
     // callback.  If the selected DW is already open, submit it now through
     // the same capture-yield helper used by the deadline.  Otherwise the
@@ -1573,7 +1805,8 @@ pub fn queue_active_discovery() -> bool {
         0x11,
         &request[..used],
     );
-    let queued = queue_sdf_frame_kind(&frame, true, 1);
+    // Immediately, then in the next window and across a DW0/DW8 cycle, like the wake.
+    let queued = queue_sdf_frame_kind(&frame, true, true, NAN_WAKE_BURST_WINDOWS);
     if queued {
         ACTIVE_DISCOVERY_QUEUED.fetch_add(1, Ordering::Relaxed);
     }
@@ -1592,7 +1825,7 @@ pub fn queue_nan_pair_wakeup(target: [u8; 6]) -> bool {
     queue_nan_targeted_wakeup(target, true)
 }
 
-fn queue_nan_targeted_wakeup(target: [u8; 6], virgin_only: bool) -> bool {
+fn queue_nan_targeted_wakeup(target: [u8; 6], unpaired: bool) -> bool {
     if !active_on_nan_channel() {
         return false;
     }
@@ -1609,7 +1842,7 @@ fn queue_nan_targeted_wakeup(target: [u8; 6], virgin_only: bool) -> bool {
         return false;
     }
     let mut record = [0u8; 96];
-    let used = if virgin_only {
+    let used = if unpaired {
         dmesh_server::announce::encode_nan_pair_wakeup_request(target, 0, &mut record)
     } else {
         let request = dmesh_server::control::Request::TransportSet {
@@ -1636,7 +1869,7 @@ fn queue_nan_targeted_wakeup(target: [u8; 6], virgin_only: bool) -> bool {
     // Cover more than one complete DW8 cadence while retaining one bounded
     // *semantic intent*. Each received frame remains independently parsed;
     // this fixed management-action burst is never an idle poll.
-    queue_sdf_frame_kind(&frame, false, NAN_WAKE_BURST_WINDOWS)
+    queue_sdf_frame_kind(&frame, false, true, NAN_WAKE_BURST_WINDOWS)
 }
 
 /// `(queued, sent, dropped)` active-discovery Subscribe evidence.  `sent`
@@ -1851,9 +2084,9 @@ pub fn next_capture_start_us(not_before_us: u64) -> Option<u64> {
 /// base DW (often a few hundred milliseconds later) and destroy the intended
 /// duty cycle.
 pub fn next_sleepy_capture_start_us(after_us: u64, interval: u8) -> Option<u64> {
-    next_capture_start_us(after_us).map(|first| {
-        let skipped_windows = u64::from(interval.max(1) - 1);
-        first.saturating_add(skipped_windows * 512 * 1_024)
+    let (bssid, anchor_us, _) = sync_diagnostics();
+    (!bssid_is_unset(bssid) && anchor_us != 0).then(|| {
+        capture_start_us(anchor_us, after_us, interval)
     })
 }
 
@@ -2127,11 +2360,8 @@ pub fn start(interval: u8) -> bool {
     // after every DW8 wake kept the radio awake almost continuously.  Reuse
     // a live cluster anchor to arm the next ordinary bounded DW instead.
     if RESUME_SAVED_SYNC.swap(false, Ordering::AcqRel) && !bssid_is_unset(bssid) && anchor_us != 0 {
-        let next_us = dmesh_rawnan::next_nan_dw_start_us(
-            anchor_us,
-            now_us().saturating_add(NAN_DW_PRE_BEACON_US),
-        )
-        .saturating_sub(NAN_DW_PRE_BEACON_US);
+        let selected_interval = if SLEEPY_DW_PAIR.load(Ordering::Acquire) { interval } else { 1 };
+        let next_us = capture_start_us(anchor_us, now_us(), selected_interval);
         CAPTURING.store(false, Ordering::Release);
         ACQUIRING.store(false, Ordering::Release);
         ACQUIRE_PENDING.store(false, Ordering::Release);
@@ -2278,7 +2508,8 @@ pub fn service_deadline() {
     // makes DW8 wake at the wrong time and prevents convergence on the live
     // NAN cluster. The normal acquisition window below is intentionally the
     // only recovery path; this does not add a polling task.
-    let (selected, anchor_us, _) = sync_diagnostics();
+    let (selected, _, _) = sync_diagnostics();
+    let anchor_us = sync_received_us();
     if !bssid_is_unset(selected)
         && anchor_us != 0
         && now_us().saturating_sub(anchor_us) >= NAN_CLUSTER_MISSED_BEACON_US
@@ -2307,6 +2538,7 @@ pub fn service_deadline() {
         drain_pending_followup_responses();
         drain_active_publish();
         drain_pending_sdfs();
+        drain_now_sync();
         return;
     }
     // A direct one-shot ROC request may have been made between periodic
@@ -2326,6 +2558,7 @@ pub fn service_deadline() {
         drain_pending_followup_responses();
         drain_active_publish();
         drain_pending_sdfs();
+        drain_now_sync();
         return;
     }
     // An explicit raw-NOW association temporarily extends the same receive
@@ -2339,6 +2572,7 @@ pub fn service_deadline() {
         drain_pending_followup_responses();
         drain_active_publish();
         drain_pending_sdfs();
+        drain_now_sync();
         return;
     }
     let service_until = NOW_SERVICE_RECEIVE_UNTIL_MS.load(Ordering::Acquire);
@@ -2350,6 +2584,7 @@ pub fn service_deadline() {
             drain_pending_followup_responses();
             drain_active_publish();
             drain_pending_sdfs();
+            drain_now_sync();
             return;
         }
         // The responder received no traffic before its explicit lease
@@ -2365,11 +2600,8 @@ pub fn service_deadline() {
     // local time. This aligns independent devices to the same cluster beacon
     // instead of preserving their arbitrary boot-time phase.
     if let Some(anchor_us) = take_sync_anchor_us() {
-        let next_us = dmesh_rawnan::next_nan_dw_start_us(
-            anchor_us,
-            now_us().saturating_add(NAN_DW_PRE_BEACON_US),
-        )
-        .saturating_sub(NAN_DW_PRE_BEACON_US);
+        let selected_interval = if SLEEPY_DW_PAIR.load(Ordering::Acquire) { interval() } else { 1 };
+        let next_us = capture_start_us(anchor_us, now_us(), selected_interval);
         NEXT_MS.store(
             (next_us / 1_000).min(u64::from(u32::MAX)) as u32,
             Ordering::Release,
@@ -2385,13 +2617,14 @@ pub fn service_deadline() {
         drain_pending_followup_responses();
         drain_active_publish();
         drain_pending_sdfs();
+        drain_now_sync();
         if due(now, UNTIL_MS.load(Ordering::Relaxed)) {
             if SLEEPY_DW_PAIR.load(Ordering::Acquire)
                 && !SLEEPY_DW_PAIR_SECOND.swap(true, Ordering::AcqRel)
             {
                 // Do not toggle promiscuous RX between the paired windows:
                 // the NOW window begins exactly as the NAN DW ends.
-                UNTIL_MS.store(now.wrapping_add(NOW_DW_CAPTURE_MS), Ordering::Release);
+                UNTIL_MS.store(now.wrapping_add(NOW_DW_CAPTURE_MS + SLEEPY_DW_PAIR_TAIL_MS), Ordering::Release);
                 crate::commands::send_response(b"now DW start: paired capture retained");
                 return;
             }
@@ -2401,6 +2634,23 @@ pub fn service_deadline() {
             // phase-locked deadline.
             let _ = crate::wifi_esp::set_nan_dw_power_save(true);
             CAPTURING.store(false, Ordering::Release);
+            // Private allocation-soak observations, no strings/heap records.
+            static CLOSED_WINDOWS: AtomicU32 = AtomicU32::new(0);
+            if SLEEPY_DW_PAIR.load(Ordering::Acquire)
+                && CLOSED_WINDOWS.fetch_add(1, Ordering::Relaxed) % 64 == 0
+            {
+                let memory = crate::shared_ingress_esp::memory_stats();
+                let (sleep_exits, sleep_total_us, sleep_last_us, sleep_callback) = crate::power_esp::automatic_sleep_metrics();
+                crate::commands::send_stats(&[
+                    (b"nan auto sleep callback", u64::from(sleep_callback)),
+                    (b"nan auto sleep long_returns", u64::from(sleep_exits)),
+                    (b"nan auto sleep total_us", u64::from(sleep_total_us)),
+                    (b"nan auto sleep last_us", u64::from(sleep_last_us)),
+                    (b"nan heap free", u64::from(memory.free_internal_bytes)),
+                    (b"nan heap minimum", u64::from(memory.min_free_internal_bytes)),
+                    (b"nan heap largest", u64::from(memory.largest_internal_block_bytes)),
+                ]);
+            }
             let capture_started_us = CAPTURE_STARTED_US.swap(0, Ordering::AcqRel);
             crate::commands::send_stats(&[
                 (
@@ -2426,6 +2676,8 @@ pub fn service_deadline() {
             ]);
             if ACQUIRING.swap(false, Ordering::AcqRel) {
                 NEXT_MS.store(now.wrapping_add(dw_period_ms()), Ordering::Release);
+                // Nothing was heard: be the anchor master of a NOW-only cluster.
+                form_now_master();
             }
         }
         return;
@@ -2443,10 +2695,18 @@ pub fn service_deadline() {
         CAPTURING.store(true, Ordering::Release);
         SLEEPY_DW_PAIR_SECOND.store(false, Ordering::Release);
         UNTIL_MS.store(now.wrapping_add(NAN_DW_CAPTURE_MS), Ordering::Relaxed);
-        NEXT_MS.store(now.wrapping_add(dw_period_ms()), Ordering::Relaxed);
+        // Even without a fresh beacon in this DW, retain the selected beacon
+        // phase instead of accumulating millisecond truncation and worker delay.
+        let next_us = next_sleepy_capture_start_us(now_us().saturating_add(1), interval());
+        NEXT_MS.store(
+            next_us.map(|us| us.div_ceil(1_000) as u32)
+                .unwrap_or_else(|| now.wrapping_add(dw_period_ms())),
+            Ordering::Relaxed,
+        );
         drain_pending_followup_responses();
         drain_active_publish();
         drain_pending_sdfs();
+        drain_now_sync();
         let cluster = selected_bssid();
         crate::commands::send_stats(&[
             (b"nan DW start interval", u64::from(interval())),
@@ -2605,11 +2865,7 @@ fn receive_management_frame(frame: &[u8]) {
         if let Some(bssid) = frame.get(dmesh_rawnan::FRAME_BSSID..dmesh_rawnan::FRAME_BSSID + 6) {
             let selected = selected_bssid();
             let received_us = now_us();
-            let last_selected_us = {
-                let high = SYNC_ANCHOR_HI.load(Ordering::Acquire);
-                let low = SYNC_ANCHOR_LO.load(Ordering::Relaxed);
-                (u64::from(high) << 32) | u64::from(low)
-            };
+            let last_selected_us = sync_received_us();
             // Keep one live cluster so peers retain a common DW phase. If it
             // disappears, a foreign NAN beacon may replace it after the same
             // three-DW guard as rawnan::NanState. This avoids a permanently
@@ -2626,15 +2882,26 @@ fn receive_management_frame(frame: &[u8]) {
                 && bssid != selected
                 && received_us.saturating_sub(last_selected_us)
                     >= dmesh_rawnan::NAN_CLUSTER_RESELECT_AFTER_US;
-            if bssid_is_unset(selected) || replace_stale_cluster {
+            // A real NAN cluster outranks a NOW-only one formed from sync records: it
+            // replaces it at once, with no stale wait (the NOW-only cluster is the
+            // substitute used when no NAN device is around).
+            let replace_now_cluster = SELECTED_FROM_NOW.load(Ordering::Acquire)
+                && !bssid_is_unset(selected)
+                && bssid != selected;
+            if bssid_is_unset(selected) || replace_stale_cluster || replace_now_cluster {
                 select_cluster_bssid(bssid);
             }
-            if bssid_is_unset(selected) || bssid == selected || replace_stale_cluster {
-                // Store the local receive point. The selected beacon is the
-                // local-clock anchor for subsequent fixed-interval DWs.
-                store_sync_anchor_us(received_us);
-                SYNC_ANCHOR_PENDING.store(true, Ordering::Release);
-                FILTER_PENDING.store(true, Ordering::Release);
+            if bssid_is_unset(selected)
+                || bssid == selected
+                || replace_stale_cluster
+                || replace_now_cluster
+            {
+                // Any selected beacon can refresh clock synchronization, but
+                // only its TSF phase determines the discovery-window boundary.
+                let Some(tsf_us) = dmesh_rawnan::beacon_tsf_us(frame) else { return; };
+                SELECTED_FROM_NOW.store(false, Ordering::Release);
+                NOW_MASTER.store(false, Ordering::Release);
+                apply_cluster_timing(received_us, tsf_us);
                 shorten_sleepy_resume_capture_after_beacon(received_us);
             }
         }

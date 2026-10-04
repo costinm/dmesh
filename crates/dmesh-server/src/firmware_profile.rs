@@ -15,6 +15,49 @@ use crate::{
 /// is not persisted as part of STA association.
 pub const DEFAULT_EVENT_PORT: u16 = 3336;
 
+/// Association and radio-role changes do not invalidate a Wi-Fi driver.
+pub fn wifi_driver_policy_changed(initialized: bool, ampdu: bool, rates_11b_disabled: bool, desired_ampdu: bool, desired_rates_11b_disabled: bool) -> bool {
+    initialized && (ampdu != desired_ampdu || rates_11b_disabled != desired_rates_11b_disabled)
+}
+
+/// A target-only wake is a lease renewal once STA is selected, including
+/// while association is in progress. Requests carrying settings remain edits.
+pub fn targeted_wake_renews_sta(profile: &TransportProfile, config: TransportConfig<'_>) -> bool {
+    config.wake_target.is_some()
+        && config == (TransportConfig { wake_target: config.wake_target, ..TransportConfig::default() })
+        && profile.requested_transport == Some(TransportKind::Sta)
+}
+
+#[cfg(test)]
+mod driver_policy_tests {
+    use super::*;
+    #[test]
+    fn unchanged_policy_preserves_driver() {
+        for ampdu in [false, true] {
+            for rates in [false, true] {
+                assert!(!wifi_driver_policy_changed(true, ampdu, rates, ampdu, rates));
+                assert!(wifi_driver_policy_changed(true, ampdu, rates, !ampdu, rates));
+                assert!(wifi_driver_policy_changed(true, ampdu, rates, ampdu, !rates));
+                assert!(!wifi_driver_policy_changed(false, ampdu, rates, !ampdu, !rates));
+            }
+        }
+    }
+    #[test]
+    fn repeated_wake_is_a_lease_renewal_not_a_new_radio_epoch() {
+        let mut profile = TransportProfile::default();
+        let config = TransportConfig { wake_target: Some([1; 6]), ..Default::default() };
+        profile.requested_transport = Some(TransportKind::Nan);
+        assert!(!targeted_wake_renews_sta(&profile, config));
+        profile.requested_transport = Some(TransportKind::Sta);
+        for run_requested in [false, true] {
+            profile.run_requested = run_requested;
+            assert!(targeted_wake_renews_sta(&profile, config));
+        }
+        assert!(!targeted_wake_renews_sta(&profile, TransportConfig { channel: Some(7), ..config }));
+        assert!(!targeted_wake_renews_sta(&profile, TransportConfig::default()));
+    }
+}
+
 /// A zero UART selector means "use the product default", currently 115200.
 /// This lets a controller avoid board-specific baud knowledge without making
 /// the default spelling ambiguous with an explicit bearer shutdown.
@@ -118,6 +161,12 @@ pub struct TransportProfile {
 }
 
 impl TransportProfile {
+    /// Stored STA credentials do not activate STA. UART also remains
+    /// available without changing the NAN-only Wi-Fi sleep personality.
+    pub fn is_nan_only(&self) -> bool {
+        self.requested_transport == Some(TransportKind::Nan)
+            && self.now == 2 && self.ap == 0
+    }
     pub const fn new() -> Self {
         Self {
             ssid: [0; 33],
@@ -304,6 +353,25 @@ fn control_method(request: control::Request<'_>) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nan_only_sleep_policy_ignores_stored_credentials_and_uart() {
+        let mut profile = super::TransportProfile::new();
+        profile.requested_transport = Some(super::TransportKind::Nan);
+        profile.now = 2;
+        profile.ap = 0;
+        profile.ssid_len = 4;
+        profile.ssid[..4].copy_from_slice(b"test");
+        profile.uart = super::UART_115200;
+        assert!(profile.is_nan_only());
+        profile.now = 1;
+        assert!(!profile.is_nan_only());
+        profile.now = 2;
+        profile.ap = 1;
+        assert!(!profile.is_nan_only());
+        profile.ap = 0;
+        profile.requested_transport = Some(super::TransportKind::Sta);
+        assert!(!profile.is_nan_only());
+    }
     use super::*;
     use crate::control::TransportConfig;
 

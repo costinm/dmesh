@@ -23,7 +23,7 @@ use std::{
     vec::Vec,
 };
 
-const MAX_LOG_LINE: usize = 512;
+const MAX_LOG_LINE: usize = 4096;
 const UART_LOG_ENV: &str = "UART_CODEC_LOG";
 /// Default line rate used by DMesh physical UART bearers when no override is supplied.
 pub const DEFAULT_BAUD: u32 = 115_200;
@@ -38,6 +38,7 @@ enum SidebandState {
 struct SidebandText {
     state: SidebandState,
     line: Vec<u8>,
+    overflow: bool,
 }
 
 impl SidebandText {
@@ -45,12 +46,14 @@ impl SidebandText {
         Self {
             state: SidebandState::Text,
             line: Vec::new(),
+            overflow: false,
         }
     }
 
     fn reset(&mut self) {
         self.state = SidebandState::Text;
         self.line.clear();
+        self.overflow = false;
     }
 
     /// Extract unframed boot/crash text without examining bytes inside a
@@ -61,10 +64,11 @@ impl SidebandText {
             if byte == UART_FLAG {
                 self.state = SidebandState::AfterFlag;
                 self.line.clear();
+                self.overflow = false;
                 continue;
             }
             match self.state {
-                SidebandState::AfterFlag if byte == PACKET_MARKER => {
+                SidebandState::AfterFlag if byte == PACKET_MARKER || byte >= 0x80 => {
                     self.state = SidebandState::MarkedFrame;
                     continue;
                 }
@@ -75,19 +79,28 @@ impl SidebandText {
             match byte {
                 b'\r' => {}
                 b'\n' if !self.line.is_empty() => {
+                    if self.overflow {
+                        self.line.extend_from_slice(b" [uart_log_truncated limit=4096]");
+                    }
                     if let Ok(text) = String::from_utf8(core::mem::take(&mut self.line)) {
                         line(text);
                     }
+                    self.overflow = false;
                 }
                 b'\n' => {}
                 byte if byte.is_ascii_graphic() || byte == b' ' || byte == b'\t' => {
-                    if self.line.len() < MAX_LOG_LINE {
+                    if self.overflow {
+                        continue;
+                    } else if self.line.len() < MAX_LOG_LINE {
                         self.line.push(byte);
                     } else {
-                        self.line.clear();
+                        self.overflow = true;
                     }
                 }
-                _ => self.line.clear(),
+                _ => {
+                    self.line.clear();
+                    self.overflow = false;
+                }
             }
         }
     }
@@ -196,6 +209,16 @@ pub enum UartRecord {
     Datagram(Vec<u8>),
     /// Boot/crash text observed outside normal service framing.
     Log(String),
+}
+
+fn framed_record(payload: &[u8]) -> Option<UartRecord> {
+    if let Ok(packet) = decode_packet(payload) {
+        Some(UartRecord::Datagram(packet.to_vec()))
+    } else if payload.first().is_some_and(|byte| byte >> 5 == 5) {
+        Some(UartRecord::Log(render_sideband_record(payload)))
+    } else {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -421,8 +444,8 @@ impl UartPort {
             // The marker is now the UART bearer contract. Treating an
             // unmarked record as QUIC confuses ordinary ESP-IDF text between
             // two flags with a legacy packet.
-            if let Ok(packet) = decode_packet(&payload) {
-                records.push(UartRecord::Datagram(packet.to_vec()));
+            if let Some(record) = framed_record(&payload) {
+                records.push(record);
             }
         }
         Ok(records)
@@ -481,6 +504,9 @@ pub struct TokioUartBearer<const SLOTS: usize, const MTU: usize> {
     tx: Arc<TokioUartTx<SLOTS, MTU>>,
     sideband: Option<Arc<dyn Fn(TokioUartReceive) + Send + Sync>>,
     log_file: Option<Arc<Mutex<File>>>,
+    /// Dropped with the bearer (when the node removes it), which ends the
+    /// reader and writer tasks so the port is released.
+    closed: tokio::sync::watch::Sender<()>,
 }
 
 /// Read half of a Tokio UART bearer. It owns incremental framing state and can
@@ -542,6 +568,7 @@ impl<const SLOTS: usize, const MTU: usize> TokioUartBearer<SLOTS, MTU> {
             tx,
             sideband: None,
             log_file,
+            closed: tokio::sync::watch::channel(()).0,
         })
     }
 
@@ -696,6 +723,10 @@ impl<const SLOTS: usize, const MTU: usize> TokioUartReader<SLOTS, MTU> {
                 log_file.write_all(line.as_bytes())?;
                 log_file.write_all(b"\n")?;
             }
+            for record in &result.log_records {
+                log_file.write_all(render_sideband_record(record).as_bytes())?;
+                log_file.write_all(b"\n")?;
+            }
             log_file.flush()?;
         }
         Ok(result)
@@ -704,6 +735,51 @@ impl<const SLOTS: usize, const MTU: usize> TokioUartReader<SLOTS, MTU> {
     fn scan_async_text(&mut self, bytes: &[u8], logs: &mut Vec<String>) {
         self.sideband.push(bytes, |line| logs.push(line));
     }
+}
+
+/// Host-only presentation of structured CBOR sideband. Numeric tags are
+/// preserved; malformed records fall back to text or hex, never disappear.
+pub fn render_sideband_record(bytes: &[u8]) -> String {
+    fn value(d: &mut mesh_api::cbor::Decoder<'_>, out: &mut String, depth: usize) -> Option<()> {
+        use std::fmt::Write;
+        if depth > 8 { return None; }
+        let start = d.position();
+        let (major, count) = d.head()?;
+        match major {
+            0 => write!(out, "{count}").ok()?,
+            1 => write!(out, "-{}", u128::from(count) + 1).ok()?,
+            3 => {
+                d.set_position(start);
+                write!(out, "{:?}", core::str::from_utf8(d.text_ref()?).ok()?).ok()?;
+            }
+            4 | 5 if count <= 128 => {
+                out.push(if major == 5 { '{' } else { '[' });
+                for i in 0..count {
+                    if i != 0 { out.push(' '); }
+                    value(d, out, depth + 1)?;
+                    if major == 5 { out.push('='); value(d, out, depth + 1)?; }
+                }
+                out.push(if major == 5 { '}' } else { ']' });
+            }
+            7 if count == 20 => out.push_str("false"),
+            7 if count == 21 => out.push_str("true"),
+            7 if count == 22 => out.push_str("null"),
+            _ => return None,
+        }
+        Some(())
+    }
+    let mut decoder = mesh_api::cbor::Decoder::new(bytes);
+    let mut out = String::new();
+    if bytes.first().is_some_and(|byte| byte >> 5 == 5)
+        && value(&mut decoder, &mut out, 0).is_some() && decoder.is_finished() {
+        return out;
+    }
+    if let Ok(text) = core::str::from_utf8(bytes) { return String::from(text); }
+    use std::fmt::Write;
+    out.clear();
+    out.push_str("cbor_invalid hex=");
+    for byte in bytes { let _ = write!(out, "{byte:02x}"); }
+    out
 }
 
 impl<const SLOTS: usize, const MTU: usize> PacketEgress<PoolBufferLease<'static, SLOTS, MTU>>
@@ -801,13 +877,22 @@ impl<const SLOTS: usize, const MTU: usize> PacketBearer<PacketPool<SLOTS, MTU>>
         };
         let receive_context = context.clone();
         let sideband = self.sideband.clone();
+        let mut reader_closed = self.closed.subscribe();
+        let mut writer_closed = self.closed.subscribe();
         tokio::spawn(async move {
             let peer = PeerL2Address::new(1).expect("one is a valid UART peer address");
             loop {
-                match reader
-                    .receive_into(peer, quic_lite::PACKET_PREFIX_RESERVE, 0, &receive_context)
-                    .await
-                {
+                let received = tokio::select! {
+                    // The sender is only ever dropped, never sent on.
+                    _ = reader_closed.changed() => break,
+                    received = reader.receive_into(
+                        peer,
+                        quic_lite::PACKET_PREFIX_RESERVE,
+                        0,
+                        &receive_context,
+                    ) => received,
+                };
+                match received {
                     Ok(received) => {
                         if (!received.logs.is_empty()
                             || !received.log_records.is_empty()
@@ -824,7 +909,11 @@ impl<const SLOTS: usize, const MTU: usize> PacketBearer<PacketPool<SLOTS, MTU>>
         let writer_context = context;
         tokio::spawn(async move {
             loop {
-                match writer.write_ready().await {
+                let ready = tokio::select! {
+                    _ = writer_closed.changed() => break,
+                    ready = writer.write_ready() => ready,
+                };
+                match ready {
                     Ok(true) => writer_context.send_ready(),
                     Ok(false) => {}
                     Err(_) => break,
@@ -905,6 +994,70 @@ fn configure(file: &File, baud: Option<u32>) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn passive_frames_separate_structured_logs_from_quic() {
+        let log = [0xa1, 1, 3];
+        assert_eq!(super::framed_record(&log), Some(super::UartRecord::Log("{1=3}".into())));
+        assert_eq!(super::framed_record(&[crate::PACKET_MARKER, 0x40, 1]),
+            Some(super::UartRecord::Datagram(vec![0x40, 1])));
+        assert_eq!(super::framed_record(b"boot text"), None);
+        assert!(matches!(super::framed_record(&[0xa1, 1]), Some(super::UartRecord::Log(s)) if s.starts_with("cbor_invalid")));
+    }
+    #[test]
+    fn structured_sideband_preserves_numeric_tags_and_values() {
+        assert_eq!(super::render_sideband_record(&[0xa2, 1, 0x67, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 2, 3]), "{1=\"example\" 2=3}");
+        assert_eq!(super::render_sideband_record(&[0xa1, 7, 0xa2, 1, 0xf5, 2, 0xf6]), "{7={1=true 2=null}}");
+    }
+
+    #[test]
+    fn cbor_sideband_is_not_misidentified_as_console_text() {
+        let payload = [0xa1, 1, 0x65, b'h', b'i', b'\n', b'h', b'i'];
+        let wire = crate::codec::encode_payload(&payload, 128).unwrap();
+        let mut decoder = super::SidebandText::new();
+        let mut lines = Vec::new();
+        for chunk in wire.chunks(3) { decoder.push(chunk, |line| lines.push(line)); }
+        decoder.push(b"boot text\n", |line| lines.push(line));
+        assert_eq!(lines, vec!["boot text"]);
+    }
+
+    #[test]
+    fn malformed_cbor_sideband_is_visible() {
+        assert!(super::render_sideband_record(&[0xa1, 1]).starts_with("cbor_invalid hex="));
+    }
+    #[test]
+    fn long_flash_console_line_survives_fragmented_reads() {
+        let expected = format!("event=object_flash.quic_progress {} quic_submission_failures=17", "counter=1234567890 ".repeat(90));
+        let wire = format!("{expected}\r\n");
+        let mut decoder = super::SidebandText::new();
+        let mut lines = Vec::new();
+        for chunk in wire.as_bytes().chunks(37) {
+            decoder.push(chunk, |line| lines.push(line));
+        }
+        assert_eq!(lines, vec![expected]);
+    }
+
+    #[test]
+    fn oversized_console_line_keeps_prefix_and_reports_truncation_once() {
+        let wire = format!("{}\nnext complete line\n", "x".repeat(super::MAX_LOG_LINE + 1024));
+        let mut decoder = super::SidebandText::new();
+        let mut lines = Vec::new();
+        for chunk in wire.as_bytes().chunks(73) {
+            decoder.push(chunk, |line| lines.push(line));
+        }
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], format!("{} [uart_log_truncated limit=4096]", "x".repeat(super::MAX_LOG_LINE)));
+        assert_eq!(lines[1], "next complete line");
+    }
+
+    #[test]
+    fn marked_packet_after_oversized_text_does_not_leak_into_console() {
+        let mut decoder = super::SidebandText::new();
+        let mut lines = Vec::new();
+        decoder.push(&vec![b'x'; super::MAX_LOG_LINE + 1], |line| lines.push(line));
+        decoder.push(&[super::UART_FLAG, super::PACKET_MARKER, b'h', b'i', b'\n', super::UART_FLAG], |line| lines.push(line));
+        decoder.push(b"real console\n", |line| lines.push(line));
+        assert_eq!(lines, vec!["real console"]);
+    }
     use super::*;
     use std::format;
     use std::os::fd::FromRawFd;

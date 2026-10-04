@@ -85,7 +85,7 @@ pub fn mark_main_start() {
 /// Mark Main healthy and clear only Recovery's consumed Main handoff.
 ///
 /// A pending Main-to-Recovery request is armed after the terminal response
-/// has been acknowledged but before the delayed reset runs. Main's normal
+/// has been written and finished but before the delayed reset runs. Main's normal
 /// health callback can still execute in that small interval, so it must not
 /// turn `HANDOFF_RECOVERY` back into normal boot.
 pub fn mark_main_healthy() {
@@ -97,9 +97,10 @@ pub fn mark_main_healthy() {
     }
 }
 
-/// Record a Recovery request without racing its QUIC response.
+/// Schedule Recovery after the normal handler response has been written and
+/// finished. Called only from the shared response-completion lifecycle.
 pub fn request_recovery_boot() -> bool {
-    // Re-enable only after the new stream API exposes terminal delivery. A
-    // request must never arm Recovery merely because its response was queued.
-    false
+    arm_recovery();
+    crate::main_runtime::request_reset_after_response();
+    true
 }

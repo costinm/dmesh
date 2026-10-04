@@ -5,12 +5,13 @@ edition = "2024"
 autoexamples = false
 
 [dependencies]
-dmesh-rawnan = { path = "../rawnan" }
+dmesh-rawnan = { path = "../rawnan", features = ["linux"] }
+dmesh-discovery = { path = "../dmesh-discovery", features = ["tokio"] }
 dmesh-server = { path = "../dmesh-server" }
 quic-lite = { path = "../quic-lite", features = ["tokio"] }
 lmesh-wifi = { path = "../lmesh-wifi" }
 lmesh-ble-hci = { path = "../lmesh-ble-hci" }
-uart-codec = { path = "../uart-codec", features = ["host"] }
+uart-codec = { path = "../uart-codec", features = ["host", "pair"] }
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros", "time", "sync", "net", "io-util"] }
 tracing = "0.1"
 serde = {version = "1.0.130", features = ["derive"]}

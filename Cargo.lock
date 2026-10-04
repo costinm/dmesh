@@ -12,6 +12,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "adb_client"
+version = "3.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "773b25a440e72829bbb1b96435ee0e65ef0f14a3da545590930ca881a68e59d7"
+dependencies = [
+ "base64 0.22.1",
+ "byteorder",
+ "chrono",
+ "log",
+ "num-bigint-dig",
+ "num-traits",
+ "num_enum",
+ "quick-protobuf",
+ "rand 0.10.3",
+ "rcgen",
+ "regex",
+ "rsa 0.9.10",
+ "rustls",
+ "rustls-pki-types",
+ "sha1 0.10.7",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -136,6 +160,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "android-control"
+version = "0.1.0"
+dependencies = [
+ "adb_client",
+ "aes-gcm 0.10.3",
+ "anyhow",
+ "base64 0.22.1",
+ "clap",
+ "curve25519-dalek",
+ "hkdf 0.12.4",
+ "jni 0.21.1",
+ "mdns-sd",
+ "num-bigint-dig",
+ "num-traits",
+ "pkcs8 0.10.2",
+ "rand 0.8.8",
+ "rcgen",
+ "rsa 0.9.10",
+ "rustls",
+ "rustls-pemfile",
+ "rustls-pki-types",
+ "serde_json",
+ "sha1 0.10.7",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+]
+
+[[package]]
 name = "android-properties"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -203,7 +258,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -214,7 +269,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -364,6 +419,29 @@ name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
+
+[[package]]
+name = "aws-lc-rs"
+version = "1.18.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b281d307588d634de920874890732659e2e7672f72b5e10e81badc1a8a83621e"
+dependencies = [
+ "aws-lc-sys",
+ "zeroize",
+]
+
+[[package]]
+name = "aws-lc-sys"
+version = "0.45.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9bff6c3b54fad79a2e60b8102caf565819711497c1f5f092f49508e2f5c31b27"
+dependencies = [
+ "cc",
+ "cmake",
+ "dunce",
+ "fs_extra",
+ "pkg-config",
+]
 
 [[package]]
 name = "axum"
@@ -865,6 +943,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cmake"
+version = "0.1.58"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "cmov"
 version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1161,6 +1248,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
 dependencies = [
  "generic-array 0.14.7",
+ "rand_core 0.6.4",
  "typenum",
 ]
 
@@ -1471,6 +1559,7 @@ dependencies = [
  "async-trait",
  "axum",
  "chrono",
+ "dmesh-discovery",
  "dmesh-rawnan",
  "dmesh-server",
  "dmesh-store",
@@ -1516,10 +1605,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "dmesh-discovery"
+version = "0.1.0"
+dependencies = [
+ "dmesh-server",
+ "libc",
+ "p256",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "dmesh-rawnan"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
+ "quic-lite",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -1530,6 +1637,7 @@ dependencies = [
  "async-trait",
  "dmesh-rawnan",
  "hex",
+ "libc",
  "mesh",
  "mesh-api",
  "p256",
@@ -1613,6 +1721,12 @@ name = "dpi"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
+
+[[package]]
+name = "dunce"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "ecdsa"
@@ -1898,7 +2012,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2105,6 +2219,12 @@ checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
 ]
+
+[[package]]
+name = "fs_extra"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "futures"
@@ -2754,7 +2874,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.61.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -2874,6 +2994,16 @@ checksum = "cb68373c0d6620ef8105e855e7745e18b0d00d3bdb07fb532e434244cdb9a714"
 dependencies = [
  "icu_normalizer",
  "icu_properties",
+]
+
+[[package]]
+name = "if-addrs"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0a05c691e1fae256cf7013d99dad472dc52d5543322761f83ec8d47eab40d2b"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3300,6 +3430,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "dmesh-discovery",
  "dmesh-rawnan",
  "dmesh-server",
  "libc",
@@ -3324,9 +3455,10 @@ name = "lmesh-ble-hci"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dmesh-server",
  "libc",
  "quic-lite",
- "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -3335,6 +3467,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "dmesh-discovery",
  "dmesh-rawnan",
  "dmesh-server",
  "libc",
@@ -3422,6 +3555,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
 
 [[package]]
+name = "mdns-sd"
+version = "0.19.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "18148fee27e99e76dbf6e137f27727113d31f766e578d1b93a93c3615fca7081"
+dependencies = [
+ "fastrand",
+ "flume 0.11.1",
+ "if-addrs",
+ "log",
+ "mio",
+ "socket-pktinfo",
+ "socket2",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3457,6 +3605,7 @@ dependencies = [
 [[package]]
 name = "mesh"
 version = "0.1.0"
+source = "git+https://github.com/costinm/ssh-mesh#c15c7a0acebea0b936a6a126d7b9e217632caf1d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3480,6 +3629,7 @@ dependencies = [
 [[package]]
 name = "mesh-api"
 version = "0.1.0"
+source = "git+https://github.com/costinm/ssh-mesh#c15c7a0acebea0b936a6a126d7b9e217632caf1d"
 dependencies = [
  "serde",
 ]
@@ -3487,6 +3637,7 @@ dependencies = [
 [[package]]
 name = "mesh-mcp"
 version = "0.1.0"
+source = "git+https://github.com/costinm/ssh-mesh#c15c7a0acebea0b936a6a126d7b9e217632caf1d"
 dependencies = [
  "mesh",
  "serde",
@@ -3818,7 +3969,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4772,6 +4923,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a993555f31e5a609f617c12db6250dedcac1b0a85076912c436e6fc9b2c8e6a3"
 
 [[package]]
+name = "quick-protobuf"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d6da84cc204722a989e01ba2f6e1e276e190f22263d0cb6ce8526fcdb0d2e1f"
+dependencies = [
+ "byteorder",
+]
+
+[[package]]
 name = "quick-xml"
 version = "0.39.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4833,7 +4993,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5388,7 +5548,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5397,6 +5557,7 @@ version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
+ "aws-lc-rs",
  "log",
  "once_cell",
  "ring",
@@ -5431,6 +5592,7 @@ version = "0.103.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
 dependencies = [
+ "aws-lc-rs",
  "ring",
  "rustls-pki-types",
  "untrusted",
@@ -5653,6 +5815,7 @@ dependencies = [
 [[package]]
 name = "sftp-server"
 version = "0.1.0"
+source = "git+https://github.com/costinm/ssh-mesh#c15c7a0acebea0b936a6a126d7b9e217632caf1d"
 dependencies = [
  "anyhow",
  "bytes",
@@ -5888,13 +6051,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "socket-pktinfo"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "927136cc2ae6a1b0e66ac6b1210902b75c3f726db004a73bc18686dcd0dcd22f"
+dependencies = [
+ "libc",
+ "socket2",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
 name = "socket2"
 version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6158,6 +6332,7 @@ dependencies = [
 [[package]]
 name = "ssh-config"
 version = "0.57.0"
+source = "git+https://github.com/costinm/ssh-mesh#c15c7a0acebea0b936a6a126d7b9e217632caf1d"
 dependencies = [
  "futures",
  "glob",
@@ -6220,6 +6395,7 @@ dependencies = [
 [[package]]
 name = "ssh-mesh"
 version = "0.1.0"
+source = "git+https://github.com/costinm/ssh-mesh#c15c7a0acebea0b936a6a126d7b9e217632caf1d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6420,7 +6596,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.5",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6924,8 +7100,12 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 name = "uart-codec"
 version = "0.1.0"
 dependencies = [
+ "dmesh-discovery",
+ "dmesh-server",
  "libc",
+ "mesh-api",
  "quic-lite",
+ "tempfile",
  "tokio",
 ]
 
@@ -7508,7 +7688,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8089,7 +8269,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d6f32a0ff4a9f6f01231eb2059cc85479330739333e0e58cadf03b6af2cca10"
 dependencies = [
  "cfg-if",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8107,6 +8287,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 [[package]]
 name = "ws"
 version = "0.1.0"
+source = "git+https://github.com/costinm/ssh-mesh#c15c7a0acebea0b936a6a126d7b9e217632caf1d"
 dependencies = [
  "async-trait",
  "axum",

@@ -5,6 +5,7 @@
 //! the bearer framing, so no UART marker is added.
 
 use std::sync::{Arc, Mutex};
+use std::string::String;
 
 use quic_lite::bearer::{
     BearerContext, BearerInfo, BearerName, EgressSubmission, PacketBearer, PacketEgress,
@@ -52,7 +53,7 @@ where
             return;
         };
         let Some((peer, len)) =
-            dmesh_rawnan::espnow::parse_action_frame_into(frame, writer.payload_mut())
+            crate::espnow::parse_action_frame_into(frame, writer.payload_mut())
         else {
             return;
         };
@@ -76,7 +77,7 @@ where
 /// ESP-NOW action-frame bearer. The radio monitor owns frame parsing and calls
 /// the returned [`EspNowIngress`]; this adapter owns no packet queue or pool.
 pub struct EspNowBearer<P: PacketPool + 'static> {
-    transmitter: crate::radio::RawActionTransmitter,
+    transmitter: super::frames::RawActionTransmitter,
     shared: Arc<Shared<P>>,
 }
 
@@ -91,7 +92,7 @@ impl<P: PacketPool + 'static> EspNowBearer<P> {
         });
         (
             Self {
-                transmitter: crate::radio::RawActionTransmitter::new(iface.into()),
+                transmitter: super::frames::RawActionTransmitter::new(iface.into()),
                 shared: shared.clone(),
             },
             shared,
@@ -116,10 +117,10 @@ where
                 submission.complete(PacketSendOutcome::Sent, 0);
                 Ok(())
             }
-            Err(crate::radio::RawActionSubmitError::WouldBlock) => {
+            Err(super::frames::RawActionSubmitError::WouldBlock) => {
                 Err(PacketSubmitError::WouldBlock(submission))
             }
-            Err(crate::radio::RawActionSubmitError::Failed(error)) => {
+            Err(super::frames::RawActionSubmitError::Failed(error)) => {
                 tracing::warn!(peer = ?address_peer(peer), %error, "lmesh_espnow_submit_failed");
                 submission.complete(PacketSendOutcome::Failed, 0);
                 Ok(())
@@ -195,7 +196,7 @@ mod tests {
         let control = [0xa3, 1, 6, 2, 1, 3, 1];
         let quic = [0x40, 0x01, 0x02, 0x03];
         let frame =
-            dmesh_rawnan::espnow::build_action_frame([0xff; 6], source, [0xff; 6], &control)
+            crate::espnow::build_action_frame([0xff; 6], source, [0xff; 6], &control)
                 .unwrap();
         let (bearer, ingress) = EspNowBearer::<TestPool>::new("not-opened-by-receive-test");
         let mut node: quic_lite::QuicNode<TestPool> = quic_lite::QuicNode::new(&POOL);
@@ -213,7 +214,7 @@ mod tests {
         assert_eq!(POOL.available(), available_before_control);
 
         let quic_frame =
-            dmesh_rawnan::espnow::build_action_frame([0xff; 6], source, [0xff; 6], &quic).unwrap();
+            crate::espnow::build_action_frame([0xff; 6], source, [0xff; 6], &quic).unwrap();
         let available_before_quic = POOL.available();
         ingress.receive_action_frame(&quic_frame, 18, &mut |peer, payload| {
             assert_eq!(peer, source);

@@ -11,7 +11,6 @@ const MAX_EVENT_RESPONSE_BYTES: usize = 1200;
 /// This is also a memory boundary: a count-limited history without a payload
 /// limit would still allow one producer to retain an arbitrary allocation.
 pub const MAX_BINARY_EVENT_PAYLOAD_BYTES: usize = 1024;
-pub const LOG_WATCH_MAX_RECORDS: usize = 64;
 
 /// Current Main identity and infrastructure-link state exposed by the
 /// generic `status` stream method. Address values are presentation-ready text
@@ -151,9 +150,6 @@ impl<K: Eq> Default for OrderedRecordAssembler<K> {
 pub const DIAGNOSTIC_COMPONENT: u64 = 9;
 pub const DIAGNOSTIC_STATUS_METHOD: u64 = 1;
 pub const DIAGNOSTIC_SERVICES_METHOD: u64 = 2;
-pub const DIAGNOSTIC_METRICS_METHOD: u64 = 3;
-pub const DIAGNOSTIC_EVENTS_METHOD: u64 = 4;
-pub const DIAGNOSTIC_LOG_WATCH_METHOD: u64 = 5;
 /// Main-only boot-control component. It is stream-only; Recovery deliberately
 /// does not register it.
 pub const BOOT_COMPONENT: u64 = 11;
@@ -161,13 +157,9 @@ pub const BOOT_RECOVERY_METHOD: u64 = 1;
 /// Read-only identity of the currently executing firmware image.
 pub const FIRMWARE_COMPONENT: u64 = 12;
 pub const FIRMWARE_IDENTITY_METHOD: u64 = 1;
-/// Host/device runtime snapshot and reset component. Firmware defines the
-/// scalar vocabulary in its runtime state; the component identity is shared.
+/// Runtime reset component (the state snapshot is `telemetry.runtime`).
 pub const RUNTIME_SNAPSHOT_COMPONENT: u64 = 101;
-pub const RUNTIME_SNAPSHOT_METHOD: u64 = 1;
 pub const RUNTIME_RESET_METHOD: u64 = 2;
-pub const POWER_SNAPSHOT_COMPONENT: u64 = 102;
-pub const MEMORY_SNAPSHOT_COMPONENT: u64 = 103;
 /// BLE adapter component shared by the ESP firmware adapter and host
 /// services that expose the same catalog surface.
 pub const BLE_COMPONENT: u64 = 104;
@@ -229,49 +221,6 @@ pub fn encode_tagged_service_catalog() -> Vec<u8> {
 /// Association identity for handlers that bind follow-on streams or state to
 /// a peer. Kept under its historical name; the type lives with the registry.
 pub use crate::registry::CallContext as TaggedRequestContext;
-
-/// Decode `{1: since?, 2: records?}` without allowing unknown or duplicate
-/// fields. An omitted fields map is the same as an empty map.
-pub fn decode_diagnostic_fields(fields: Option<&[u8]>) -> Option<(Option<u64>, Option<u64>)> {
-    let Some(fields) = fields else {
-        return Some((None, None));
-    };
-    let mut decoder = crate::cbor::Decoder::new(fields);
-    let (major, count) = decoder.head()?;
-    if major != 5 || count == u64::MAX {
-        return None;
-    }
-    let mut since = None;
-    let mut records = None;
-    for _ in 0..count {
-        match decoder.uint()? {
-            1 if since.is_none() => since = Some(decoder.uint()?),
-            2 if records.is_none() => records = Some(decoder.uint()?),
-            _ => return None,
-        }
-    }
-    decoder.is_finished().then_some((since, records))
-}
-
-/// Bounded subscription request shared by every server adapter. The request
-/// is deliberately small and opaque to QUIC-lite: adapters decide only how
-/// to schedule the resulting stream records.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LogWatchRequest {
-    pub records: usize,
-}
-
-pub fn decode_log_watch_request(data: &[u8]) -> Result<LogWatchRequest, &'static str> {
-    let records = match data {
-        [] => 1,
-        [records] => usize::from(*records),
-        _ => return Err("log-watch request must contain at most one record count"),
-    };
-    if !(1..=LOG_WATCH_MAX_RECORDS).contains(&records) {
-        return Err("log-watch record count out of range");
-    }
-    Ok(LogWatchRequest { records })
-}
 
 #[cfg(test)]
 mod record_assembler_tests {

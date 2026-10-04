@@ -10,6 +10,13 @@
 //! silently changing the Android/ESP interoperability format.
 
 extern crate alloc;
+#[cfg(feature = "linux")]
+#[macro_use]
+extern crate std;
+
+/// Linux backend (feature `linux`): the raw Wi-Fi bearer's system plumbing.
+#[cfg(feature = "linux")]
+pub mod linux;
 
 use alloc::{vec, vec::Vec};
 use anyhow::{anyhow, bail, Result};
@@ -26,7 +33,7 @@ pub mod now_sync;
 pub use now_sync::{
     build_now_sync_body, build_now_sync_frame, elect_now_anchor_master, is_now_sync,
     next_now_dw_start_us, now_sync_observe, now_sync_tick, parse_now_sync_body,
-    parse_now_sync_frame, NowSyncAction, NowSyncFrame, NowSyncObservation, NowSyncState,
+    parse_now_sync_frame, NowSyncAction, NowSyncFrame, NowSyncObservation, NowSyncDecision, now_master_tsf_us, NowSyncOutgoing, NowSelection, now_sync_decide, NowSyncState,
     NOW_SYNC_DEFAULT_INTERVAL_TU, NOW_SYNC_FLAG_MASTER, NOW_SYNC_FLAG_NAN_ALIGNED,
     NOW_SYNC_HEADER_LEN, NOW_SYNC_MAGIC_VERSION, NOW_SYNC_PREFIX_BYTE, NOW_SYNC_RESELECT_AFTER_US,
     NOW_SYNC_SERVICE_INFO_MAX_LEN, NOW_SYNC_STALE_AFTER_US,
@@ -83,6 +90,13 @@ pub const NAN_AVAILABILITY_BITMAP_TU: u32 = 16;
 /// A frame outside this interval cannot be assumed to reach a sleepy peer.
 pub const NAN_TX_DWELL_US: u64 = 32_000;
 
+/// Map the cluster TSF's DW boundary into the receiver's local clock. A
+/// discovery beacon received between DWs updates synchronization without
+/// making its arrival a new DW boundary.
+pub const fn nan_dw_boundary_local_us(received_local_us: u64, beacon_tsf_us: u64) -> u64 {
+    received_local_us.saturating_sub(beacon_tsf_us % NAN_DISCOVERY_PERIOD_US)
+}
+
 /// Return the next 512-TU discovery-window start derived from an observed
 /// cluster beacon's *local receive timestamp*.  The radio adapter samples the
 /// timestamp; this pure calculation is shared by host, Recovery, and Main.
@@ -96,6 +110,33 @@ pub const fn next_nan_dw_start_us(anchor_local_us: u64, now_us: u64) -> u64 {
     let elapsed = now_us - anchor_local_us;
     let periods = elapsed.div_ceil(NAN_DISCOVERY_PERIOD_US);
     anchor_local_us + periods * NAN_DISCOVERY_PERIOD_US
+}
+
+/// Next selected receive start, locked to the last beacon, not to the end of
+/// the preceding capture or a local boot clock. An interval of eight skips
+/// seven base DWs after the first eligible one. The pre-beacon margin belongs
+/// outside the 16-TU NAN DW and its immediately adjacent 16-TU NOW DW.
+pub const fn next_nan_capture_start_us(
+    anchor_local_us: u64, not_before_us: u64, interval: u8, pre_beacon_us: u64,
+) -> u64 {
+    let skipped = if interval > 1 { interval as u64 - 1 } else { 0 };
+    next_nan_dw_start_us(anchor_local_us, not_before_us.saturating_add(pre_beacon_us))
+        .saturating_sub(pre_beacon_us)
+        .saturating_add(skipped * NAN_DISCOVERY_PERIOD_US)
+}
+/// Like [`next_nan_capture_start_us`], but the selected windows are the cluster's own
+/// DW0/DW8 pattern: the next window (at least `pre_beacon_us` after `not_before_us`)
+/// whose TSF slot is a multiple of `interval`. `boundary_local_us` is a window start in the
+/// local clock and `boundary_slot` its TSF slot (`tsf / 512 TU`), so every device of a
+/// cluster picks the same windows, whenever it joined.
+pub const fn next_nan_capture_slot_start_us(
+    boundary_local_us: u64, boundary_slot: u64, not_before_us: u64, interval: u8, pre_beacon_us: u64,
+) -> u64 {
+    let first = next_nan_dw_start_us(boundary_local_us, not_before_us.saturating_add(pre_beacon_us));
+    let slot = boundary_slot + (first - boundary_local_us) / NAN_DISCOVERY_PERIOD_US;
+    let interval = if interval == 0 { 1 } else { interval as u64 };
+    let skipped = (interval - slot % interval) % interval;
+    (first + skipped * NAN_DISCOVERY_PERIOD_US).saturating_sub(pre_beacon_us)
 }
 pub const DMESH_SERVICE_ID: [u8; 6] = [0x75, 0x94, 0x31, 0x93, 0xea, 0xc9];
 pub const DMESH_MAGIC: [u8; 2] = *b"DM";
@@ -784,6 +825,69 @@ mod tests {
         frame
     }
 
+    fn synced(anchor_us: u64, tsf_us: u64) -> NanState {
+        let mut state = NanState::new(NAN_CLUSTER_STALE_AFTER_US);
+        let beacon = nan_beacon([0x50, 0x6f, 0x9a, 0x01, 0x00, 0x01], tsf_us, 100);
+        state.observe(RxFrame { bytes: &beacon, rssi_dbm: 0, timestamp_us: anchor_us });
+        state
+    }
+
+    #[test]
+    fn a_beacon_inside_a_dw_slot_does_not_move_the_dw_phase() {
+        let period = NAN_DISCOVERY_PERIOD_US;
+        let boundary_local = 10_000_000;
+        let mut state = synced(boundary_local, 5 * period);
+        let offset = 100 * 1_024;
+        let beacon = nan_beacon([0x50, 0x6f, 0x9a, 0x01, 0x00, 0x01], 5 * period + offset, 100);
+        state.observe(RxFrame {
+            bytes: &beacon,
+            rssi_dbm: 0,
+            timestamp_us: boundary_local + offset,
+        });
+        // This beacon updates clock synchronization, but its arrival is not
+        // a new discovery-window boundary. The current DW has already ended.
+        let next = state.window_at_or_after(boundary_local + offset).unwrap();
+        assert_eq!((next.slot, next.start_local_us), (6, boundary_local + period));
+    }
+
+    #[test]
+    fn windows_are_extrapolated_from_the_last_beacon_every_512_tu() {
+        let anchor = 10_000_000;
+        // TSF in slot 5 at the anchor.
+        let state = synced(anchor, 5 * NAN_DISCOVERY_PERIOD_US);
+        let first = state.window_at_or_after(anchor).unwrap();
+        assert_eq!((first.slot, first.start_local_us), (5, anchor));
+        assert!(first.open_at(anchor + NAN_TX_DWELL_US) && !first.open_at(anchor + NAN_TX_DWELL_US + 1));
+        // Between windows the next one is ahead, one period later, one slot on.
+        let next = state.window_at_or_after(anchor + NAN_TX_DWELL_US + 1).unwrap();
+        assert_eq!((next.slot, next.start_local_us), (6, anchor + NAN_DISCOVERY_PERIOD_US));
+        // Three periods on, still derived from the same beacon.
+        let later = state.window_at_or_after(anchor + 3 * NAN_DISCOVERY_PERIOD_US + 1_000).unwrap();
+        assert_eq!((later.slot, later.start_local_us), (8, anchor + 3 * NAN_DISCOVERY_PERIOD_US));
+        assert!(later.dw0_or_dw8() && !first.dw0_or_dw8());
+    }
+
+    #[test]
+    fn a_stale_sync_gives_no_window_and_no_sync_gives_none() {
+        let anchor = 10_000_000;
+        let state = synced(anchor, NAN_DISCOVERY_PERIOD_US);
+        assert!(state.window_at_or_after(anchor + NAN_CLUSTER_STALE_AFTER_US).is_some());
+        assert!(state.window_at_or_after(anchor + NAN_CLUSTER_STALE_AFTER_US + 1).is_none());
+        assert!(NanState::new(NAN_CLUSTER_STALE_AFTER_US).window_at_or_after(anchor).is_none());
+    }
+
+    #[test]
+    fn dw0_and_dw8_are_every_eighth_window() {
+        let anchor = 1_000_000;
+        let state = synced(anchor, 3 * NAN_DISCOVERY_PERIOD_US);
+        let slots: Vec<u64> = (0..10)
+            .map(|k| state.window_at_or_after(anchor + k * NAN_DISCOVERY_PERIOD_US).unwrap())
+            .filter(DiscoveryWindow::dw0_or_dw8)
+            .map(|window| window.slot)
+            .collect();
+        assert_eq!(slots, [8]);
+    }
+
     #[test]
     fn rewrite_sync_beacon_is_host_testable_and_preserves_nan_attributes() {
         let original_bssid = [0x50, 0x6f, 0x9a, 0x01, 0x01, 0x02];
@@ -820,6 +924,50 @@ mod tests {
             next_nan_dw_start_us(anchor, anchor + 2 * NAN_DISCOVERY_PERIOD_US + 7),
             anchor + 3 * NAN_DISCOVERY_PERIOD_US
         );
+    }
+
+    #[test]
+    fn selected_capture_preserves_beacon_phase_and_interval() {
+        let anchor = 7_123_456;
+        let pre = 8_000;
+        for interval in [1, 8, 16] {
+            let first = next_nan_capture_start_us(anchor, anchor + 40_000, interval, pre);
+            assert_eq!(first + pre, anchor + u64::from(interval) * NAN_DISCOVERY_PERIOD_US);
+            for jitter in [0, 5_000, 31_000] {
+                let next = next_nan_capture_start_us(anchor, first + 45_000 + jitter, interval, pre);
+                assert_eq!(next - first, u64::from(interval) * NAN_DISCOVERY_PERIOD_US);
+                assert_eq!((next + pre - anchor) % NAN_DISCOVERY_PERIOD_US, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn slot_capture_picks_the_clusters_dw0_and_dw8_whenever_the_device_joined() {
+        let pre = 8_000;
+        // Two devices joined at different times and slots of the same cluster pick the
+        // same windows: those whose TSF slot is a multiple of 8.
+        for (boundary, slot) in [(1_000_000, 3), (77_000_000, 8), (5_000_000, 13)] {
+            let start = next_nan_capture_slot_start_us(boundary, slot, boundary + 40_000, 8, pre) + pre;
+            let k = (start - boundary) / NAN_DISCOVERY_PERIOD_US;
+            assert_eq!((start - boundary) % NAN_DISCOVERY_PERIOD_US, 0);
+            assert_eq!((slot + k) % 8, 0);
+            assert!(k >= 1 && k <= 8);
+        }
+        // Interval 1 is the next window; the result never precedes the ready time.
+        let next = next_nan_capture_slot_start_us(1_000, 5, 1_000 + 40_000, 1, pre) + pre;
+        assert_eq!(next, 1_000 + NAN_DISCOVERY_PERIOD_US);
+        // Slot 8 itself is selected when it is the next window.
+        let at8 = next_nan_capture_slot_start_us(0, 7, 40_000, 8, pre) + pre;
+        assert_eq!(at8, NAN_DISCOVERY_PERIOD_US);
+    }
+
+    #[test]
+    fn capture_deadline_never_precedes_requested_ready_time() {
+        let anchor = 1_234_567;
+        for delta in [0, 1, 8_000, 524_287, 524_288, 524_289] {
+            let ready = anchor + delta;
+            assert!(next_nan_capture_start_us(anchor, ready, 1, 8_000) >= ready);
+        }
     }
 
     #[test]
@@ -1466,6 +1614,28 @@ pub const fn beacon_dwell_open(age_us: u64) -> bool {
     age_us <= NAN_TX_DWELL_US
 }
 
+/// One NAN discovery window, derived from the last observed cluster beacon. A sync
+/// from NOW's fake-beacons feeds the same state, so this is also the NOW window.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DiscoveryWindow {
+    /// The window's number in the cluster's TSF timeline (512-TU windows).
+    pub slot: u64,
+    /// When it starts, on the local monotonic clock.
+    pub start_local_us: u64,
+}
+
+impl DiscoveryWindow {
+    /// DW0 and DW8: the windows a sleepy peer is awake in (every eighth window).
+    pub const fn dw0_or_dw8(&self) -> bool {
+        self.slot % 8 == 0
+    }
+
+    /// `now_us` falls inside the transmit dwell of this window.
+    pub const fn open_at(&self, now_us: u64) -> bool {
+        now_us >= self.start_local_us && now_us - self.start_local_us <= NAN_TX_DWELL_US
+    }
+}
+
 /// Stable slot identity for duplicate suppression across host and firmware.
 pub const fn beacon_slot(tsf_us: u64, period_us: u64) -> Option<u64> {
     if period_us == 0 {
@@ -1484,6 +1654,11 @@ pub struct NanState {
     beacon_interval_tu: u32,
     last_beacon_us: u64,
     stale_after_us: u64,
+    /// The selected cluster is a real NAN cluster (a NAN beacon, or a NOW sync record that
+    /// reports one). A NAN cluster outranks a NOW-only one, which any NAN beacon replaces.
+    nan_cluster: bool,
+    /// This device is the anchor master of the NOW-only cluster it follows (see `now_sync`).
+    now_master: bool,
 }
 
 impl NanState {
@@ -1496,6 +1671,8 @@ impl NanState {
             beacon_interval_tu: 0,
             last_beacon_us: 0,
             stale_after_us,
+            nan_cluster: false,
+            now_master: false,
         }
     }
     pub const fn mode(&self) -> FilterMode {
@@ -1530,6 +1707,31 @@ impl NanState {
         }
     }
 
+    /// The discovery window that is open at `now_us`, or else the next one, extrapolated
+    /// from the last selected beacon: its TSF offset within the 512-TU period
+    /// maps the DW boundary into local time. Beacon arrival itself need not be
+    /// a DW boundary. `None` when there is no sync, or the last
+    /// beacon is older than the cluster staleness limit (the sync is lost).
+    pub fn window_at_or_after(&self, now_us: u64) -> Option<DiscoveryWindow> {
+        let (anchor_us, tsf_us, period_us) = self.nan_sync_timing()?;
+        if now_us.saturating_sub(anchor_us) > self.stale_after_us {
+            return None;
+        }
+        let boundary_us = nan_dw_boundary_local_us(anchor_us, tsf_us);
+        let anchor_slot = tsf_us / period_us;
+        let window = |k: u64| DiscoveryWindow {
+            slot: anchor_slot + k,
+            start_local_us: boundary_us + k * period_us,
+        };
+        let k = now_us.saturating_sub(boundary_us) / period_us;
+        let current = window(k);
+        Some(if current.open_at(now_us) || current.start_local_us > now_us {
+            current
+        } else {
+            window(k + 1)
+        })
+    }
+
     /// Record a normal AP beacon as a timing fallback.  A selected NAN
     /// cluster remains preferred; the AP beacon is only an anchor when no NAN
     /// cluster beacon has been seen.
@@ -1558,9 +1760,13 @@ impl NanState {
                 self.beacon_interval_tu = beacon_interval_tu(frame.bytes).unwrap_or(0);
                 self.mode = FilterMode::Cluster;
                 self.last_beacon_us = frame.timestamp_us;
+                self.nan_cluster = true;
+                self.now_master = false;
                 return Action::ArmA3(a3);
             }
             if self.cluster == Some(a3) {
+                self.nan_cluster = true;
+                self.now_master = false;
                 // Each selected NAN beacon advances the common DW slot.
                 // Retaining the first TSF made host DW work reuse a stale
                 // slot indefinitely even while its local receive time moved.
@@ -1569,9 +1775,14 @@ impl NanState {
                 self.last_beacon_us = frame.timestamp_us;
                 return Action::None;
             }
-            if frame.timestamp_us.saturating_sub(self.last_beacon_us)
-                >= NAN_CLUSTER_RESELECT_AFTER_US
+            // A real NAN cluster replaces a NOW-only one at once; two NAN clusters keep the
+            // sticky three-DW guard.
+            if !self.nan_cluster
+                || frame.timestamp_us.saturating_sub(self.last_beacon_us)
+                    >= NAN_CLUSTER_RESELECT_AFTER_US
             {
+                self.nan_cluster = true;
+                self.now_master = false;
                 self.cluster = Some(a3);
                 self.sync_bssid = Some(a3);
                 self.last_beacon_tsf_us = beacon_tsf_us(frame.bytes).unwrap_or(0);
@@ -1596,6 +1807,8 @@ impl NanState {
             self.sync_bssid = None;
             self.last_beacon_tsf_us = 0;
             self.beacon_interval_tu = 0;
+            self.nan_cluster = false;
+            self.now_master = false;
             return Action::Rediscover;
         }
         Action::None

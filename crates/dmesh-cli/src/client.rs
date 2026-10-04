@@ -1047,19 +1047,17 @@ fn split_object_file_argument(
 
 /// Select the wildcard address family from the peer. A raw IPv6 bearer must
 /// not first fail in the host client by binding an IPv4 socket.
+/// Source port of `dmesh-cli` itself (override with `DMESH_UDP_SOURCE_PORT`).
+pub(crate) const DMESH_CLI_UDP_PORT: u16 = 3338;
+
 fn udp_bind_for_peer(peer: SocketAddr) -> SocketAddr {
     let port = env::var("DMESH_UDP_SOURCE_PORT")
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
-        // An operator may pin this for a capture/reproduction, but a normal
-        // one-shot client must not share one port with every peer's multicast
-        // announce stream. On a populated LAN that made an unrelated board's
-        // packet look like the selected target's QUIC bootstrap response.
-        .unwrap_or(0);
-    // Keep the operator/client socket distinct from both managed host
-    // listeners (wlan0:3336, wlan1:3337) and firmware raw UDP6 (3339).
-    // The default is an ephemeral port. Set DMESH_UDP_SOURCE_PORT when a
-    // reproducible fixed source is specifically required for a capture.
+        // The client's own fixed port: lmesh, Android and the firmware serve 3339, and this
+        // is the one port the CLI uses, so a firewall or capture can name it.
+        .unwrap_or(DMESH_CLI_UDP_PORT);
+    // If another `dmesh-cli` holds it, an ephemeral port is used (see `bind_client_udp`).
     quic_lite::bearer_udp::wildcard_bind(peer, port)
 }
 
@@ -1242,6 +1240,7 @@ fn flash_target_from_catalog_profile(profile: &DeviceProfile) -> Result<FlashTar
         ));
     }
     Ok(FlashTarget {
+        restore_sleepy: profile.sleepy,
         description: profile
             .vip6
             .map(|vip6| format!("{name} ({vip6})"))
@@ -2203,6 +2202,7 @@ mod tests {
             0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x00, 0x11, 0x22, 0xff, 0xfe, 0x33, 0x44, 0x55,
         ]);
         let target = FlashTarget {
+            restore_sleepy: false,
             description: "node-under-test".into(),
             node: None,
             mac: Some(mac),

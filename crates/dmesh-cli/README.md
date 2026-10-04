@@ -30,7 +30,7 @@ dmesh-cli http://127.0.0.1:18480 transport.set --mode=6
 . ./env.sh
 export DMESH_DEVICE_CATALOG=/path/to/device-catalog.toml # Deprecated test override only.
 dmesh-cli DEVICE status
-dmesh-cli udp://[fe80::1234%wlan0]:3337 status
+dmesh-cli udp://[fe80::1234%wlan0]:3339 status
 dmesh-cli SERIAL status
 ~~~
 
@@ -127,7 +127,7 @@ dmesh-cli DEVICE radio.snapshot                  # Raw radio state and counters.
 dmesh-cli DEVICE wifi.scan --last_results=true     # Retained Wi-Fi scan results.
 dmesh-cli DEVICE probe.start --bytes=4096 --packet_size=256 # CLI probes DEVICE (calls its probe.handler).
 dmesh-cli DEVICE probe.start --bytes=65536 --packet_size=1024 --parallel_streams=2
-dmesh-cli DEVICE probe.start --peer=udp://HOST:3337 --bytes=65536 # DEVICE probes HOST.
+dmesh-cli DEVICE probe.start --peer=udp://HOST:3339 --bytes=65536 # DEVICE probes HOST.
 ~~~
 
 probe reports bytes and timing; it does not prove that a separate application

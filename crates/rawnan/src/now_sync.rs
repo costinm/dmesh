@@ -505,6 +505,202 @@ pub const fn next_now_dw_start_us(anchor_local_us: u64, now_us: u64) -> u64 {
     crate::next_nan_dw_start_us(anchor_local_us, now_us)
 }
 
+/// The cluster TSF a new NOW-only master starts from: the Unix time in microseconds when the
+/// clock is set (any time after 2020), so independent clusters on synchronized clocks number
+/// their windows the same way and DW0 is whichever slot is a multiple of 8 (the low bits of
+/// `tsf / 512 TU` are zero), as in a NAN cluster. Without a set clock, the local monotonic
+/// time: the cluster is still consistent, only its slot numbers are its own.
+pub const fn now_master_tsf_us(unix_us: Option<u64>, local_us: u64) -> u64 {
+    const UNIX_2020_US: u64 = 1_577_836_800_000_000;
+    match unix_us {
+        Some(unix) if unix >= UNIX_2020_US => unix,
+        _ => local_us.saturating_add(1),
+    }
+}
+
+/// What this device sends as its NOW sync record: the fields of
+/// [`build_now_sync_frame`], from [`crate::NanState::now_sync_outgoing`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NowSyncOutgoing {
+    pub cluster_id: [u8; 6],
+    pub anchor_master: [u8; 6],
+    pub tsf_us: u64,
+    pub interval_tu: u32,
+    pub flags: u8,
+}
+
+/// The NOW cluster is formed in the one [`crate::NanState`] that also follows real NAN
+/// beacons, so the discovery-window scheduler of every platform has a single source of
+/// timing. A NOW record plays the part of a beacon: its cluster id is the selection key,
+/// its TSF places the window boundary, and the same sticky/3-DW/5-s rules apply. A real
+/// NAN cluster always wins over a NOW-only one.
+/// The selected cluster, as far as the NOW selection rules need it. A platform that keeps
+/// its selection in its own fields (the firmware's atomics) builds one of these and calls
+/// [`now_sync_decide`]; [`crate::NanState`] does the same from its own.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NowSelection {
+    /// The followed cluster id, `[0; 6]` when none.
+    pub cluster: [u8; 6],
+    /// It is a real NAN cluster (a NAN beacon or an aligned NOW record selected it).
+    pub nan_cluster: bool,
+    /// This device is its NOW-only anchor master.
+    pub master: bool,
+    /// Local receive time of the last record that kept it alive.
+    pub last_local_us: u64,
+}
+
+/// What an observed NOW sync record does to the selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NowSyncDecision {
+    /// Not a usable record (names this device, or nobody).
+    Ignore,
+    /// Select this record's cluster (a first cluster, a NAN cluster replacing a NOW-only
+    /// one, a lower MAC replacing a master, or a reselection after the guard).
+    Join,
+    /// The followed cluster's timing is refreshed.
+    Refresh,
+    /// A different cluster while the selected one stays.
+    Drop,
+}
+
+/// The NOW cluster selection rules, in one place for every platform: the same sticky /
+/// 3-DW / 5-s rules as NAN beacons, a real NAN cluster outranking a NOW-only one, and,
+/// among NOW-only masters, the lowest MAC winning. With nothing selected a NOW-only
+/// cluster is joined only when its id is below `local`; otherwise the caller becomes the
+/// master, so two isolated devices cannot adopt each other.
+pub fn now_sync_decide(
+    selection: NowSelection,
+    local: [u8; 6],
+    cluster: [u8; 6],
+    nan_aligned: bool,
+    local_us: u64,
+) -> NowSyncDecision {
+    use NowSyncDecision::{Drop, Ignore, Join, Refresh};
+    if cluster == [0; 6] || cluster == local {
+        return Ignore;
+    }
+    if selection.cluster == [0; 6] {
+        return if nan_aligned || cluster < local { Join } else { Ignore };
+    }
+    if selection.cluster == cluster {
+        return Refresh;
+    }
+    if nan_aligned && !selection.nan_cluster {
+        Join
+    } else if !nan_aligned && selection.nan_cluster {
+        Drop
+    } else if selection.master {
+        if cluster < selection.cluster { Join } else { Drop }
+    } else if local_us.saturating_sub(selection.last_local_us) >= crate::NAN_CLUSTER_RESELECT_AFTER_US {
+        Join
+    } else {
+        Drop
+    }
+}
+
+impl crate::NanState {
+    /// Observe one NOW sync record. `Action::ArmA3(cluster)` reports that this record
+    /// selected (or replaced) the followed cluster, exactly as a NAN beacon would; see
+    /// [`now_sync_decide`] for the rules.
+    pub fn observe_now_sync(
+        &mut self,
+        local: crate::MacAddr,
+        cluster: [u8; 6],
+        tsf_us: u64,
+        interval_tu: u32,
+        nan_aligned: bool,
+        local_us: u64,
+    ) -> crate::Action {
+        use crate::{Action, FilterMode, MacAddr};
+        let selection = NowSelection {
+            cluster: self.cluster.map_or([0; 6], |mac| mac.0),
+            nan_cluster: self.nan_cluster,
+            master: self.now_master,
+            last_local_us: self.last_beacon_us,
+        };
+        match now_sync_decide(selection, local.0, cluster, nan_aligned, local_us) {
+            NowSyncDecision::Ignore => Action::None,
+            NowSyncDecision::Drop => Action::DropForeign,
+            NowSyncDecision::Refresh => {
+                self.last_beacon_tsf_us = tsf_us;
+                self.beacon_interval_tu = interval_tu.max(1);
+                self.last_beacon_us = local_us;
+                if nan_aligned {
+                    self.nan_cluster = true;
+                }
+                Action::None
+            }
+            NowSyncDecision::Join => {
+                self.cluster = Some(MacAddr(cluster));
+                self.sync_bssid = Some(MacAddr(cluster));
+                self.last_beacon_tsf_us = tsf_us;
+                self.beacon_interval_tu = interval_tu.max(1);
+                self.mode = FilterMode::Cluster;
+                self.last_beacon_us = local_us;
+                self.nan_cluster = nan_aligned;
+                self.now_master = false;
+                Action::ArmA3(MacAddr(cluster))
+            }
+        }
+    }
+
+    /// Form (or keep) a NOW-only cluster with this device as its anchor master: its own
+    /// clock is the cluster TSF, so its windows are the 512-TU multiples of `now_us`.
+    /// Does nothing while another cluster is followed. Returns true while master.
+    /// Call it when about to send a sync record with nothing selected, and at every
+    /// record, so the master's own sync does not go stale.
+    pub fn become_now_master(
+        &mut self,
+        local: crate::MacAddr,
+        now_us: u64,
+        unix_us: Option<u64>,
+    ) -> bool {
+        if self.cluster.is_some() && !self.now_master {
+            return false;
+        }
+        // A master already running keeps its phase: its TSF is carried forward, not reset.
+        let tsf_us = match (self.now_master, self.now_sync_outgoing(now_us)) {
+            (true, Some(out)) => out.tsf_us,
+            _ => now_master_tsf_us(unix_us, now_us),
+        };
+        self.cluster = Some(local);
+        self.sync_bssid = Some(local);
+        self.last_beacon_tsf_us = tsf_us;
+        self.beacon_interval_tu = NOW_SYNC_DEFAULT_INTERVAL_TU;
+        self.mode = crate::FilterMode::Cluster;
+        self.last_beacon_us = now_us;
+        self.nan_cluster = false;
+        self.now_master = true;
+        true
+    }
+
+    pub const fn is_now_master(&self) -> bool {
+        self.now_master
+    }
+
+    /// The record to send now for the followed cluster, with the cluster TSF carried
+    /// forward to `now_us`. `None` when no cluster is selected.
+    pub fn now_sync_outgoing(&self, now_us: u64) -> Option<NowSyncOutgoing> {
+        let cluster = self.cluster?;
+        let mut flags = 0;
+        if self.now_master {
+            flags |= NOW_SYNC_FLAG_MASTER;
+        }
+        if self.nan_cluster {
+            flags |= NOW_SYNC_FLAG_NAN_ALIGNED;
+        }
+        Some(NowSyncOutgoing {
+            cluster_id: cluster.0,
+            anchor_master: cluster.0,
+            tsf_us: self
+                .last_beacon_tsf_us
+                .saturating_add(now_us.saturating_sub(self.last_beacon_us)),
+            interval_tu: self.beacon_interval_tu.max(1),
+            flags,
+        })
+    }
+}
+
 impl NowSyncState {
     const fn priority(&self) -> u8 {
         if self.nan_aligned {
@@ -755,5 +951,125 @@ mod tests {
 
     fn build_dmesh_service_info_for_test() -> Vec<u8> {
         crate::build_dmesh_service_info([9, 8, 7, 6, 5, 4], 1, None).to_vec()
+    }
+
+    mod cluster {
+        use super::*;
+        use crate::{Action, MacAddr, NanState, NAN_DISCOVERY_PERIOD_US as P};
+
+        const A: MacAddr = MacAddr([2, 0, 0, 0, 0, 1]);
+        const B: MacAddr = MacAddr([2, 0, 0, 0, 0, 2]);
+        const C: MacAddr = MacAddr([2, 0, 0, 0, 0, 3]);
+
+        fn state() -> NanState {
+            NanState::new(crate::NAN_CLUSTER_STALE_AFTER_US)
+        }
+
+        #[test]
+        fn two_isolated_devices_converge_on_the_lowest_mac_and_never_adopt_each_other() {
+            let (mut a, mut b) = (state(), state());
+            assert!(a.become_now_master(A, 1_000_000, None));
+            assert!(b.become_now_master(B, 2_000_000, None));
+            let from_a = a.now_sync_outgoing(1_100_000).unwrap();
+            let from_b = b.now_sync_outgoing(2_100_000).unwrap();
+            assert!(from_a.flags & NOW_SYNC_FLAG_MASTER != 0);
+            // The higher MAC follows; the lower one ignores it.
+            assert_eq!(a.observe_now_sync(A, from_b.cluster_id, from_b.tsf_us, 512, false, 1_100_000), Action::DropForeign);
+            assert_eq!(b.observe_now_sync(B, from_a.cluster_id, from_a.tsf_us, 512, false, 2_100_000), Action::ArmA3(A));
+            assert_eq!(b.cluster(), Some(A));
+            assert!(!b.is_now_master() && a.is_now_master());
+            // B now forwards A's cluster, not its own, with A's TSF carried forward.
+            let forwarded = b.now_sync_outgoing(2_200_000).unwrap();
+            assert_eq!(forwarded.cluster_id, A.0);
+            assert_eq!(forwarded.tsf_us, from_a.tsf_us + 100_000);
+            assert_eq!(forwarded.flags & NOW_SYNC_FLAG_MASTER, 0);
+        }
+
+        #[test]
+        fn a_follower_places_its_windows_on_the_masters_clock() {
+            let mut b = state();
+            let tsf = 5 * P + 1_000;
+            assert_eq!(b.observe_now_sync(B, A.0, tsf, 512, false, 9_000_000), Action::ArmA3(A));
+            let open = b.window_at_or_after(9_000_000).unwrap();
+            assert_eq!((open.slot, open.start_local_us), (5, 9_000_000 - 1_000));
+            let next = b.window_at_or_after(9_000_000 + crate::NAN_TX_DWELL_US).unwrap();
+            assert_eq!((next.slot, next.start_local_us), (6, 9_000_000 - 1_000 + P));
+        }
+
+        #[test]
+        fn nothing_selected_and_a_higher_mac_leaves_the_caller_to_become_master() {
+            let mut a = state();
+            assert_eq!(a.observe_now_sync(A, B.0, 10, 512, false, 1), Action::None);
+            assert!(a.cluster().is_none());
+            assert_eq!(a.observe_now_sync(B, A.0, 10, 512, false, 1), Action::ArmA3(A));
+            // A record naming this device itself, or nobody, is ignored.
+            assert_eq!(state().observe_now_sync(A, A.0, 10, 512, false, 1), Action::None);
+            assert_eq!(state().observe_now_sync(A, [0; 6], 10, 512, false, 1), Action::None);
+        }
+
+        #[test]
+        fn a_follower_is_sticky_until_the_guard_and_the_master_never_follows_a_higher_mac() {
+            let mut s = state();
+            assert_eq!(s.observe_now_sync(C, B.0, 10, 512, false, 1_000), Action::ArmA3(B));
+            // A lower MAC does not take over inside the guard, only after 3 DWs.
+            assert_eq!(s.observe_now_sync(C, A.0, 10, 512, false, 2_000), Action::DropForeign);
+            let late = 1_000 + crate::NAN_CLUSTER_RESELECT_AFTER_US;
+            assert_eq!(s.observe_now_sync(C, A.0, 10, 512, false, late), Action::ArmA3(A));
+            let mut m = state();
+            m.become_now_master(A, 1_000, None);
+            assert_eq!(m.observe_now_sync(A, C.0, 10, 512, false, 2_000), Action::DropForeign);
+            assert_eq!(m.cluster(), Some(A));
+        }
+
+        #[test]
+        fn a_nan_cluster_replaces_a_now_only_one_at_once_and_is_never_replaced_by_one() {
+            let mut s = state();
+            s.become_now_master(A, 1_000, None);
+            // A NOW record reporting a NAN cluster joins it (the revert case).
+            let nan = [0x50, 0x6f, 0x9a, 1, 2, 3];
+            assert_eq!(s.observe_now_sync(A, nan, 7 * P, 512, true, 2_000), Action::ArmA3(MacAddr(nan)));
+            assert!(!s.is_now_master());
+            assert_eq!(s.now_sync_outgoing(2_000).unwrap().flags, NOW_SYNC_FLAG_NAN_ALIGNED);
+            // A NOW-only record, even with a lower MAC, is dropped while a NAN cluster is live.
+            assert_eq!(s.observe_now_sync(B, [1; 6], 1, 512, false, 3_000), Action::DropForeign);
+            // And a NOW-only follower is replaced by a real NAN beacon at once.
+            let mut f = state();
+            f.observe_now_sync(C, B.0, 1, 512, false, 1_000);
+            assert!(!f.nan_cluster);
+        }
+
+        #[test]
+        fn a_master_numbers_its_windows_by_unix_time_so_dw0_is_a_multiple_of_8() {
+            let unix = 1_790_000_000_000_000u64 / P * P + 1_000;
+            let mut a = state();
+            a.become_now_master(A, 5_000_000, Some(unix));
+            let slot = a.window_at_or_after(5_000_000).unwrap().slot;
+            assert_eq!(slot, unix / P);
+            // Refreshing keeps the phase; an unset clock falls back to local time.
+            a.become_now_master(A, 5_100_000, Some(unix + 999_999_999));
+            assert_eq!(a.now_sync_outgoing(5_100_000).unwrap().tsf_us, unix + 100_000);
+            assert_eq!(now_master_tsf_us(Some(12345), 777), 778);
+            // A follower in another clock domain lands on the same slots.
+            let out = a.now_sync_outgoing(5_300_000).unwrap();
+            let mut b = state();
+            b.observe_now_sync(B, out.cluster_id, out.tsf_us, 512, false, 900_000_000);
+            let w = b.window_at_or_after(900_000_000).unwrap();
+            // The master's window 301 ms ago is over; the follower's next one is the next slot.
+            assert_eq!(w.slot, out.tsf_us / P + 1);
+        }
+
+        #[test]
+        fn the_master_goes_stale_without_refreshing_itself_and_follows_none() {
+            let mut m = state();
+            m.become_now_master(A, 1_000, None);
+            assert_eq!(m.tick(1_000 + crate::NAN_CLUSTER_STALE_AFTER_US), Action::Rediscover);
+            assert!(m.cluster().is_none() && !m.is_now_master());
+            assert!(m.now_sync_outgoing(0).is_none());
+            // A follower is not turned into a master.
+            let mut f = state();
+            f.observe_now_sync(C, B.0, 1, 512, false, 1);
+            assert!(!f.become_now_master(C, 100, None));
+            assert_eq!(f.cluster(), Some(B));
+        }
     }
 }

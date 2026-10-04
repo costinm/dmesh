@@ -42,7 +42,7 @@ pub use bearer::{
     PacketSubmitError, PacketWriter, PeerL2Address,
 };
 pub use node::{
-    AssociationEvent, AssociationLimits, CircuitId, CircuitInfo, CircuitNextHop, CircuitStatus,
+    AssociationEvent, AssociationRow, BearerRow, AssociationLimits, CircuitId, CircuitInfo, CircuitNextHop, CircuitStatus,
     DEFAULT_PACKET_POOL_SLOT_SIZE, MAX_NEARBY_RETURN_RELAYS, NearbyRelayHint, NearbyRelayHints,
     NodeLimits, PACKET_PREFIX_RESERVE, PACKET_SUFFIX_RESERVE, PacingConfig, PathEstimatorConfig,
     QuicAssociation, QuicNode, QuicNodeEgressError, QuicNodeError, QuicStream, ReceivedStreamChunk,
@@ -3708,13 +3708,15 @@ impl PathState {
                     .min(u128::from(u64::MAX)) as u64
             };
             let packet_denominator = rtt.saturating_mul(mss).max(1);
-            let packet_rate_q16 = window.saturating_mul(Q16) / packet_denominator;
             let packet_wait = if packet_deficit == 0 {
                 0
-            } else if packet_rate_q16 == 0 {
-                1
             } else {
-                (u128::from(packet_deficit).saturating_add(packet_rate_q16 - 1) / packet_rate_q16)
+                // Calculate the wait before dividing the fractional packet
+                // rate. A multi-second RTT can make Q16 packets/us round to
+                // zero; retrying every microsecond then rounds every refill
+                // to zero too, permanently starving a pending write.
+                (u128::from(packet_deficit).saturating_mul(packet_denominator)
+                    .saturating_add(byte_denominator - 1) / byte_denominator)
                     .min(u128::from(u64::MAX)) as u64
             };
             self.pacing_deadline_us =
@@ -6773,6 +6775,17 @@ impl<const P: usize> EndpointState<P> {
         frame: Frame<'_>,
         out: &mut [u8],
     ) -> Result<usize, Error> {
+        self.encode_path_control_packet_inner(path_id, destination, frame, out, false)
+    }
+
+    fn encode_path_control_packet_inner(
+        &mut self,
+        path_id: usize,
+        destination: ConnectionId,
+        frame: Frame<'_>,
+        out: &mut [u8],
+        pto_probe: bool,
+    ) -> Result<usize, Error> {
         if path_id >= self.paths.len()
             || destination.value() == 0
             || !matches!(
@@ -6828,7 +6841,7 @@ impl<const P: usize> EndpointState<P> {
                 | Frame::Ping
         );
         let transmission_slot = if track_flight {
-            if self.in_flight_packet_count() >= self.peer_max_in_flight_packets {
+            if !pto_probe && self.in_flight_packet_count() >= self.peer_max_in_flight_packets {
                 return Err(Error::Blocked);
             }
             let slot = self
@@ -6837,7 +6850,7 @@ impl<const P: usize> EndpointState<P> {
                 .take(self.transmission_limit)
                 .position(Option::is_none)
                 .ok_or(Error::HistoryFull)?;
-            if !self.paths[path_id].congestion.can_send(used as u64) {
+            if !pto_probe && !self.paths[path_id].congestion.can_send(used as u64) {
                 return Err(Error::Blocked);
             }
             Some(slot)
@@ -6865,8 +6878,14 @@ impl<const P: usize> EndpointState<P> {
         {
             return Err(Error::Blocked);
         }
-        if track_flight && !self.paths[path_id].congestion.on_packet_sent(used as u64) {
-            return Err(Error::Blocked);
+        if track_flight {
+            if pto_probe {
+                // A PTO probe must be able to elicit an ACK even when lost
+                // copies have filled the window. It still counts as flight.
+                self.paths[path_id].congestion.on_retransmission_sent(used as u64);
+            } else if !self.paths[path_id].congestion.on_packet_sent(used as u64) {
+                return Err(Error::Blocked);
+            }
         }
         let duplication_charge = if path_probe && self.duplication_budget_available() >= used as u64
         {
@@ -8002,6 +8021,35 @@ impl<const P: usize> EndpointState<P> {
         }
     }
 
+    fn probe_delivered_flight(
+        &mut self,
+        now: u64,
+        out: &mut [u8],
+    ) -> Result<Option<(usize, u32)>, Error> {
+        // Original data can be acknowledged while all fresh-number
+        // replacement copies were dropped. Their payload no longer needs
+        // retransmission, but their physical flight still needs an ACK/loss
+        // decision. A tracked PING advances ACK evidence rather than leaving
+        // an expired PTO with nothing to send.
+        let path_id = self.paths.iter().enumerate().find_map(|(path_id, path)| {
+            let interval = self.pto_timeout_for_path(path_id)
+                .saturating_mul(1u64 << path.pto_backoff.min(MAX_PTO_BACKOFF_EXPONENT));
+            let oldest = self.sent_packets.iter().flatten()
+                .filter(|packet| packet.path_id == path_id && packet.accepted && !packet.lost)
+                .map(|packet| packet.sent_at).min()?;
+            let due = path.last_pto_probe_at.unwrap_or(oldest).saturating_add(interval);
+            (now >= due).then_some(path_id)
+        });
+        let Some(path_id) = path_id else { return Ok(None); };
+        let Some(destination) = self.peer_connection_id_on_path(path_id) else { return Ok(None); };
+        let packet_number = self.next_packet_number;
+        let used = self.encode_path_control_packet_inner(path_id, destination, Frame::Ping, out, true)?;
+        self.paths[path_id].last_pto_probe_at = Some(now);
+        self.paths[path_id].pto_backoff = self.paths[path_id].pto_backoff
+            .saturating_add(1).min(MAX_PTO_BACKOFF_EXPONENT);
+        Ok(Some((used, packet_number)))
+    }
+
     fn newer_transmission_covers_retransmission_head(&self, packet: &SentPacket) -> bool {
         let Some(range_slot) = packet.send_buffer_slot else {
             return false;
@@ -8117,7 +8165,7 @@ impl<const P: usize> EndpointState<P> {
                 }
                 Ok(retransmission)
             }
-            None => Ok(None),
+            None => self.probe_delivered_flight(now, out),
         }
     }
 
@@ -10662,6 +10710,48 @@ mod tests {
     }
 
     #[test]
+    fn delayed_original_ack_with_dropped_replacements_recovers_send_capacity() {
+        let local = ConnectionId::new(53).unwrap();
+        let peer = ConnectionId::new(54).unwrap();
+        let mut sender = EndpointState::<128>::new(Role::Client, ConnectionLimits::default(), 1200);
+        let mut receiver = EndpointState::<128>::new(Role::Server, ConnectionLimits::default(), 1200);
+        sender.install_connection_ids(local, peer).unwrap();
+        receiver.install_connection_ids(peer, local).unwrap();
+        sender.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
+        let mut packet = [0u8; 256];
+        let (used, original) = sender.encode_stream_packet(peer, 4, 0, false, b"first", &mut packet).unwrap();
+        receiver.receive_packet(&packet[..used]).unwrap();
+        // The peer is busy for several seconds. Original data reached it,
+        // but every replacement transmission is dropped during the pause.
+        for now in [100_000, 300_000, 700_000, 1_500_000] {
+            sender.set_time(now);
+            sender.retransmit_stream_packet(original, &mut packet).unwrap().unwrap();
+        }
+        sender.set_time(3_000_000);
+        receiver.set_time(3_000_000);
+        let mut ack = [0u8; 256];
+        let ack_len = receiver.poll_transmit(&mut ack).unwrap().unwrap();
+        sender.receive_packet(&ack[..ack_len]).unwrap();
+        assert_eq!(sender.retained_payload_bytes(), 0);
+        assert!(sender.bytes_in_flight() > 0);
+        sender.paths[0].congestion.congestion_window = sender.bytes_in_flight();
+        assert_eq!(sender.encode_stream_packet(peer, 4, 5, false, b"next", &mut packet), Err(Error::Blocked));
+
+        let deadline = sender.next_bearer_deadline().unwrap().max(3_000_001);
+        let (probe_len, _) = sender.retransmit_due(deadline, 0, &mut packet).unwrap()
+            .expect("outstanding delivered copies still require an ack-eliciting PTO probe");
+        receiver.set_time(deadline);
+        receiver.receive_packet(&packet[..probe_len]).unwrap();
+        receiver.set_time(deadline + 25_000);
+        let ack_len = receiver.poll_transmit(&mut ack).unwrap().unwrap();
+        sender.set_time(deadline + 25_000);
+        sender.receive_packet(&ack[..ack_len]).unwrap();
+        assert_eq!(sender.bytes_in_flight(), 0);
+        assert_eq!(sender.history_len(), 0);
+        sender.encode_stream_packet(peer, 4, 5, false, b"next", &mut packet).unwrap();
+    }
+
+    #[test]
     fn overlapping_acknowledgement_retransmits_only_unacknowledged_bytes() {
         let local = ConnectionId::new(0x761).unwrap();
         let peer = ConnectionId::new(0x762).unwrap();
@@ -12767,6 +12857,24 @@ mod tests {
         assert!(ready_at_us > 0);
         assert!(path.try_reserve_pacing(1200, ready_at_us));
         assert_eq!(path.pacing_deadline_us(), None);
+    }
+
+    #[test]
+    fn per_path_pacer_refills_after_multi_second_rtt_without_zero_rate_spin() {
+        let mut path = PathState::new(1200, 8);
+        path.rtt.update_at(3_000_000, 0);
+        path.congestion.congestion_window = 4800;
+        path.set_pacing_config(crate::PacingConfig {
+            enabled: true, max_burst_packets: 1, max_burst_bytes: 2400,
+        });
+        assert!(path.try_reserve_pacing(1200, 0));
+        assert!(!path.try_reserve_pacing(1200, 0));
+        let deadline = path.pacing_deadline_us().unwrap();
+        assert_eq!(deadline, 750_000);
+        assert!(!path.try_reserve_pacing(1200, deadline - 1));
+        // One early poll can lose less than a Q16 unit through rounding.
+        let deadline = path.pacing_deadline_us().unwrap();
+        assert!(path.try_reserve_pacing(1200, deadline));
     }
 
     #[test]

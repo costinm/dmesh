@@ -42,8 +42,9 @@ fn quic_driver_exit_error(
 pub struct RuntimeDefaults {
     pub control_socket: &'static str,
     pub http_port: u16,
-    /// Normal unicast object/QUIC-lite listener. This is intentionally not a
-    /// discovery port and must remain distinct per supervised service.
+    /// Normal unicast object/QUIC-lite listener: the one DMesh UDP port every platform
+    /// (ESP32, Android, Linux) serves, so a peer needs no per-platform port. A client such
+    /// as `dmesh-cli` binds an ephemeral port instead of this one.
     pub udp_port: u16,
 }
 
@@ -51,7 +52,7 @@ pub struct RuntimeDefaults {
 pub const LMESH_DEFAULTS: RuntimeDefaults = RuntimeDefaults {
     control_socket: "/run/mesh/lmesh/mesh.sock.cbor",
     http_port: 18981,
-    udp_port: 3337,
+    udp_port: 3339,
 };
 
 /// Generated public catalog. Only reviewed entries carry numeric tags, so the
@@ -75,16 +76,33 @@ fn public_tools_json() -> serde_json::Value {
         .expect("lmesh tools.json must contain tools")
 }
 
+/// Registers an executable's own handlers (for example a bearer it owns) with
+/// the service registry. It receives the running QUIC node, for attaching
+/// bearers, and this node's compressed P-256 public key, the default
+/// control-plane root a pairing installs.
+pub type RegistryExtension =
+    Box<dyn FnOnce(&Registry, &quic_lite::tokio::TokioNode, &[u8], &Arc<LocalDiscovery>) + Send>;
+
+/// Who owns the Wi-Fi radio. `Internal` is this crate's `RadioService` (the
+/// experimental AP/NAN/NOW stack). `External` means the executable runs the radio
+/// itself (`rawnan`'s raw bearer) and registers every radio-facing method; this crate
+/// then neither starts the radio nor registers those methods.
+pub enum RadioOwner {
+    Internal(Arc<dyn crate::espnow_bearer::EspNowIngress>),
+    External,
+}
+
 /// Run the shared Linux mesh control plane.
 pub async fn run_mesh_service(
     defaults: RuntimeDefaults,
     node: HostQuicNode,
     now_bearer: quic_lite::BearerId,
-    espnow_ingress: Arc<dyn crate::espnow_bearer::EspNowIngress>,
+    radio: RadioOwner,
+    extend: RegistryExtension,
 ) -> Result<()> {
     let (trace_buffer, _trace_guard) = mesh::local_trace::init("lmesh");
     mesh::local_trace::serve("lmesh", trace_buffer.clone());
-    if let Err(error) = run_server(defaults, node, now_bearer, espnow_ingress).await {
+    if let Err(error) = run_server(defaults, node, now_bearer, radio, extend).await {
         // mesh-init intentionally discards child stderr in the production
         // service unit. Persist the startup failure in the service log so a
         // stale control socket is diagnosable without changing radio state or
@@ -99,9 +117,11 @@ async fn run_server(
     defaults: RuntimeDefaults,
     node: HostQuicNode,
     now_bearer: quic_lite::BearerId,
-    espnow_ingress: Arc<dyn crate::espnow_bearer::EspNowIngress>,
+    radio: RadioOwner,
+    extend: RegistryExtension,
 ) -> Result<()> {
     crate::mesh_core::note_service_started();
+    let external_radio = matches!(radio, RadioOwner::External);
     let (node, driver) = quic_lite::tokio::TokioNodeDriver::new(
         node,
         quic_lite::AssociationLimits::host().connection,
@@ -122,54 +142,63 @@ async fn run_server(
     let discovery = Arc::new(discovery);
     let service = Arc::new(LmeshService::new(discovery.clone()));
     service.set_now_quic_client(node.clone(), now_bearer);
-    service.set_espnow_ingress(espnow_ingress);
+    if let RadioOwner::Internal(ingress) = radio {
+        service.set_espnow_ingress(ingress);
+    }
     // Netlink is only an advisory hint. A base-device event waits for the USB
     // driver to settle, then runs the same presence-edge check as the periodic
     // fallback. AP, monitor, carrier, and P2P events are ignored.
     let owned_interfaces = service.wifi_owned_interfaces();
     let owned_base_interfaces = owned_interfaces.names().to_vec();
-    let owns_wifi = !owned_base_interfaces.is_empty();
-    let (link_events, mut link_event_rx) = tokio::sync::mpsc::unbounded_channel();
-    std::thread::spawn(move || {
-        lmesh_wifi::recovery::watch_link_events(owned_interfaces, link_events)
-    });
-    let recovery_service = service.clone();
-    tokio::spawn(async move {
-        while let Some(event) = link_event_rx.recv().await {
-            let is_base = event
-                .iface
-                .as_deref()
-                .is_some_and(|iface| owned_base_interfaces.iter().any(|owned| owned == iface));
-            if !is_base {
-                continue;
+    let owns_wifi = !owned_base_interfaces.is_empty() && !external_radio;
+    if owns_wifi {
+        let (link_events, mut link_event_rx) = tokio::sync::mpsc::unbounded_channel();
+        std::thread::spawn(move || {
+            lmesh_wifi::recovery::watch_link_events(owned_interfaces, link_events)
+        });
+        let recovery_service = service.clone();
+        tokio::spawn(async move {
+            while let Some(event) = link_event_rx.recv().await {
+                let is_base = event
+                    .iface
+                    .as_deref()
+                    .is_some_and(|iface| owned_base_interfaces.iter().any(|owned| owned == iface));
+                if !is_base {
+                    continue;
+                }
+                sleep(Duration::from_secs(30)).await;
+                let result = recovery_service.reconcile_wifi_health();
+                if result.get("state").and_then(serde_json::Value::as_str)
+                    == Some("reappeared_reinitialized")
+                {
+                    warn!(?event, ?result, "lmesh_wifi_reappeared_reinitialized");
+                }
             }
-            sleep(Duration::from_secs(30)).await;
-            let result = recovery_service.reconcile_wifi_health();
-            if result.get("state").and_then(serde_json::Value::as_str)
-                == Some("reappeared_reinitialized")
-            {
-                warn!(?event, ?result, "lmesh_wifi_reappeared_reinitialized");
+        });
+        let presence_service = service.clone();
+        tokio::spawn(async move {
+            // Establish the initial presence state without disturbing an already
+            // initialized radio, then provide a five-minute fallback for missed
+            // USB/netlink events.
+            let _ = presence_service.reconcile_wifi_health();
+            loop {
+                sleep(Duration::from_secs(5 * 60)).await;
+                let result = presence_service.reconcile_wifi_health();
+                if result.get("state").and_then(serde_json::Value::as_str)
+                    == Some("reappeared_reinitialized")
+                {
+                    warn!(?result, "lmesh_wifi_periodic_reappeared_reinitialized");
+                }
             }
-        }
-    });
-    let presence_service = service.clone();
-    tokio::spawn(async move {
-        // Establish the initial presence state without disturbing an already
-        // initialized radio, then provide a five-minute fallback for missed
-        // USB/netlink events.
-        let _ = presence_service.reconcile_wifi_health();
-        loop {
-            sleep(Duration::from_secs(5 * 60)).await;
-            let result = presence_service.reconcile_wifi_health();
-            if result.get("state").and_then(serde_json::Value::as_str)
-                == Some("reappeared_reinitialized")
-            {
-                warn!(?result, "lmesh_wifi_periodic_reappeared_reinitialized");
-            }
-        }
-    });
+        });
+    }
     // One registry serves both the QUIC streams and the control socket.
-    let cbor_handler = LmeshCborHandler::new(service.clone());
+    let extension_node = node.clone();
+    let public_key = discovery.public_key_bytes().to_vec();
+    let extension_discovery = discovery.clone();
+    let cbor_handler = LmeshCborHandler::new(service.clone(), external_radio, move |registry| {
+        extend(registry, &extension_node, &public_key, &extension_discovery)
+    });
     // QUIC streams are served from the registry as handler streams (header,
     // then an optional raw body). A text-named common ssh-mesh method is
     // numbered at the edge, before dispatch.
@@ -379,9 +408,13 @@ struct LmeshCborHandler {
 }
 
 impl LmeshCborHandler {
-    fn new(service: Arc<LmeshService>) -> Self {
+    fn new(
+        service: Arc<LmeshService>,
+        external_radio: bool,
+        extend: impl FnOnce(&Registry),
+    ) -> Self {
         Self {
-            registry: linux_registry(service.clone()),
+            registry: linux_registry(service.clone(), external_radio, extend),
             service,
         }
     }
@@ -427,12 +460,17 @@ fn number_common_names_in_header(header: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Host methods answered directly by [`host_component_response`].
+/// The host identity and settings methods every Linux node answers.
+const COMMON_HOST_METHODS: &[Method] = &[
+    methods::STATUS,
+    methods::SETTINGS_GET,
+    methods::SETTINGS_SET,
+    methods::SETTINGS_LIST,
+    methods::TELEMETRY_DEVICE,
+];
+
 const HOST_METHODS: &[Method] = &[
     methods::STATUS,
-    methods::SERVICES,
-    methods::METRICS,
-    methods::EVENTS,
-    methods::LOG_WATCH,
     methods::SETTINGS_GET,
     methods::SETTINGS_SET,
     methods::SETTINGS_LIST,
@@ -441,8 +479,7 @@ const HOST_METHODS: &[Method] = &[
     methods::RADIO_SNAPSHOT,
     methods::RADIO_RESET_COUNTERS,
     methods::NAN_PAIR_WAKEUP,
-    methods::RUNTIME_SNAPSHOT,
-    methods::FIRMWARE_IDENTITY,
+    methods::TELEMETRY_DEVICE,
 ];
 
 const fn lmesh(
@@ -459,33 +496,18 @@ const fn lmesh(
 /// plus the Linux-only and development methods.
 const REQUEST_METHODS: &[Method] = &[
     methods::TRANSPORT_SET,
-    methods::DISCOVERY_NODES,
     methods::DISCOVERY_ACTIVE,
     methods::NAN_WAKEUP,
     methods::TELEMETRY_NAN_STATUS,
-    methods::TELEMETRY_NOW_METRICS,
-    methods::TELEMETRY_NAN_METRICS,
-    methods::TELEMETRY_UDP6_METRICS,
-    methods::TELEMETRY_WIFI_LINK_METRICS,
-    methods::TELEMETRY_QUIC_METRICS,
-    methods::WIFI_SCAN,
-    lmesh(209, "companion", 1, "pair"),
-    lmesh(209, "companion", 2, "unpair"),
     lmesh(4, "lmesh", 8, "send"),
     lmesh(4, "lmesh", 10, "messages.history"),
     lmesh(221, "link", 30, "steer"),
     lmesh(224, "object", 30, "nan.dry_run"),
-    lmesh(5, "wifi", 13, "mgmt.capture"),
     lmesh(5, "wifi", 30, "interface.list"),
     lmesh(5, "wifi", 31, "interface.up"),
     lmesh(5, "wifi", 32, "interface.channel"),
-    lmesh(5, "wifi", 33, "ocb.start"),
-    lmesh(5, "wifi", 34, "rate.profile"),
-    lmesh(5, "wifi", 35, "data.listen"),
-    lmesh(5, "wifi", 36, "data.send"),
     lmesh(5, "wifi", 37, "ap.start_open"),
     lmesh(5, "wifi", 38, "ap.stop"),
-    lmesh(5, "wifi", 39, "ap.station.add"),
     lmesh(5, "wifi", 40, "sta.join_open"),
     lmesh(5, "wifi", 41, "sta.configure_ipv4"),
 ];
@@ -538,35 +560,148 @@ impl Handler for LinuxHandler {
 /// The registry for one lmesh service: every method Linux implements, and
 /// nothing else. `battery`, `power.snapshot`, `memory.snapshot` and the BLE
 /// scan/connect methods have no Linux source today and are not registered.
-fn linux_registry(service: Arc<LmeshService>) -> Arc<Registry> {
-    let registry = Registry::new();
-    for (list, executor) in [
-        (HOST_METHODS, Executor::Host),
-        (REQUEST_METHODS, Executor::Request),
-    ] {
-        let registered = registry.register_all(
-            list,
-            LinuxHandler {
-                service: service.clone(),
-                executor,
-            },
+fn linux_registry(
+    service: Arc<LmeshService>,
+    external_radio: bool,
+    extend: impl FnOnce(&Registry),
+) -> Arc<Registry> {
+    Arc::new_cyclic(|this: &std::sync::Weak<Registry>| {
+        let registry = Registry::new();
+        // With an external radio the executable registers every radio-facing method
+        // (and Linux has no extensions beyond the common API); only the host
+        // identity methods remain here.
+        let host: &[Method] = if external_radio { COMMON_HOST_METHODS } else { HOST_METHODS };
+        let request: &[Method] = if external_radio { &[] } else { REQUEST_METHODS };
+        for (list, executor) in [(host, Executor::Host), (request, Executor::Request)] {
+            if list.is_empty() {
+                continue;
+            }
+            let registered = registry.register_all(
+                list,
+                LinuxHandler {
+                    service: service.clone(),
+                    executor,
+                },
+            );
+            assert!(registered, "lmesh method registered twice or table full");
+        }
+        register_telemetry(&registry, &service, external_radio);
+        assert!(
+            registry.register(methods::SERVICES, ServicesHandler(this.clone())),
+            "services registered twice"
         );
-        assert!(registered, "lmesh method registered twice or table full");
+        assert!(
+            registry.register(methods::DISCOVERY_NODES, DiscoveryNodesHandler(service.clone())),
+            "discovery.nodes registered twice"
+        );
+        register_log_watch(&registry, this.clone());
+        // The probed node's end of a probe: a header, then the payload as the
+        // response body. Any node can be probed by any other.
+        assert!(
+            registry.register_stream(methods::PROBE_HANDLER, dmesh_server::probe::ProbeHandler),
+            "probe.handler registered twice"
+        );
+        // `probe`: run a probe against `peer` with this node as the client.
+        // Header only in both directions; the response header is the outcome.
+        assert!(
+            registry.register(methods::PROBE_START, ProbeStartHandler(service.clone())),
+            "probe registered twice"
+        );
+        register_common_methods(&registry);
+        extend(&registry);
+        registry
+    })
+}
+
+/// The telemetry methods Linux has a source for, each an ordinary registered
+/// handler returning its generated struct (`API.md`). `bearers`, `power` and
+/// `runtime` have no Linux source and are not registered.
+fn register_telemetry(registry: &Registry, service: &Arc<LmeshService>, external_radio: bool) {
+    use dmesh_server::platform_api as api;
+    use dmesh_server::registry_bridge::TypedHandler;
+    macro_rules! typed {
+        ($method:expr, $request:ty, $call:ident) => {{
+            let service = service.clone();
+            assert!(
+                registry.register(
+                    $method,
+                    TypedHandler::new(move |_: $request, _: CallContext| {
+                        let service = service.clone();
+                        async move { service.$call() }
+                    }),
+                ),
+                "telemetry method registered twice"
+            );
+        }};
     }
-    // The probed node's end of a probe: a header, then the payload as the
-    // response body. Any node can be probed by any other.
+    if !external_radio {
+        typed!(methods::TELEMETRY_NOW_METRICS, api::TelemetryNowRequest, telemetry_now);
+        typed!(methods::TELEMETRY_NAN_METRICS, api::TelemetryNanRequest, telemetry_nan);
+        typed!(methods::TELEMETRY_UDP6_METRICS, api::TelemetryUdp6Request, telemetry_udp6);
+        typed!(
+            methods::TELEMETRY_WIFI_LINK_METRICS,
+            api::TelemetryWifiLinkRequest,
+            telemetry_wifi_link
+        );
+    }
+    typed!(methods::TELEMETRY_MEMORY, api::TelemetryMemoryRequest, telemetry_memory);
+    let quic = service.clone();
     assert!(
-        registry.register_stream(methods::PROBE_HANDLER, dmesh_server::probe::ProbeHandler),
-        "probe.handler registered twice"
+        registry.register(
+            methods::TELEMETRY_QUIC_METRICS,
+            TypedHandler::new(move |_: api::TelemetryQuicRequest, _: CallContext| {
+                let service = quic.clone();
+                async move { service.telemetry_quic().await }
+            }),
+        ),
+        "telemetry.quic registered twice"
     );
-    // `probe`: run a probe against `peer` with this node as the client. Header
-    // only in both directions; the response header is the outcome.
+    let associations = service.clone();
     assert!(
-        registry.register(methods::PROBE_START, ProbeStartHandler(service.clone())),
-        "probe registered twice"
+        registry.register(
+            methods::TELEMETRY_QUIC_ASSOCIATIONS,
+            TypedHandler::new(move |_: api::TelemetryQuicAssociationsRequest, _: CallContext| {
+                let service = associations.clone();
+                async move { service.telemetry_quic_associations().await }
+            }),
+        ),
+        "telemetry.quic_associations registered twice"
     );
-    register_common_methods(&registry);
-    Arc::new(registry)
+    let bearers = service.clone();
+    assert!(
+        registry.register(
+            methods::TELEMETRY_BEARERS,
+            TypedHandler::new(move |_: api::TelemetryBearersRequest, _: CallContext| {
+                let service = bearers.clone();
+                async move { service.telemetry_bearers().await }
+            }),
+        ),
+        "telemetry.bearers registered twice"
+    );
+}
+
+/// `log.watch` over this process's `tracing` history (`mesh::local_trace`).
+/// Periodic snapshots go through the same registry, so a snapshot is exactly
+/// the response of the telemetry method it names; a method that needs an async
+/// runtime (`telemetry.quic`) cannot be snapshotted and is reported as skipped.
+fn register_log_watch(registry: &Registry, this: std::sync::Weak<Registry>) {
+    let Some(buffer) = mesh::local_trace::global_buffer() else {
+        return;
+    };
+    let dispatch: dmesh_server::log_watch::Dispatch = Arc::new(move |request| {
+        this.upgrade()?
+            .dispatch_now(request, CallContext::local())
+    });
+    assert!(
+        registry.register_stream(
+            methods::LOG_WATCH_RECORDS,
+            dmesh_server::log_watch::LogWatchHandler::new(
+                Arc::new(dmesh_server::log_watch::MeshLogSource(buffer)),
+                Some(dispatch),
+            ),
+        ),
+        "log.watch registered twice"
+    );
 }
 
 /// The common ssh-mesh methods (`mesh.*`, `trace.*`) have reserved numbers
@@ -621,6 +756,38 @@ impl Handler for ProbeStartHandler {
             )?;
             response.truncate(used);
             Some(response)
+        })
+    }
+}
+
+/// `discovery.nodes` from the shared discovery inventory: one typed row per
+/// device and bearer, the same wire Android and the firmware send. Rows for a
+/// UDP path whose link-local scope has vanished are left out.
+#[derive(Clone)]
+struct DiscoveryNodesHandler(Arc<LmeshService>);
+
+impl Handler for DiscoveryNodesHandler {
+    fn call<'a>(&'a self, call: Call<'a>) -> Reply<'a> {
+        Box::pin(async move {
+            let id = call.record.id?;
+            dmesh_discovery::nodes::response(&self.0.discovery_engine().devices(), id, true)
+        })
+    }
+}
+
+/// `services`: the methods this service's own registry holds, as `[component, method, name]`
+/// rows. It reads the registry it is registered in, not a global one, so it lists exactly
+/// what a request can reach.
+#[derive(Clone)]
+struct ServicesHandler(std::sync::Weak<Registry>);
+
+impl Handler for ServicesHandler {
+    fn call<'a>(&'a self, call: Call<'a>) -> Reply<'a> {
+        Box::pin(async move {
+            let id = mesh::cbor::decode_record(call.data).ok()?.id?;
+            let catalog = self.0.upgrade()?.encode_service_catalog();
+            let services = mesh::cbor::decode_value_bytes(&catalog).ok()?;
+            mesh::cbor::encode_record(&mesh::wire::response_ok(id, services)).ok()
         })
     }
 }
@@ -777,29 +944,12 @@ async fn host_component_response(
     };
     let (component, method) = (u64::from(*component), u64::from(*method));
     let fields = CONTROL_CATALOG.to_jsonl(record);
-    let field_u64 = |name: &str| fields.get(name).and_then(serde_json::Value::as_u64);
     let response = match (component, method) {
-        // Connection diagnostics (status/services/metrics/events/log-watch).
+        // Connection diagnostics (`services` is `ServicesHandler`).
         (
             dmesh_server::services::DIAGNOSTIC_COMPONENT,
             dmesh_server::services::DIAGNOSTIC_STATUS_METHOD,
         ) => service.host_status(),
-        (
-            dmesh_server::services::DIAGNOSTIC_COMPONENT,
-            dmesh_server::services::DIAGNOSTIC_SERVICES_METHOD,
-        ) => host_services_response(),
-        (
-            dmesh_server::services::DIAGNOSTIC_COMPONENT,
-            dmesh_server::services::DIAGNOSTIC_METRICS_METHOD,
-        ) => service.host_metrics(),
-        (
-            dmesh_server::services::DIAGNOSTIC_COMPONENT,
-            dmesh_server::services::DIAGNOSTIC_EVENTS_METHOD,
-        ) => service.host_events(field_u64("since"), Some(field_u64("records").unwrap_or(64))),
-        (
-            dmesh_server::services::DIAGNOSTIC_COMPONENT,
-            dmesh_server::services::DIAGNOSTIC_LOG_WATCH_METHOD,
-        ) => service.host_log_watch(field_u64("since"), Some(field_u64("records").unwrap_or(16))),
         // Common control-plane settings, backed by the shared settings store.
         (dmesh_server::control::CONTROL_COMPONENT, dmesh_server::control::SETTINGS_GET) => {
             host_settings_get(fields.get("key").and_then(serde_json::Value::as_str))
@@ -838,26 +988,14 @@ async fn host_component_response(
             Some(to) => service.host_pair_wakeup(to),
             None => mesh::protocol::Response::err("nan.pair_wakeup requires to"),
         },
-        // Host runtime and identity.
+        // Host identity.
         (
-            dmesh_server::services::RUNTIME_SNAPSHOT_COMPONENT,
-            dmesh_server::services::RUNTIME_SNAPSHOT_METHOD,
-        ) => host_runtime_snapshot(),
-        (
-            dmesh_server::services::FIRMWARE_COMPONENT,
-            dmesh_server::services::FIRMWARE_IDENTITY_METHOD,
-        ) => host_firmware_identity(),
+            dmesh_server::telemetry::TELEMETRY_COMPONENT,
+            dmesh_server::telemetry::DEVICE_METHOD,
+        ) => host_device_telemetry(),
         _ => return None,
     };
     Some(response)
-}
-
-/// The built-in tagged service catalog as a correlated result value.
-fn host_services_response() -> mesh::protocol::Response {
-    match mesh::cbor::decode_value_bytes(&dmesh_server::services::encode_tagged_service_catalog()) {
-        Ok(services) => mesh::protocol::Response::ok_with_data(services),
-        Err(error) => mesh::protocol::Response::err(format!("service catalog: {error}")),
-    }
 }
 
 /// The host settings file: an explicit path wins over the service home.
@@ -989,26 +1127,13 @@ fn hex_decode_bytes(value: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// Bounded host runtime snapshot for the shared runtime component.
-fn host_runtime_snapshot() -> mesh::protocol::Response {
-    mesh::protocol::Response::ok_with_data(serde_json::json!({
-        "role": "host",
-        "service": "lmesh",
-        "version": env!("CARGO_PKG_VERSION"),
-        "uptime_secs": crate::mesh_core::service_uptime_secs(),
-        "udp_port": LMESH_DEFAULTS.udp_port,
-        "http_port": LMESH_DEFAULTS.http_port,
-        "announce_interval_secs": announce_interval().as_secs(),
-    }))
-}
-
 /// Host service identity for the shared firmware-identity surface.
-fn host_firmware_identity() -> mesh::protocol::Response {
+fn host_device_telemetry() -> mesh::protocol::Response {
     mesh::protocol::Response::ok_with_data(serde_json::json!({
-        "name": "lmesh",
         "version": env!("CARGO_PKG_VERSION"),
-        "role": "host",
-        "uptime_secs": crate::mesh_core::service_uptime_secs(),
+        "cpu_type": std::env::consts::ARCH,
+        "role": "linux",
+        "total_ram_bytes": dmesh_server::telemetry::host_total_ram_bytes(),
     }))
 }
 
@@ -1046,27 +1171,9 @@ fn decode_lmesh_tagged_request(
                 .limit
                 .map(|limit| limit.min(usize::MAX as u64) as usize),
         }),
-        "discovery.nodes" => Ok(crate::mesh_core::Request::RadioDevices),
         "discovery.active" => serde_json::from_value(value),
         "discovery.status" => Ok(crate::mesh_core::Request::DiscoveryStatus),
         "telemetry.nan_status" => Ok(crate::mesh_core::Request::NanStatus),
-        "telemetry.now" => Ok(crate::mesh_core::Request::NowMetrics),
-        "telemetry.nan" => Ok(crate::mesh_core::Request::NanMetrics),
-        "telemetry.udp6" => Ok(crate::mesh_core::Request::Udp6Metrics),
-        "telemetry.wifi_link" => Ok(crate::mesh_core::Request::WifiLinkMetrics),
-        "telemetry.quic" => Ok(crate::mesh_core::Request::QuicMetrics),
-        "wifi.mgmt.capture" => serde_json::from_value::<
-            crate::mesh_core::api::WifiMgmtCaptureRequest,
-        >(value)
-        .map(|request| crate::mesh_core::Request::WifiMgmtCapture {
-            iface: request.iface,
-            channel: request.channel,
-            capture_ms: request.capture_ms,
-            max_frames: request
-                .max_frames
-                .map(|value| value.min(usize::MAX as u64) as usize),
-            active: request.active,
-        }),
         _ => serde_json::from_value(value),
     }
     .context("deserialize tagged lmesh request")
@@ -1091,20 +1198,6 @@ mod tests {
 
     #[test]
     fn shared_method_names_keep_linux_fields() {
-        let scan = CONTROL_CATALOG
-            .parse_argv(
-                "wifi.scan",
-                &["--iface=wlan0".into(), "--last_results=true".into()],
-            )
-            .unwrap();
-        assert!(matches!(
-            decode_lmesh_tagged_request(&scan).unwrap(),
-            crate::mesh_core::Request::WifiScan {
-                iface: Some(iface),
-                last_results: Some(true),
-                ..
-            } if iface == "wlan0"
-        ));
         let transport = CONTROL_CATALOG
             .parse_argv(
                 "transport.set",
@@ -1141,6 +1234,32 @@ mod tests {
             assert_eq!(
                 tool["x-method-index"],
                 method.method,
+                "{}",
+                method.wire_name()
+            );
+        }
+    }
+
+    #[test]
+    fn typed_linux_methods_match_the_installed_catalog() {
+        let catalog = public_tools_json();
+        let tools = catalog.as_array().unwrap();
+        for method in [
+            methods::TELEMETRY_NOW_METRICS,
+            methods::TELEMETRY_NAN_METRICS,
+            methods::TELEMETRY_UDP6_METRICS,
+            methods::TELEMETRY_WIFI_LINK_METRICS,
+            methods::TELEMETRY_QUIC_METRICS,
+            methods::TELEMETRY_MEMORY,
+            methods::LOG_WATCH_RECORDS,
+        ] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool["name"] == method.wire_name().as_str())
+                .unwrap_or_else(|| panic!("{} is not in tools.json", method.wire_name()));
+            assert_eq!(
+                (&tool["x-component-index"], &tool["x-method-index"]),
+                (&serde_json::json!(method.component), &serde_json::json!(method.method)),
                 "{}",
                 method.wire_name()
             );
@@ -1239,13 +1358,16 @@ mod tests {
 
     #[test]
     fn discovery_nodes_is_the_only_inventory_name() {
-        let record = CONTROL_CATALOG
-            .record_from_value("discovery.nodes", &serde_json::json!({}))
-            .unwrap();
-        assert!(matches!(
-            decode_lmesh_tagged_request(&record).unwrap(),
-            crate::mesh_core::Request::RadioDevices
-        ));
+        // `discovery.nodes` is a registered handler (the shared typed rows), not
+        // a JSON request, and no second inventory name exists.
+        assert!(
+            decode_lmesh_tagged_request(
+                &CONTROL_CATALOG
+                    .record_from_value("discovery.nodes", &serde_json::json!({}))
+                    .unwrap()
+            )
+            .is_err()
+        );
         assert!(
             serde_json::from_value::<crate::mesh_core::Request>(serde_json::json!({
                 "method": "discovery.devices"
@@ -1324,10 +1446,7 @@ mod tests {
 
         let expected = [
             "discovery.nodes",
-            "events",
-            "log-watch",
             "log.watch",
-            "metrics",
             "probe.start",
             "radio.snapshot",
             "services",
@@ -1442,43 +1561,18 @@ mod tests {
     }
 
     #[test]
-    fn common_nan_metrics_decode_from_the_shared_component() {
-        let request = decode_lmesh_tagged_request(&mesh::tagged::TaggedRecord {
+    fn telemetry_is_a_typed_registered_method_not_a_json_request() {
+        // `telemetry.nan` is answered by its typed handler (`register_telemetry`),
+        // so the JSON-lines request adapter no longer knows it.
+        let error = decode_lmesh_tagged_request(&mesh::tagged::TaggedRecord {
             component: mesh::tagged::NameOrTag::Tag(7),
             method: mesh::tagged::NameOrTag::Tag(3),
             id: Some(serde_json::json!(3)),
             ..Default::default()
         })
-        .unwrap();
-        assert!(matches!(request, crate::mesh_core::Request::NanMetrics));
-    }
-
-    #[test]
-    fn diagnostic_fields_use_the_shared_tagged_fields_map() {
-        let record = CONTROL_CATALOG
-            .record_from_value("events", &serde_json::json!({"since": 0}))
-            .unwrap();
-        let wire = mesh::cbor::encode_record(&record).unwrap();
-        let record = dmesh_server::tagged::decode(&wire).unwrap();
-        assert_eq!(
-            record.component,
-            Some(dmesh_server::tagged::Name::Tag(
-                dmesh_server::services::DIAGNOSTIC_COMPONENT
-            ))
-        );
-        assert_eq!(
-            record.method,
-            Some(dmesh_server::tagged::Name::Tag(
-                dmesh_server::services::DIAGNOSTIC_EVENTS_METHOD
-            ))
-        );
-        assert!(record.params.is_none());
-        let fields = record.fields.unwrap();
-        let mut decoder = dmesh_server::cbor::Decoder::new(fields);
-        assert_eq!(decoder.head(), Some((5, 1)));
-        assert_eq!(decoder.uint(), Some(1));
-        assert_eq!(decoder.uint(), Some(0));
-        assert!(decoder.is_finished());
+        .unwrap_err();
+        // It is rejected rather than decoded into a request.
+        assert!(!error.to_string().is_empty());
     }
 
     #[test]

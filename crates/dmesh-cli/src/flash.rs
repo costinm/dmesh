@@ -9,7 +9,7 @@ use crate::client::fresh_request_id;
 use crate::{
     client::{
         catalog_udp6_peer, direct_discovery_announce, discover_and_nan_activate,
-        ensure_stream_success, exchange_udp_stream_record, firmware_identity, flash_target_matches,
+        ensure_stream_success, exchange_udp_stream_record, flash_target_matches,
         flash_target_matches_announce, hex_encode, multicast_discover_peers, parse_mac,
         run_udp_service_client, submit_nan_wake_to_all,
     },
@@ -84,6 +84,7 @@ pub(crate) fn object_upload_timeout() -> Duration {
 /// radio MAC only for waking an otherwise unreachable device.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FlashTarget {
+    pub(crate) restore_sleepy: bool,
     pub(crate) description: String,
     pub(crate) node: Option<String>,
     pub(crate) mac: Option<[u8; 6]>,
@@ -95,6 +96,7 @@ pub(crate) struct FlashTarget {
 fn resolve_flash_target(value: &str) -> Result<FlashTarget, String> {
     if let Some(mac) = parse_mac(value) {
         return Ok(FlashTarget {
+            restore_sleepy: false,
             description: value.to_owned(),
             node: None,
             mac: Some(mac),
@@ -106,6 +108,7 @@ fn resolve_flash_target(value: &str) -> Result<FlashTarget, String> {
             return Err(format!("flash target VIP6 must use fc00::/8, got {vip6}"));
         }
         return Ok(FlashTarget {
+            restore_sleepy: resolve_catalog_target(value)?.is_some_and(|profile| profile.sleepy),
             description: value.to_owned(),
             node: Some(hex_encode(&vip6.octets()[8..])),
             mac: None,
@@ -118,6 +121,7 @@ fn resolve_flash_target(value: &str) -> Result<FlashTarget, String> {
     }
     if value.len() == 16 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Ok(FlashTarget {
+            restore_sleepy: false,
             description: value.to_owned(),
             node: Some(value.to_ascii_lowercase()),
             mac: None,
@@ -137,6 +141,7 @@ fn flash_target_from_profile(
     let name = profile.name.as_deref().unwrap_or(value);
     if let Some(vip6) = profile.vip6 {
         return Ok(FlashTarget {
+            restore_sleepy: profile.sleepy,
             description: format!("{name} ({vip6})"),
             node: Some(hex_encode(&vip6.octets()[8..])),
             mac: profile.mac,
@@ -147,6 +152,7 @@ fn flash_target_from_profile(
         .mac
         .ok_or_else(|| format!("catalog device {value:?} has neither VIP6 nor MAC identity"))?;
     Ok(FlashTarget {
+        restore_sleepy: profile.sleepy,
         description: format!("{name} (MAC discovery)"),
         node: None,
         mac: Some(mac),
@@ -296,11 +302,9 @@ fn run_automated_flash_timed(arguments: &[String], started: Instant) -> Result<(
     if selected.is_none() {
         selected = target_peer.map(|peer| (peer.peer, peer.announce));
     }
-    // An absent multicast target was reached only by the bounded NAN wake
-    // path below. Preserve its battery-oriented personality after a verified
-    // update instead of silently converting an installed sleepy device into
-    // an always-on STA node.
-    let mut was_sleepy = selected.is_none();
+    // Missing multicast or an association failure is not a sleep-policy fact.
+    // Only an explicit catalog policy may restore NAN-only sleep after update.
+    let was_sleepy = target.restore_sleepy;
     println!("dmesh_flash_gate target_found={}", selected.is_some());
     report_flash_step("initial_discovery", started, discovery_started);
 
@@ -317,15 +321,15 @@ fn run_automated_flash_timed(arguments: &[String], started: Instant) -> Result<(
         format!("target_cpu_unknown device_class={}; flash a concrete-family Main over a controlled path first", announce.device_class)
     })?;
     let target_ready_started = Instant::now();
-    let initial_identity = match firmware_identity(peer) {
-        Ok(identity) => identity,
+    let _ready_announce = match direct_discovery_announce(peer) {
+        Ok((_, ready)) if ready.device_id() == announce.device_id()
+            && ready.device_class == announce.device_class => ready,
+        Ok(_) => return Err("direct discovery returned a different flash target".into()),
         Err(initial_error) if target.mac.is_some() => {
             // A DW-only target can answer one multicast discovery request
             // while its receive lease is open, then disappear before the
-            // first unicast QUIC stream. Treat that as sleepy evidence, not
-            // as an active UDP endpoint. Wake through every controller and
-            // require the normal direct identity response before flashing.
-            was_sleepy = true;
+            // first unicast QUIC stream. Wake through every controller and
+            // require the same signed discovery identity before flashing.
             println!(
                 "dmesh_flash_gate target_udp_ready=false peer={peer} error={initial_error}; nan_wake_retry=true"
             );
@@ -336,14 +340,16 @@ fn run_automated_flash_timed(arguments: &[String], started: Instant) -> Result<(
 
             let deadline = Instant::now() + Duration::from_secs(45);
             loop {
-                match firmware_identity(peer) {
-                    Ok(identity) => break identity,
+                match direct_discovery_announce(peer) {
+                    Ok((_, ready)) if ready.device_id() == announce.device_id()
+                        && ready.device_class == announce.device_class => break ready,
+                    Ok(_) => return Err("direct discovery returned a different flash target".into()),
                     Err(_) if Instant::now() < deadline => {
                         std::thread::sleep(Duration::from_millis(500));
                     }
                     Err(error) => {
                         return Err(format!(
-                            "target_wake_timeout target={}; NAN wake was accepted but UDP identity did not return: {error}",
+                            "target_wake_timeout target={}; NAN wake was accepted but directed discovery did not return: {error}",
                             target.description
                         ));
                     }
@@ -444,17 +450,14 @@ fn run_automated_flash_timed(arguments: &[String], started: Instant) -> Result<(
         println!("dmesh_flash_gate recovery_requested=true peer={peer}");
         report_flash_step("recovery_request", started, recovery_request_started);
 
-        // Recovery reuses the target identity and endpoint. Prefer its fresh
-        // signed multicast marker, but a bridged WLAN can suppress link-local
-        // multicast even when Recovery has submitted it. In that case a direct
-        // image identity different from the pre-handoff Main remains evidence
-        // that this exact endpoint changed images.
+        // Recovery retains the signed node identity and advertises its role.
+        // Directed discovery supports bridges that suppress multicast.
         let recovery_wait_started = Instant::now();
         let deadline = Instant::now() + Duration::from_secs(75);
         loop {
             if Instant::now() >= deadline {
                 return Err(
-                    "recovery_seen=false timeout waiting for signed Recovery announce or changed direct identity"
+                    "recovery_seen=false timeout waiting for signed Recovery announce"
                         .into(),
                 );
             }
@@ -468,22 +471,18 @@ fn run_automated_flash_timed(arguments: &[String], started: Instant) -> Result<(
                 report_flash_step("recovery_wait", started, recovery_wait_started);
                 break candidate.peer;
             }
-            if firmware_identity(peer).is_ok_and(|identity| identity != initial_identity) {
-                println!("dmesh_flash_recovery_evidence source=direct_identity");
+            if direct_discovery_announce(peer).is_ok_and(|(_, ready)|
+                ready.device_id() == announce.device_id()
+                    && ready.device_class == announce.device_class && ready.recovery) {
+                println!("dmesh_flash_recovery_evidence source=direct_discovery");
                 report_flash_step("recovery_wait", started, recovery_wait_started);
                 break peer;
             }
         }
     };
     println!("dmesh_flash_gate recovery_seen=true peer={recovery_peer}");
-    // A Main update is allowed to change the application ELF hash, including
-    // when the requested image differs from the Main that initiated this
-    // handoff. The pre-handoff Main identity therefore cannot be the expected
-    // post-update identity. Capture Recovery's running-image identity instead:
-    // the final gate must prove that this endpoint left Recovery, then require
-    // a normal Main status response. This also accepts an idempotent reflash
-    // of the same Main image.
-    let recovery_identity = firmware_identity(recovery_peer)?;
+    // Durable upload completion is followed by signed Main-role discovery
+    // and a normal Main health response, not a comparison of firmware hashes.
     let mut upload = vec![
         format!("udp://{recovery_peer}"),
         "object.flash".to_owned(),
@@ -515,18 +514,14 @@ fn run_automated_flash_timed(arguments: &[String], started: Instant) -> Result<(
                 && candidate.announce.device_class == announce.device_class
                 && !candidate.announce.recovery
         });
-        // A bridge may suppress receiver-visible link-local multicast even
-        // though the target can still answer direct UDP6. Recovery uses this
-        // same fallback above. The Recovery identity makes the final check
-        // safe: status alone must not mistake the still-running Recovery for
-        // the returned Main image, while a changed Main image need not equal
-        // the Main identity that initiated the update.
+        // Require the same signed node and the Main role before checking health.
         let health_peer = multicast_peer
             .map(|candidate| candidate.peer)
             .unwrap_or(peer);
-        let identity_matches_main =
-            firmware_identity(health_peer).is_ok_and(|identity| identity != recovery_identity);
-        if identity_matches_main {
+        let main_seen = direct_discovery_announce(health_peer).is_ok_and(|(_, ready)|
+            ready.device_id() == announce.device_id()
+                && ready.device_class == announce.device_class && !ready.recovery);
+        if main_seen {
             let status = encode_stream_command_with_id("status", fresh_request_id())
                 .map_err(|error| error.to_string())?;
             if ensure_stream_success(
@@ -575,11 +570,14 @@ fn restore_sleepy_after_flash(
     // also answer a multicast discovery packet during its brief radio window,
     // so multicast presence cannot establish that the STA/UDP control path
     // remained active. After the handoff, require the stronger inverse: a
-    // normal unicast QUIC identity stream must no longer be reachable.
+    // normal unicast QUIC status stream must no longer be reachable.
     std::thread::sleep(Duration::from_secs(6));
-    if firmware_identity(peer).is_ok() {
+    let status = encode_stream_command_with_id("status", fresh_request_id())
+        .map_err(|error| error.to_string())?;
+    if exchange_udp_stream_record(peer, &status)
+        .and_then(|response| ensure_stream_success(response, "status")).is_ok() {
         return Err(format!(
-            "sleepy_profile_restore=false target still accepted a unicast UDP identity stream{}",
+            "sleepy_profile_restore=false target still accepted a unicast UDP status stream{}",
             restore_reply
                 .err()
                 .map(|error| format!("; reply={error}"))
@@ -602,6 +600,7 @@ mod tests {
         let target = flash_target_from_profile(
             "node-under-test",
             DeviceProfile {
+                sleepy: false,
                 name: Some("node-under-test".into()),
                 static_ipv4: Some(Ipv4Addr::new(192, 0, 2, 44)),
                 vip6: None,
@@ -611,7 +610,7 @@ mod tests {
                 serial_id: None,
                 uart_baud: None,
                 auth_secret_ref: None,
-                udp_port: 3337,
+                udp_port: 3339,
             },
         )
         .unwrap();
@@ -619,5 +618,19 @@ mod tests {
         assert_eq!(target.node, None);
         assert_eq!(target.mac, Some([0x02, 0x11, 0x22, 0x33, 0x44, 0x55]));
         assert_eq!(target.known_peer, None);
+        assert!(!target.restore_sleepy);
+    }
+
+    #[test]
+    fn sleep_restoration_requires_explicit_catalog_policy() {
+        for sleepy in [false, true] {
+            let target = flash_target_from_profile("node-under-test", DeviceProfile {
+                sleepy, name: None, static_ipv4: None, vip6: None,
+                ipv6_link_local: None, udp6_iface: None,
+                mac: Some([2, 0, 0, 0, 0, 1]), serial_id: None,
+                uart_baud: None, auth_secret_ref: None, udp_port: 3339,
+            }).unwrap();
+            assert_eq!(target.restore_sleepy, sleepy);
+        }
     }
 }

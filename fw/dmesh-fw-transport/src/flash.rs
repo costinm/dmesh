@@ -8,10 +8,8 @@
 //! writes, as a body sink.
 
 use alloc::{boxed::Box, vec, vec::Vec};
-use core::{
-    fmt::{self, Write},
-    sync::atomic::{AtomicBool, Ordering},
-};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use dmesh_server::cbor::FieldValue::{self, Unsigned as U, Text as T, Null};
 use dmesh_server::verified_object::{BLOCK_SIZE, ImageSink, StreamingImageSink};
 
 const STAGE2_REGION_BYTES: usize = 0x7000;
@@ -171,15 +169,18 @@ impl dmesh_server::stream::BodySink for FlashSink {
                 },
             );
         }
-        if complete && !self.dry_run {
-            DURABLE_COMPLETED.store(true, Ordering::Release);
-        }
+        let handoff_after_response = complete && !self.dry_run;
         self.end();
-        dmesh_server::stream::Response::header(if complete {
+        let response = dmesh_server::stream::Response::header(if complete {
             flash_result(self.request_id, b"flash complete", false)
         } else {
             flash_result(self.request_id, b"flash object rejected", true)
-        })
+        });
+        if handoff_after_response {
+            response.after_finish(|| DURABLE_COMPLETED.store(true, Ordering::Release))
+        } else {
+            response
+        }
     }
 
     fn abort(mut self: Box<Self>) {
@@ -210,7 +211,8 @@ pub fn transfer_active() -> bool {
     TRANSFER_ACTIVE.load(Ordering::Acquire)
 }
 
-/// Observe successful durable completion. Recovery uses this edge to hand
+/// Observe successful durable completion followed by finishing the ordinary
+/// handler response. Recovery uses this edge to hand
 /// control back to Stage2; Main simply leaves the updated partition in place.
 pub fn take_durable_flash_completion() -> bool {
     DURABLE_COMPLETED.swap(false, Ordering::AcqRel)
@@ -242,54 +244,61 @@ pub(crate) fn next_report_delay_ms(now: u64) -> Option<u32> {
 pub(crate) fn report_progress(
     now: u64,
     mut telemetry: impl FnMut(quic_lite::QuicAssociation) -> Option<quic_lite::AssociationTelemetry>,
-) {
+) -> bool {
     let Some(session) = progress().as_mut() else {
-        return;
+        return false;
     };
     if now
         < session
             .last_report_ms
             .saturating_add(FLASH_PROGRESS_INTERVAL_MS)
     {
-        return;
+        return false;
     }
     let snapshot = session.association.and_then(|association| telemetry(association));
-    let mut line = LogLine::new();
     let idle_ms = now.saturating_sub(session.last_progress_ms);
     let elapsed_ms = now.saturating_sub(session.started_ms);
-    let _ = write!(
-        line,
-        "ts_ms={now} level=info event=object_flash.progress request_id={} association={:?} stream_id={:?} received_bytes={} elapsed_ms={} idle_ms={}",
-        session.request_id,
-        session.association,
-        session.stream_id,
-        session.received,
-        elapsed_ms,
-        idle_ms,
-    );
+    emit_event("object_flash.progress", &[
+        (1, U(session.request_id)), (2, session.stream_id.map(U).unwrap_or(Null)),
+        (3, U(session.received)), (4, U(elapsed_ms)), (5, U(idle_ms)),
+    ]);
     if let Some(snapshot) = snapshot {
         let stats = snapshot.transport;
-        let _ = write!(
-            line,
-            " quic_rx={} quic_tx={} quic_tx_stream={} quic_tx_control={} quic_acked_by_peer_valid={} quic_acked_by_peer_pn={} quic_in_flight_bytes={} quic_retransmit={} quic_loss_events={} quic_rx_missing={} quic_duplicates={} quic_submission_failures={}",
-            stats.received_packets,
-            stats.sent_packets,
-            stats.sent_stream_packets,
-            stats.sent_control_packets,
-            u8::from(snapshot.largest_acked_by_peer.is_some()),
-            snapshot.largest_acked_by_peer.unwrap_or(0),
-            snapshot.bytes_in_flight,
-            stats.retransmitted_packets,
-            stats.loss_events,
-            stats.inferred_missing_packets,
-            stats.duplicate_packets,
-            stats.submission_failures,
-        );
+        emit_event("object_flash.quic_progress", &[
+            (1, U(session.request_id)), (2, session.stream_id.map(U).unwrap_or(Null)),
+            (10, U(stats.received_packets)), (11, U(stats.sent_packets)),
+            (12, U(stats.sent_stream_packets)), (13, U(stats.sent_control_packets)),
+            (14, snapshot.largest_acked_by_peer.map(|pn| U(u64::from(pn))).unwrap_or(Null)),
+            (15, U(snapshot.bytes_in_flight)), (16, U(stats.retransmitted_packets)),
+            (17, U(stats.loss_events)), (18, U(stats.inferred_missing_packets)),
+            (19, U(stats.duplicate_packets)), (20, U(stats.submission_failures)),
+            (21, U(stats.stream_packets)), (22, U(stats.control_packets)),
+            (23, U(stats.out_of_order_packets)), (24, U(snapshot.peer_max_data)),
+            (25, U(snapshot.peer_sent_data)), (26, U(stats.ack_ranges_dropped)),
+            (27, U(stats.pto_retransmitted_packets)),
+        ]);
     } else {
-        let _ = line.write_str(" quic=unavailable");
+        emit_event("object_flash.quic_progress", &[(1, U(session.request_id)), (10, Null)]);
     }
-    emit(line);
     session.last_report_ms = now;
+    true
+}
+
+/// Temporary debug report: owner deadline, packet pressure, and UDP6 adapter
+/// counters. Identical for Main and Recovery; UDP counters are explicitly
+/// named and are not attributed to the association's other bearers.
+pub(crate) fn report_owner_progress(now: u64, deadline_ms: Option<u64>, pool_available: usize) {
+    let (rx, drops, invalid, udp_tx, frames_tx, failures) = crate::wifi_raw_udp6_esp::stats();
+    let memory = crate::shared_ingress_esp::memory_stats();
+    let _ = now;
+    emit_event("object_flash.owner_progress", &[
+        (1, deadline_ms.map(U).unwrap_or(Null)), (2, U(pool_available as u64)),
+        (3, U(u64::from(rx))), (4, U(u64::from(drops))), (5, U(u64::from(invalid))),
+        (6, U(u64::from(udp_tx))), (7, U(u64::from(frames_tx))), (8, U(u64::from(failures))),
+        (9, U(u64::from(memory.free_internal_bytes))),
+        (10, U(u64::from(memory.min_free_internal_bytes))),
+        (11, U(u64::from(memory.largest_internal_block_bytes))),
+    ]);
 }
 
 fn flash_result(request_id: u64, message: &[u8], error: bool) -> Vec<u8> {
@@ -324,62 +333,51 @@ fn now_ms() -> u64 {
 pub(crate) fn log_flash_event(
     event: &str,
     request_id: u64,
-    association: quic_lite::QuicAssociation,
+    _association: quic_lite::QuicAssociation,
     stream_id: u64,
     received: u64,
     declared: u64,
     detail: &str,
 ) {
-    let mut line = LogLine::new();
-    let _ = write!(
-        line,
-        "ts_ms={} level=info event=object_flash.{event} request_id={request_id} association={association:?} stream_id={stream_id} received_bytes={received} declared_bytes={declared} {detail}",
-        now_ms()
-    );
-    emit(line);
+    emit_event("object_flash.event", &[
+        (1, U(request_id)), (2, U(stream_id)), (3, U(received)),
+        (4, U(declared)), (5, T(event)), (6, T(detail)),
+    ]);
 }
 
 fn log_receiver_error(
     request_id: u64,
-    association: Option<quic_lite::QuicAssociation>,
+    _association: Option<quic_lite::QuicAssociation>,
     stream_id: Option<u64>,
     received: u64,
     error: &dmesh_server::verified_object::ImageError,
 ) {
-    let mut line = LogLine::new();
-    let _ = write!(
-        line,
-        "ts_ms={} level=error event=object_flash.receiver_rejected request_id={request_id} association={association:?} stream_id={stream_id:?} received_bytes={received} error={error:?}",
-        now_ms(),
-    );
-    emit(line);
+    use dmesh_server::verified_object::ImageError;
+    let reason = match error {
+        ImageError::Truncated => "truncated", ImageError::Allocation => "allocation",
+        ImageError::InvalidManifest => "invalid_manifest", ImageError::InvalidBlock => "invalid_block",
+        ImageError::InvalidSignature => "invalid_signature", ImageError::Sink => "sink",
+    };
+    emit_event("object_flash.receiver_rejected", &[
+        (1, U(request_id)), (2, stream_id.map(U).unwrap_or(Null)), (3, U(received)), (4, T(reason)),
+    ]);
 }
 
-struct LogLine {
-    bytes: [u8; 240],
-    len: usize,
-}
-
-impl LogLine {
-    const fn new() -> Self {
-        Self {
-            bytes: [0; 240],
-            len: 0,
-        }
-    }
-}
-
-impl Write for LogLine {
-    fn write_str(&mut self, value: &str) -> fmt::Result {
-        let count = value.len().min(self.bytes.len().saturating_sub(self.len));
-        self.bytes[self.len..self.len + count].copy_from_slice(&value.as_bytes()[..count]);
-        self.len += count;
-        Ok(())
-    }
-}
-
-fn emit(line: LogLine) {
-    let _ = crate::uart_esp::send_debug_text(&line.bytes[..line.len]);
+fn emit_event(kind: &str, fields: &[(u64, FieldValue<'_>)]) {
+    static SEQUENCE: AtomicU32 = AtomicU32::new(0);
+    let mut out = [0u8; 512];
+    let Some(used) = dmesh_server::cbor::encode_fields(&mut out, fields) else { return; };
+    let record = dmesh_server::log_watch::LogRecord {
+        seq: u64::from(SEQUENCE.fetch_add(1, Ordering::Relaxed)) + 1,
+        time_ms: now_ms(),
+        level: if kind == "object_flash.receiver_rejected" {
+            dmesh_server::log_watch::LEVEL_ERROR
+        } else { dmesh_server::log_watch::LEVEL_INFO },
+        source: "flash".into(),
+        kind: Some(kind.into()), text: alloc::string::String::new(),
+        fields: Some(out[..used].to_vec()),
+    };
+    let _ = crate::uart_esp::send_log_record(&record.encode());
 }
 
 fn new_receiver(
@@ -470,9 +468,54 @@ pub struct EspPartitionSink {
     capacity: usize,
     target: u8,
     dry_run: bool,
+    erase: EraseTiming,
+}
+
+// All region-erase drivers in the configured ESP-IDF support 64 KiB blocks.
+// Whole-chip erase must never be used for an image/partition update.
+const ERASE_BLOCK_BYTES: usize = 64 * 1024;
+
+#[derive(Default)]
+struct EraseTiming {
+    planned: usize,
+    erased: usize,
+    calls: u64,
+    total_us: u64,
+    longest_us: u64,
+    writes_us: u64,
+}
+
+fn flash_clock_us() -> u64 {
+    unsafe { esp_idf_sys::esp_timer_get_time().max(0) as u64 }
 }
 
 impl EspPartitionSink {
+    fn erase_next(&mut self, count: usize) -> Result<(), ()> {
+        let offset = self.address.checked_add(self.erase.erased).ok_or(())?;
+        let started = flash_clock_us();
+        let result = unsafe {
+            if self.partition.is_null() {
+                esp_idf_sys::esp_flash_erase_region(core::ptr::null_mut(), offset as u32, count as u32)
+            } else {
+                esp_idf_sys::esp_partition_erase_range(self.partition, offset, count)
+            }
+        };
+        let elapsed = flash_clock_us().saturating_sub(started);
+        self.erase.calls += 1;
+        self.erase.total_us = self.erase.total_us.saturating_add(elapsed);
+        self.erase.longest_us = self.erase.longest_us.max(elapsed);
+        emit_event("object_flash.erase", &[
+            (1, U(progress().as_ref().map_or(0, |p| p.request_id))),
+            (2, U(u64::from(self.target))), (3, U(offset as u64)),
+            (4, U(count as u64)), (5, U(elapsed)), (6, U(self.erase.total_us)),
+            (7, T("incremental64")),
+            (8, FieldValue::Bool(result == esp_idf_sys::ESP_OK)),
+        ]);
+        if result != esp_idf_sys::ESP_OK { return Err(()); }
+        self.erase.erased = self.erase.erased.checked_add(count).ok_or(())?;
+        Ok(())
+    }
+
     fn new_partition(
         kind: esp_idf_sys::esp_partition_type_t,
         label: &[u8],
@@ -509,6 +552,7 @@ impl EspPartitionSink {
             capacity,
             target,
             dry_run,
+            erase: EraseTiming::default(),
         })
     }
 
@@ -544,6 +588,7 @@ impl EspPartitionSink {
             capacity,
             target,
             dry_run,
+            erase: EraseTiming::default(),
         })
     }
 }
@@ -566,28 +611,32 @@ impl ImageSink for EspPartitionSink {
         if self.dry_run {
             return Ok(());
         }
-        let result = unsafe {
-            if self.partition.is_null() {
-                esp_idf_sys::esp_flash_erase_region(
-                    core::ptr::null_mut(),
-                    self.address as u32,
-                    erase_len as u32,
-                )
-            } else {
-                esp_idf_sys::esp_partition_erase_range(self.partition, self.address, erase_len)
-            }
-        };
-        (result == esp_idf_sys::ESP_OK).then_some(()).ok_or(())
+        // Erase one hardware block on demand before writing into it. Keeping
+        // begin nonblocking avoids the former whole-image transport pause.
+        self.erase = EraseTiming { planned: erase_len, ..Default::default() };
+        Ok(())
     }
 
     fn write_block(&mut self, index: u32, bytes: &[u8]) -> Result<(), ()> {
         if self.dry_run {
             return Ok(());
         }
+        let relative = (index as usize).checked_mul(BLOCK_SIZE).ok_or(())?;
+        let end = relative.checked_add(bytes.len()).ok_or(())?;
+        if end > self.erase.planned { return Err(()); }
+        while self.erase.erased < end {
+            let base = if self.partition.is_null() { 0 } else { unsafe { (*self.partition).address as usize } };
+            let address = base.checked_add(self.address).and_then(|base| base.checked_add(self.erase.erased)).ok_or(())?;
+            let count = dmesh_server::verified_object::next_erase_chunk_len(
+                address, self.erase.planned - self.erase.erased, BLOCK_SIZE, ERASE_BLOCK_BYTES,
+            ).ok_or(())?;
+            self.erase_next(count)?;
+        }
         let offset = self
             .address
             .checked_add(index as usize * BLOCK_SIZE)
             .ok_or(())?;
+        let started = flash_clock_us();
         let result = unsafe {
             if self.partition.is_null() {
                 esp_idf_sys::esp_flash_write(
@@ -605,10 +654,18 @@ impl ImageSink for EspPartitionSink {
                 )
             }
         };
+        self.erase.writes_us = self.erase.writes_us.saturating_add(flash_clock_us().saturating_sub(started));
         (result == esp_idf_sys::ESP_OK).then_some(()).ok_or(())
     }
 
     fn finish(&mut self, _: &dmesh_server::verified_object::ImageManifest) -> Result<(), ()> {
+        emit_event("object_flash.storage_timing", &[
+            (1, U(progress().as_ref().map_or(0, |p| p.request_id))),
+            (2, U(u64::from(self.target))), (3, U(self.erase.erased as u64)),
+            (4, U(self.erase.calls)), (5, U(self.erase.total_us)),
+            (6, U(self.erase.longest_us)), (7, U(self.erase.writes_us)),
+            (8, T("incremental64")),
+        ]);
         Ok(())
     }
     fn abort(&mut self) {}

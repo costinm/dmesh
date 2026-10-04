@@ -222,12 +222,14 @@ musl() {
     configure_musl
     # Android JNI/UI crates are libraries, not Linux MUSL binaries. Build the
     # device services and terminal UI explicitly so NativeActivity backends
-    # are not pulled into the static Linux artifact set.
+    # are not pulled into the static Linux artifact set. android-control also
+    # ships a host CLI (android-control-cli) used to drive ADB pairing/connect.
     "$DMESH_CARGO_BIN" build --release --target x86_64-unknown-linux-musl \
         -p lmesh \
         -p dmesh-cli \
         -p mesh-tun \
-        -p dmeshtui
+        -p dmeshtui \
+        -p android-control
 
     local target_dir="${CARGO_TARGET_DIR:-$DMESH_REPO/target}"
     # Keep mesh-init service homes uniform: /home/<service> is provisioned as

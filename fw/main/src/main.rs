@@ -16,9 +16,7 @@ fn receive_boot_control(record: dmesh_server::tagged::Record<'_>) -> Option<allo
     {
         return None;
     }
-    // A stream handler always returns a correlated tagged record.  Returning
-    // bare text here left the caller without the normal response contract and
-    // prevented the RTC handoff from being tied to delivery of that response.
+    // Return the normal CBOR response envelope on the request stream.
     let id = record.id?;
     let mut response = [0u8; 64];
     let used = dmesh_server::tagged::encode_numeric_data_response(
@@ -29,16 +27,26 @@ fn receive_boot_control(record: dmesh_server::tagged::Record<'_>) -> Option<allo
         true,
         &mut response,
     )?;
-    // This remains one transition log per accepted command; Recovery's UART
-    // console is deliberately output-only, so it is also the bounded fallback
-    // evidence when a remote client loses the terminal stream response.
-    unsafe { esp_idf_sys::esp_rom_printf(b"DMESH main: recovery requested\n\0".as_ptr().cast()) };
-    dmesh_fw_transport::rtc::request_recovery_boot().then(|| {
-        unsafe {
-            esp_idf_sys::esp_rom_printf(b"DMESH main: recovery response queued\n\0".as_ptr().cast())
+    Some(alloc::vec::Vec::from(&response[..used]))
+}
+
+struct BootRecoveryHandler;
+
+impl dmesh_server::stream::StreamHandler for BootRecoveryHandler {
+    fn open<'a>(&'a self, request: dmesh_server::stream::Request<'a>)
+        -> dmesh_server::stream::OpenFuture<'a>
+    {
+        use dmesh_server::stream::{Outcome, Response};
+        let response = match receive_boot_control(request.record) {
+            Some(header) => Response::header(header).after_finish(|| {
+                unsafe { esp_idf_sys::esp_rom_printf(b"DMESH main: recovery response finished\n\0".as_ptr().cast()) };
+                let _ = dmesh_fw_transport::rtc::request_recovery_boot();
+            }),
+            None => Response::header(dmesh_server::stream::error_header(
+                request.record.id, b"invalid boot.recovery request")),
         };
-        alloc::vec::Vec::from(&response[..used])
-    })
+        alloc::boxed::Box::pin(core::future::ready(Some(Outcome::Respond(response))))
+    }
 }
 
 fn main() {
@@ -84,9 +92,9 @@ pub extern "C" fn app_main() {
     };
     dmesh_fw_transport::rtc::mark_main_start();
     let _ = esp_idf_sys::link_patches();
-    assert!(dmesh_server::registry::register(
+    assert!(dmesh_server::registry::register_stream(
         dmesh_server::registry::methods::BOOT_RECOVERY,
-        dmesh_server::registry::SyncFn(receive_boot_control),
+        BootRecoveryHandler,
     ));
     ble::register();
     pairing::register();

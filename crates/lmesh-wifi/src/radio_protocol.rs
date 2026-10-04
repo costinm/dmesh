@@ -23,7 +23,6 @@ const DMESH_MAGIC: [u8; 2] = *b"DM";
 const DMESH_VERSION: u8 = 1;
 const BLE_MAX_PREFIX: usize = 17;
 const BLE_DEDUPE_TTL: Duration = Duration::from_secs(10);
-const NAN_DEDUPE_TTL: Duration = Duration::from_secs(30);
 
 const BLE_EVENT_GENERIC: u8 = 0;
 const BLE_EVENT_LORA_RX: u8 = 1;
@@ -49,7 +48,6 @@ const NAN_MSG_COMMAND_TEXT: u8 = 6;
 const NAN_MSG_COMMAND_CBOR: u8 = 7;
 
 static BLE_DEDUPE: OnceLock<Mutex<Dedupe>> = OnceLock::new();
-static NAN_DEDUPE: OnceLock<Mutex<Dedupe>> = OnceLock::new();
 static NAN_SEQ: OnceLock<Mutex<u16>> = OnceLock::new();
 
 #[derive(Default)]

@@ -3,15 +3,31 @@
 //! Main and Recovery use the same raw Ethernet UDP6 adapter, shared ingress
 //! worker, QUIC-lite dispatcher, stream handlers, and flash sink. Recovery
 //! owns only STA startup, periodic presence, deadline wakeups, and the final
-//! Stage2 handoff. UART remains an unframed console output only.
+//! Stage2 handoff. UART is console output only, never a QUIC bearer.
 
 const START_TIMEOUT_MS: u64 = 75_000;
 const ANNOUNCE_INTERVAL_MS: u64 = 2_000;
 static DEADLINE_OWNER_TASK: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
+pub(crate) fn active() -> bool {
+    DEADLINE_OWNER_TASK.load(core::sync::atomic::Ordering::Acquire) != 0
+}
+
 pub fn run() {
     esp_idf_sys::link_patches();
+    // Console output also carries structured log records. Disable newline
+    // translation once at startup: binary 0x0a must remain a single byte.
+    unsafe {
+        #[cfg(target_arch = "riscv32")]
+        esp_idf_sys::usb_serial_jtag_vfs_set_tx_line_endings(
+            esp_idf_sys::esp_line_endings_t_ESP_LINE_ENDINGS_LF,
+        );
+        #[cfg(not(target_arch = "riscv32"))]
+        esp_idf_sys::uart_vfs_dev_port_set_tx_line_endings(
+            0, esp_idf_sys::esp_line_endings_t_ESP_LINE_ENDINGS_LF,
+        );
+    }
     // Recovery shares Main's packet-memory capability and therefore reads the
     // same durable ceiling before enabling any Wi-Fi callback.
     crate::main_runtime::apply_packet_pool_capacity_from_nvs();
@@ -20,14 +36,13 @@ pub fn run() {
     // not install a diagnostic catalog, UART input, or another transport.
     use dmesh_server::registry::{self, SyncFn, methods};
     let _ = registry::register(
-        methods::FIRMWARE_IDENTITY,
-        SyncFn(crate::firmware_identity::receive_tagged_identity),
+        methods::TELEMETRY_DEVICE,
+        SyncFn(crate::device_telemetry::receive),
     );
     let _ = registry::register_stream(
         methods::OBJECT_FLASH,
         dmesh_server::verified_object::FlashHandler(crate::flash::EspFlashPlatform),
     );
-    crate::quic_node_esp::register_probe_handlers();
     // Recovery answers a discovery check with its own announce, as a registered
     // handler like every other method, whichever delivery form carries it.
     let _ = registry::register(
@@ -107,6 +122,10 @@ fn serve_upload(started_us: u64) -> ! {
     );
     crate::core_runtime::install_connection_deadline_waker(Some(wake_deadline_owner));
     loop {
+        // Bearers only enqueue packet ownership. Recovery must drive the
+        // same QUIC owner as Main; timer advancement alone cannot dispatch
+        // requests or submit stream responses.
+        crate::quic_node_esp::progress();
         let elapsed = elapsed_ms(started_us);
         if elapsed.saturating_sub(last_announce_ms) >= ANNOUNCE_INTERVAL_MS {
             if let Some((record, used)) =

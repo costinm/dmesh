@@ -1,0 +1,27 @@
+[package]
+name = "dmesh-discovery"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "Local discovery for DMesh: signed announces, a typed device inventory and a sans-IO engine, with an optional tokio UDP6 transport."
+
+[features]
+default = []
+# The UDP6/UDP4 multicast transport and its receive loop. Without it the crate
+# is the sans-IO engine only, so a platform with its own sockets or radios
+# (NAN, NOW, BLE, an Android-owned socket) supplies the transport.
+tokio = ["dep:tokio"]
+
+[dependencies]
+# The announce wire format, `tagged` envelope and shared observation model.
+dmesh-server = { path = "../dmesh-server" }
+p256 = { version = "=0.14.0-rc.7", features = ["pem", "ecdsa"] }
+sha2 = "0.11"
+libc = "0.2"
+tracing = "0.1"
+serde_json = "1"
+tokio = { version = "1", default-features = false, features = ["net", "time", "sync", "rt", "macros"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["net", "time", "sync", "rt", "macros"] }
+tempfile = "3"

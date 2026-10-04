@@ -3,25 +3,76 @@
 use serde::{Deserialize, Serialize};
 
 /// Return the retained cross-bearer observed-device inventory
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct DiscoveryNodesRequest;
 
 impl mesh::tagged::TaggedFields for DiscoveryNodesRequest {
     const FIELDS: &'static [(&'static str, u32)] = &[];
 }
 
+impl DiscoveryNodesRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for DiscoveryNodesRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        DiscoveryNodesRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        DiscoveryNodesRequest::decode_cbor(input)
+    }
+}
+
 /// Return the retained cross-bearer observed-device inventory
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct DiscoveryNodesResponse {
     /// API field `device_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_id: Option<Vec<u8>>,
     /// API field `peer`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub peer: Option<serde_json::Value>,
+    pub peer: Option<Vec<u8>>,
     /// API field `bssid`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bssid: Option<serde_json::Value>,
+    pub bssid: Option<Vec<u8>>,
     /// API field `available_fields`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub available_fields: Option<u32>,
@@ -58,14 +109,219 @@ pub struct DiscoveryNodesResponse {
     /// API field `channel`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel: Option<u8>,
+    /// API field `bearer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer: Option<String>,
+    /// API field `rssi_dbm`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rssi_dbm: Option<i16>,
+    /// API field `name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// API field `vip6`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vip6: Option<Vec<u8>>,
+    /// API field `device_class`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_class: Option<u8>,
+    /// API field `probe_capabilities`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_capabilities: Option<u16>,
+    /// API field `authenticated`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authenticated: Option<bool>,
+    /// API field `uptime_secs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uptime_secs: Option<u32>,
+    /// API field `udp_endpoint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub udp_endpoint: Option<String>,
+    /// API field `network_name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_name: Option<String>,
 }
 
 impl mesh::tagged::TaggedFields for DiscoveryNodesResponse {
-    const FIELDS: &'static [(&'static str, u32)] = &[("device_id", 1), ("peer", 2), ("bssid", 3), ("available_fields", 4), ("first_seen_ms", 5), ("last_seen_ms", 6), ("packets", 7), ("active_publish_rx", 8), ("active_subscribe_rx", 9), ("followup_rx", 10), ("last_kind", 11), ("last_payload_len", 12), ("last_payload_hash", 13), ("unavailable_fields", 14), ("channel", 15)];
+    const FIELDS: &'static [(&'static str, u32)] = &[("device_id", 1), ("peer", 2), ("bssid", 3), ("available_fields", 4), ("first_seen_ms", 5), ("last_seen_ms", 6), ("packets", 7), ("active_publish_rx", 8), ("active_subscribe_rx", 9), ("followup_rx", 10), ("last_kind", 11), ("last_payload_len", 12), ("last_payload_hash", 13), ("unavailable_fields", 14), ("channel", 15), ("bearer", 16), ("rssi_dbm", 17), ("name", 18), ("vip6", 19), ("device_class", 20), ("probe_capabilities", 21), ("authenticated", 22), ("uptime_secs", 23), ("udp_endpoint", 24), ("network_name", 25)];
+}
+
+impl DiscoveryNodesResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64 + u64::from(self.device_id.is_some()) + u64::from(self.peer.is_some()) + u64::from(self.bssid.is_some()) + u64::from(self.available_fields.is_some()) + u64::from(self.first_seen_ms.is_some()) + u64::from(self.last_seen_ms.is_some()) + u64::from(self.packets.is_some()) + u64::from(self.active_publish_rx.is_some()) + u64::from(self.active_subscribe_rx.is_some()) + u64::from(self.followup_rx.is_some()) + u64::from(self.last_kind.is_some()) + u64::from(self.last_payload_len.is_some()) + u64::from(self.last_payload_hash.is_some()) + u64::from(self.unavailable_fields.is_some()) + u64::from(self.channel.is_some()) + u64::from(self.bearer.is_some()) + u64::from(self.rssi_dbm.is_some()) + u64::from(self.name.is_some()) + u64::from(self.vip6.is_some()) + u64::from(self.device_class.is_some()) + u64::from(self.probe_capabilities.is_some()) + u64::from(self.authenticated.is_some()) + u64::from(self.uptime_secs.is_some()) + u64::from(self.udp_endpoint.is_some()) + u64::from(self.network_name.is_some()))?;
+        if let Some(value) = &self.device_id {
+        e.uint(1)?;
+        e.bytes_value(value)?;
+        }
+        if let Some(value) = &self.peer {
+        e.uint(2)?;
+        e.bytes_value(value)?;
+        }
+        if let Some(value) = &self.bssid {
+        e.uint(3)?;
+        e.bytes_value(value)?;
+        }
+        if let Some(value) = &self.available_fields {
+        e.uint(4)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.first_seen_ms {
+        e.uint(5)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.last_seen_ms {
+        e.uint(6)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.packets {
+        e.uint(7)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.active_publish_rx {
+        e.uint(8)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.active_subscribe_rx {
+        e.uint(9)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.followup_rx {
+        e.uint(10)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.last_kind {
+        e.uint(11)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.last_payload_len {
+        e.uint(12)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.last_payload_hash {
+        e.uint(13)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.unavailable_fields {
+        e.uint(14)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.channel {
+        e.uint(15)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.bearer {
+        e.uint(16)?;
+        e.text_value(value.as_bytes())?;
+        }
+        if let Some(value) = &self.rssi_dbm {
+        e.uint(17)?;
+        e.int(i64::from(*value))?;
+        }
+        if let Some(value) = &self.name {
+        e.uint(18)?;
+        e.text_value(value.as_bytes())?;
+        }
+        if let Some(value) = &self.vip6 {
+        e.uint(19)?;
+        e.bytes_value(value)?;
+        }
+        if let Some(value) = &self.device_class {
+        e.uint(20)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.probe_capabilities {
+        e.uint(21)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.authenticated {
+        e.uint(22)?;
+        e.bool(*value)?;
+        }
+        if let Some(value) = &self.uptime_secs {
+        e.uint(23)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.udp_endpoint {
+        e.uint(24)?;
+        e.text_value(value.as_bytes())?;
+        }
+        if let Some(value) = &self.network_name {
+        e.uint(25)?;
+        e.text_value(value.as_bytes())?;
+        }
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                1 => out.device_id = Some(d.bytes_ref().ok_or("invalid byte string")?.to_vec()),
+                2 => out.peer = Some(d.bytes_ref().ok_or("invalid byte string")?.to_vec()),
+                3 => out.bssid = Some(d.bytes_ref().ok_or("invalid byte string")?.to_vec()),
+                4 => out.available_fields = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                5 => out.first_seen_ms = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                6 => out.last_seen_ms = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                7 => out.packets = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                8 => out.active_publish_rx = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                9 => out.active_subscribe_rx = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                10 => out.followup_rx = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                11 => out.last_kind = Some(u8::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                12 => out.last_payload_len = Some(u16::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                13 => out.last_payload_hash = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                14 => out.unavailable_fields = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                15 => out.channel = Some(u8::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                16 => out.bearer = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                17 => out.rssi_dbm = Some(i16::try_from(d.int().ok_or("invalid integer")?).map_err(|_| "integer out of range")?),
+                18 => out.name = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                19 => out.vip6 = Some(d.bytes_ref().ok_or("invalid byte string")?.to_vec()),
+                20 => out.device_class = Some(u8::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                21 => out.probe_capabilities = Some(u16::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                22 => out.authenticated = Some(d.bool().ok_or("invalid bool")?),
+                23 => out.uptime_secs = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                24 => out.udp_endpoint = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                25 => out.network_name = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for DiscoveryNodesResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        DiscoveryNodesResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        DiscoveryNodesResponse::decode_cbor(input)
+    }
 }
 
 /// Run one discovery pass on every available local bearer
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct DiscoveryActiveRequest {
     /// API field `medium`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -79,40 +335,344 @@ impl mesh::tagged::TaggedFields for DiscoveryActiveRequest {
     const FIELDS: &'static [(&'static str, u32)] = &[("medium", 40), ("to", 41)];
 }
 
+impl DiscoveryActiveRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64 + u64::from(self.medium.is_some()) + u64::from(self.to.is_some()))?;
+        if let Some(value) = &self.medium {
+        e.uint(40)?;
+        e.text_value(value.as_bytes())?;
+        }
+        if let Some(value) = &self.to {
+        e.uint(41)?;
+        e.text_value(value.as_bytes())?;
+        }
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                40 => out.medium = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                41 => out.to = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for DiscoveryActiveRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        DiscoveryActiveRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        DiscoveryActiveRequest::decode_cbor(input)
+    }
+}
+
 /// Run one discovery pass on every available local bearer
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct DiscoveryActiveResponse;
 
 impl mesh::tagged::TaggedFields for DiscoveryActiveResponse {
     const FIELDS: &'static [(&'static str, u32)] = &[];
 }
 
+impl DiscoveryActiveResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for DiscoveryActiveResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        DiscoveryActiveResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        DiscoveryActiveResponse::decode_cbor(input)
+    }
+}
+
 /// Return local NAN attach, cluster, synchronization, and publish state
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct TelemetryNanStatusRequest;
 
 impl mesh::tagged::TaggedFields for TelemetryNanStatusRequest {
     const FIELDS: &'static [(&'static str, u32)] = &[];
 }
 
+impl TelemetryNanStatusRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for TelemetryNanStatusRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        TelemetryNanStatusRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        TelemetryNanStatusRequest::decode_cbor(input)
+    }
+}
+
 /// Return local NAN attach, cluster, synchronization, and publish state
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TelemetryNanStatusResponse;
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct TelemetryNanStatusResponse {
+    /// API field `active`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<bool>,
+    /// API field `cluster_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_id: Option<Vec<u8>>,
+    /// API field `sync_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_id: Option<Vec<u8>>,
+    /// API field `publishing`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publishing: Option<bool>,
+    /// API field `publish_pending`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_pending: Option<bool>,
+}
 
 impl mesh::tagged::TaggedFields for TelemetryNanStatusResponse {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
+    const FIELDS: &'static [(&'static str, u32)] = &[("active", 1), ("cluster_id", 2), ("sync_id", 3), ("publishing", 4), ("publish_pending", 5)];
+}
+
+impl TelemetryNanStatusResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64 + u64::from(self.active.is_some()) + u64::from(self.cluster_id.is_some()) + u64::from(self.sync_id.is_some()) + u64::from(self.publishing.is_some()) + u64::from(self.publish_pending.is_some()))?;
+        if let Some(value) = &self.active {
+        e.uint(1)?;
+        e.bool(*value)?;
+        }
+        if let Some(value) = &self.cluster_id {
+        e.uint(2)?;
+        e.bytes_value(value)?;
+        }
+        if let Some(value) = &self.sync_id {
+        e.uint(3)?;
+        e.bytes_value(value)?;
+        }
+        if let Some(value) = &self.publishing {
+        e.uint(4)?;
+        e.bool(*value)?;
+        }
+        if let Some(value) = &self.publish_pending {
+        e.uint(5)?;
+        e.bool(*value)?;
+        }
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                1 => out.active = Some(d.bool().ok_or("invalid bool")?),
+                2 => out.cluster_id = Some(d.bytes_ref().ok_or("invalid byte string")?.to_vec()),
+                3 => out.sync_id = Some(d.bytes_ref().ok_or("invalid byte string")?.to_vec()),
+                4 => out.publishing = Some(d.bool().ok_or("invalid bool")?),
+                5 => out.publish_pending = Some(d.bool().ok_or("invalid bool")?),
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for TelemetryNanStatusResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        TelemetryNanStatusResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        TelemetryNanStatusResponse::decode_cbor(input)
+    }
 }
 
 /// Return local ESP-NOW submission, receive, admission, dispatch, drop, and error counters
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct TelemetryNowRequest;
 
 impl mesh::tagged::TaggedFields for TelemetryNowRequest {
     const FIELDS: &'static [(&'static str, u32)] = &[];
 }
 
+impl TelemetryNowRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for TelemetryNowRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        TelemetryNowRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        TelemetryNowRequest::decode_cbor(input)
+    }
+}
+
 /// Return local ESP-NOW submission, receive, admission, dispatch, drop, and error counters
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct TelemetryNowResponse {
     /// API field `tx_attempted`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -174,16 +734,207 @@ impl mesh::tagged::TaggedFields for TelemetryNowResponse {
     const FIELDS: &'static [(&'static str, u32)] = &[("tx_attempted", 1), ("tx_accepted", 2), ("tx_failed", 3), ("rx_dispatched", 4), ("rx_accepted", 5), ("rx_rejected", 6), ("rx_self_echo", 7), ("rx_dropped", 8), ("registered_actions", 9), ("registered_drops", 10), ("last_roc_body_prefix", 11), ("last_roc_body_len", 12), ("rx_invalid_drops", 13), ("rx_busy_drops", 14), ("rx_shared_ingress_drops", 15), ("last_registered_body_prefix", 16), ("last_registered_body_len", 17), ("tx_busy", 18)];
 }
 
+impl TelemetryNowResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64 + u64::from(self.tx_attempted.is_some()) + u64::from(self.tx_accepted.is_some()) + u64::from(self.tx_failed.is_some()) + u64::from(self.rx_dispatched.is_some()) + u64::from(self.rx_accepted.is_some()) + u64::from(self.rx_rejected.is_some()) + u64::from(self.rx_self_echo.is_some()) + u64::from(self.rx_dropped.is_some()) + u64::from(self.registered_actions.is_some()) + u64::from(self.registered_drops.is_some()) + u64::from(self.last_roc_body_prefix.is_some()) + u64::from(self.last_roc_body_len.is_some()) + u64::from(self.rx_invalid_drops.is_some()) + u64::from(self.rx_busy_drops.is_some()) + u64::from(self.rx_shared_ingress_drops.is_some()) + u64::from(self.last_registered_body_prefix.is_some()) + u64::from(self.last_registered_body_len.is_some()) + u64::from(self.tx_busy.is_some()))?;
+        if let Some(value) = &self.tx_attempted {
+        e.uint(1)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.tx_accepted {
+        e.uint(2)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.tx_failed {
+        e.uint(3)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.rx_dispatched {
+        e.uint(4)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.rx_accepted {
+        e.uint(5)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.rx_rejected {
+        e.uint(6)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.rx_self_echo {
+        e.uint(7)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.rx_dropped {
+        e.uint(8)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.registered_actions {
+        e.uint(9)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.registered_drops {
+        e.uint(10)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.last_roc_body_prefix {
+        e.uint(11)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.last_roc_body_len {
+        e.uint(12)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.rx_invalid_drops {
+        e.uint(13)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.rx_busy_drops {
+        e.uint(14)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.rx_shared_ingress_drops {
+        e.uint(15)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.last_registered_body_prefix {
+        e.uint(16)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.last_registered_body_len {
+        e.uint(17)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.tx_busy {
+        e.uint(18)?;
+        e.uint(u64::from(*value))?;
+        }
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                1 => out.tx_attempted = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                2 => out.tx_accepted = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                3 => out.tx_failed = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                4 => out.rx_dispatched = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                5 => out.rx_accepted = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                6 => out.rx_rejected = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                7 => out.rx_self_echo = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                8 => out.rx_dropped = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                9 => out.registered_actions = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                10 => out.registered_drops = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                11 => out.last_roc_body_prefix = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                12 => out.last_roc_body_len = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                13 => out.rx_invalid_drops = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                14 => out.rx_busy_drops = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                15 => out.rx_shared_ingress_drops = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                16 => out.last_registered_body_prefix = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                17 => out.last_registered_body_len = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                18 => out.tx_busy = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for TelemetryNowResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        TelemetryNowResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        TelemetryNowResponse::decode_cbor(input)
+    }
+}
+
 /// Return local NAN beacon, SDF, Service Info, Follow-up, dispatch, drop, and error counters
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct TelemetryNanRequest;
 
 impl mesh::tagged::TaggedFields for TelemetryNanRequest {
     const FIELDS: &'static [(&'static str, u32)] = &[];
 }
 
+impl TelemetryNanRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for TelemetryNanRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        TelemetryNanRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        TelemetryNanRequest::decode_cbor(input)
+    }
+}
+
 /// Return local NAN beacon, SDF, Service Info, Follow-up, dispatch, drop, and error counters
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct TelemetryNanResponse {
     /// API field `beacons`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -302,16 +1053,302 @@ impl mesh::tagged::TaggedFields for TelemetryNanResponse {
     const FIELDS: &'static [(&'static str, u32)] = &[("beacons", 1), ("sdfs", 2), ("followups_rx", 3), ("followups_queued", 4), ("followups_sent", 5), ("followups_dropped", 6), ("service_info_matched", 7), ("service_info_enqueued", 8), ("service_info_dropped", 9), ("service_info_dispatched", 10), ("active_publish_attempted", 11), ("active_publish_sent", 12), ("active_publish_dropped", 13), ("active_discovery_queued", 14), ("active_discovery_sent", 15), ("active_discovery_dropped", 16), ("dw8_radio_stop_us", 17), ("dw8_radio_resume_us", 18), ("dw8_awake_us", 19), ("last_sdf_after_beacon_us", 20), ("last_sdf_frame_bytes", 21), ("last_sdf_source_le", 22), ("small_sdf_max_bytes", 23), ("small_sdf_max_source_le", 24), ("pending_sdf_queued", 25), ("pending_sdf_rejected", 26), ("pending_sdf_tx_attempted", 27), ("pending_sdf_tx_accepted", 28), ("pending_sdf_completed", 29), ("pending_sdf_count", 30), ("light_sleep_attempts", 31), ("light_sleep_entries", 32), ("light_sleep_skipped", 33), ("last_sleep_requested_us", 34), ("last_sleep_duration_us", 35), ("first_frame_after_wake_us", 36), ("first_beacon_after_wake_us", 37)];
 }
 
+impl TelemetryNanResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64 + u64::from(self.beacons.is_some()) + u64::from(self.sdfs.is_some()) + u64::from(self.followups_rx.is_some()) + u64::from(self.followups_queued.is_some()) + u64::from(self.followups_sent.is_some()) + u64::from(self.followups_dropped.is_some()) + u64::from(self.service_info_matched.is_some()) + u64::from(self.service_info_enqueued.is_some()) + u64::from(self.service_info_dropped.is_some()) + u64::from(self.service_info_dispatched.is_some()) + u64::from(self.active_publish_attempted.is_some()) + u64::from(self.active_publish_sent.is_some()) + u64::from(self.active_publish_dropped.is_some()) + u64::from(self.active_discovery_queued.is_some()) + u64::from(self.active_discovery_sent.is_some()) + u64::from(self.active_discovery_dropped.is_some()) + u64::from(self.dw8_radio_stop_us.is_some()) + u64::from(self.dw8_radio_resume_us.is_some()) + u64::from(self.dw8_awake_us.is_some()) + u64::from(self.last_sdf_after_beacon_us.is_some()) + u64::from(self.last_sdf_frame_bytes.is_some()) + u64::from(self.last_sdf_source_le.is_some()) + u64::from(self.small_sdf_max_bytes.is_some()) + u64::from(self.small_sdf_max_source_le.is_some()) + u64::from(self.pending_sdf_queued.is_some()) + u64::from(self.pending_sdf_rejected.is_some()) + u64::from(self.pending_sdf_tx_attempted.is_some()) + u64::from(self.pending_sdf_tx_accepted.is_some()) + u64::from(self.pending_sdf_completed.is_some()) + u64::from(self.pending_sdf_count.is_some()) + u64::from(self.light_sleep_attempts.is_some()) + u64::from(self.light_sleep_entries.is_some()) + u64::from(self.light_sleep_skipped.is_some()) + u64::from(self.last_sleep_requested_us.is_some()) + u64::from(self.last_sleep_duration_us.is_some()) + u64::from(self.first_frame_after_wake_us.is_some()) + u64::from(self.first_beacon_after_wake_us.is_some()))?;
+        if let Some(value) = &self.beacons {
+        e.uint(1)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.sdfs {
+        e.uint(2)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.followups_rx {
+        e.uint(3)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.followups_queued {
+        e.uint(4)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.followups_sent {
+        e.uint(5)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.followups_dropped {
+        e.uint(6)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.service_info_matched {
+        e.uint(7)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.service_info_enqueued {
+        e.uint(8)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.service_info_dropped {
+        e.uint(9)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.service_info_dispatched {
+        e.uint(10)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.active_publish_attempted {
+        e.uint(11)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.active_publish_sent {
+        e.uint(12)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.active_publish_dropped {
+        e.uint(13)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.active_discovery_queued {
+        e.uint(14)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.active_discovery_sent {
+        e.uint(15)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.active_discovery_dropped {
+        e.uint(16)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.dw8_radio_stop_us {
+        e.uint(17)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.dw8_radio_resume_us {
+        e.uint(18)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.dw8_awake_us {
+        e.uint(19)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.last_sdf_after_beacon_us {
+        e.uint(20)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.last_sdf_frame_bytes {
+        e.uint(21)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.last_sdf_source_le {
+        e.uint(22)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.small_sdf_max_bytes {
+        e.uint(23)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.small_sdf_max_source_le {
+        e.uint(24)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.pending_sdf_queued {
+        e.uint(25)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.pending_sdf_rejected {
+        e.uint(26)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.pending_sdf_tx_attempted {
+        e.uint(27)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.pending_sdf_tx_accepted {
+        e.uint(28)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.pending_sdf_completed {
+        e.uint(29)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.pending_sdf_count {
+        e.uint(30)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.light_sleep_attempts {
+        e.uint(31)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.light_sleep_entries {
+        e.uint(32)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.light_sleep_skipped {
+        e.uint(33)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.last_sleep_requested_us {
+        e.uint(34)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.last_sleep_duration_us {
+        e.uint(35)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.first_frame_after_wake_us {
+        e.uint(36)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.first_beacon_after_wake_us {
+        e.uint(37)?;
+        e.uint(u64::from(*value))?;
+        }
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                1 => out.beacons = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                2 => out.sdfs = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                3 => out.followups_rx = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                4 => out.followups_queued = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                5 => out.followups_sent = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                6 => out.followups_dropped = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                7 => out.service_info_matched = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                8 => out.service_info_enqueued = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                9 => out.service_info_dropped = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                10 => out.service_info_dispatched = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                11 => out.active_publish_attempted = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                12 => out.active_publish_sent = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                13 => out.active_publish_dropped = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                14 => out.active_discovery_queued = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                15 => out.active_discovery_sent = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                16 => out.active_discovery_dropped = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                17 => out.dw8_radio_stop_us = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                18 => out.dw8_radio_resume_us = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                19 => out.dw8_awake_us = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                20 => out.last_sdf_after_beacon_us = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                21 => out.last_sdf_frame_bytes = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                22 => out.last_sdf_source_le = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                23 => out.small_sdf_max_bytes = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                24 => out.small_sdf_max_source_le = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                25 => out.pending_sdf_queued = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                26 => out.pending_sdf_rejected = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                27 => out.pending_sdf_tx_attempted = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                28 => out.pending_sdf_tx_accepted = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                29 => out.pending_sdf_completed = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                30 => out.pending_sdf_count = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                31 => out.light_sleep_attempts = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                32 => out.light_sleep_entries = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                33 => out.light_sleep_skipped = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                34 => out.last_sleep_requested_us = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                35 => out.last_sleep_duration_us = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                36 => out.first_frame_after_wake_us = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                37 => out.first_beacon_after_wake_us = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for TelemetryNanResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        TelemetryNanResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        TelemetryNanResponse::decode_cbor(input)
+    }
+}
+
 /// Return local raw IPv6 validation, UDP delivery, NDP, transmit, and failure counters
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct TelemetryUdp6Request;
 
 impl mesh::tagged::TaggedFields for TelemetryUdp6Request {
     const FIELDS: &'static [(&'static str, u32)] = &[];
 }
 
+impl TelemetryUdp6Request {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for TelemetryUdp6Request {
+    fn encode_cbor(&self) -> Vec<u8> {
+        TelemetryUdp6Request::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        TelemetryUdp6Request::decode_cbor(input)
+    }
+}
+
 /// Return local raw IPv6 validation, UDP delivery, NDP, transmit, and failure counters
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct TelemetryUdp6Response {
     /// API field `rx_frames`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -343,17 +1380,5564 @@ impl mesh::tagged::TaggedFields for TelemetryUdp6Response {
     const FIELDS: &'static [(&'static str, u32)] = &[("rx_frames", 1), ("rx_queue_drops", 2), ("rx_invalid", 3), ("udp_delivered", 4), ("ndp_advertisements", 5), ("tx_failures", 6), ("raw_tx_completions", 7), ("raw_tx_completion_failures", 8)];
 }
 
+impl TelemetryUdp6Response {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64 + u64::from(self.rx_frames.is_some()) + u64::from(self.rx_queue_drops.is_some()) + u64::from(self.rx_invalid.is_some()) + u64::from(self.udp_delivered.is_some()) + u64::from(self.ndp_advertisements.is_some()) + u64::from(self.tx_failures.is_some()) + u64::from(self.raw_tx_completions.is_some()) + u64::from(self.raw_tx_completion_failures.is_some()))?;
+        if let Some(value) = &self.rx_frames {
+        e.uint(1)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.rx_queue_drops {
+        e.uint(2)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.rx_invalid {
+        e.uint(3)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.udp_delivered {
+        e.uint(4)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.ndp_advertisements {
+        e.uint(5)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.tx_failures {
+        e.uint(6)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.raw_tx_completions {
+        e.uint(7)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.raw_tx_completion_failures {
+        e.uint(8)?;
+        e.uint(u64::from(*value))?;
+        }
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                1 => out.rx_frames = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                2 => out.rx_queue_drops = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                3 => out.rx_invalid = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                4 => out.udp_delivered = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                5 => out.ndp_advertisements = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                6 => out.tx_failures = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                7 => out.raw_tx_completions = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                8 => out.raw_tx_completion_failures = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for TelemetryUdp6Response {
+    fn encode_cbor(&self) -> Vec<u8> {
+        TelemetryUdp6Response::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        TelemetryUdp6Response::decode_cbor(input)
+    }
+}
+
 /// Return common optional per-peer Wi-Fi link observations
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct TelemetryWifiLinkRequest;
 
 impl mesh::tagged::TaggedFields for TelemetryWifiLinkRequest {
     const FIELDS: &'static [(&'static str, u32)] = &[];
 }
 
+impl TelemetryWifiLinkRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for TelemetryWifiLinkRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        TelemetryWifiLinkRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        TelemetryWifiLinkRequest::decode_cbor(input)
+    }
+}
+
 /// Return common optional per-peer Wi-Fi link observations
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct TelemetryWifiLinkResponse {
+    /// API field `schema_version`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<u8>,
+    /// API field `interface_index`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_index: Option<u32>,
+    /// API field `peer_mac`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_mac: Option<Vec<u8>>,
+    /// API field `rx_bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rx_bytes: Option<u64>,
+    /// API field `tx_bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_bytes: Option<u64>,
+    /// API field `rx_packets`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rx_packets: Option<u64>,
+    /// API field `tx_packets`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_packets: Option<u64>,
+    /// API field `mac_tx_retries`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac_tx_retries: Option<u64>,
+    /// API field `mac_tx_failed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac_tx_failed: Option<u64>,
+    /// API field `rx_dropped`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rx_dropped: Option<u64>,
+    /// API field `rx_airtime_us`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rx_airtime_us: Option<u64>,
+    /// API field `tx_airtime_us`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_airtime_us: Option<u64>,
+    /// API field `signal_dbm`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal_dbm: Option<i8>,
+    /// API field `signal_avg_dbm`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal_avg_dbm: Option<i8>,
+    /// API field `ack_signal_dbm`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack_signal_dbm: Option<i8>,
+    /// API field `ack_signal_avg_dbm`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack_signal_avg_dbm: Option<i8>,
+    /// API field `rx_bitrate_kbit_s`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rx_bitrate_kbit_s: Option<u64>,
+    /// API field `tx_bitrate_kbit_s`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_bitrate_kbit_s: Option<u64>,
+    /// API field `expected_throughput_kbit_s`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_throughput_kbit_s: Option<u64>,
+    /// API field `bearer_rx_frames`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer_rx_frames: Option<u64>,
+    /// API field `bearer_rx_drops`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer_rx_drops: Option<u64>,
+    /// API field `bearer_rx_invalid`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer_rx_invalid: Option<u64>,
+    /// API field `bearer_udp_delivered`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer_udp_delivered: Option<u64>,
+    /// API field `bearer_ndp_advertisements`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer_ndp_advertisements: Option<u64>,
+    /// API field `bearer_tx_failures`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer_tx_failures: Option<u64>,
+    /// API field `raw_tx_completion_failures`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_tx_completion_failures: Option<u64>,
+    /// API field `links`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub links: Option<Vec<WifiLink>>,
+}
+
+impl mesh::tagged::TaggedFields for TelemetryWifiLinkResponse {
+    const FIELDS: &'static [(&'static str, u32)] = &[("schema_version", 1), ("interface_index", 2), ("peer_mac", 3), ("rx_bytes", 4), ("tx_bytes", 5), ("rx_packets", 6), ("tx_packets", 7), ("mac_tx_retries", 8), ("mac_tx_failed", 9), ("rx_dropped", 10), ("rx_airtime_us", 11), ("tx_airtime_us", 12), ("signal_dbm", 13), ("signal_avg_dbm", 14), ("ack_signal_dbm", 15), ("ack_signal_avg_dbm", 16), ("rx_bitrate_kbit_s", 17), ("tx_bitrate_kbit_s", 18), ("expected_throughput_kbit_s", 19), ("bearer_rx_frames", 20), ("bearer_rx_drops", 21), ("bearer_rx_invalid", 22), ("bearer_udp_delivered", 23), ("bearer_ndp_advertisements", 24), ("bearer_tx_failures", 25), ("raw_tx_completion_failures", 26), ("links", 27)];
+}
+
+impl TelemetryWifiLinkResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64 + u64::from(self.schema_version.is_some()) + u64::from(self.interface_index.is_some()) + u64::from(self.peer_mac.is_some()) + u64::from(self.rx_bytes.is_some()) + u64::from(self.tx_bytes.is_some()) + u64::from(self.rx_packets.is_some()) + u64::from(self.tx_packets.is_some()) + u64::from(self.mac_tx_retries.is_some()) + u64::from(self.mac_tx_failed.is_some()) + u64::from(self.rx_dropped.is_some()) + u64::from(self.rx_airtime_us.is_some()) + u64::from(self.tx_airtime_us.is_some()) + u64::from(self.signal_dbm.is_some()) + u64::from(self.signal_avg_dbm.is_some()) + u64::from(self.ack_signal_dbm.is_some()) + u64::from(self.ack_signal_avg_dbm.is_some()) + u64::from(self.rx_bitrate_kbit_s.is_some()) + u64::from(self.tx_bitrate_kbit_s.is_some()) + u64::from(self.expected_throughput_kbit_s.is_some()) + u64::from(self.bearer_rx_frames.is_some()) + u64::from(self.bearer_rx_drops.is_some()) + u64::from(self.bearer_rx_invalid.is_some()) + u64::from(self.bearer_udp_delivered.is_some()) + u64::from(self.bearer_ndp_advertisements.is_some()) + u64::from(self.bearer_tx_failures.is_some()) + u64::from(self.raw_tx_completion_failures.is_some()) + u64::from(self.links.is_some()))?;
+        if let Some(value) = &self.schema_version {
+        e.uint(1)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.interface_index {
+        e.uint(2)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.peer_mac {
+        e.uint(3)?;
+        e.bytes_value(value)?;
+        }
+        if let Some(value) = &self.rx_bytes {
+        e.uint(4)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.tx_bytes {
+        e.uint(5)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.rx_packets {
+        e.uint(6)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.tx_packets {
+        e.uint(7)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.mac_tx_retries {
+        e.uint(8)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.mac_tx_failed {
+        e.uint(9)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.rx_dropped {
+        e.uint(10)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.rx_airtime_us {
+        e.uint(11)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.tx_airtime_us {
+        e.uint(12)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.signal_dbm {
+        e.uint(13)?;
+        e.int(i64::from(*value))?;
+        }
+        if let Some(value) = &self.signal_avg_dbm {
+        e.uint(14)?;
+        e.int(i64::from(*value))?;
+        }
+        if let Some(value) = &self.ack_signal_dbm {
+        e.uint(15)?;
+        e.int(i64::from(*value))?;
+        }
+        if let Some(value) = &self.ack_signal_avg_dbm {
+        e.uint(16)?;
+        e.int(i64::from(*value))?;
+        }
+        if let Some(value) = &self.rx_bitrate_kbit_s {
+        e.uint(17)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.tx_bitrate_kbit_s {
+        e.uint(18)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.expected_throughput_kbit_s {
+        e.uint(19)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.bearer_rx_frames {
+        e.uint(20)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.bearer_rx_drops {
+        e.uint(21)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.bearer_rx_invalid {
+        e.uint(22)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.bearer_udp_delivered {
+        e.uint(23)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.bearer_ndp_advertisements {
+        e.uint(24)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.bearer_tx_failures {
+        e.uint(25)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.raw_tx_completion_failures {
+        e.uint(26)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.links {
+        e.uint(27)?;
+        e.array(value.len() as u64)?;
+        for item in value.iter() {
+            e.encoded_value(&item.encode_cbor())?;
+        }
+        }
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                1 => out.schema_version = Some(u8::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                2 => out.interface_index = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                3 => out.peer_mac = Some(d.bytes_ref().ok_or("invalid byte string")?.to_vec()),
+                4 => out.rx_bytes = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                5 => out.tx_bytes = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                6 => out.rx_packets = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                7 => out.tx_packets = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                8 => out.mac_tx_retries = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                9 => out.mac_tx_failed = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                10 => out.rx_dropped = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                11 => out.rx_airtime_us = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                12 => out.tx_airtime_us = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                13 => out.signal_dbm = Some(i8::try_from(d.int().ok_or("invalid integer")?).map_err(|_| "integer out of range")?),
+                14 => out.signal_avg_dbm = Some(i8::try_from(d.int().ok_or("invalid integer")?).map_err(|_| "integer out of range")?),
+                15 => out.ack_signal_dbm = Some(i8::try_from(d.int().ok_or("invalid integer")?).map_err(|_| "integer out of range")?),
+                16 => out.ack_signal_avg_dbm = Some(i8::try_from(d.int().ok_or("invalid integer")?).map_err(|_| "integer out of range")?),
+                17 => out.rx_bitrate_kbit_s = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                18 => out.tx_bitrate_kbit_s = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                19 => out.expected_throughput_kbit_s = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                20 => out.bearer_rx_frames = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                21 => out.bearer_rx_drops = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                22 => out.bearer_rx_invalid = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                23 => out.bearer_udp_delivered = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                24 => out.bearer_ndp_advertisements = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                25 => out.bearer_tx_failures = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                26 => out.raw_tx_completion_failures = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                27 => out.links = Some({ let (major, length) = d.head().ok_or("invalid array")?; if major != 4 { return Err("not a CBOR array".to_owned()); } let mut items = Vec::new(); for _ in 0..length { items.push({ let start = d.position(); d.skip().ok_or("invalid row")?; WifiLink::decode_cbor(&input[start..d.position()])? }); } items }),
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for TelemetryWifiLinkResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        TelemetryWifiLinkResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        TelemetryWifiLinkResponse::decode_cbor(input)
+    }
+}
+
+/// Return the latest portable battery and power snapshot
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct TelemetryBatteryRequest;
+
+impl mesh::tagged::TaggedFields for TelemetryBatteryRequest {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl TelemetryBatteryRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for TelemetryBatteryRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        TelemetryBatteryRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        TelemetryBatteryRequest::decode_cbor(input)
+    }
+}
+
+/// Return the latest portable battery and power snapshot
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct TelemetryBatteryResponse {
+    /// API field `battery_percent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub battery_percent: Option<u8>,
+    /// API field `charging`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub charging: Option<bool>,
+    /// API field `power_save`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power_save: Option<bool>,
+    /// API field `idle`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle: Option<bool>,
+    /// API field `idle_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_ms: Option<u64>,
+    /// API field `total_idle_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_idle_ms: Option<u64>,
+    /// API field `charging_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub charging_ms: Option<u64>,
+}
+
+impl mesh::tagged::TaggedFields for TelemetryBatteryResponse {
+    const FIELDS: &'static [(&'static str, u32)] = &[("battery_percent", 1), ("charging", 2), ("power_save", 3), ("idle", 4), ("idle_ms", 5), ("total_idle_ms", 6), ("charging_ms", 7)];
+}
+
+impl TelemetryBatteryResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64 + u64::from(self.battery_percent.is_some()) + u64::from(self.charging.is_some()) + u64::from(self.power_save.is_some()) + u64::from(self.idle.is_some()) + u64::from(self.idle_ms.is_some()) + u64::from(self.total_idle_ms.is_some()) + u64::from(self.charging_ms.is_some()))?;
+        if let Some(value) = &self.battery_percent {
+        e.uint(1)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.charging {
+        e.uint(2)?;
+        e.bool(*value)?;
+        }
+        if let Some(value) = &self.power_save {
+        e.uint(3)?;
+        e.bool(*value)?;
+        }
+        if let Some(value) = &self.idle {
+        e.uint(4)?;
+        e.bool(*value)?;
+        }
+        if let Some(value) = &self.idle_ms {
+        e.uint(5)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.total_idle_ms {
+        e.uint(6)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.charging_ms {
+        e.uint(7)?;
+        e.uint(u64::from(*value))?;
+        }
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                1 => out.battery_percent = Some(u8::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                2 => out.charging = Some(d.bool().ok_or("invalid bool")?),
+                3 => out.power_save = Some(d.bool().ok_or("invalid bool")?),
+                4 => out.idle = Some(d.bool().ok_or("invalid bool")?),
+                5 => out.idle_ms = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                6 => out.total_idle_ms = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                7 => out.charging_ms = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for TelemetryBatteryResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        TelemetryBatteryResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        TelemetryBatteryResponse::decode_cbor(input)
+    }
+}
+
+/// Return aggregate QUIC counters for live associations
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct TelemetryQuicRequest;
+
+impl mesh::tagged::TaggedFields for TelemetryQuicRequest {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl TelemetryQuicRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for TelemetryQuicRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        TelemetryQuicRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        TelemetryQuicRequest::decode_cbor(input)
+    }
+}
+
+/// Return aggregate QUIC counters for live associations
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct TelemetryQuicResponse {
+    /// API field `live_associations`.
+    pub live_associations: u64,
+    /// API field `received_packets`.
+    pub received_packets: u64,
+    /// API field `sent_packets`.
+    pub sent_packets: u64,
+    /// API field `received_stream_packets`.
+    pub received_stream_packets: u64,
+    /// API field `received_control_packets`.
+    pub received_control_packets: u64,
+    /// API field `sent_stream_packets`.
+    pub sent_stream_packets: u64,
+    /// API field `sent_control_packets`.
+    pub sent_control_packets: u64,
+    /// API field `duplicate_packets`.
+    pub duplicate_packets: u64,
+    /// API field `out_of_order_packets`.
+    pub out_of_order_packets: u64,
+    /// API field `inferred_missing_packets`.
+    pub inferred_missing_packets: u64,
+    /// API field `retransmitted_packets`.
+    pub retransmitted_packets: u64,
+    /// API field `loss_events`.
+    pub loss_events: u64,
+    /// API field `submission_failures`.
+    pub submission_failures: u64,
+}
+
+impl mesh::tagged::TaggedFields for TelemetryQuicResponse {
+    const FIELDS: &'static [(&'static str, u32)] = &[("live_associations", 1), ("received_packets", 2), ("sent_packets", 3), ("received_stream_packets", 4), ("received_control_packets", 5), ("sent_stream_packets", 6), ("sent_control_packets", 7), ("duplicate_packets", 8), ("out_of_order_packets", 9), ("inferred_missing_packets", 10), ("retransmitted_packets", 11), ("loss_events", 12), ("submission_failures", 13)];
+}
+
+impl TelemetryQuicResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(13u64)?;
+        e.uint(1)?;
+        e.uint(u64::from(*&self.live_associations))?;
+        e.uint(2)?;
+        e.uint(u64::from(*&self.received_packets))?;
+        e.uint(3)?;
+        e.uint(u64::from(*&self.sent_packets))?;
+        e.uint(4)?;
+        e.uint(u64::from(*&self.received_stream_packets))?;
+        e.uint(5)?;
+        e.uint(u64::from(*&self.received_control_packets))?;
+        e.uint(6)?;
+        e.uint(u64::from(*&self.sent_stream_packets))?;
+        e.uint(7)?;
+        e.uint(u64::from(*&self.sent_control_packets))?;
+        e.uint(8)?;
+        e.uint(u64::from(*&self.duplicate_packets))?;
+        e.uint(9)?;
+        e.uint(u64::from(*&self.out_of_order_packets))?;
+        e.uint(10)?;
+        e.uint(u64::from(*&self.inferred_missing_packets))?;
+        e.uint(11)?;
+        e.uint(u64::from(*&self.retransmitted_packets))?;
+        e.uint(12)?;
+        e.uint(u64::from(*&self.loss_events))?;
+        e.uint(13)?;
+        e.uint(u64::from(*&self.submission_failures))?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        let mut seen_1 = false;
+        let mut seen_2 = false;
+        let mut seen_3 = false;
+        let mut seen_4 = false;
+        let mut seen_5 = false;
+        let mut seen_6 = false;
+        let mut seen_7 = false;
+        let mut seen_8 = false;
+        let mut seen_9 = false;
+        let mut seen_10 = false;
+        let mut seen_11 = false;
+        let mut seen_12 = false;
+        let mut seen_13 = false;
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                1 => { out.live_associations = u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?; seen_1 = true; }
+                2 => { out.received_packets = u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?; seen_2 = true; }
+                3 => { out.sent_packets = u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?; seen_3 = true; }
+                4 => { out.received_stream_packets = u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?; seen_4 = true; }
+                5 => { out.received_control_packets = u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?; seen_5 = true; }
+                6 => { out.sent_stream_packets = u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?; seen_6 = true; }
+                7 => { out.sent_control_packets = u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?; seen_7 = true; }
+                8 => { out.duplicate_packets = u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?; seen_8 = true; }
+                9 => { out.out_of_order_packets = u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?; seen_9 = true; }
+                10 => { out.inferred_missing_packets = u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?; seen_10 = true; }
+                11 => { out.retransmitted_packets = u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?; seen_11 = true; }
+                12 => { out.loss_events = u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?; seen_12 = true; }
+                13 => { out.submission_failures = u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?; seen_13 = true; }
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        if !seen_1 {
+            return Err("missing required field `live_associations`".to_owned());
+        }
+        if !seen_2 {
+            return Err("missing required field `received_packets`".to_owned());
+        }
+        if !seen_3 {
+            return Err("missing required field `sent_packets`".to_owned());
+        }
+        if !seen_4 {
+            return Err("missing required field `received_stream_packets`".to_owned());
+        }
+        if !seen_5 {
+            return Err("missing required field `received_control_packets`".to_owned());
+        }
+        if !seen_6 {
+            return Err("missing required field `sent_stream_packets`".to_owned());
+        }
+        if !seen_7 {
+            return Err("missing required field `sent_control_packets`".to_owned());
+        }
+        if !seen_8 {
+            return Err("missing required field `duplicate_packets`".to_owned());
+        }
+        if !seen_9 {
+            return Err("missing required field `out_of_order_packets`".to_owned());
+        }
+        if !seen_10 {
+            return Err("missing required field `inferred_missing_packets`".to_owned());
+        }
+        if !seen_11 {
+            return Err("missing required field `retransmitted_packets`".to_owned());
+        }
+        if !seen_12 {
+            return Err("missing required field `loss_events`".to_owned());
+        }
+        if !seen_13 {
+            return Err("missing required field `submission_failures`".to_owned());
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for TelemetryQuicResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        TelemetryQuicResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        TelemetryQuicResponse::decode_cbor(input)
+    }
+}
+
+/// Return QUIC transport state for each live association
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct TelemetryQuicAssociationsRequest;
+
+impl mesh::tagged::TaggedFields for TelemetryQuicAssociationsRequest {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl TelemetryQuicAssociationsRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for TelemetryQuicAssociationsRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        TelemetryQuicAssociationsRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        TelemetryQuicAssociationsRequest::decode_cbor(input)
+    }
+}
+
+/// Return QUIC transport state for each live association
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct TelemetryQuicAssociationsResponse {
+    /// API field `associations`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub associations: Option<Vec<QuicAssociation>>,
+}
+
+impl mesh::tagged::TaggedFields for TelemetryQuicAssociationsResponse {
+    const FIELDS: &'static [(&'static str, u32)] = &[("associations", 1)];
+}
+
+impl TelemetryQuicAssociationsResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64 + u64::from(self.associations.is_some()))?;
+        if let Some(value) = &self.associations {
+        e.uint(1)?;
+        e.array(value.len() as u64)?;
+        for item in value.iter() {
+            e.encoded_value(&item.encode_cbor())?;
+        }
+        }
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                1 => out.associations = Some({ let (major, length) = d.head().ok_or("invalid array")?; if major != 4 { return Err("not a CBOR array".to_owned()); } let mut items = Vec::new(); for _ in 0..length { items.push({ let start = d.position(); d.skip().ok_or("invalid row")?; QuicAssociation::decode_cbor(&input[start..d.position()])? }); } items }),
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for TelemetryQuicAssociationsResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        TelemetryQuicAssociationsResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        TelemetryQuicAssociationsResponse::decode_cbor(input)
+    }
+}
+
+/// Return common counters for each bearer
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct TelemetryBearersRequest;
+
+impl mesh::tagged::TaggedFields for TelemetryBearersRequest {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl TelemetryBearersRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for TelemetryBearersRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        TelemetryBearersRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        TelemetryBearersRequest::decode_cbor(input)
+    }
+}
+
+/// Return common counters for each bearer
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct TelemetryBearersResponse {
+    /// API field `bearers`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearers: Option<Vec<BearerCounters>>,
+}
+
+impl mesh::tagged::TaggedFields for TelemetryBearersResponse {
+    const FIELDS: &'static [(&'static str, u32)] = &[("bearers", 1)];
+}
+
+impl TelemetryBearersResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64 + u64::from(self.bearers.is_some()))?;
+        if let Some(value) = &self.bearers {
+        e.uint(1)?;
+        e.array(value.len() as u64)?;
+        for item in value.iter() {
+            e.encoded_value(&item.encode_cbor())?;
+        }
+        }
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                1 => out.bearers = Some({ let (major, length) = d.head().ok_or("invalid array")?; if major != 4 { return Err("not a CBOR array".to_owned()); } let mut items = Vec::new(); for _ in 0..length { items.push({ let start = d.position(); d.skip().ok_or("invalid row")?; BearerCounters::decode_cbor(&input[start..d.position()])? }); } items }),
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for TelemetryBearersResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        TelemetryBearersResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        TelemetryBearersResponse::decode_cbor(input)
+    }
+}
+
+/// Return packet pool, worker stack, and memory metrics
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct TelemetryMemoryRequest;
+
+impl mesh::tagged::TaggedFields for TelemetryMemoryRequest {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl TelemetryMemoryRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for TelemetryMemoryRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        TelemetryMemoryRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        TelemetryMemoryRequest::decode_cbor(input)
+    }
+}
+
+/// Return packet pool, worker stack, and memory metrics
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct TelemetryMemoryResponse {
+    /// API field `packet_slots`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packet_slots: Option<u32>,
+    /// API field `packet_slots_available`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packet_slots_available: Option<u32>,
+    /// API field `packet_drops`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packet_drops: Option<u32>,
+    /// API field `worker_stack_bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_stack_bytes: Option<u32>,
+    /// API field `worker_running`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_running: Option<bool>,
+    /// API field `worker_starts`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_starts: Option<u32>,
+    /// API field `worker_create_failures`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_create_failures: Option<u32>,
+    /// API field `worker_stack_min_free_words`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_stack_min_free_words: Option<u32>,
+    /// API field `free_internal_bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_internal_bytes: Option<u32>,
+    /// API field `min_free_internal_bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_free_internal_bytes: Option<u32>,
+    /// API field `largest_internal_block_bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub largest_internal_block_bytes: Option<u32>,
+    /// API field `process_rss_bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_rss_bytes: Option<u64>,
+}
+
+impl mesh::tagged::TaggedFields for TelemetryMemoryResponse {
+    const FIELDS: &'static [(&'static str, u32)] = &[("packet_slots", 1), ("packet_slots_available", 2), ("packet_drops", 3), ("worker_stack_bytes", 4), ("worker_running", 5), ("worker_starts", 6), ("worker_create_failures", 7), ("worker_stack_min_free_words", 8), ("free_internal_bytes", 9), ("min_free_internal_bytes", 10), ("largest_internal_block_bytes", 11), ("process_rss_bytes", 12)];
+}
+
+impl TelemetryMemoryResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64 + u64::from(self.packet_slots.is_some()) + u64::from(self.packet_slots_available.is_some()) + u64::from(self.packet_drops.is_some()) + u64::from(self.worker_stack_bytes.is_some()) + u64::from(self.worker_running.is_some()) + u64::from(self.worker_starts.is_some()) + u64::from(self.worker_create_failures.is_some()) + u64::from(self.worker_stack_min_free_words.is_some()) + u64::from(self.free_internal_bytes.is_some()) + u64::from(self.min_free_internal_bytes.is_some()) + u64::from(self.largest_internal_block_bytes.is_some()) + u64::from(self.process_rss_bytes.is_some()))?;
+        if let Some(value) = &self.packet_slots {
+        e.uint(1)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.packet_slots_available {
+        e.uint(2)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.packet_drops {
+        e.uint(3)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.worker_stack_bytes {
+        e.uint(4)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.worker_running {
+        e.uint(5)?;
+        e.bool(*value)?;
+        }
+        if let Some(value) = &self.worker_starts {
+        e.uint(6)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.worker_create_failures {
+        e.uint(7)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.worker_stack_min_free_words {
+        e.uint(8)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.free_internal_bytes {
+        e.uint(9)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.min_free_internal_bytes {
+        e.uint(10)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.largest_internal_block_bytes {
+        e.uint(11)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.process_rss_bytes {
+        e.uint(12)?;
+        e.uint(u64::from(*value))?;
+        }
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                1 => out.packet_slots = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                2 => out.packet_slots_available = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                3 => out.packet_drops = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                4 => out.worker_stack_bytes = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                5 => out.worker_running = Some(d.bool().ok_or("invalid bool")?),
+                6 => out.worker_starts = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                7 => out.worker_create_failures = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                8 => out.worker_stack_min_free_words = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                9 => out.free_internal_bytes = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                10 => out.min_free_internal_bytes = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                11 => out.largest_internal_block_bytes = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                12 => out.process_rss_bytes = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for TelemetryMemoryResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        TelemetryMemoryResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        TelemetryMemoryResponse::decode_cbor(input)
+    }
+}
+
+/// Return CPU frequency, power-management, and sleep counters
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct TelemetryPowerRequest;
+
+impl mesh::tagged::TaggedFields for TelemetryPowerRequest {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl TelemetryPowerRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for TelemetryPowerRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        TelemetryPowerRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        TelemetryPowerRequest::decode_cbor(input)
+    }
+}
+
+/// Return CPU frequency, power-management, and sleep counters
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct TelemetryPowerResponse {
+    /// API field `cpu_mhz`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_mhz: Option<u32>,
+    /// API field `min_mhz`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_mhz: Option<u32>,
+    /// API field `max_mhz`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_mhz: Option<u32>,
+    /// API field `automatic_light_sleep`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automatic_light_sleep: Option<bool>,
+    /// API field `configured`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured: Option<bool>,
+    /// API field `light_sleep_attempts`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub light_sleep_attempts: Option<u32>,
+    /// API field `light_sleep_entries`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub light_sleep_entries: Option<u32>,
+    /// API field `light_sleep_skipped`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub light_sleep_skipped: Option<u32>,
+    /// API field `last_sleep_requested_us`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sleep_requested_us: Option<u32>,
+    /// API field `last_sleep_duration_us`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sleep_duration_us: Option<u32>,
+}
+
+impl mesh::tagged::TaggedFields for TelemetryPowerResponse {
+    const FIELDS: &'static [(&'static str, u32)] = &[("cpu_mhz", 1), ("min_mhz", 2), ("max_mhz", 3), ("automatic_light_sleep", 4), ("configured", 5), ("light_sleep_attempts", 6), ("light_sleep_entries", 7), ("light_sleep_skipped", 8), ("last_sleep_requested_us", 9), ("last_sleep_duration_us", 10)];
+}
+
+impl TelemetryPowerResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64 + u64::from(self.cpu_mhz.is_some()) + u64::from(self.min_mhz.is_some()) + u64::from(self.max_mhz.is_some()) + u64::from(self.automatic_light_sleep.is_some()) + u64::from(self.configured.is_some()) + u64::from(self.light_sleep_attempts.is_some()) + u64::from(self.light_sleep_entries.is_some()) + u64::from(self.light_sleep_skipped.is_some()) + u64::from(self.last_sleep_requested_us.is_some()) + u64::from(self.last_sleep_duration_us.is_some()))?;
+        if let Some(value) = &self.cpu_mhz {
+        e.uint(1)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.min_mhz {
+        e.uint(2)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.max_mhz {
+        e.uint(3)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.automatic_light_sleep {
+        e.uint(4)?;
+        e.bool(*value)?;
+        }
+        if let Some(value) = &self.configured {
+        e.uint(5)?;
+        e.bool(*value)?;
+        }
+        if let Some(value) = &self.light_sleep_attempts {
+        e.uint(6)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.light_sleep_entries {
+        e.uint(7)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.light_sleep_skipped {
+        e.uint(8)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.last_sleep_requested_us {
+        e.uint(9)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.last_sleep_duration_us {
+        e.uint(10)?;
+        e.uint(u64::from(*value))?;
+        }
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                1 => out.cpu_mhz = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                2 => out.min_mhz = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                3 => out.max_mhz = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                4 => out.automatic_light_sleep = Some(d.bool().ok_or("invalid bool")?),
+                5 => out.configured = Some(d.bool().ok_or("invalid bool")?),
+                6 => out.light_sleep_attempts = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                7 => out.light_sleep_entries = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                8 => out.light_sleep_skipped = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                9 => out.last_sleep_requested_us = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                10 => out.last_sleep_duration_us = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for TelemetryPowerResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        TelemetryPowerResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        TelemetryPowerResponse::decode_cbor(input)
+    }
+}
+
+/// Return radio lifecycle generations and sleep state
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct TelemetryRuntimeRequest;
+
+impl mesh::tagged::TaggedFields for TelemetryRuntimeRequest {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl TelemetryRuntimeRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for TelemetryRuntimeRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        TelemetryRuntimeRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        TelemetryRuntimeRequest::decode_cbor(input)
+    }
+}
+
+/// Return radio lifecycle generations and sleep state
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct TelemetryRuntimeResponse {
+    /// API field `desired_mode`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desired_mode: Option<u32>,
+    /// API field `desired_generation`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desired_generation: Option<u32>,
+    /// API field `request_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<u32>,
+    /// API field `sleepy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sleepy: Option<bool>,
+    /// API field `radio_lifecycle`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radio_lifecycle: Option<u32>,
+    /// API field `applied_generation`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_generation: Option<u32>,
+    /// API field `power_lifecycle`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power_lifecycle: Option<u32>,
+    /// API field `sleep_blockers`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sleep_blockers: Option<u32>,
+    /// API field `last_error`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<u32>,
+    /// API field `stale_completion_count`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_completion_count: Option<u32>,
+    /// API field `queue_overflow_count`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_overflow_count: Option<u32>,
+    /// API field `wake_cause`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_cause: Option<u32>,
+    /// API field `last_stale_reason`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_stale_reason: Option<u32>,
+}
+
+impl mesh::tagged::TaggedFields for TelemetryRuntimeResponse {
+    const FIELDS: &'static [(&'static str, u32)] = &[("desired_mode", 1), ("desired_generation", 2), ("request_id", 3), ("sleepy", 4), ("radio_lifecycle", 5), ("applied_generation", 6), ("power_lifecycle", 7), ("sleep_blockers", 8), ("last_error", 9), ("stale_completion_count", 10), ("queue_overflow_count", 11), ("wake_cause", 12), ("last_stale_reason", 13)];
+}
+
+impl TelemetryRuntimeResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64 + u64::from(self.desired_mode.is_some()) + u64::from(self.desired_generation.is_some()) + u64::from(self.request_id.is_some()) + u64::from(self.sleepy.is_some()) + u64::from(self.radio_lifecycle.is_some()) + u64::from(self.applied_generation.is_some()) + u64::from(self.power_lifecycle.is_some()) + u64::from(self.sleep_blockers.is_some()) + u64::from(self.last_error.is_some()) + u64::from(self.stale_completion_count.is_some()) + u64::from(self.queue_overflow_count.is_some()) + u64::from(self.wake_cause.is_some()) + u64::from(self.last_stale_reason.is_some()))?;
+        if let Some(value) = &self.desired_mode {
+        e.uint(1)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.desired_generation {
+        e.uint(2)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.request_id {
+        e.uint(3)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.sleepy {
+        e.uint(4)?;
+        e.bool(*value)?;
+        }
+        if let Some(value) = &self.radio_lifecycle {
+        e.uint(5)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.applied_generation {
+        e.uint(6)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.power_lifecycle {
+        e.uint(7)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.sleep_blockers {
+        e.uint(8)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.last_error {
+        e.uint(9)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.stale_completion_count {
+        e.uint(10)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.queue_overflow_count {
+        e.uint(11)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.wake_cause {
+        e.uint(12)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.last_stale_reason {
+        e.uint(13)?;
+        e.uint(u64::from(*value))?;
+        }
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                1 => out.desired_mode = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                2 => out.desired_generation = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                3 => out.request_id = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                4 => out.sleepy = Some(d.bool().ok_or("invalid bool")?),
+                5 => out.radio_lifecycle = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                6 => out.applied_generation = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                7 => out.power_lifecycle = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                8 => out.sleep_blockers = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                9 => out.last_error = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                10 => out.stale_completion_count = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                11 => out.queue_overflow_count = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                12 => out.wake_cause = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                13 => out.last_stale_reason = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for TelemetryRuntimeResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        TelemetryRuntimeResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        TelemetryRuntimeResponse::decode_cbor(input)
+    }
+}
+
+/// Return software version and hardware capacity
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct TelemetryDeviceRequest;
+
+impl mesh::tagged::TaggedFields for TelemetryDeviceRequest {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl TelemetryDeviceRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for TelemetryDeviceRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        TelemetryDeviceRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        TelemetryDeviceRequest::decode_cbor(input)
+    }
+}
+
+/// Return software version and hardware capacity
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct TelemetryDeviceResponse {
+    /// API field `version`.
+    pub version: String,
+    /// API field `cpu_type`.
+    pub cpu_type: String,
+    /// API field `total_ram_bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_ram_bytes: Option<u64>,
+    /// API field `flash_bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flash_bytes: Option<u64>,
+    /// API field `role`.
+    pub role: String,
+}
+
+impl mesh::tagged::TaggedFields for TelemetryDeviceResponse {
+    const FIELDS: &'static [(&'static str, u32)] = &[("version", 1), ("cpu_type", 2), ("total_ram_bytes", 3), ("flash_bytes", 4), ("role", 5)];
+}
+
+impl TelemetryDeviceResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(3u64 + u64::from(self.total_ram_bytes.is_some()) + u64::from(self.flash_bytes.is_some()))?;
+        e.uint(1)?;
+        e.text_value(&self.version.as_bytes())?;
+        e.uint(2)?;
+        e.text_value(&self.cpu_type.as_bytes())?;
+        if let Some(value) = &self.total_ram_bytes {
+        e.uint(3)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.flash_bytes {
+        e.uint(4)?;
+        e.uint(u64::from(*value))?;
+        }
+        e.uint(5)?;
+        e.text_value(&self.role.as_bytes())?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        let mut seen_1 = false;
+        let mut seen_2 = false;
+        let mut seen_5 = false;
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                1 => { out.version = String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?; seen_1 = true; }
+                2 => { out.cpu_type = String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?; seen_2 = true; }
+                3 => out.total_ram_bytes = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                4 => out.flash_bytes = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                5 => { out.role = String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?; seen_5 = true; }
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        if !seen_1 {
+            return Err("missing required field `version`".to_owned());
+        }
+        if !seen_2 {
+            return Err("missing required field `cpu_type`".to_owned());
+        }
+        if !seen_5 {
+            return Err("missing required field `role`".to_owned());
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for TelemetryDeviceResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        TelemetryDeviceResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        TelemetryDeviceResponse::decode_cbor(input)
+    }
+}
+
+/// Replace a node's complete volatile physical transport profile
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct TransportSetRequest {
+    /// API field `mode`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u8>,
+    /// API field `ssid`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssid: Option<String>,
+    /// API field `bssid`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bssid: Option<String>,
+    /// API field `channel`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<u8>,
+    /// API field `raw_tx_rate`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_tx_rate: Option<u8>,
+    /// API field `sta_driver_tx`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sta_driver_tx: Option<bool>,
+    /// API field `sta_bssid_check_disabled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sta_bssid_check_disabled: Option<bool>,
+    /// API field `sta_ampdu_enabled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sta_ampdu_enabled: Option<bool>,
+    /// API field `sta_11b_rates_disabled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sta_11b_rates_disabled: Option<bool>,
+    /// API field `sta_raw_rx_enabled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sta_raw_rx_enabled: Option<bool>,
+    /// API field `espnow_capture`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub espnow_capture: Option<bool>,
+    /// API field `nan_dw_interval`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nan_dw_interval: Option<u8>,
+    /// API field `now`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub now: Option<u8>,
+    /// API field `ap`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ap: Option<u8>,
+    /// API field `passphrase`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passphrase: Option<String>,
+    /// API field `uart`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uart: Option<u8>,
+    /// API field `ndp`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ndp: Option<u8>,
+    /// API field `open`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open: Option<bool>,
+    /// API field `wake_target`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_target: Option<String>,
+    /// API field `ble`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ble: Option<u8>,
+    /// API field `iface`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iface: Option<String>,
+}
+
+impl mesh::tagged::TaggedFields for TransportSetRequest {
+    const FIELDS: &'static [(&'static str, u32)] = &[("mode", 1), ("ssid", 2), ("bssid", 3), ("channel", 4), ("raw_tx_rate", 5), ("sta_driver_tx", 6), ("sta_bssid_check_disabled", 7), ("sta_ampdu_enabled", 8), ("sta_11b_rates_disabled", 9), ("sta_raw_rx_enabled", 10), ("espnow_capture", 13), ("nan_dw_interval", 14), ("now", 15), ("ap", 16), ("passphrase", 17), ("uart", 18), ("ndp", 19), ("open", 24), ("wake_target", 25), ("ble", 26), ("iface", 27)];
+}
+
+impl TransportSetRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64 + u64::from(self.mode.is_some()) + u64::from(self.ssid.is_some()) + u64::from(self.bssid.is_some()) + u64::from(self.channel.is_some()) + u64::from(self.raw_tx_rate.is_some()) + u64::from(self.sta_driver_tx.is_some()) + u64::from(self.sta_bssid_check_disabled.is_some()) + u64::from(self.sta_ampdu_enabled.is_some()) + u64::from(self.sta_11b_rates_disabled.is_some()) + u64::from(self.sta_raw_rx_enabled.is_some()) + u64::from(self.espnow_capture.is_some()) + u64::from(self.nan_dw_interval.is_some()) + u64::from(self.now.is_some()) + u64::from(self.ap.is_some()) + u64::from(self.passphrase.is_some()) + u64::from(self.uart.is_some()) + u64::from(self.ndp.is_some()) + u64::from(self.open.is_some()) + u64::from(self.wake_target.is_some()) + u64::from(self.ble.is_some()) + u64::from(self.iface.is_some()))?;
+        if let Some(value) = &self.mode {
+        e.uint(1)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.ssid {
+        e.uint(2)?;
+        e.text_value(value.as_bytes())?;
+        }
+        if let Some(value) = &self.bssid {
+        e.uint(3)?;
+        e.text_value(value.as_bytes())?;
+        }
+        if let Some(value) = &self.channel {
+        e.uint(4)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.raw_tx_rate {
+        e.uint(5)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.sta_driver_tx {
+        e.uint(6)?;
+        e.bool(*value)?;
+        }
+        if let Some(value) = &self.sta_bssid_check_disabled {
+        e.uint(7)?;
+        e.bool(*value)?;
+        }
+        if let Some(value) = &self.sta_ampdu_enabled {
+        e.uint(8)?;
+        e.bool(*value)?;
+        }
+        if let Some(value) = &self.sta_11b_rates_disabled {
+        e.uint(9)?;
+        e.bool(*value)?;
+        }
+        if let Some(value) = &self.sta_raw_rx_enabled {
+        e.uint(10)?;
+        e.bool(*value)?;
+        }
+        if let Some(value) = &self.espnow_capture {
+        e.uint(13)?;
+        e.bool(*value)?;
+        }
+        if let Some(value) = &self.nan_dw_interval {
+        e.uint(14)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.now {
+        e.uint(15)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.ap {
+        e.uint(16)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.passphrase {
+        e.uint(17)?;
+        e.text_value(value.as_bytes())?;
+        }
+        if let Some(value) = &self.uart {
+        e.uint(18)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.ndp {
+        e.uint(19)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.open {
+        e.uint(24)?;
+        e.bool(*value)?;
+        }
+        if let Some(value) = &self.wake_target {
+        e.uint(25)?;
+        e.text_value(value.as_bytes())?;
+        }
+        if let Some(value) = &self.ble {
+        e.uint(26)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.iface {
+        e.uint(27)?;
+        e.text_value(value.as_bytes())?;
+        }
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                1 => out.mode = Some(u8::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                2 => out.ssid = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                3 => out.bssid = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                4 => out.channel = Some(u8::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                5 => out.raw_tx_rate = Some(u8::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                6 => out.sta_driver_tx = Some(d.bool().ok_or("invalid bool")?),
+                7 => out.sta_bssid_check_disabled = Some(d.bool().ok_or("invalid bool")?),
+                8 => out.sta_ampdu_enabled = Some(d.bool().ok_or("invalid bool")?),
+                9 => out.sta_11b_rates_disabled = Some(d.bool().ok_or("invalid bool")?),
+                10 => out.sta_raw_rx_enabled = Some(d.bool().ok_or("invalid bool")?),
+                13 => out.espnow_capture = Some(d.bool().ok_or("invalid bool")?),
+                14 => out.nan_dw_interval = Some(u8::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                15 => out.now = Some(u8::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                16 => out.ap = Some(u8::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                17 => out.passphrase = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                18 => out.uart = Some(u8::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                19 => out.ndp = Some(u8::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                24 => out.open = Some(d.bool().ok_or("invalid bool")?),
+                25 => out.wake_target = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                26 => out.ble = Some(u8::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                27 => out.iface = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for TransportSetRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        TransportSetRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        TransportSetRequest::decode_cbor(input)
+    }
+}
+
+/// Replace a node's complete volatile physical transport profile
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct TransportSetResponse;
+
+impl mesh::tagged::TaggedFields for TransportSetResponse {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl TransportSetResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for TransportSetResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        TransportSetResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        TransportSetResponse::decode_cbor(input)
+    }
+}
+
+/// Provision an unpaired companion
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct CompanionPairRequest {
+    /// API field `kind`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// API field `id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// API field `vip6`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vip6: Option<String>,
+    /// API field `baud`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baud: Option<u32>,
+    /// API field `psm`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub psm: Option<u16>,
+    /// API field `name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// API field `root_public_key_b64`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_public_key_b64: Option<String>,
+}
+
+impl mesh::tagged::TaggedFields for CompanionPairRequest {
+    const FIELDS: &'static [(&'static str, u32)] = &[("kind", 1), ("id", 2), ("vip6", 3), ("baud", 4), ("psm", 5), ("name", 6), ("root_public_key_b64", 7)];
+}
+
+impl CompanionPairRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64 + u64::from(self.kind.is_some()) + u64::from(self.id.is_some()) + u64::from(self.vip6.is_some()) + u64::from(self.baud.is_some()) + u64::from(self.psm.is_some()) + u64::from(self.name.is_some()) + u64::from(self.root_public_key_b64.is_some()))?;
+        if let Some(value) = &self.kind {
+        e.uint(1)?;
+        e.text_value(value.as_bytes())?;
+        }
+        if let Some(value) = &self.id {
+        e.uint(2)?;
+        e.text_value(value.as_bytes())?;
+        }
+        if let Some(value) = &self.vip6 {
+        e.uint(3)?;
+        e.text_value(value.as_bytes())?;
+        }
+        if let Some(value) = &self.baud {
+        e.uint(4)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.psm {
+        e.uint(5)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.name {
+        e.uint(6)?;
+        e.text_value(value.as_bytes())?;
+        }
+        if let Some(value) = &self.root_public_key_b64 {
+        e.uint(7)?;
+        e.text_value(value.as_bytes())?;
+        }
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                1 => out.kind = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                2 => out.id = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                3 => out.vip6 = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                4 => out.baud = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                5 => out.psm = Some(u16::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                6 => out.name = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                7 => out.root_public_key_b64 = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for CompanionPairRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        CompanionPairRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        CompanionPairRequest::decode_cbor(input)
+    }
+}
+
+/// Provision an unpaired companion
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct CompanionPairResponse;
+
+impl mesh::tagged::TaggedFields for CompanionPairResponse {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl CompanionPairResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for CompanionPairResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        CompanionPairResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        CompanionPairResponse::decode_cbor(input)
+    }
+}
+
+/// Reset a companion to unpaired state
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct CompanionUnpairRequest {
+    /// API field `kind`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// API field `id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+impl mesh::tagged::TaggedFields for CompanionUnpairRequest {
+    const FIELDS: &'static [(&'static str, u32)] = &[("kind", 1), ("id", 2)];
+}
+
+impl CompanionUnpairRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64 + u64::from(self.kind.is_some()) + u64::from(self.id.is_some()))?;
+        if let Some(value) = &self.kind {
+        e.uint(1)?;
+        e.text_value(value.as_bytes())?;
+        }
+        if let Some(value) = &self.id {
+        e.uint(2)?;
+        e.text_value(value.as_bytes())?;
+        }
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                1 => out.kind = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                2 => out.id = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for CompanionUnpairRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        CompanionUnpairRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        CompanionUnpairRequest::decode_cbor(input)
+    }
+}
+
+/// Reset a companion to unpaired state
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct CompanionUnpairResponse;
+
+impl mesh::tagged::TaggedFields for CompanionUnpairResponse {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl CompanionUnpairResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for CompanionUnpairResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        CompanionUnpairResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        CompanionUnpairResponse::decode_cbor(input)
+    }
+}
+
+/// Commit an unpaired device's companion credentials
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct ProvisionInstallRequest {
+    /// API field `name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// API field `root_public_key`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_public_key: Option<Vec<u8>>,
+    /// API field `secret`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<Vec<u8>>,
+}
+
+impl mesh::tagged::TaggedFields for ProvisionInstallRequest {
+    const FIELDS: &'static [(&'static str, u32)] = &[("name", 1), ("root_public_key", 2), ("secret", 3)];
+}
+
+impl ProvisionInstallRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64 + u64::from(self.name.is_some()) + u64::from(self.root_public_key.is_some()) + u64::from(self.secret.is_some()))?;
+        if let Some(value) = &self.name {
+        e.uint(1)?;
+        e.text_value(value.as_bytes())?;
+        }
+        if let Some(value) = &self.root_public_key {
+        e.uint(2)?;
+        e.bytes_value(value)?;
+        }
+        if let Some(value) = &self.secret {
+        e.uint(3)?;
+        e.bytes_value(value)?;
+        }
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                1 => out.name = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                2 => out.root_public_key = Some(d.bytes_ref().ok_or("invalid byte string")?.to_vec()),
+                3 => out.secret = Some(d.bytes_ref().ok_or("invalid byte string")?.to_vec()),
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for ProvisionInstallRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        ProvisionInstallRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        ProvisionInstallRequest::decode_cbor(input)
+    }
+}
+
+/// Commit an unpaired device's companion credentials
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct ProvisionInstallResponse;
+
+impl mesh::tagged::TaggedFields for ProvisionInstallResponse {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl ProvisionInstallResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for ProvisionInstallResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        ProvisionInstallResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        ProvisionInstallResponse::decode_cbor(input)
+    }
+}
+
+/// Forget the companion credentials and BLE bonds
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct ProvisionUnpairRequest;
+
+impl mesh::tagged::TaggedFields for ProvisionUnpairRequest {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl ProvisionUnpairRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for ProvisionUnpairRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        ProvisionUnpairRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        ProvisionUnpairRequest::decode_cbor(input)
+    }
+}
+
+/// Forget the companion credentials and BLE bonds
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct ProvisionUnpairResponse;
+
+impl mesh::tagged::TaggedFields for ProvisionUnpairResponse {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl ProvisionUnpairResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for ProvisionUnpairResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        ProvisionUnpairResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        ProvisionUnpairResponse::decode_cbor(input)
+    }
+}
+
+/// One-way diagnostic message from a companion bearer
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct LogRecordRequest {
+    /// API field `text`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// API field `source`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// API field `timestamp_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_ms: Option<u64>,
+}
+
+impl mesh::tagged::TaggedFields for LogRecordRequest {
+    const FIELDS: &'static [(&'static str, u32)] = &[("text", 1), ("source", 2), ("timestamp_ms", 3)];
+}
+
+impl LogRecordRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64 + u64::from(self.text.is_some()) + u64::from(self.source.is_some()) + u64::from(self.timestamp_ms.is_some()))?;
+        if let Some(value) = &self.text {
+        e.uint(1)?;
+        e.text_value(value.as_bytes())?;
+        }
+        if let Some(value) = &self.source {
+        e.uint(2)?;
+        e.text_value(value.as_bytes())?;
+        }
+        if let Some(value) = &self.timestamp_ms {
+        e.uint(3)?;
+        e.uint(u64::from(*value))?;
+        }
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                1 => out.text = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                2 => out.source = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                3 => out.timestamp_ms = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for LogRecordRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        LogRecordRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        LogRecordRequest::decode_cbor(input)
+    }
+}
+
+/// One-way diagnostic message from a companion bearer
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct LogRecordResponse;
+
+impl mesh::tagged::TaggedFields for LogRecordResponse {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl LogRecordResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for LogRecordResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        LogRecordResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        LogRecordResponse::decode_cbor(input)
+    }
+}
+
+/// Read retained log and event records, optionally streaming them with periodic metric snapshots
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct LogWatchRequest {
+    /// API field `since_seq`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_seq: Option<u64>,
+    /// API field `limit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// API field `level`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<u8>,
+    /// API field `source`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// API field `kind`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// API field `stream`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
+    /// API field `snapshots`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshots: Option<Vec<String>>,
+    /// API field `interval_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_ms: Option<u32>,
+}
+
+impl mesh::tagged::TaggedFields for LogWatchRequest {
+    const FIELDS: &'static [(&'static str, u32)] = &[("since_seq", 1), ("limit", 2), ("level", 3), ("source", 4), ("kind", 5), ("stream", 6), ("snapshots", 7), ("interval_ms", 8)];
+}
+
+impl LogWatchRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64 + u64::from(self.since_seq.is_some()) + u64::from(self.limit.is_some()) + u64::from(self.level.is_some()) + u64::from(self.source.is_some()) + u64::from(self.kind.is_some()) + u64::from(self.stream.is_some()) + u64::from(self.snapshots.is_some()) + u64::from(self.interval_ms.is_some()))?;
+        if let Some(value) = &self.since_seq {
+        e.uint(1)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.limit {
+        e.uint(2)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.level {
+        e.uint(3)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.source {
+        e.uint(4)?;
+        e.text_value(value.as_bytes())?;
+        }
+        if let Some(value) = &self.kind {
+        e.uint(5)?;
+        e.text_value(value.as_bytes())?;
+        }
+        if let Some(value) = &self.stream {
+        e.uint(6)?;
+        e.bool(*value)?;
+        }
+        if let Some(value) = &self.snapshots {
+        e.uint(7)?;
+        e.array(value.len() as u64)?;
+        for item in value.iter() {
+            e.text_value(item.as_bytes())?;
+        }
+        }
+        if let Some(value) = &self.interval_ms {
+        e.uint(8)?;
+        e.uint(u64::from(*value))?;
+        }
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                1 => out.since_seq = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                2 => out.limit = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                3 => out.level = Some(u8::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                4 => out.source = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                5 => out.kind = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                6 => out.stream = Some(d.bool().ok_or("invalid bool")?),
+                7 => out.snapshots = Some({ let (major, length) = d.head().ok_or("invalid array")?; if major != 4 { return Err("not a CBOR array".to_owned()); } let mut items = Vec::new(); for _ in 0..length { items.push(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?); } items }),
+                8 => out.interval_ms = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for LogWatchRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        LogWatchRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        LogWatchRequest::decode_cbor(input)
+    }
+}
+
+/// Read retained log and event records, optionally streaming them with periodic metric snapshots
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct LogWatchResponse {
+    /// API field `records`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub records: Option<Vec<LogRecord>>,
+    /// API field `cursor`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<u64>,
+    /// API field `dropped`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropped: Option<u64>,
+}
+
+impl mesh::tagged::TaggedFields for LogWatchResponse {
+    const FIELDS: &'static [(&'static str, u32)] = &[("records", 1), ("cursor", 2), ("dropped", 3)];
+}
+
+impl LogWatchResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64 + u64::from(self.records.is_some()) + u64::from(self.cursor.is_some()) + u64::from(self.dropped.is_some()))?;
+        if let Some(value) = &self.records {
+        e.uint(1)?;
+        e.array(value.len() as u64)?;
+        for item in value.iter() {
+            e.encoded_value(&item.encode_cbor())?;
+        }
+        }
+        if let Some(value) = &self.cursor {
+        e.uint(2)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.dropped {
+        e.uint(3)?;
+        e.uint(u64::from(*value))?;
+        }
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                1 => out.records = Some({ let (major, length) = d.head().ok_or("invalid array")?; if major != 4 { return Err("not a CBOR array".to_owned()); } let mut items = Vec::new(); for _ in 0..length { items.push({ let start = d.position(); d.skip().ok_or("invalid row")?; LogRecord::decode_cbor(&input[start..d.position()])? }); } items }),
+                2 => out.cursor = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                3 => out.dropped = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for LogWatchResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        LogWatchResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        LogWatchResponse::decode_cbor(input)
+    }
+}
+
+/// Ask a node to run a probe against a peer
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct ProbeStartRequest {
+    /// API field `bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    /// API field `packet_size`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packet_size: Option<u16>,
+    /// API field `ack_frequency`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack_frequency: Option<u8>,
+    /// API field `ack_delay_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack_delay_ms: Option<u8>,
+    /// API field `low_priority_bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub low_priority_bytes: Option<u32>,
+    /// API field `high_priority_bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub high_priority_bytes: Option<u32>,
+    /// API field `parallel_streams`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_streams: Option<u8>,
+    /// API field `initial_consume_delay_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_consume_delay_ms: Option<u32>,
+    /// API field `consume_delay_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consume_delay_ms: Option<u32>,
+    /// API field `peer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer: Option<String>,
+    /// API field `to`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+}
+
+impl mesh::tagged::TaggedFields for ProbeStartRequest {
+    const FIELDS: &'static [(&'static str, u32)] = &[("bytes", 1), ("packet_size", 2), ("ack_frequency", 6), ("ack_delay_ms", 7), ("low_priority_bytes", 8), ("high_priority_bytes", 9), ("parallel_streams", 10), ("initial_consume_delay_ms", 11), ("consume_delay_ms", 12), ("peer", 13), ("to", 15)];
+}
+
+impl ProbeStartRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64 + u64::from(self.bytes.is_some()) + u64::from(self.packet_size.is_some()) + u64::from(self.ack_frequency.is_some()) + u64::from(self.ack_delay_ms.is_some()) + u64::from(self.low_priority_bytes.is_some()) + u64::from(self.high_priority_bytes.is_some()) + u64::from(self.parallel_streams.is_some()) + u64::from(self.initial_consume_delay_ms.is_some()) + u64::from(self.consume_delay_ms.is_some()) + u64::from(self.peer.is_some()) + u64::from(self.to.is_some()))?;
+        if let Some(value) = &self.bytes {
+        e.uint(1)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.packet_size {
+        e.uint(2)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.ack_frequency {
+        e.uint(6)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.ack_delay_ms {
+        e.uint(7)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.low_priority_bytes {
+        e.uint(8)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.high_priority_bytes {
+        e.uint(9)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.parallel_streams {
+        e.uint(10)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.initial_consume_delay_ms {
+        e.uint(11)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.consume_delay_ms {
+        e.uint(12)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.peer {
+        e.uint(13)?;
+        e.text_value(value.as_bytes())?;
+        }
+        if let Some(value) = &self.to {
+        e.uint(15)?;
+        e.text_value(value.as_bytes())?;
+        }
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                1 => out.bytes = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                2 => out.packet_size = Some(u16::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                6 => out.ack_frequency = Some(u8::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                7 => out.ack_delay_ms = Some(u8::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                8 => out.low_priority_bytes = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                9 => out.high_priority_bytes = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                10 => out.parallel_streams = Some(u8::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                11 => out.initial_consume_delay_ms = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                12 => out.consume_delay_ms = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                13 => out.peer = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                15 => out.to = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for ProbeStartRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        ProbeStartRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        ProbeStartRequest::decode_cbor(input)
+    }
+}
+
+/// Ask a node to run a probe against a peer
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct ProbeStartResponse {
+    /// API field `status`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// API field `peer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer: Option<String>,
+    /// API field `requested_bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_bytes: Option<u64>,
+    /// API field `received_bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub received_bytes: Option<u64>,
+    /// API field `elapsed_us`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_us: Option<u64>,
+}
+
+impl mesh::tagged::TaggedFields for ProbeStartResponse {
+    const FIELDS: &'static [(&'static str, u32)] = &[("status", 1), ("peer", 2), ("requested_bytes", 3), ("received_bytes", 4), ("elapsed_us", 5)];
+}
+
+impl ProbeStartResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64 + u64::from(self.status.is_some()) + u64::from(self.peer.is_some()) + u64::from(self.requested_bytes.is_some()) + u64::from(self.received_bytes.is_some()) + u64::from(self.elapsed_us.is_some()))?;
+        if let Some(value) = &self.status {
+        e.uint(1)?;
+        e.text_value(value.as_bytes())?;
+        }
+        if let Some(value) = &self.peer {
+        e.uint(2)?;
+        e.text_value(value.as_bytes())?;
+        }
+        if let Some(value) = &self.requested_bytes {
+        e.uint(3)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.received_bytes {
+        e.uint(4)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.elapsed_us {
+        e.uint(5)?;
+        e.uint(u64::from(*value))?;
+        }
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                1 => out.status = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                2 => out.peer = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                3 => out.requested_bytes = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                4 => out.received_bytes = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                5 => out.elapsed_us = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for ProbeStartResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        ProbeStartResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        ProbeStartResponse::decode_cbor(input)
+    }
+}
+
+/// Answer a probe with a header and then the probe payload
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct ProbeHandlerRequest {
+    /// API field `bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    /// API field `packet_size`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packet_size: Option<u16>,
+    /// API field `ack_frequency`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack_frequency: Option<u8>,
+    /// API field `ack_delay_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack_delay_ms: Option<u8>,
+    /// API field `low_priority_bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub low_priority_bytes: Option<u32>,
+    /// API field `high_priority_bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub high_priority_bytes: Option<u32>,
+    /// API field `parallel_streams`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_streams: Option<u8>,
+    /// API field `initial_consume_delay_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_consume_delay_ms: Option<u32>,
+    /// API field `consume_delay_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consume_delay_ms: Option<u32>,
+}
+
+impl mesh::tagged::TaggedFields for ProbeHandlerRequest {
+    const FIELDS: &'static [(&'static str, u32)] = &[("bytes", 1), ("packet_size", 2), ("ack_frequency", 6), ("ack_delay_ms", 7), ("low_priority_bytes", 8), ("high_priority_bytes", 9), ("parallel_streams", 10), ("initial_consume_delay_ms", 11), ("consume_delay_ms", 12)];
+}
+
+impl ProbeHandlerRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64 + u64::from(self.bytes.is_some()) + u64::from(self.packet_size.is_some()) + u64::from(self.ack_frequency.is_some()) + u64::from(self.ack_delay_ms.is_some()) + u64::from(self.low_priority_bytes.is_some()) + u64::from(self.high_priority_bytes.is_some()) + u64::from(self.parallel_streams.is_some()) + u64::from(self.initial_consume_delay_ms.is_some()) + u64::from(self.consume_delay_ms.is_some()))?;
+        if let Some(value) = &self.bytes {
+        e.uint(1)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.packet_size {
+        e.uint(2)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.ack_frequency {
+        e.uint(6)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.ack_delay_ms {
+        e.uint(7)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.low_priority_bytes {
+        e.uint(8)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.high_priority_bytes {
+        e.uint(9)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.parallel_streams {
+        e.uint(10)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.initial_consume_delay_ms {
+        e.uint(11)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.consume_delay_ms {
+        e.uint(12)?;
+        e.uint(u64::from(*value))?;
+        }
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                1 => out.bytes = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                2 => out.packet_size = Some(u16::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                6 => out.ack_frequency = Some(u8::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                7 => out.ack_delay_ms = Some(u8::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                8 => out.low_priority_bytes = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                9 => out.high_priority_bytes = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                10 => out.parallel_streams = Some(u8::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                11 => out.initial_consume_delay_ms = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                12 => out.consume_delay_ms = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for ProbeHandlerRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        ProbeHandlerRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        ProbeHandlerRequest::decode_cbor(input)
+    }
+}
+
+/// Answer a probe with a header and then the probe payload
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct ProbeHandlerResponse {
+    /// API field `bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    /// API field `packet_size`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packet_size: Option<u64>,
+}
+
+impl mesh::tagged::TaggedFields for ProbeHandlerResponse {
+    const FIELDS: &'static [(&'static str, u32)] = &[("bytes", 1), ("packet_size", 2)];
+}
+
+impl ProbeHandlerResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64 + u64::from(self.bytes.is_some()) + u64::from(self.packet_size.is_some()))?;
+        if let Some(value) = &self.bytes {
+        e.uint(1)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.packet_size {
+        e.uint(2)?;
+        e.uint(u64::from(*value))?;
+        }
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                1 => out.bytes = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                2 => out.packet_size = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for ProbeHandlerResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        ProbeHandlerResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        ProbeHandlerResponse::decode_cbor(input)
+    }
+}
+
+/// Report local BLE adapter and bearer state
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct BleStatusRequest;
+
+impl mesh::tagged::TaggedFields for BleStatusRequest {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl BleStatusRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for BleStatusRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        BleStatusRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        BleStatusRequest::decode_cbor(input)
+    }
+}
+
+/// Report local BLE adapter and bearer state
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct BleStatusResponse;
+
+impl mesh::tagged::TaggedFields for BleStatusResponse {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl BleStatusResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for BleStatusResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        BleStatusResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        BleStatusResponse::decode_cbor(input)
+    }
+}
+
+/// Start a time-limited BLE scan
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct BleScanRequest;
+
+impl mesh::tagged::TaggedFields for BleScanRequest {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl BleScanRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for BleScanRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        BleScanRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        BleScanRequest::decode_cbor(input)
+    }
+}
+
+/// Start a time-limited BLE scan
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct BleScanResponse;
+
+impl mesh::tagged::TaggedFields for BleScanResponse {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl BleScanResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for BleScanResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        BleScanResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        BleScanResponse::decode_cbor(input)
+    }
+}
+
+/// Stop the BLE scan
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct BleScanStopRequest;
+
+impl mesh::tagged::TaggedFields for BleScanStopRequest {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl BleScanStopRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for BleScanStopRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        BleScanStopRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        BleScanStopRequest::decode_cbor(input)
+    }
+}
+
+/// Stop the BLE scan
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct BleScanStopResponse;
+
+impl mesh::tagged::TaggedFields for BleScanStopResponse {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl BleScanStopResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for BleScanStopResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        BleScanStopResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        BleScanStopResponse::decode_cbor(input)
+    }
+}
+
+/// List retained BLE scan results
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct BleScanResultsRequest {
+    /// API field `limit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+}
+
+impl mesh::tagged::TaggedFields for BleScanResultsRequest {
+    const FIELDS: &'static [(&'static str, u32)] = &[("limit", 1)];
+}
+
+impl BleScanResultsRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64 + u64::from(self.limit.is_some()))?;
+        if let Some(value) = &self.limit {
+        e.uint(1)?;
+        e.uint(u64::from(*value))?;
+        }
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                1 => out.limit = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for BleScanResultsRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        BleScanResultsRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        BleScanResultsRequest::decode_cbor(input)
+    }
+}
+
+/// List retained BLE scan results
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct BleScanResultsResponse;
+
+impl mesh::tagged::TaggedFields for BleScanResultsResponse {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl BleScanResultsResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for BleScanResultsResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        BleScanResultsResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        BleScanResultsResponse::decode_cbor(input)
+    }
+}
+
+/// Clear retained BLE scan results
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct BleScanClearRequest;
+
+impl mesh::tagged::TaggedFields for BleScanClearRequest {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl BleScanClearRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for BleScanClearRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        BleScanClearRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        BleScanClearRequest::decode_cbor(input)
+    }
+}
+
+/// Clear retained BLE scan results
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct BleScanClearResponse;
+
+impl mesh::tagged::TaggedFields for BleScanClearResponse {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl BleScanClearResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for BleScanClearResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        BleScanClearResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        BleScanClearResponse::decode_cbor(input)
+    }
+}
+
+/// Connect to a BLE device over L2CAP CoC
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct BleConnectRequest {
+    /// API field `address`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    /// API field `psm`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub psm: Option<u16>,
+}
+
+impl mesh::tagged::TaggedFields for BleConnectRequest {
+    const FIELDS: &'static [(&'static str, u32)] = &[("address", 1), ("psm", 2)];
+}
+
+impl BleConnectRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64 + u64::from(self.address.is_some()) + u64::from(self.psm.is_some()))?;
+        if let Some(value) = &self.address {
+        e.uint(1)?;
+        e.text_value(value.as_bytes())?;
+        }
+        if let Some(value) = &self.psm {
+        e.uint(2)?;
+        e.uint(u64::from(*value))?;
+        }
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                1 => out.address = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                2 => out.psm = Some(u16::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for BleConnectRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        BleConnectRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        BleConnectRequest::decode_cbor(input)
+    }
+}
+
+/// Connect to a BLE device over L2CAP CoC
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct BleConnectResponse;
+
+impl mesh::tagged::TaggedFields for BleConnectResponse {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl BleConnectResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for BleConnectResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        BleConnectResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        BleConnectResponse::decode_cbor(input)
+    }
+}
+
+/// Disconnect the local BLE bearer
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct BleDisconnectRequest;
+
+impl mesh::tagged::TaggedFields for BleDisconnectRequest {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl BleDisconnectRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for BleDisconnectRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        BleDisconnectRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        BleDisconnectRequest::decode_cbor(input)
+    }
+}
+
+/// Disconnect the local BLE bearer
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct BleDisconnectResponse;
+
+impl mesh::tagged::TaggedFields for BleDisconnectResponse {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl BleDisconnectResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for BleDisconnectResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        BleDisconnectResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        BleDisconnectResponse::decode_cbor(input)
+    }
+}
+
+/// Read retained local radio event history
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct RadioHistoryRequest {
+    /// API field `limit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+    /// API field `since_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_ms: Option<u64>,
+    /// API field `keys`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys: Option<String>,
+}
+
+impl mesh::tagged::TaggedFields for RadioHistoryRequest {
+    const FIELDS: &'static [(&'static str, u32)] = &[("limit", 1), ("since_ms", 2), ("keys", 3)];
+}
+
+impl RadioHistoryRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64 + u64::from(self.limit.is_some()) + u64::from(self.since_ms.is_some()) + u64::from(self.keys.is_some()))?;
+        if let Some(value) = &self.limit {
+        e.uint(1)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.since_ms {
+        e.uint(2)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.keys {
+        e.uint(3)?;
+        e.text_value(value.as_bytes())?;
+        }
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                1 => out.limit = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                2 => out.since_ms = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                3 => out.keys = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for RadioHistoryRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        RadioHistoryRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        RadioHistoryRequest::decode_cbor(input)
+    }
+}
+
+/// Read retained local radio event history
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct RadioHistoryResponse {
+    /// API field `events`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events: Option<Vec<Vec<u8>>>,
+    /// API field `followups`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub followups: Option<Vec<Vec<u8>>>,
+    /// API field `ble_scan_results`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ble_scan_results: Option<Vec<u8>>,
+    /// API field `count`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u64>,
+}
+
+impl mesh::tagged::TaggedFields for RadioHistoryResponse {
+    const FIELDS: &'static [(&'static str, u32)] = &[("events", 1), ("followups", 2), ("ble_scan_results", 3), ("count", 4)];
+}
+
+impl RadioHistoryResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64 + u64::from(self.events.is_some()) + u64::from(self.followups.is_some()) + u64::from(self.ble_scan_results.is_some()) + u64::from(self.count.is_some()))?;
+        if let Some(value) = &self.events {
+        e.uint(1)?;
+        e.array(value.len() as u64)?;
+        for item in value.iter() {
+            e.encoded_value(item)?;
+        }
+        }
+        if let Some(value) = &self.followups {
+        e.uint(2)?;
+        e.array(value.len() as u64)?;
+        for item in value.iter() {
+            e.encoded_value(item)?;
+        }
+        }
+        if let Some(value) = &self.ble_scan_results {
+        e.uint(3)?;
+        e.encoded_value(value)?;
+        }
+        if let Some(value) = &self.count {
+        e.uint(4)?;
+        e.uint(u64::from(*value))?;
+        }
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                1 => out.events = Some({ let (major, length) = d.head().ok_or("invalid array")?; if major != 4 { return Err("not a CBOR array".to_owned()); } let mut items = Vec::new(); for _ in 0..length { items.push({ let start = d.position(); d.skip().ok_or("invalid value")?; input[start..d.position()].to_vec() }); } items }),
+                2 => out.followups = Some({ let (major, length) = d.head().ok_or("invalid array")?; if major != 4 { return Err("not a CBOR array".to_owned()); } let mut items = Vec::new(); for _ in 0..length { items.push({ let start = d.position(); d.skip().ok_or("invalid value")?; input[start..d.position()].to_vec() }); } items }),
+                3 => out.ble_scan_results = Some({ let start = d.position(); d.skip().ok_or("invalid value")?; input[start..d.position()].to_vec() }),
+                4 => out.count = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for RadioHistoryResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        RadioHistoryResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        RadioHistoryResponse::decode_cbor(input)
+    }
+}
+
+/// Report local USB adapter state
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct UsbStatusRequest;
+
+impl mesh::tagged::TaggedFields for UsbStatusRequest {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl UsbStatusRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for UsbStatusRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        UsbStatusRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        UsbStatusRequest::decode_cbor(input)
+    }
+}
+
+/// Report local USB adapter state
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct UsbStatusResponse;
+
+impl mesh::tagged::TaggedFields for UsbStatusResponse {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl UsbStatusResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for UsbStatusResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        UsbStatusResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        UsbStatusResponse::decode_cbor(input)
+    }
+}
+
+/// List USB devices visible to the host
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct UsbDevicesRequest;
+
+impl mesh::tagged::TaggedFields for UsbDevicesRequest {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl UsbDevicesRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for UsbDevicesRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        UsbDevicesRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        UsbDevicesRequest::decode_cbor(input)
+    }
+}
+
+/// List USB devices visible to the host
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct UsbDevicesResponse;
+
+impl mesh::tagged::TaggedFields for UsbDevicesResponse {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl UsbDevicesResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for UsbDevicesResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        UsbDevicesResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        UsbDevicesResponse::decode_cbor(input)
+    }
+}
+
+/// Open and attach a USB serial device
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct UsbOpenRequest {
+    /// API field `vendor_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor_id: Option<u16>,
+    /// API field `product_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_id: Option<u16>,
+    /// API field `auto`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto: Option<bool>,
+}
+
+impl mesh::tagged::TaggedFields for UsbOpenRequest {
+    const FIELDS: &'static [(&'static str, u32)] = &[("vendor_id", 1), ("product_id", 2), ("auto", 3)];
+}
+
+impl UsbOpenRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64 + u64::from(self.vendor_id.is_some()) + u64::from(self.product_id.is_some()) + u64::from(self.auto.is_some()))?;
+        if let Some(value) = &self.vendor_id {
+        e.uint(1)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.product_id {
+        e.uint(2)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.auto {
+        e.uint(3)?;
+        e.bool(*value)?;
+        }
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                1 => out.vendor_id = Some(u16::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                2 => out.product_id = Some(u16::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                3 => out.auto = Some(d.bool().ok_or("invalid bool")?),
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for UsbOpenRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        UsbOpenRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        UsbOpenRequest::decode_cbor(input)
+    }
+}
+
+/// Open and attach a USB serial device
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct UsbOpenResponse;
+
+impl mesh::tagged::TaggedFields for UsbOpenResponse {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl UsbOpenResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for UsbOpenResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        UsbOpenResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        UsbOpenResponse::decode_cbor(input)
+    }
+}
+
+/// Close the active USB bearer
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct UsbCloseRequest;
+
+impl mesh::tagged::TaggedFields for UsbCloseRequest {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl UsbCloseRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for UsbCloseRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        UsbCloseRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        UsbCloseRequest::decode_cbor(input)
+    }
+}
+
+/// Close the active USB bearer
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct UsbCloseResponse;
+
+impl mesh::tagged::TaggedFields for UsbCloseResponse {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl UsbCloseResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for UsbCloseResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        UsbCloseResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        UsbCloseResponse::decode_cbor(input)
+    }
+}
+
+/// Read the attached device's signed identity
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct UsbDiscoverRequest;
+
+impl mesh::tagged::TaggedFields for UsbDiscoverRequest {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl UsbDiscoverRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for UsbDiscoverRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        UsbDiscoverRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        UsbDiscoverRequest::decode_cbor(input)
+    }
+}
+
+/// Read the attached device's signed identity
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct UsbDiscoverResponse;
+
+impl mesh::tagged::TaggedFields for UsbDiscoverResponse {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl UsbDiscoverResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for UsbDiscoverResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        UsbDiscoverResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        UsbDiscoverResponse::decode_cbor(input)
+    }
+}
+
+/// Report local Wi-Fi controller and NAN state
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct WifiStatusRequest;
+
+impl mesh::tagged::TaggedFields for WifiStatusRequest {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl WifiStatusRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for WifiStatusRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        WifiStatusRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        WifiStatusRequest::decode_cbor(input)
+    }
+}
+
+/// Report local Wi-Fi controller and NAN state
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct WifiStatusResponse;
+
+impl mesh::tagged::TaggedFields for WifiStatusResponse {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl WifiStatusResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for WifiStatusResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        WifiStatusResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        WifiStatusResponse::decode_cbor(input)
+    }
+}
+
+/// Request a time-limited platform Wi-Fi scan
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct WifiScanRequest;
+
+impl mesh::tagged::TaggedFields for WifiScanRequest {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl WifiScanRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for WifiScanRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        WifiScanRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        WifiScanRequest::decode_cbor(input)
+    }
+}
+
+/// Request a time-limited platform Wi-Fi scan
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct WifiScanResponse;
+
+impl mesh::tagged::TaggedFields for WifiScanResponse {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl WifiScanResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for WifiScanResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        WifiScanResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        WifiScanResponse::decode_cbor(input)
+    }
+}
+
+/// Return the Rust-generated local status table
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct StatusTextRequest;
+
+impl mesh::tagged::TaggedFields for StatusTextRequest {
+    const FIELDS: &'static [(&'static str, u32)] = &[];
+}
+
+impl StatusTextRequest {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = &self;
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64)?;
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for StatusTextRequest {
+    fn encode_cbor(&self) -> Vec<u8> {
+        StatusTextRequest::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        StatusTextRequest::decode_cbor(input)
+    }
+}
+
+/// Return the Rust-generated local status table
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct StatusTextResponse {
+    /// API field `status_text`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_text: Option<String>,
+}
+
+impl mesh::tagged::TaggedFields for StatusTextResponse {
+    const FIELDS: &'static [(&'static str, u32)] = &[("status_text", 1)];
+}
+
+impl StatusTextResponse {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64 + u64::from(self.status_text.is_some()))?;
+        if let Some(value) = &self.status_text {
+        e.uint(1)?;
+        e.text_value(value.as_bytes())?;
+        }
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                1 => out.status_text = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl crate::registry_bridge::TaggedCbor for StatusTextResponse {
+    fn encode_cbor(&self) -> Vec<u8> {
+        StatusTextResponse::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        StatusTextResponse::decode_cbor(input)
+    }
+}
+
+/// One `WifiLink` row.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct WifiLink {
     /// API field `schema_version`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_version: Option<u8>,
@@ -434,948 +7018,616 @@ pub struct TelemetryWifiLinkResponse {
     pub raw_tx_completion_failures: Option<u64>,
 }
 
-impl mesh::tagged::TaggedFields for TelemetryWifiLinkResponse {
+impl mesh::tagged::TaggedFields for WifiLink {
     const FIELDS: &'static [(&'static str, u32)] = &[("schema_version", 1), ("interface_index", 2), ("peer_mac", 3), ("rx_bytes", 4), ("tx_bytes", 5), ("rx_packets", 6), ("tx_packets", 7), ("mac_tx_retries", 8), ("mac_tx_failed", 9), ("rx_dropped", 10), ("rx_airtime_us", 11), ("tx_airtime_us", 12), ("signal_dbm", 13), ("signal_avg_dbm", 14), ("ack_signal_dbm", 15), ("ack_signal_avg_dbm", 16), ("rx_bitrate_kbit_s", 17), ("tx_bitrate_kbit_s", 18), ("expected_throughput_kbit_s", 19), ("bearer_rx_frames", 20), ("bearer_rx_drops", 21), ("bearer_rx_invalid", 22), ("bearer_udp_delivered", 23), ("bearer_ndp_advertisements", 24), ("bearer_tx_failures", 25), ("raw_tx_completion_failures", 26)];
 }
 
-/// Return the latest portable battery and power snapshot
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TelemetryBatteryRequest;
+impl WifiLink {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
 
-impl mesh::tagged::TaggedFields for TelemetryBatteryRequest {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64 + u64::from(self.schema_version.is_some()) + u64::from(self.interface_index.is_some()) + u64::from(self.peer_mac.is_some()) + u64::from(self.rx_bytes.is_some()) + u64::from(self.tx_bytes.is_some()) + u64::from(self.rx_packets.is_some()) + u64::from(self.tx_packets.is_some()) + u64::from(self.mac_tx_retries.is_some()) + u64::from(self.mac_tx_failed.is_some()) + u64::from(self.rx_dropped.is_some()) + u64::from(self.rx_airtime_us.is_some()) + u64::from(self.tx_airtime_us.is_some()) + u64::from(self.signal_dbm.is_some()) + u64::from(self.signal_avg_dbm.is_some()) + u64::from(self.ack_signal_dbm.is_some()) + u64::from(self.ack_signal_avg_dbm.is_some()) + u64::from(self.rx_bitrate_kbit_s.is_some()) + u64::from(self.tx_bitrate_kbit_s.is_some()) + u64::from(self.expected_throughput_kbit_s.is_some()) + u64::from(self.bearer_rx_frames.is_some()) + u64::from(self.bearer_rx_drops.is_some()) + u64::from(self.bearer_rx_invalid.is_some()) + u64::from(self.bearer_udp_delivered.is_some()) + u64::from(self.bearer_ndp_advertisements.is_some()) + u64::from(self.bearer_tx_failures.is_some()) + u64::from(self.raw_tx_completion_failures.is_some()))?;
+        if let Some(value) = &self.schema_version {
+        e.uint(1)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.interface_index {
+        e.uint(2)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.peer_mac {
+        e.uint(3)?;
+        e.bytes_value(value)?;
+        }
+        if let Some(value) = &self.rx_bytes {
+        e.uint(4)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.tx_bytes {
+        e.uint(5)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.rx_packets {
+        e.uint(6)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.tx_packets {
+        e.uint(7)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.mac_tx_retries {
+        e.uint(8)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.mac_tx_failed {
+        e.uint(9)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.rx_dropped {
+        e.uint(10)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.rx_airtime_us {
+        e.uint(11)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.tx_airtime_us {
+        e.uint(12)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.signal_dbm {
+        e.uint(13)?;
+        e.int(i64::from(*value))?;
+        }
+        if let Some(value) = &self.signal_avg_dbm {
+        e.uint(14)?;
+        e.int(i64::from(*value))?;
+        }
+        if let Some(value) = &self.ack_signal_dbm {
+        e.uint(15)?;
+        e.int(i64::from(*value))?;
+        }
+        if let Some(value) = &self.ack_signal_avg_dbm {
+        e.uint(16)?;
+        e.int(i64::from(*value))?;
+        }
+        if let Some(value) = &self.rx_bitrate_kbit_s {
+        e.uint(17)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.tx_bitrate_kbit_s {
+        e.uint(18)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.expected_throughput_kbit_s {
+        e.uint(19)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.bearer_rx_frames {
+        e.uint(20)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.bearer_rx_drops {
+        e.uint(21)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.bearer_rx_invalid {
+        e.uint(22)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.bearer_udp_delivered {
+        e.uint(23)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.bearer_ndp_advertisements {
+        e.uint(24)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.bearer_tx_failures {
+        e.uint(25)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.raw_tx_completion_failures {
+        e.uint(26)?;
+        e.uint(u64::from(*value))?;
+        }
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                1 => out.schema_version = Some(u8::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                2 => out.interface_index = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                3 => out.peer_mac = Some(d.bytes_ref().ok_or("invalid byte string")?.to_vec()),
+                4 => out.rx_bytes = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                5 => out.tx_bytes = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                6 => out.rx_packets = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                7 => out.tx_packets = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                8 => out.mac_tx_retries = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                9 => out.mac_tx_failed = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                10 => out.rx_dropped = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                11 => out.rx_airtime_us = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                12 => out.tx_airtime_us = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                13 => out.signal_dbm = Some(i8::try_from(d.int().ok_or("invalid integer")?).map_err(|_| "integer out of range")?),
+                14 => out.signal_avg_dbm = Some(i8::try_from(d.int().ok_or("invalid integer")?).map_err(|_| "integer out of range")?),
+                15 => out.ack_signal_dbm = Some(i8::try_from(d.int().ok_or("invalid integer")?).map_err(|_| "integer out of range")?),
+                16 => out.ack_signal_avg_dbm = Some(i8::try_from(d.int().ok_or("invalid integer")?).map_err(|_| "integer out of range")?),
+                17 => out.rx_bitrate_kbit_s = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                18 => out.tx_bitrate_kbit_s = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                19 => out.expected_throughput_kbit_s = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                20 => out.bearer_rx_frames = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                21 => out.bearer_rx_drops = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                22 => out.bearer_rx_invalid = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                23 => out.bearer_udp_delivered = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                24 => out.bearer_ndp_advertisements = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                25 => out.bearer_tx_failures = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                26 => out.raw_tx_completion_failures = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
 }
 
-/// Return the latest portable battery and power snapshot
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TelemetryBatteryResponse {
-    /// API field `battery_percent`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub battery_percent: Option<u8>,
-    /// API field `charging`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub charging: Option<bool>,
-    /// API field `power_save`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub power_save: Option<bool>,
-    /// API field `idle`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub idle: Option<bool>,
-    /// API field `idle_ms`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub idle_ms: Option<u64>,
-    /// API field `total_idle_ms`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub total_idle_ms: Option<u64>,
-    /// API field `charging_ms`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub charging_ms: Option<u64>,
+impl crate::registry_bridge::TaggedCbor for WifiLink {
+    fn encode_cbor(&self) -> Vec<u8> {
+        WifiLink::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        WifiLink::decode_cbor(input)
+    }
 }
 
-impl mesh::tagged::TaggedFields for TelemetryBatteryResponse {
-    const FIELDS: &'static [(&'static str, u32)] = &[("battery_percent", 1), ("charging", 2), ("power_save", 3), ("idle", 4), ("idle_ms", 5), ("total_idle_ms", 6), ("charging_ms", 7)];
-}
-
-/// Return aggregate QUIC counters for live associations
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TelemetryQuicRequest;
-
-impl mesh::tagged::TaggedFields for TelemetryQuicRequest {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
-}
-
-/// Return aggregate QUIC counters for live associations
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TelemetryQuicResponse {
-    /// API field `live_associations`.
-    pub live_associations: u64,
+/// One `QuicAssociation` row.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct QuicAssociation {
+    /// API field `association`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub association: Option<u64>,
+    /// API field `bearer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer: Option<String>,
+    /// API field `peer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer: Option<String>,
     /// API field `received_packets`.
-    pub received_packets: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub received_packets: Option<u64>,
     /// API field `sent_packets`.
-    pub sent_packets: u64,
-    /// API field `received_stream_packets`.
-    pub received_stream_packets: u64,
-    /// API field `received_control_packets`.
-    pub received_control_packets: u64,
-    /// API field `sent_stream_packets`.
-    pub sent_stream_packets: u64,
-    /// API field `sent_control_packets`.
-    pub sent_control_packets: u64,
-    /// API field `duplicate_packets`.
-    pub duplicate_packets: u64,
-    /// API field `out_of_order_packets`.
-    pub out_of_order_packets: u64,
-    /// API field `inferred_missing_packets`.
-    pub inferred_missing_packets: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_packets: Option<u64>,
     /// API field `retransmitted_packets`.
-    pub retransmitted_packets: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retransmitted_packets: Option<u64>,
     /// API field `loss_events`.
-    pub loss_events: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss_events: Option<u64>,
     /// API field `submission_failures`.
-    pub submission_failures: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission_failures: Option<u64>,
+    /// API field `bytes_in_flight`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_in_flight: Option<u64>,
+    /// API field `peer_max_data`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_max_data: Option<u64>,
+    /// API field `peer_sent_data`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_sent_data: Option<u64>,
+    /// API field `largest_acked_by_peer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub largest_acked_by_peer: Option<u32>,
+    /// API field `streams_local_active`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streams_local_active: Option<u64>,
+    /// API field `streams_peer_active`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streams_peer_active: Option<u64>,
 }
 
-impl mesh::tagged::TaggedFields for TelemetryQuicResponse {
-    const FIELDS: &'static [(&'static str, u32)] = &[("live_associations", 1), ("received_packets", 2), ("sent_packets", 3), ("received_stream_packets", 4), ("received_control_packets", 5), ("sent_stream_packets", 6), ("sent_control_packets", 7), ("duplicate_packets", 8), ("out_of_order_packets", 9), ("inferred_missing_packets", 10), ("retransmitted_packets", 11), ("loss_events", 12), ("submission_failures", 13)];
+impl mesh::tagged::TaggedFields for QuicAssociation {
+    const FIELDS: &'static [(&'static str, u32)] = &[("association", 1), ("bearer", 2), ("peer", 3), ("received_packets", 4), ("sent_packets", 5), ("retransmitted_packets", 6), ("loss_events", 7), ("submission_failures", 8), ("bytes_in_flight", 9), ("peer_max_data", 10), ("peer_sent_data", 11), ("largest_acked_by_peer", 12), ("streams_local_active", 13), ("streams_peer_active", 14)];
 }
 
-/// Return QUIC transport state for each live association
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TelemetryQuicAssociationsRequest;
+impl QuicAssociation {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
 
-impl mesh::tagged::TaggedFields for TelemetryQuicAssociationsRequest {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64 + u64::from(self.association.is_some()) + u64::from(self.bearer.is_some()) + u64::from(self.peer.is_some()) + u64::from(self.received_packets.is_some()) + u64::from(self.sent_packets.is_some()) + u64::from(self.retransmitted_packets.is_some()) + u64::from(self.loss_events.is_some()) + u64::from(self.submission_failures.is_some()) + u64::from(self.bytes_in_flight.is_some()) + u64::from(self.peer_max_data.is_some()) + u64::from(self.peer_sent_data.is_some()) + u64::from(self.largest_acked_by_peer.is_some()) + u64::from(self.streams_local_active.is_some()) + u64::from(self.streams_peer_active.is_some()))?;
+        if let Some(value) = &self.association {
+        e.uint(1)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.bearer {
+        e.uint(2)?;
+        e.text_value(value.as_bytes())?;
+        }
+        if let Some(value) = &self.peer {
+        e.uint(3)?;
+        e.text_value(value.as_bytes())?;
+        }
+        if let Some(value) = &self.received_packets {
+        e.uint(4)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.sent_packets {
+        e.uint(5)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.retransmitted_packets {
+        e.uint(6)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.loss_events {
+        e.uint(7)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.submission_failures {
+        e.uint(8)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.bytes_in_flight {
+        e.uint(9)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.peer_max_data {
+        e.uint(10)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.peer_sent_data {
+        e.uint(11)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.largest_acked_by_peer {
+        e.uint(12)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.streams_local_active {
+        e.uint(13)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.streams_peer_active {
+        e.uint(14)?;
+        e.uint(u64::from(*value))?;
+        }
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                1 => out.association = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                2 => out.bearer = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                3 => out.peer = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                4 => out.received_packets = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                5 => out.sent_packets = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                6 => out.retransmitted_packets = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                7 => out.loss_events = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                8 => out.submission_failures = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                9 => out.bytes_in_flight = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                10 => out.peer_max_data = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                11 => out.peer_sent_data = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                12 => out.largest_acked_by_peer = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                13 => out.streams_local_active = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                14 => out.streams_peer_active = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
 }
 
-/// Return QUIC transport state for each live association
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TelemetryQuicAssociationsResponse {
-    /// API field `associations`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub associations: Option<Vec<serde_json::Value>>,
+impl crate::registry_bridge::TaggedCbor for QuicAssociation {
+    fn encode_cbor(&self) -> Vec<u8> {
+        QuicAssociation::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        QuicAssociation::decode_cbor(input)
+    }
 }
 
-impl mesh::tagged::TaggedFields for TelemetryQuicAssociationsResponse {
-    const FIELDS: &'static [(&'static str, u32)] = &[("associations", 1)];
-}
-
-/// Return common counters for each bearer
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TelemetryBearersRequest;
-
-impl mesh::tagged::TaggedFields for TelemetryBearersRequest {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
-}
-
-/// Return common counters for each bearer
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TelemetryBearersResponse {
-    /// API field `bearers`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bearers: Option<Vec<serde_json::Value>>,
-}
-
-impl mesh::tagged::TaggedFields for TelemetryBearersResponse {
-    const FIELDS: &'static [(&'static str, u32)] = &[("bearers", 1)];
-}
-
-/// Return packet pool, worker stack, and memory metrics
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TelemetryMemoryRequest;
-
-impl mesh::tagged::TaggedFields for TelemetryMemoryRequest {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
-}
-
-/// Return packet pool, worker stack, and memory metrics
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TelemetryMemoryResponse {
-    /// API field `packet_slots`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub packet_slots: Option<u32>,
-    /// API field `packet_slots_available`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub packet_slots_available: Option<u32>,
-    /// API field `packet_drops`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub packet_drops: Option<u32>,
-    /// API field `worker_stack_bytes`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worker_stack_bytes: Option<u32>,
-    /// API field `worker_running`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worker_running: Option<bool>,
-    /// API field `worker_starts`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worker_starts: Option<u32>,
-    /// API field `worker_create_failures`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worker_create_failures: Option<u32>,
-    /// API field `worker_stack_min_free_words`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worker_stack_min_free_words: Option<u32>,
-    /// API field `free_internal_bytes`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub free_internal_bytes: Option<u32>,
-    /// API field `min_free_internal_bytes`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub min_free_internal_bytes: Option<u32>,
-    /// API field `largest_internal_block_bytes`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub largest_internal_block_bytes: Option<u32>,
-    /// API field `process_rss_bytes`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub process_rss_bytes: Option<u64>,
-}
-
-impl mesh::tagged::TaggedFields for TelemetryMemoryResponse {
-    const FIELDS: &'static [(&'static str, u32)] = &[("packet_slots", 1), ("packet_slots_available", 2), ("packet_drops", 3), ("worker_stack_bytes", 4), ("worker_running", 5), ("worker_starts", 6), ("worker_create_failures", 7), ("worker_stack_min_free_words", 8), ("free_internal_bytes", 9), ("min_free_internal_bytes", 10), ("largest_internal_block_bytes", 11), ("process_rss_bytes", 12)];
-}
-
-/// Return CPU frequency, power-management, and sleep counters
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TelemetryPowerRequest;
-
-impl mesh::tagged::TaggedFields for TelemetryPowerRequest {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
-}
-
-/// Return CPU frequency, power-management, and sleep counters
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TelemetryPowerResponse {
-    /// API field `cpu_mhz`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cpu_mhz: Option<u32>,
-    /// API field `min_mhz`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub min_mhz: Option<u32>,
-    /// API field `max_mhz`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_mhz: Option<u32>,
-    /// API field `automatic_light_sleep`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub automatic_light_sleep: Option<bool>,
-    /// API field `configured`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub configured: Option<bool>,
-    /// API field `light_sleep_attempts`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub light_sleep_attempts: Option<u32>,
-    /// API field `light_sleep_entries`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub light_sleep_entries: Option<u32>,
-    /// API field `light_sleep_skipped`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub light_sleep_skipped: Option<u32>,
-    /// API field `last_sleep_requested_us`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_sleep_requested_us: Option<u32>,
-    /// API field `last_sleep_duration_us`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_sleep_duration_us: Option<u32>,
-}
-
-impl mesh::tagged::TaggedFields for TelemetryPowerResponse {
-    const FIELDS: &'static [(&'static str, u32)] = &[("cpu_mhz", 1), ("min_mhz", 2), ("max_mhz", 3), ("automatic_light_sleep", 4), ("configured", 5), ("light_sleep_attempts", 6), ("light_sleep_entries", 7), ("light_sleep_skipped", 8), ("last_sleep_requested_us", 9), ("last_sleep_duration_us", 10)];
-}
-
-/// Return radio lifecycle generations and sleep state
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TelemetryRuntimeRequest;
-
-impl mesh::tagged::TaggedFields for TelemetryRuntimeRequest {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
-}
-
-/// Return radio lifecycle generations and sleep state
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TelemetryRuntimeResponse {
-    /// API field `desired_mode`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub desired_mode: Option<u32>,
-    /// API field `desired_generation`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub desired_generation: Option<u32>,
-    /// API field `request_id`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request_id: Option<u32>,
-    /// API field `sleepy`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sleepy: Option<bool>,
-    /// API field `radio_lifecycle`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub radio_lifecycle: Option<u32>,
-    /// API field `applied_generation`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub applied_generation: Option<u32>,
-    /// API field `power_lifecycle`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub power_lifecycle: Option<u32>,
-    /// API field `sleep_blockers`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sleep_blockers: Option<u32>,
-    /// API field `last_error`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_error: Option<u32>,
-    /// API field `stale_completion_count`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stale_completion_count: Option<u32>,
-    /// API field `queue_overflow_count`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub queue_overflow_count: Option<u32>,
-    /// API field `wake_cause`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wake_cause: Option<u32>,
-    /// API field `last_stale_reason`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_stale_reason: Option<u32>,
-}
-
-impl mesh::tagged::TaggedFields for TelemetryRuntimeResponse {
-    const FIELDS: &'static [(&'static str, u32)] = &[("desired_mode", 1), ("desired_generation", 2), ("request_id", 3), ("sleepy", 4), ("radio_lifecycle", 5), ("applied_generation", 6), ("power_lifecycle", 7), ("sleep_blockers", 8), ("last_error", 9), ("stale_completion_count", 10), ("queue_overflow_count", 11), ("wake_cause", 12), ("last_stale_reason", 13)];
-}
-
-/// Replace a node's complete volatile physical transport profile
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TransportSetRequest {
-    /// API field `mode`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode: Option<u8>,
-    /// API field `ssid`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ssid: Option<String>,
-    /// API field `bssid`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bssid: Option<String>,
-    /// API field `channel`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub channel: Option<u8>,
-    /// API field `raw_tx_rate`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub raw_tx_rate: Option<u8>,
-    /// API field `sta_driver_tx`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sta_driver_tx: Option<bool>,
-    /// API field `sta_bssid_check_disabled`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sta_bssid_check_disabled: Option<bool>,
-    /// API field `sta_ampdu_enabled`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sta_ampdu_enabled: Option<bool>,
-    /// API field `sta_11b_rates_disabled`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sta_11b_rates_disabled: Option<bool>,
-    /// API field `sta_raw_rx_enabled`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sta_raw_rx_enabled: Option<bool>,
-    /// API field `espnow_capture`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub espnow_capture: Option<bool>,
-    /// API field `nan_dw_interval`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub nan_dw_interval: Option<u8>,
-    /// API field `now`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub now: Option<u8>,
-    /// API field `ap`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ap: Option<u8>,
-    /// API field `passphrase`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub passphrase: Option<String>,
-    /// API field `uart`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub uart: Option<u8>,
-    /// API field `ndp`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ndp: Option<u8>,
-    /// API field `open`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub open: Option<bool>,
-    /// API field `wake_target`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wake_target: Option<String>,
-    /// API field `ble`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ble: Option<u8>,
-    /// API field `iface`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub iface: Option<String>,
-}
-
-impl mesh::tagged::TaggedFields for TransportSetRequest {
-    const FIELDS: &'static [(&'static str, u32)] = &[("mode", 1), ("ssid", 2), ("bssid", 3), ("channel", 4), ("raw_tx_rate", 5), ("sta_driver_tx", 6), ("sta_bssid_check_disabled", 7), ("sta_ampdu_enabled", 8), ("sta_11b_rates_disabled", 9), ("sta_raw_rx_enabled", 10), ("espnow_capture", 13), ("nan_dw_interval", 14), ("now", 15), ("ap", 16), ("passphrase", 17), ("uart", 18), ("ndp", 19), ("open", 24), ("wake_target", 25), ("ble", 26), ("iface", 27)];
-}
-
-/// Replace a node's complete volatile physical transport profile
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TransportSetResponse;
-
-impl mesh::tagged::TaggedFields for TransportSetResponse {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
-}
-
-/// Provision an unpaired companion
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct CompanionPairRequest {
-    /// API field `kind`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kind: Option<String>,
-    /// API field `id`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-    /// API field `vip6`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vip6: Option<String>,
-    /// API field `baud`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub baud: Option<u32>,
-    /// API field `psm`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub psm: Option<u16>,
+/// One `BearerCounters` row.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct BearerCounters {
     /// API field `name`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// API field `root_public_key_b64`.
+    /// API field `state`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub root_public_key_b64: Option<String>,
-}
-
-impl mesh::tagged::TaggedFields for CompanionPairRequest {
-    const FIELDS: &'static [(&'static str, u32)] = &[("kind", 1), ("id", 2), ("vip6", 3), ("baud", 4), ("psm", 5), ("name", 6), ("root_public_key_b64", 7)];
-}
-
-/// Provision an unpaired companion
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct CompanionPairResponse;
-
-impl mesh::tagged::TaggedFields for CompanionPairResponse {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
-}
-
-/// Reset a companion to unpaired state
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct CompanionUnpairRequest {
-    /// API field `kind`.
+    pub state: Option<u8>,
+    /// API field `tx_submitted`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kind: Option<String>,
-    /// API field `id`.
+    pub tx_submitted: Option<u64>,
+    /// API field `tx_accepted`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
+    pub tx_accepted: Option<u64>,
+    /// API field `tx_failed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_failed: Option<u64>,
+    /// API field `tx_busy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_busy: Option<u64>,
+    /// API field `rx_packets`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rx_packets: Option<u64>,
+    /// API field `rx_rejected`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rx_rejected: Option<u64>,
+    /// API field `rx_dropped`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rx_dropped: Option<u64>,
+    /// API field `queue_depth`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_depth: Option<u32>,
 }
 
-impl mesh::tagged::TaggedFields for CompanionUnpairRequest {
-    const FIELDS: &'static [(&'static str, u32)] = &[("kind", 1), ("id", 2)];
+impl mesh::tagged::TaggedFields for BearerCounters {
+    const FIELDS: &'static [(&'static str, u32)] = &[("name", 1), ("state", 2), ("tx_submitted", 3), ("tx_accepted", 4), ("tx_failed", 5), ("tx_busy", 6), ("rx_packets", 7), ("rx_rejected", 8), ("rx_dropped", 9), ("queue_depth", 10)];
 }
 
-/// Reset a companion to unpaired state
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct CompanionUnpairResponse;
+impl BearerCounters {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
 
-impl mesh::tagged::TaggedFields for CompanionUnpairResponse {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(0u64 + u64::from(self.name.is_some()) + u64::from(self.state.is_some()) + u64::from(self.tx_submitted.is_some()) + u64::from(self.tx_accepted.is_some()) + u64::from(self.tx_failed.is_some()) + u64::from(self.tx_busy.is_some()) + u64::from(self.rx_packets.is_some()) + u64::from(self.rx_rejected.is_some()) + u64::from(self.rx_dropped.is_some()) + u64::from(self.queue_depth.is_some()))?;
+        if let Some(value) = &self.name {
+        e.uint(1)?;
+        e.text_value(value.as_bytes())?;
+        }
+        if let Some(value) = &self.state {
+        e.uint(2)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.tx_submitted {
+        e.uint(3)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.tx_accepted {
+        e.uint(4)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.tx_failed {
+        e.uint(5)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.tx_busy {
+        e.uint(6)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.rx_packets {
+        e.uint(7)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.rx_rejected {
+        e.uint(8)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.rx_dropped {
+        e.uint(9)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.queue_depth {
+        e.uint(10)?;
+        e.uint(u64::from(*value))?;
+        }
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                1 => out.name = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                2 => out.state = Some(u8::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                3 => out.tx_submitted = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                4 => out.tx_accepted = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                5 => out.tx_failed = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                6 => out.tx_busy = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                7 => out.rx_packets = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                8 => out.rx_rejected = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                9 => out.rx_dropped = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                10 => out.queue_depth = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        Ok(out)
+    }
 }
 
-/// Commit an unpaired device's companion credentials
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ProvisionInstallRequest {
-    /// API field `name`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    /// API field `root_public_key`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub root_public_key: Option<Vec<u8>>,
-    /// API field `secret`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub secret: Option<Vec<u8>>,
+impl crate::registry_bridge::TaggedCbor for BearerCounters {
+    fn encode_cbor(&self) -> Vec<u8> {
+        BearerCounters::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        BearerCounters::decode_cbor(input)
+    }
 }
 
-impl mesh::tagged::TaggedFields for ProvisionInstallRequest {
-    const FIELDS: &'static [(&'static str, u32)] = &[("name", 1), ("root_public_key", 2), ("secret", 3)];
-}
-
-/// Commit an unpaired device's companion credentials
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ProvisionInstallResponse;
-
-impl mesh::tagged::TaggedFields for ProvisionInstallResponse {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
-}
-
-/// One-way diagnostic message from a companion bearer
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct LogRecordRequest {
-    /// API field `text`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
-    /// API field `source`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-    /// API field `timestamp_ms`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timestamp_ms: Option<u64>,
-}
-
-impl mesh::tagged::TaggedFields for LogRecordRequest {
-    const FIELDS: &'static [(&'static str, u32)] = &[("text", 1), ("source", 2), ("timestamp_ms", 3)];
-}
-
-/// One-way diagnostic message from a companion bearer
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct LogRecordResponse;
-
-impl mesh::tagged::TaggedFields for LogRecordResponse {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
-}
-
-/// Read retained log and event records, optionally streaming them with periodic metric snapshots
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct LogWatchRequest {
-    /// API field `since_seq`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub since_seq: Option<u64>,
-    /// API field `limit`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<u32>,
+/// One `LogRecord` row.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct LogRecord {
+    /// API field `seq`.
+    pub seq: u64,
+    /// API field `time_ms`.
+    pub time_ms: u64,
     /// API field `level`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub level: Option<u8>,
+    pub level: u8,
     /// API field `source`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
+    pub source: String,
     /// API field `kind`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
-    /// API field `stream`.
+    /// API field `text`.
+    pub text: String,
+    /// API field `fields`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stream: Option<bool>,
-    /// API field `snapshots`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub snapshots: Option<Vec<serde_json::Value>>,
-    /// API field `interval_ms`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub interval_ms: Option<u32>,
+    pub fields: Option<Vec<u8>>,
 }
 
-impl mesh::tagged::TaggedFields for LogWatchRequest {
-    const FIELDS: &'static [(&'static str, u32)] = &[("since_seq", 1), ("limit", 2), ("level", 3), ("source", 4), ("kind", 5), ("stream", 6), ("snapshots", 7), ("interval_ms", 8)];
+impl mesh::tagged::TaggedFields for LogRecord {
+    const FIELDS: &'static [(&'static str, u32)] = &[("seq", 1), ("time_ms", 2), ("level", 3), ("source", 4), ("kind", 5), ("text", 6), ("fields", 7)];
 }
 
-/// Read retained log and event records, optionally streaming them with periodic metric snapshots
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct LogWatchResponse {
-    /// API field `records`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub records: Option<Vec<serde_json::Value>>,
-    /// API field `cursor`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cursor: Option<u64>,
-    /// API field `dropped`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dropped: Option<u64>,
+impl LogRecord {
+    /// Encode as the tag-keyed CBOR map of `API.md`, omitting absent fields.
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        let mut size = 256;
+        loop {
+            let mut out = vec![0u8; size];
+            if let Some(used) = self.encode_cbor_into(&mut out) {
+                out.truncate(used);
+                return out;
+            }
+            size *= 2;
+        }
+    }
+
+    /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
+    pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
+        let mut e = crate::cbor::Encoder::new(out);
+        e.map(5u64 + u64::from(self.kind.is_some()) + u64::from(self.fields.is_some()))?;
+        e.uint(1)?;
+        e.uint(u64::from(*&self.seq))?;
+        e.uint(2)?;
+        e.uint(u64::from(*&self.time_ms))?;
+        e.uint(3)?;
+        e.uint(u64::from(*&self.level))?;
+        e.uint(4)?;
+        e.text_value(&self.source.as_bytes())?;
+        if let Some(value) = &self.kind {
+        e.uint(5)?;
+        e.text_value(value.as_bytes())?;
+        }
+        e.uint(6)?;
+        e.text_value(&self.text.as_bytes())?;
+        if let Some(value) = &self.fields {
+        e.uint(7)?;
+        e.encoded_value(value)?;
+        }
+        Some(e.len())
+    }
+
+    /// Decode the tag-keyed CBOR map of `API.md`. Unknown tags are skipped, so a
+    /// newer peer's extra fields do not break an older one.
+    pub fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        let mut d = crate::cbor::Decoder::new(input);
+        let (major, count) = d.head().ok_or("not a CBOR map")?;
+        if major != 5 {
+            return Err("not a CBOR map".to_owned());
+        }
+        let mut out = Self::default();
+        let mut seen_1 = false;
+        let mut seen_2 = false;
+        let mut seen_3 = false;
+        let mut seen_4 = false;
+        let mut seen_6 = false;
+        for _ in 0..count {
+            let tag = d.uint().ok_or("invalid field tag")?;
+            match tag {
+                1 => { out.seq = u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?; seen_1 = true; }
+                2 => { out.time_ms = u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?; seen_2 = true; }
+                3 => { out.level = u8::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?; seen_3 = true; }
+                4 => { out.source = String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?; seen_4 = true; }
+                5 => out.kind = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                6 => { out.text = String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?; seen_6 = true; }
+                7 => out.fields = Some({ let start = d.position(); d.skip().ok_or("invalid value")?; input[start..d.position()].to_vec() }),
+                _ => d.skip().ok_or("invalid value")?,
+            }
+        }
+        if !seen_1 {
+            return Err("missing required field `seq`".to_owned());
+        }
+        if !seen_2 {
+            return Err("missing required field `time_ms`".to_owned());
+        }
+        if !seen_3 {
+            return Err("missing required field `level`".to_owned());
+        }
+        if !seen_4 {
+            return Err("missing required field `source`".to_owned());
+        }
+        if !seen_6 {
+            return Err("missing required field `text`".to_owned());
+        }
+        Ok(out)
+    }
 }
 
-impl mesh::tagged::TaggedFields for LogWatchResponse {
-    const FIELDS: &'static [(&'static str, u32)] = &[("records", 1), ("cursor", 2), ("dropped", 3)];
-}
-
-/// Ask a node to run a probe against a peer
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ProbeStartRequest {
-    /// API field `bytes`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bytes: Option<u64>,
-    /// API field `packet_size`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub packet_size: Option<u16>,
-    /// API field `ack_frequency`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ack_frequency: Option<u8>,
-    /// API field `ack_delay_ms`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ack_delay_ms: Option<u8>,
-    /// API field `low_priority_bytes`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub low_priority_bytes: Option<u32>,
-    /// API field `high_priority_bytes`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub high_priority_bytes: Option<u32>,
-    /// API field `parallel_streams`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parallel_streams: Option<u8>,
-    /// API field `initial_consume_delay_ms`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub initial_consume_delay_ms: Option<u32>,
-    /// API field `consume_delay_ms`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub consume_delay_ms: Option<u32>,
-    /// API field `peer`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub peer: Option<String>,
-    /// API field `to`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub to: Option<String>,
-}
-
-impl mesh::tagged::TaggedFields for ProbeStartRequest {
-    const FIELDS: &'static [(&'static str, u32)] = &[("bytes", 1), ("packet_size", 2), ("ack_frequency", 6), ("ack_delay_ms", 7), ("low_priority_bytes", 8), ("high_priority_bytes", 9), ("parallel_streams", 10), ("initial_consume_delay_ms", 11), ("consume_delay_ms", 12), ("peer", 13), ("to", 15)];
-}
-
-/// Ask a node to run a probe against a peer
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ProbeStartResponse {
-    /// API field `status`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status: Option<String>,
-    /// API field `peer`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub peer: Option<String>,
-    /// API field `requested_bytes`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub requested_bytes: Option<u64>,
-    /// API field `received_bytes`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub received_bytes: Option<u64>,
-    /// API field `elapsed_us`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub elapsed_us: Option<u64>,
-}
-
-impl mesh::tagged::TaggedFields for ProbeStartResponse {
-    const FIELDS: &'static [(&'static str, u32)] = &[("status", 1), ("peer", 2), ("requested_bytes", 3), ("received_bytes", 4), ("elapsed_us", 5)];
-}
-
-/// Answer a probe with a header and then the probe payload
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ProbeHandlerRequest {
-    /// API field `bytes`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bytes: Option<u64>,
-    /// API field `packet_size`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub packet_size: Option<u16>,
-    /// API field `ack_frequency`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ack_frequency: Option<u8>,
-    /// API field `ack_delay_ms`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ack_delay_ms: Option<u8>,
-    /// API field `low_priority_bytes`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub low_priority_bytes: Option<u32>,
-    /// API field `high_priority_bytes`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub high_priority_bytes: Option<u32>,
-    /// API field `parallel_streams`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parallel_streams: Option<u8>,
-    /// API field `initial_consume_delay_ms`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub initial_consume_delay_ms: Option<u32>,
-    /// API field `consume_delay_ms`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub consume_delay_ms: Option<u32>,
-}
-
-impl mesh::tagged::TaggedFields for ProbeHandlerRequest {
-    const FIELDS: &'static [(&'static str, u32)] = &[("bytes", 1), ("packet_size", 2), ("ack_frequency", 6), ("ack_delay_ms", 7), ("low_priority_bytes", 8), ("high_priority_bytes", 9), ("parallel_streams", 10), ("initial_consume_delay_ms", 11), ("consume_delay_ms", 12)];
-}
-
-/// Answer a probe with a header and then the probe payload
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ProbeHandlerResponse {
-    /// API field `bytes`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bytes: Option<u64>,
-    /// API field `packet_size`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub packet_size: Option<u64>,
-}
-
-impl mesh::tagged::TaggedFields for ProbeHandlerResponse {
-    const FIELDS: &'static [(&'static str, u32)] = &[("bytes", 1), ("packet_size", 2)];
-}
-
-/// Report local BLE adapter and bearer state
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct BleStatusRequest;
-
-impl mesh::tagged::TaggedFields for BleStatusRequest {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
-}
-
-/// Report local BLE adapter and bearer state
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct BleStatusResponse;
-
-impl mesh::tagged::TaggedFields for BleStatusResponse {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
-}
-
-/// Start a time-limited BLE scan
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct BleScanRequest;
-
-impl mesh::tagged::TaggedFields for BleScanRequest {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
-}
-
-/// Start a time-limited BLE scan
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct BleScanResponse;
-
-impl mesh::tagged::TaggedFields for BleScanResponse {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
-}
-
-/// Stop the BLE scan
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct BleScanStopRequest;
-
-impl mesh::tagged::TaggedFields for BleScanStopRequest {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
-}
-
-/// Stop the BLE scan
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct BleScanStopResponse;
-
-impl mesh::tagged::TaggedFields for BleScanStopResponse {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
-}
-
-/// List retained BLE scan results
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct BleScanResultsRequest {
-    /// API field `limit`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<u64>,
-}
-
-impl mesh::tagged::TaggedFields for BleScanResultsRequest {
-    const FIELDS: &'static [(&'static str, u32)] = &[("limit", 1)];
-}
-
-/// List retained BLE scan results
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct BleScanResultsResponse;
-
-impl mesh::tagged::TaggedFields for BleScanResultsResponse {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
-}
-
-/// Clear retained BLE scan results
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct BleScanClearRequest;
-
-impl mesh::tagged::TaggedFields for BleScanClearRequest {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
-}
-
-/// Clear retained BLE scan results
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct BleScanClearResponse;
-
-impl mesh::tagged::TaggedFields for BleScanClearResponse {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
-}
-
-/// Connect to a BLE device over L2CAP CoC
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct BleConnectRequest {
-    /// API field `address`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub address: Option<String>,
-    /// API field `psm`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub psm: Option<u16>,
-}
-
-impl mesh::tagged::TaggedFields for BleConnectRequest {
-    const FIELDS: &'static [(&'static str, u32)] = &[("address", 1), ("psm", 2)];
-}
-
-/// Connect to a BLE device over L2CAP CoC
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct BleConnectResponse;
-
-impl mesh::tagged::TaggedFields for BleConnectResponse {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
-}
-
-/// Disconnect the local BLE bearer
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct BleDisconnectRequest;
-
-impl mesh::tagged::TaggedFields for BleDisconnectRequest {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
-}
-
-/// Disconnect the local BLE bearer
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct BleDisconnectResponse;
-
-impl mesh::tagged::TaggedFields for BleDisconnectResponse {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
-}
-
-/// Read retained local radio event history
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct RadioHistoryRequest {
-    /// API field `limit`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<u64>,
-    /// API field `since_ms`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub since_ms: Option<u64>,
-    /// API field `keys`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub keys: Option<String>,
-}
-
-impl mesh::tagged::TaggedFields for RadioHistoryRequest {
-    const FIELDS: &'static [(&'static str, u32)] = &[("limit", 1), ("since_ms", 2), ("keys", 3)];
-}
-
-/// Read retained local radio event history
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct RadioHistoryResponse {
-    /// API field `events`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub events: Option<Vec<serde_json::Value>>,
-    /// API field `followups`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub followups: Option<Vec<serde_json::Value>>,
-    /// API field `ble_scan_results`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ble_scan_results: Option<serde_json::Value>,
-    /// API field `count`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub count: Option<u64>,
-}
-
-impl mesh::tagged::TaggedFields for RadioHistoryResponse {
-    const FIELDS: &'static [(&'static str, u32)] = &[("events", 1), ("followups", 2), ("ble_scan_results", 3), ("count", 4)];
-}
-
-/// Report local USB adapter state
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct UsbStatusRequest;
-
-impl mesh::tagged::TaggedFields for UsbStatusRequest {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
-}
-
-/// Report local USB adapter state
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct UsbStatusResponse;
-
-impl mesh::tagged::TaggedFields for UsbStatusResponse {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
-}
-
-/// List USB devices visible to the host
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct UsbDevicesRequest;
-
-impl mesh::tagged::TaggedFields for UsbDevicesRequest {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
-}
-
-/// List USB devices visible to the host
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct UsbDevicesResponse;
-
-impl mesh::tagged::TaggedFields for UsbDevicesResponse {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
-}
-
-/// Open and attach a USB serial device
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct UsbOpenRequest {
-    /// API field `vendor_id`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vendor_id: Option<u16>,
-    /// API field `product_id`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub product_id: Option<u16>,
-    /// API field `auto`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auto: Option<bool>,
-}
-
-impl mesh::tagged::TaggedFields for UsbOpenRequest {
-    const FIELDS: &'static [(&'static str, u32)] = &[("vendor_id", 1), ("product_id", 2), ("auto", 3)];
-}
-
-/// Open and attach a USB serial device
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct UsbOpenResponse;
-
-impl mesh::tagged::TaggedFields for UsbOpenResponse {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
-}
-
-/// Close the active USB bearer
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct UsbCloseRequest;
-
-impl mesh::tagged::TaggedFields for UsbCloseRequest {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
-}
-
-/// Close the active USB bearer
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct UsbCloseResponse;
-
-impl mesh::tagged::TaggedFields for UsbCloseResponse {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
-}
-
-/// Read the attached device's signed identity
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct UsbDiscoverRequest;
-
-impl mesh::tagged::TaggedFields for UsbDiscoverRequest {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
-}
-
-/// Read the attached device's signed identity
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct UsbDiscoverResponse;
-
-impl mesh::tagged::TaggedFields for UsbDiscoverResponse {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
-}
-
-/// Report local Wi-Fi controller and NAN state
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct WifiStatusRequest;
-
-impl mesh::tagged::TaggedFields for WifiStatusRequest {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
-}
-
-/// Report local Wi-Fi controller and NAN state
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct WifiStatusResponse;
-
-impl mesh::tagged::TaggedFields for WifiStatusResponse {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
-}
-
-/// Request a time-limited platform Wi-Fi scan
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct WifiScanRequest;
-
-impl mesh::tagged::TaggedFields for WifiScanRequest {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
-}
-
-/// Request a time-limited platform Wi-Fi scan
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct WifiScanResponse;
-
-impl mesh::tagged::TaggedFields for WifiScanResponse {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
-}
-
-/// Return the Rust-generated local status table
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct StatusTextRequest;
-
-impl mesh::tagged::TaggedFields for StatusTextRequest {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
-}
-
-/// Return the Rust-generated local status table
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct StatusTextResponse {
-    /// API field `status_text`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status_text: Option<String>,
-}
-
-impl mesh::tagged::TaggedFields for StatusTextResponse {
-    const FIELDS: &'static [(&'static str, u32)] = &[("status_text", 1)];
+impl crate::registry_bridge::TaggedCbor for LogRecord {
+    fn encode_cbor(&self) -> Vec<u8> {
+        LogRecord::encode_cbor(self)
+    }
+
+    fn decode_cbor(input: &[u8]) -> Result<Self, String> {
+        LogRecord::decode_cbor(input)
+    }
 }

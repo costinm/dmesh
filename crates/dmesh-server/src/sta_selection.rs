@@ -20,6 +20,35 @@ pub struct StaSelection<'a> {
     pub server_link_local: [u8; 16],
 }
 
+/// Reuse only a previously associated target for the same network. Credentials
+/// are compared by the adapter without exposing them to telemetry or this API.
+pub fn reusable_sta_target(
+    verified: bool, previous_ssid: &[u8], requested_ssid: &[u8],
+    bssid: [u8; 6], channel: u8, required_bssid: Option<[u8; 6]>,
+    required_channel: u8,
+) -> bool {
+    verified && previous_ssid == requested_ssid
+        && bssid != [0; 6] && bssid[0] & 1 == 0 && (1..=13).contains(&channel)
+        && required_bssid.is_none_or(|required| required == bssid)
+        && (required_channel == 0 || required_channel == channel)
+}
+
+#[cfg(test)]
+mod reuse_tests {
+    use super::reusable_sta_target;
+    #[test]
+    fn reuse_requires_verified_matching_network_and_target() {
+        let peer = [2, 3, 4, 5, 6, 7];
+        assert!(reusable_sta_target(true, b"network", b"network", peer, 6, None, 0));
+        assert!(!reusable_sta_target(false, b"network", b"network", peer, 6, None, 0));
+        assert!(!reusable_sta_target(true, b"old", b"new", peer, 6, None, 0));
+        assert!(!reusable_sta_target(true, b"network", b"network", peer, 6, Some([2; 6]), 0));
+        assert!(!reusable_sta_target(true, b"network", b"network", peer, 6, None, 11));
+        assert!(!reusable_sta_target(true, b"network", b"network", peer, 0, None, 0));
+        assert!(!reusable_sta_target(true, b"network", b"network", [0; 6], 6, None, 0));
+    }
+}
+
 /// Derive the IPv6 link-local address used by a Wi-Fi peer from its MAC.
 pub const fn link_local_from_mac(mac: [u8; 6]) -> [u8; 16] {
     [
@@ -44,6 +73,12 @@ pub const fn link_local_from_mac(mac: [u8; 6]) -> [u8; 16] {
 
 /// True for the DMesh `DIRECT-...-dmesh` AP naming family.
 pub const fn is_dmesh_direct_ssid(ssid: &[u8]) -> bool {
+    // The default firmware/host AP has no per-device suffix.
+    if ssid.len() == b"DIRECT-dmesh".len()
+        && starts_with_ascii_ignore_case(ssid, b"DIRECT-dmesh")
+    {
+        return true;
+    }
     const PREFIX: &[u8] = b"DIRECT-";
     const MARKER: &[u8] = b"-dmesh";
     if ssid.len() <= PREFIX.len() + MARKER.len() || !starts_with_ascii_ignore_case(ssid, PREFIX) {
@@ -57,6 +92,23 @@ pub const fn is_dmesh_direct_ssid(ssid: &[u8]) -> bool {
         index += 1;
     }
     false
+}
+
+#[cfg(test)]
+mod default_ap_tests {
+    #[test]
+    fn default_ap_name_is_discoverable_and_selectable() {
+        assert!(super::is_dmesh_direct_ssid(b"DIRECT-dmesh"));
+        assert!(super::is_dmesh_direct_ssid(b"direct-DMESH"));
+        assert!(!super::is_dmesh_direct_ssid(b"DIRECT-dmesh-other"));
+        let candidates = [super::StaCandidate {
+            ssid: b"DIRECT-dmesh", bssid: [2, 3, 4, 5, 6, 7],
+            rssi_dbm: -40, channel: 6,
+        }];
+        let selected = super::select_sta_candidate(&candidates, b"configured", -80).unwrap();
+        assert!(!selected.preferred);
+        assert_eq!(selected.candidate.ssid, b"DIRECT-dmesh");
+    }
 }
 
 /// Prefer the configured infrastructure SSID when it is usable, otherwise

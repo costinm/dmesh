@@ -12,7 +12,7 @@ use crate::{
     cbor::{Decoder, Encoder},
     tagged::{Name, Record, decode},
 };
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 use core::sync::atomic::{AtomicU8, AtomicU16, Ordering};
 use sha2::{Digest, Sha256};
 
@@ -425,7 +425,7 @@ pub struct ObservedFollowup {
 /// not interchangeable DMesh identities.  `available_fields` is accompanied
 /// on the wire by its explicit complement, so a compact firmware response
 /// has the same "unavailable, not zero" meaning as Android/Linux JSON.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ObservedDevice<'a> {
     pub device_id: &'a [u8],
     pub peer: [u8; 6],
@@ -443,11 +443,24 @@ pub struct ObservedDevice<'a> {
     pub last_kind: u8,
     pub last_payload_len: u16,
     pub last_payload_hash: u32,
+    /// Optional device attributes (field tags 16 and up), for a host or Android
+    /// that has the announce: the bearer this row's observation came from, and
+    /// what the device announced. Firmware rows leave them absent.
+    pub bearer: Option<&'a str>,
+    pub rssi_dbm: Option<i16>,
+    pub name: Option<&'a str>,
+    pub vip6: Option<[u8; 16]>,
+    pub device_class: Option<u8>,
+    pub probe_capabilities: Option<u16>,
+    pub authenticated: Option<bool>,
+    pub uptime_secs: Option<u32>,
+    pub udp_endpoint: Option<&'a str>,
+    pub network_name: Option<&'a str>,
 }
 
 /// Owned form of one canonical `discovery.nodes` row. Bearer adapters and
 /// presentation layers use this after the response buffer has gone away.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ObservedDeviceOwned {
     pub device_id: Vec<u8>,
     pub peer: Option<[u8; 6]>,
@@ -464,6 +477,16 @@ pub struct ObservedDeviceOwned {
     pub last_kind: u8,
     pub last_payload_len: u16,
     pub last_payload_hash: u32,
+    pub bearer: Option<String>,
+    pub rssi_dbm: Option<i16>,
+    pub name: Option<String>,
+    pub vip6: Option<[u8; 16]>,
+    pub device_class: Option<u8>,
+    pub probe_capabilities: Option<u16>,
+    pub authenticated: Option<bool>,
+    pub uptime_secs: Option<u32>,
+    pub udp_endpoint: Option<String>,
+    pub network_name: Option<String>,
 }
 
 impl Announce {
@@ -1144,7 +1167,19 @@ pub fn encode_devices_observed_response(
     e.uint(1)?;
     e.array(entries.len() as u64)?;
     for entry in entries {
-        e.map(13 + u64::from(entry.bssid.is_some()) + u64::from(entry.channel.is_some()))?;
+        let optional = u64::from(entry.bssid.is_some())
+            + u64::from(entry.channel.is_some())
+            + u64::from(entry.bearer.is_some())
+            + u64::from(entry.rssi_dbm.is_some())
+            + u64::from(entry.name.is_some())
+            + u64::from(entry.vip6.is_some())
+            + u64::from(entry.device_class.is_some())
+            + u64::from(entry.probe_capabilities.is_some())
+            + u64::from(entry.authenticated.is_some())
+            + u64::from(entry.uptime_secs.is_some())
+            + u64::from(entry.udp_endpoint.is_some())
+            + u64::from(entry.network_name.is_some());
+        e.map(13 + optional)?;
         e.uint(1)?;
         e.bytes_value(entry.device_id)?;
         // The receiver-local peer MAC is needed to merge observations from
@@ -1187,6 +1222,46 @@ pub fn encode_devices_observed_response(
         e.uint(u64::from(
             crate::discovery::OBSERVATION_ALL_FIELDS & !entry.available_fields,
         ))?;
+        if let Some(bearer) = entry.bearer {
+            e.uint(16)?;
+            e.text_value(bearer.as_bytes())?;
+        }
+        if let Some(rssi) = entry.rssi_dbm {
+            e.uint(17)?;
+            e.int(i64::from(rssi))?;
+        }
+        if let Some(name) = entry.name {
+            e.uint(18)?;
+            e.text_value(name.as_bytes())?;
+        }
+        if let Some(vip6) = entry.vip6 {
+            e.uint(19)?;
+            e.bytes_value(&vip6)?;
+        }
+        if let Some(class) = entry.device_class {
+            e.uint(20)?;
+            e.uint(u64::from(class))?;
+        }
+        if let Some(capabilities) = entry.probe_capabilities {
+            e.uint(21)?;
+            e.uint(u64::from(capabilities))?;
+        }
+        if let Some(authenticated) = entry.authenticated {
+            e.uint(22)?;
+            e.bool(authenticated)?;
+        }
+        if let Some(uptime) = entry.uptime_secs {
+            e.uint(23)?;
+            e.uint(u64::from(uptime))?;
+        }
+        if let Some(endpoint) = entry.udp_endpoint {
+            e.uint(24)?;
+            e.text_value(endpoint.as_bytes())?;
+        }
+        if let Some(network) = entry.network_name {
+            e.uint(25)?;
+            e.text_value(network.as_bytes())?;
+        }
     }
     Some(e.len())
 }
@@ -1214,23 +1289,7 @@ pub fn decode_devices_observed_response(packet: &[u8]) -> Option<Vec<ObservedDev
         if major != 5 {
             return None;
         }
-        let mut device = ObservedDeviceOwned {
-            device_id: Vec::new(),
-            peer: None,
-            bssid: None,
-            channel: None,
-            available_fields: 0,
-            unavailable_fields: 0,
-            first_seen_ms: 0,
-            last_seen_ms: 0,
-            packets: 0,
-            active_publish_rx: 0,
-            active_subscribe_rx: 0,
-            followup_rx: 0,
-            last_kind: 0,
-            last_payload_len: 0,
-            last_payload_hash: 0,
-        };
+        let mut device = ObservedDeviceOwned::default();
         for _ in 0..fields {
             match result.uint()? {
                 1 => device.device_id.extend_from_slice(result.bytes_ref()?),
@@ -1251,6 +1310,16 @@ pub fn decode_devices_observed_response(packet: &[u8]) -> Option<Vec<ObservedDev
                 13 => device.last_payload_hash = u32::try_from(result.uint()?).ok()?,
                 14 => device.unavailable_fields = u32::try_from(result.uint()?).ok()?,
                 15 => device.channel = Some(u8::try_from(result.uint()?).ok()?),
+                16 => device.bearer = Some(String::from_utf8(result.text_ref()?.to_vec()).ok()?),
+                17 => device.rssi_dbm = Some(i16::try_from(result.int()?).ok()?),
+                18 => device.name = Some(String::from_utf8(result.text_ref()?.to_vec()).ok()?),
+                19 => device.vip6 = Some(result.bytes_ref()?.try_into().ok()?),
+                20 => device.device_class = Some(u8::try_from(result.uint()?).ok()?),
+                21 => device.probe_capabilities = Some(u16::try_from(result.uint()?).ok()?),
+                22 => device.authenticated = Some(result.bool()?),
+                23 => device.uptime_secs = Some(u32::try_from(result.uint()?).ok()?),
+                24 => device.udp_endpoint = Some(String::from_utf8(result.text_ref()?.to_vec()).ok()?),
+                25 => device.network_name = Some(String::from_utf8(result.text_ref()?.to_vec()).ok()?),
                 _ => result.skip()?,
             }
         }
@@ -1649,6 +1718,7 @@ mod tests {
             last_kind: 2,
             last_payload_len: 231,
             last_payload_hash: 0x1234_5678,
+            ..Default::default()
         };
         let entries = [entry; 10];
         let mut direct = [0; 1_100];
@@ -1671,6 +1741,58 @@ mod tests {
         assert_eq!(decoded[0].peer, Some(entry.peer));
         assert_eq!(decoded[0].channel, entry.channel);
         assert_eq!(decoded[0].last_payload_hash, entry.last_payload_hash);
+    }
+
+    #[test]
+    fn device_rows_carry_optional_announce_attributes_per_bearer() {
+        let row = ObservedDevice {
+            device_id: &[0xab; 8],
+            available_fields: crate::discovery::OBSERVATION_PEER | crate::discovery::OBSERVATION_RSSI,
+            last_seen_ms: 9,
+            bearer: Some("udp_multicast"),
+            rssi_dbm: Some(-61),
+            name: Some("kitchen"),
+            vip6: Some([0xfd; 16]),
+            device_class: Some(DEVICE_CLASS_HOST),
+            probe_capabilities: Some(0x0f),
+            authenticated: Some(true),
+            uptime_secs: Some(1234),
+            udp_endpoint: Some("[fe80::1%7]:3336"),
+            network_name: Some("costin"),
+            ..Default::default()
+        };
+        let plain = ObservedDevice {
+            device_id: &[0xcd; 8],
+            ..Default::default()
+        };
+        let mut direct = [0; 600];
+        let used = encode_devices_observed_response(&[row, plain], &mut direct).unwrap();
+        let fields = crate::tagged::decode(&direct[..used]).unwrap().fields.unwrap();
+        let mut response = [0; 700];
+        let len = crate::tagged::encode_numeric_response(
+            ANNOUNCE_COMPONENT,
+            ANNOUNCE_DEVICES_OBSERVED,
+            3,
+            fields,
+            &mut response,
+        )
+        .unwrap();
+        let decoded = decode_devices_observed_response(&response[..len]).unwrap();
+        assert_eq!(decoded.len(), 2);
+        let first = &decoded[0];
+        assert_eq!(first.bearer.as_deref(), Some("udp_multicast"));
+        assert_eq!(first.rssi_dbm, Some(-61));
+        assert_eq!(first.name.as_deref(), Some("kitchen"));
+        assert_eq!(first.vip6, Some([0xfd; 16]));
+        assert_eq!(first.device_class, Some(DEVICE_CLASS_HOST));
+        assert_eq!(first.probe_capabilities, Some(0x0f));
+        assert_eq!(first.authenticated, Some(true));
+        assert_eq!(first.uptime_secs, Some(1234));
+        assert_eq!(first.udp_endpoint.as_deref(), Some("[fe80::1%7]:3336"));
+        assert_eq!(first.network_name.as_deref(), Some("costin"));
+        // A row without them (a firmware row) has none of them.
+        assert_eq!(decoded[1].bearer, None);
+        assert_eq!(decoded[1].authenticated, None);
     }
 
     #[test]

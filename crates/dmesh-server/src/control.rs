@@ -230,6 +230,23 @@ fn transport_kind(value: u64) -> Option<TransportKind> {
     })
 }
 
+fn parse_bssid_text(text: &[u8]) -> Option<[u8; 6]> {
+    if text.len() != 17 { return None; }
+    let mut mac = [0; 6];
+    for (index, octet) in mac.iter_mut().enumerate() {
+        let start = index * 3;
+        if index != 5 && text[start + 2] != b':' { return None; }
+        let digit = |c: u8| match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        };
+        *octet = digit(text[start])? * 16 + digit(text[start + 1])?;
+    }
+    Some(mac)
+}
+
 fn decode_transport_config(encoded: &[u8]) -> Option<TransportConfig<'_>> {
     let mut d = Decoder::new(encoded);
     let (major, count) = d.head()?;
@@ -247,8 +264,13 @@ fn decode_transport_config(encoded: &[u8]) -> Option<TransportConfig<'_>> {
                 config.ssid = Some(ssid);
             }
             FIELD_STA_BSSID => {
-                let bytes = d.bytes_ref()?;
-                config.bssid = (bytes.len() == 6).then(|| bytes.try_into().ok()).flatten();
+                let position = d.position();
+                config.bssid = Some(if let Some(value) = d.bytes_ref() {
+                    value.try_into().ok()?
+                } else {
+                    d.set_position(position);
+                    parse_bssid_text(d.text_ref()?)?
+                });
             }
             FIELD_STA_CHANNEL => {
                 let channel = u8::try_from(d.uint()?).ok()?;
@@ -558,6 +580,20 @@ fn encode_config(config: TransportConfig<'_>, e: &mut Encoder<'_>) -> Option<()>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn transport_bssid_accepts_catalog_text_and_binary() {
+        // Tagged request-field maps, matching the generated catalog wire type.
+        let text = b"\xa1\x03\x71aa:BB:02:03:04:05";
+        let binary = b"\xa1\x03\x46\xaa\xbb\x02\x03\x04\x05";
+        for encoded in [text.as_slice(), binary.as_slice()] {
+            assert_eq!(super::decode_transport_config(encoded).unwrap().bssid,
+                Some([0xaa, 0xbb, 2, 3, 4, 5]));
+        }
+        assert!(super::parse_bssid_text(b"aa-bb-02-03-04-05").is_none());
+        assert!(super::parse_bssid_text(b"aa:gg:02:03:04:05").is_none());
+        assert!(super::decode_transport_config(b"\xa1\x03\x45abcde").is_none());
+        assert!(super::decode_transport_config(b"\xa1\x03\x66abcdef").is_none());
+    }
     use super::*;
     #[test]
     fn settings_and_transport_requests_use_one_canonical_record() {

@@ -1183,6 +1183,54 @@ pub trait ImageSink {
     fn abort(&mut self);
 }
 
+/// Plan one sector-aligned erase without crossing a hardware block boundary.
+/// A leading partial block aligns subsequent calls for large-block erase;
+/// a final partial block never erases beyond the image's rounded extent.
+pub fn next_erase_chunk_len(
+    address: usize,
+    remaining: usize,
+    sector_size: usize,
+    block_size: usize,
+) -> Option<usize> {
+    if sector_size == 0 || block_size == 0 || block_size % sector_size != 0
+        || address % sector_size != 0 || remaining % sector_size != 0 {
+        return None;
+    }
+    address.checked_add(remaining)?;
+    Some(remaining.min(block_size - address % block_size))
+}
+
+#[cfg(test)]
+mod erase_chunk_tests {
+    use super::next_erase_chunk_len;
+
+    #[test]
+    fn aligned_unaligned_and_tail_erases_cover_only_the_requested_extent() {
+        for base in [0, 4096, 60 * 1024, 64 * 1024] {
+            for length in [0, 4096, 64 * 1024, 68 * 1024, 460 * 4096] {
+                let mut erased = 0;
+                while erased < length {
+                    let count = next_erase_chunk_len(base + erased, length - erased, 4096, 65536).unwrap();
+                    assert!(count > 0 && count <= 65536 && count % 4096 == 0);
+                    assert_eq!((base + erased) / 65536, (base + erased + count - 1) / 65536);
+                    erased += count;
+                }
+                assert_eq!(erased, length);
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_bad_geometry_and_overflow() {
+        assert_eq!(next_erase_chunk_len(0, 4096, 0, 65536), None);
+        assert_eq!(next_erase_chunk_len(0, 4096, 4096, 0), None);
+        assert_eq!(next_erase_chunk_len(0, 4096, 4096, 5000), None);
+        assert_eq!(next_erase_chunk_len(1, 4096, 4096, 65536), None);
+        assert_eq!(next_erase_chunk_len(0, 4097, 4096, 65536), None);
+        assert_eq!(next_erase_chunk_len(usize::MAX - 4095, 4096, 4096, 65536), None);
+    }
+}
+
 /// Incremental storage lifecycle used by a streamed verified-object consumer.
 ///
 /// Flash, disk, RAM, and delayed probe sinks implement this same interface.

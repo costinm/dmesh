@@ -27,7 +27,56 @@ pub(crate) type FirmwarePacket = OwnedPacket<PoolBufferLease<'static, PACKETS, S
 type FirmwareRuntime = NoStdRuntime<FirmwarePool>;
 
 static POOL: FirmwarePool = FirmwarePool::new();
+#[derive(Clone, Copy)]
+pub(crate) enum ControlPeer {
+    Udp(crate::wifi_raw_udp6_esp::RawUdp6Peer),
+    Now(crate::wifi_espnow_esp::EspNowPeer),
+}
+
+// Wi-Fi callbacks only retain a pool lease. CBOR dispatch/signing and radio
+// replies run on the firmware owner, not the small ESP-IDF Wi-Fi task stack.
+static PENDING_CONTROL_RX: quic_lite::packet_pool::PacketLeaseQueue<
+    ControlPeer, PoolBufferLease<'static, PACKETS, SLOT_SIZE>, PACKETS,
+> = quic_lite::packet_pool::PacketLeaseQueue::new();
+
+pub(crate) fn defer_control_request(peer: ControlPeer, payload: &[u8]) -> bool {
+    let Some(mut writer) = POOL.acquire_writer(0, 0) else { return false; };
+    if payload.is_empty() || payload.len() > writer.payload_mut().len() { return false; }
+    writer.payload_mut()[..payload.len()].copy_from_slice(payload);
+    let Some(packet) = writer.commit(payload.len()) else { return false; };
+    if PENDING_CONTROL_RX.try_push(peer, packet).is_err() { return false; }
+    crate::main_runtime::request_quic_ingress();
+    true
+}
+
+fn dispatch_control_requests() {
+    // Limit each owner turn even if callbacks refill the queue concurrently.
+    for _ in 0..PACKETS {
+        let Some((peer, packet)) = PENDING_CONTROL_RX.try_pop() else { break; };
+        let _ = crate::main_runtime::receive_connectionless_request(packet.bytes(), |response| {
+            match peer {
+                ControlPeer::Udp(peer) => {
+                    let _ = crate::wifi_raw_udp6_esp::transmit_udp6(
+                        peer.link, peer, crate::wifi_raw_udp6_esp::RAW_UDP6_PORT, response,
+                    );
+                }
+                ControlPeer::Now(peer) => {
+                    let _ = crate::wifi_espnow_esp::transmit(peer, response);
+                }
+            }
+        });
+    }
+}
 static UART_READY: AtomicBool = AtomicBool::new(false);
+static BLE_READY: AtomicBool = AtomicBool::new(false);
+/// Set while the BLE link refused a packet; cleared when it reports it can take another.
+static BLE_SEND_BLOCKED: AtomicBool = AtomicBool::new(false);
+/// The BLE link, supplied by the BLE adapter (`fw/ble`): `(connected, send)`. `send` returns
+/// 0 when the SDU was accepted, 1 when the link is busy (retry on the ready edge), else failure.
+static BLE_CONNECTED: AtomicUsize = AtomicUsize::new(0);
+static BLE_SEND: AtomicUsize = AtomicUsize::new(0);
+static mut BLE_CONTEXT: core::mem::MaybeUninit<BearerContext<FirmwarePool>> =
+    core::mem::MaybeUninit::uninit();
 static UDP6_READY: AtomicBool = AtomicBool::new(false);
 static NOW_READY: AtomicBool = AtomicBool::new(false);
 static INGRESS_ERROR_REPORTED: AtomicBool = AtomicBool::new(false);
@@ -86,6 +135,12 @@ pub(crate) enum NowReceiveError {
     InvalidFrame,
     InvalidPeer,
     CommitFailed,
+}
+
+pub(crate) enum NowPayloadAdmission {
+    Consumed,
+    Control,
+    Quic,
 }
 
 /// Copy one generated non-QUIC response into the shared node pool and defer
@@ -184,6 +239,125 @@ impl PacketBearer<FirmwarePool> for UartBearer {
         UART_READY.store(true, Ordering::Release);
         Ok(())
     }
+}
+
+/// The BLE L2CAP channel as a QUIC bearer, like the UART: one peer, one SDU per packet. The
+/// link is encrypted by BLE itself (the pairing handler requires it), so the bearer adds no
+/// cryptography of its own.
+struct BleBearer;
+
+impl PacketEgress<<FirmwarePool as quic_lite::PacketPool>::Buffer> for BleBearer {
+    fn submit(
+        &mut self,
+        _peer: PeerL2Address,
+        submission: EgressSubmission<<FirmwarePool as quic_lite::PacketPool>::Buffer>,
+    ) -> Result<(), PacketSubmitError<<FirmwarePool as quic_lite::PacketPool>::Buffer>> {
+        let connected = BLE_CONNECTED.load(Ordering::Acquire);
+        let send = BLE_SEND.load(Ordering::Acquire);
+        let link_up = connected != 0 && {
+            let connected: fn() -> bool = unsafe { core::mem::transmute(connected) };
+            connected()
+        };
+        if send == 0 || !link_up {
+            submission.complete(PacketSendOutcome::Failed, 0);
+            crate::main_runtime::request_quic_ingress();
+            return Ok(());
+        }
+        let send: fn(&[u8]) -> u8 = unsafe { core::mem::transmute(send) };
+        match send(submission.packet().bytes()) {
+            0 => {
+                submission.complete(PacketSendOutcome::Sent, 0);
+                crate::main_runtime::request_quic_ingress();
+                Ok(())
+            }
+            1 => {
+                BLE_SEND_BLOCKED.store(true, Ordering::Release);
+                Err(PacketSubmitError::WouldBlock(submission))
+            }
+            _ => {
+                submission.complete(PacketSendOutcome::Failed, 0);
+                crate::main_runtime::request_quic_ingress();
+                Ok(())
+            }
+        }
+    }
+}
+
+impl PacketBearer<FirmwarePool> for BleBearer {
+    type AttachError = ();
+
+    fn info(&self) -> BearerInfo {
+        BearerInfo {
+            name: BearerName::new("ble").expect("static bearer name is valid"),
+            max_packet_size: quic_lite::DEFAULT_MAX_PACKET_SIZE,
+            prefix_required: 0,
+            suffix_required: 0,
+            requires_packet_encryption: false,
+            secure_link: true,
+            nominal_bitrate_bps: 100_000,
+            local_mac: None,
+        }
+    }
+
+    fn attach(&mut self, context: BearerContext<FirmwarePool>) -> Result<(), Self::AttachError> {
+        unsafe {
+            core::ptr::addr_of_mut!(BLE_CONTEXT).write(core::mem::MaybeUninit::new(context));
+        }
+        BLE_READY.store(true, Ordering::Release);
+        Ok(())
+    }
+}
+
+/// Give the BLE bearer its link: `connected` reports the L2CAP channel is open and `send`
+/// submits one SDU (0 accepted, 1 busy, other failure).
+pub(crate) fn install_ble_coc_io(connected: fn() -> bool, send: fn(&[u8]) -> u8) {
+    BLE_CONNECTED.store(connected as usize, Ordering::Release);
+    BLE_SEND.store(send as usize, Ordering::Release);
+}
+
+/// Admit one SDU received on the BLE channel through the bearer's context.
+pub(crate) fn receive_ble_coc(bytes: &[u8]) -> bool {
+    unsafe {
+        let _ = runtime();
+    }
+    if !BLE_READY.load(Ordering::Acquire) || bytes.is_empty() {
+        return false;
+    }
+    let context = unsafe {
+        (&*core::ptr::addr_of!(BLE_CONTEXT).cast::<BearerContext<FirmwarePool>>()).clone()
+    };
+    let Some(mut writer) = context.pool().acquire_writer(0, 0) else {
+        return false;
+    };
+    let target = writer.payload_mut();
+    if bytes.len() > target.len() {
+        return false;
+    }
+    target[..bytes.len()].copy_from_slice(bytes);
+    let Some(packet) = writer.commit(bytes.len()) else {
+        return false;
+    };
+    context.enqueue_packet(
+        PacketMeta {
+            bearer: context.bearer(),
+            peer_l2_address: PeerL2Address::new(1).expect("BLE peer handle is nonzero"),
+            received_at_us: unsafe { esp_idf_sys::esp_timer_get_time().max(0) as u64 },
+        },
+        packet,
+    );
+    crate::main_runtime::request_quic_ingress();
+    true
+}
+
+/// The BLE link can take another SDU: release a packet retained after it was busy.
+pub(crate) fn ble_coc_send_ready() {
+    if !BLE_READY.load(Ordering::Acquire) || !BLE_SEND_BLOCKED.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let context = unsafe {
+        (&*core::ptr::addr_of!(BLE_CONTEXT).cast::<BearerContext<FirmwarePool>>()).clone()
+    };
+    context.send_ready();
 }
 
 struct Udp6Bearer;
@@ -317,6 +491,7 @@ unsafe fn runtime() -> &'static mut FirmwareRuntime {
         value
             .set_default_association_limits(embedded)
             .expect("firmware QUIC association limits are valid");
+        #[cfg(feature = "uart-transport")]
         value
             .add_bearer(UartBearer)
             .expect("static UART bearer registration succeeds");
@@ -324,12 +499,22 @@ unsafe fn runtime() -> &'static mut FirmwareRuntime {
             .add_bearer(Udp6Bearer)
             .expect("static UDP6 bearer registration succeeds");
         value
+            .add_bearer(BleBearer)
+            .expect("static BLE bearer registration succeeds");
+        #[cfg(feature = "espnow-transport")]
+        value
             .add_bearer(NowBearer)
             .expect("static ESP-NOW bearer registration succeeds");
         core::ptr::addr_of_mut!(RUNTIME).write(Box::into_raw(value));
         READY.store(true, Ordering::Release);
     }
     &mut **core::ptr::addr_of_mut!(RUNTIME)
+}
+
+/// Initialize the owner before radio callbacks can enqueue packets. Main's
+/// UART pool startup also does this; Recovery has no UART input startup.
+pub(crate) fn initialize() {
+    unsafe { let _ = runtime(); }
 }
 
 pub(crate) fn connection_delay_ms() -> Option<u32> {
@@ -363,9 +548,14 @@ pub(crate) fn node_telemetry() -> quic_lite::NodeTelemetry {
 }
 
 fn report_flash_progress(runtime: &FirmwareRuntime, now_ms: u64) {
-    crate::flash::report_progress(now_ms, |association| {
+    if crate::flash::report_progress(now_ms, |association| {
         runtime.association_telemetry(association)
-    });
+    }) {
+        let deadline_ms = runtime.next_deadline().map(|deadline| {
+            deadline.saturating_sub(now_ms.saturating_mul(1000)).div_ceil(1000)
+        });
+        crate::flash::report_owner_progress(now_ms, deadline_ms, POOL.available());
+    }
 }
 
 pub(crate) fn schedule_connection_timer() {
@@ -377,6 +567,7 @@ pub(crate) fn schedule_connection_timer() {
     if runtime.advance_time(now_us).unwrap_or(false) {
         crate::main_runtime::request_quic_ingress();
     }
+    drain_runtime_notifications(runtime);
     sweep_handler_streams(now_us / 1_000);
     if body_poll_pending() {
         // Ask the ingress loop to poll the streaming bodies again.
@@ -531,7 +722,7 @@ pub(crate) fn receive_now_packet(peer: crate::wifi_espnow_esp::EspNowPeer, bytes
 pub(crate) fn receive_now_with<F, A>(parse: F, admit: A) -> Result<bool, NowReceiveError>
 where
     F: FnOnce(&mut [u8]) -> Option<([u8; 6], usize)>,
-    A: FnOnce(crate::wifi_espnow_esp::EspNowPeer, &[u8]) -> bool,
+    A: FnOnce(crate::wifi_espnow_esp::EspNowPeer, &[u8]) -> NowPayloadAdmission,
 {
     if !NOW_READY.load(Ordering::Acquire) {
         return Err(NowReceiveError::NotReady);
@@ -549,8 +740,16 @@ where
         return Err(NowReceiveError::InvalidFrame);
     }
     let peer = crate::wifi_espnow_esp::EspNowPeer { mac };
-    if !admit(peer, &writer.payload_mut()[..len]) {
+    let admission = admit(peer, &writer.payload_mut()[..len]);
+    if matches!(admission, NowPayloadAdmission::Consumed) {
         return Ok(false);
+    }
+    if matches!(admission, NowPayloadAdmission::Control) {
+        let packet = writer.commit(len).ok_or(NowReceiveError::CommitFailed)?;
+        PENDING_CONTROL_RX.try_push(ControlPeer::Now(peer), packet)
+            .map_err(|_| NowReceiveError::PoolFull)?;
+        crate::main_runtime::request_quic_ingress();
+        return Ok(true);
     }
     let value = mac
         .into_iter()
@@ -573,25 +772,38 @@ where
     Ok(true)
 }
 
+/// This owner dispatches streams directly, rather than accepting associations
+/// through a separate application task. Consume both notification queues so
+/// short-lived command connections cannot retain lifecycle history forever.
+fn drain_runtime_notifications(runtime: &mut FirmwareRuntime) {
+    while runtime.next_association().is_some() {}
+    while runtime.next_event().is_some() {}
+}
+
 /// Advance queued bearer ingress and dispatch complete request streams.
 ///
 /// Main calls this only from its single event owner. It is intentionally not
 /// public API: physical bearers enqueue through `BearerContext` and merely
 /// wake that owner.
 pub(crate) fn progress() {
+    dispatch_control_requests();
     let runtime = unsafe { runtime() };
+    drain_runtime_notifications(runtime);
     let now_ms = (unsafe { esp_idf_sys::esp_timer_get_time().max(0) as u64 }) / 1_000;
     sweep_handler_streams(now_ms);
     report_flash_progress(runtime, now_ms);
+    #[cfg(feature = "probe")]
     progress_directed_probe(runtime);
     if runtime.take_ingress_drops() != 0 {
         let _ = crate::uart_esp::send_debug_text(b"DMESH QUIC ingress queue packet dropped");
     }
     service_handler_streams(runtime, now_ms);
     loop {
+        drain_runtime_notifications(runtime);
         let processed = match runtime.progress_with_stream(|stream, offset, fin, bytes| {
             // Data on a stream this node opened (the response of a probe it
             // runs as a client) is not a request.
+            #[cfg(feature = "probe")]
             if let Some(result) = peer_probe_chunk(&stream, fin, bytes) {
                 return result;
             }
@@ -786,9 +998,12 @@ fn find_or_open(stream: QuicStream, now_ms: u64) -> Option<&'static mut HandlerS
     if streams.len() >= MAX_HANDLER_STREAMS {
         return None;
     }
+    let association = stream.association_id();
     let context = dmesh_server::registry::CallContext {
-        association: stream.association_id(),
+        association,
         stream_id: Some(stream.id()),
+        // The node's own record of where this association runs.
+        bearer: association.and_then(|id| unsafe { runtime() }.association_bearer_name(id)),
         ..Default::default()
     };
     streams.push(HandlerStream {
@@ -933,12 +1148,16 @@ fn service_handler_streams(runtime: &mut FirmwareRuntime, now_ms: u64) {
                 WriteState::Done => writer.done = true,
                 WriteState::Failed => {
                     let _ = crate::uart_esp::send_debug_text(b"DMESH QUIC response write failed");
-                    writer.done = true;
+                    // A failed response must not invoke its after-finish
+                    // action (for example, rebooting into another image).
+                    streams.swap_remove(index);
+                    continue;
                 }
             }
         }
         let answered_and_sent = entry.writer.as_ref().is_some_and(|writer| writer.done);
         if answered_and_sent && entry.request_finished {
+            entry.writer.as_mut().unwrap().reader.finish_response();
             streams.swap_remove(index);
         } else {
             index += 1;

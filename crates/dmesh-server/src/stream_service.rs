@@ -135,7 +135,9 @@ where
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
     }
-    stream.shutdown().await
+    stream.shutdown().await?;
+    reader.finish_response();
+    Ok(())
 }
 
 impl RegistryStreamHandler {
@@ -352,6 +354,56 @@ mod tests {
         };
         let (result, ()) = tokio::join!(server_task, client_task);
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn response_finish_action_runs_once_after_envelope_and_fin() {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let completed = calls.clone();
+        let mut header = [0u8; 64];
+        let used = crate::tagged::encode_numeric_response(1, 2, 77, &[0xa0], &mut header).unwrap();
+        let expected = header[..used].to_vec();
+        let response = crate::stream::Response::header(expected.clone()).after_finish(move || {
+            completed.fetch_add(1, Ordering::SeqCst);
+        });
+        let (mut client, mut server) = tokio::io::duplex(8);
+        let receive = async {
+            let mut bytes = Vec::new();
+            client.read_to_end(&mut bytes).await.unwrap();
+            bytes
+        };
+        let (result, bytes) = tokio::join!(write_response(&mut server, response), receive);
+        result.unwrap();
+        assert_eq!(bytes, expected);
+        assert_eq!(crate::tagged::decode(&bytes).unwrap().id, Some(77));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_response_does_not_run_finish_action() {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let completed = calls.clone();
+        let response = crate::stream::Response::header(vec![0xa0]).after_finish(move || {
+            completed.fetch_add(1, Ordering::SeqCst);
+        });
+        let (client, mut server) = tokio::io::duplex(8);
+        drop(client);
+        assert!(write_response(&mut server, response).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn dropped_response_does_not_run_finish_action() {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let completed = calls.clone();
+        let response = crate::stream::Response::header(vec![0xa0]).after_finish(move || {
+            completed.fetch_add(1, Ordering::SeqCst);
+        });
+        drop(response.into_reader());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

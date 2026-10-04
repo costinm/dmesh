@@ -24,6 +24,21 @@ pub fn install_ble_coc_egress_pump(
 ) {
 }
 
+/// Give the BLE bearer its link (see `quic_node_esp::install_ble_coc_io`).
+pub fn install_ble_coc_io(connected: fn() -> bool, send: fn(&[u8]) -> u8) {
+    crate::quic_node_esp::install_ble_coc_io(connected, send);
+}
+
+/// One SDU received on the BLE L2CAP channel.
+pub fn receive_ble_coc(bytes: &[u8]) -> bool {
+    crate::quic_node_esp::receive_ble_coc(bytes)
+}
+
+/// The BLE channel can accept another SDU.
+pub fn ble_coc_send_ready() {
+    crate::quic_node_esp::ble_coc_send_ready();
+}
+
 pub(crate) fn transport_profile_snapshot() -> crate::TransportProfile {
     crate::profile_store::snapshot()
 }
@@ -34,7 +49,9 @@ pub(crate) fn apply_uart_profile(enabled: bool) {
     }
 }
 
-pub(crate) fn prepare_raw_association(_profile: &crate::TransportProfile) {}
+pub(crate) fn prepare_raw_association(_profile: &crate::TransportProfile) {
+    crate::quic_node_esp::initialize();
+}
 pub(crate) fn prepare_espnow_association(_profile: &crate::TransportProfile) {}
 pub(crate) fn replace_raw_association(_profile: &crate::TransportProfile) {}
 
@@ -164,20 +181,14 @@ pub(crate) fn receive_recovery_connectionless(
 
 /// One connectionless UDP6 message: the allow-list, then the registry.
 pub(crate) fn receive_udp6_connectionless(
-    _peer: crate::wifi_raw_udp6_esp::RawUdp6Peer,
+    peer: crate::wifi_raw_udp6_esp::RawUdp6Peer,
     packet: &[u8],
-    response: &mut [u8; crate::TRANSPORT_MTU],
+    _response: &mut [u8; crate::TRANSPORT_MTU],
 ) -> crate::wifi_raw_udp6_esp::ConnectionlessUdp6Outcome {
-    let mut used = None;
-    let accepted = crate::main_runtime::receive_connectionless_request(packet, |bytes| {
-        if bytes.len() <= response.len() {
-            response[..bytes.len()].copy_from_slice(bytes);
-            used = Some(bytes.len());
-        }
-    });
-    match (accepted, used) {
-        (true, Some(len)) => crate::wifi_raw_udp6_esp::ConnectionlessUdp6Outcome::Response(len),
-        _ => crate::wifi_raw_udp6_esp::ConnectionlessUdp6Outcome::Rejected,
+    if crate::quic_node_esp::defer_control_request(crate::quic_node_esp::ControlPeer::Udp(peer), packet) {
+        crate::wifi_raw_udp6_esp::ConnectionlessUdp6Outcome::Handled
+    } else {
+        crate::wifi_raw_udp6_esp::ConnectionlessUdp6Outcome::Rejected
     }
 }
 pub(crate) fn receive_main_espnow(

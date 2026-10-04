@@ -51,7 +51,7 @@ public class MeshNode implements AutoCloseable {
         if (context != null) {
             try {
                 acquireWifiMulticastLock(context);
-                udpFd = openNetworkUdpSocket(context, 3336);
+                udpFd = openNetworkUdpSocket(context, 3339);
                 // Android-only route-mark handoff: UDP/5227 is still wholly
                 // implemented by Rust (group join, packet parsing, replies,
                 // and cache). Java creates this descriptor only because

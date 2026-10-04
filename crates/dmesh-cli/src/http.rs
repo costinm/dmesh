@@ -1,14 +1,35 @@
 //! Generic JSON gateway for a local or adb-forwarded mesh HTTP service.
 //! The server translates this request to the same tagged-CBOR service handler
-//! used by other transports; this module owns no Android command semantics.
+//! used by other transports; this module owns no Android command semantics. It uses the
+//! catalog-assisted `call` route: the gateway maps method and field names to tags with the
+//! service catalog, so the same request reaches a gateway fronting lmesh over CBOR and an
+//! embedded Android handler.
 
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
 pub(crate) fn run(args: &[String]) -> Result<(), String> {
-    let (authority, service, _method, body) = request(args)?;
+    let (authority, service, method, body) = request(args)?;
+    // The catalog route lets the gateway map names to tags with its catalog. A gateway with no
+    // catalog for the service (an embedded Android handler) takes the named record instead.
+    let first = post(authority, &format!("/_m/mesh/services/{service}/call/{method}"), &body);
+    let outcome = match first {
+        Err(error) if error.contains("no catalog") || error.contains("not present in the service catalog") => {
+            let (component, name) = method.split_once('.').unwrap_or((service, method));
+            let fields: Value = serde_json::from_str(&body).map_err(|error| error.to_string())?;
+            let record = serde_json::json!({"component": component, "method": name, "id": 1, "env": fields});
+            post(authority, &format!("/_m/mesh/services/{service}/records"), &record.to_string())
+        }
+        other => other,
+    };
+    println!("{}", outcome?);
+    Ok(())
+}
+
+/// One HTTP POST of a JSON body; the response body of a 200, else an error naming the status.
+fn post(authority: &str, path: &str, body: &str) -> Result<String, String> {
     let address = authority
         .strip_prefix('[')
         .and_then(|rest| {
@@ -24,7 +45,7 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
     stream
         .set_write_timeout(Some(Duration::from_secs(30)))
         .map_err(|error| error.to_string())?;
-    let mut path = format!("/_m/mesh/services/{service}/records");
+    let mut path = path.to_owned();
     if let Ok(key) = std::env::var("DMESH_HTTP_API_KEY") {
         if !key.is_empty() {
             path.push_str("?apikey=");
@@ -60,8 +81,7 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
     if !status.contains(" 200 ") {
         return Err(format!("{status}: {body}"));
     }
-    println!("{body}");
-    Ok(())
+    Ok(body.to_owned())
 }
 
 fn request(args: &[String]) -> Result<(&str, &str, &str, String), String> {
@@ -103,9 +123,7 @@ fn request(args: &[String]) -> Result<(&str, &str, &str, String), String> {
         };
         body.insert(key.into(), value);
     }
-    let (_, method_name) = method.split_once('.').expect("validated method");
-    let record = json!({"component": method.split_once('.').unwrap().0, "method": method_name, "id": 1, "env": body});
-    Ok((authority, service, method, record.to_string()))
+    Ok((authority, service, method, Value::Object(body).to_string()))
 }
 
 fn valid_segment(value: &str) -> bool {
@@ -118,6 +136,7 @@ fn valid_segment(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn http_gateway_request_is_bounded_to_a_named_service() {
@@ -135,7 +154,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::from_str::<Value>(&body).unwrap(),
-            json!({"component":"transport","method":"set","id":1,"env":{"mode":6,"ap":1}})
+            json!({"mode":6,"ap":1})
         );
         assert!(request(&["http://host:1".into(), "../other".into()]).is_err());
     }

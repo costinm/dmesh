@@ -12,6 +12,7 @@ use core::{
     pin::Pin,
     task::{Context, Poll},
 };
+use std::string::{String, ToString};
 use std::{
     collections::hash_map::RandomState,
     fs::File,
@@ -61,6 +62,15 @@ enum DriverCommand {
     RemoveBearer {
         bearer: BearerId,
         reply: oneshot::Sender<bool>,
+    },
+    Rows {
+        reply: oneshot::Sender<(Vec<crate::AssociationRow>, Vec<crate::BearerRow>)>,
+    },
+    /// `attach` is a `Box<dyn FnOnce(&mut QuicNode<P, PACKET>) -> ...>` for the
+    /// driver's own `P` and `PACKET`, erased because handles are not generic.
+    AddBearer {
+        attach: Box<dyn std::any::Any + Send>,
+        reply: oneshot::Sender<Result<BearerId, String>>,
     },
     Associate {
         meta: crate::PacketMeta,
@@ -183,6 +193,41 @@ impl TokioNode {
     /// Receive the next terminal association lifecycle event.
     pub async fn next_event(&self) -> Option<crate::AssociationEvent> {
         self.events.lock().await.recv().await
+    }
+
+    /// Per-association and per-bearer rows from the node-owning driver.
+    pub async fn rows(&self) -> Option<(Vec<crate::AssociationRow>, Vec<crate::BearerRow>)> {
+        let (reply, receive) = oneshot::channel();
+        self.commands.send(DriverCommand::Rows { reply }).ok()?;
+        receive.await.ok()
+    }
+
+    /// Register a bearer with the running node, for a link that appears after
+    /// start (a connected BLE CoC). `P` and `PACKET` must be the driver's own
+    /// pool and packet size; a mismatch is reported as an error.
+    pub async fn add_bearer<P, const PACKET: usize, T>(&self, bearer: T) -> Result<BearerId, String>
+    where
+        P: PacketPool + 'static,
+        P::Buffer: Send,
+        T: PacketBearer<P> + Send + 'static,
+        T::AttachError: std::fmt::Debug,
+    {
+        type Attach<P, const PACKET: usize> =
+            Box<dyn FnOnce(&mut QuicNode<P, PACKET>) -> Result<BearerId, String> + Send>;
+        let attach: Attach<P, PACKET> = Box::new(move |node| {
+            node.add_bearer(bearer)
+                .map_err(|error| format!("{error:?}"))
+        });
+        let (reply, receive) = oneshot::channel();
+        self.commands
+            .send(DriverCommand::AddBearer {
+                attach: Box::new(attach),
+                reply,
+            })
+            .map_err(|_| "the QUIC node driver has stopped".to_string())?;
+        receive
+            .await
+            .map_err(|_| "the QUIC node driver has stopped".to_string())?
     }
 
     /// Remove a registered bearer without stopping streams on other links.
@@ -764,9 +809,21 @@ where
                 }
             };
             ::tokio::pin!(timer);
+            // The node's clock only moves when told to. A node that sat idle with no timer
+            // armed would otherwise act on a command or a packet with the time of its last
+            // loop turn: an association opened then would be created in the past, and its
+            // bootstrap attempts and timeout would all fall due at once (a peer that never
+            // got a chance to answer was reported as timed out). Bring the clock current
+            // before anything is acted on.
+            let fresh_now = move || {
+                clock_base_us.saturating_add(
+                    u64::try_from(clock_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                )
+            };
             ::tokio::select! {
                 command = self.commands.recv() => {
                     let Some(command) = command else { return Ok(()); };
+                    self.node.advance_clock(fresh_now());
                     self.handle_command(command)?;
                 }
                 event = core::future::poll_fn(|context| {
@@ -793,10 +850,12 @@ where
                                 Err(error) => return Err(error),
                             }
                         }
-                        Ok(Some(crate::node::NodeTimer::BootstrapTimedOut { .. })) => {
-                            return Err(QuicNodeEgressError::AssociationTimedOut);
-                        }
-                        Ok(Some(crate::node::NodeTimer::IdleTimedOut { .. }))
+                        // One association's setup failing is that association's outcome, not
+                        // the node's: the node has retired it and queued `SetupTimeout`,
+                        // which resolves its establishment waiter. The node, and every other
+                        // association it carries, keeps running.
+                        Ok(Some(crate::node::NodeTimer::BootstrapTimedOut { .. }))
+                        | Ok(Some(crate::node::NodeTimer::IdleTimedOut { .. }))
                         | Ok(Some(crate::node::NodeTimer::CircuitSetupTimedOut { .. }))
                         | Ok(None) => {}
                         Err(error) if error.is_retryable() => {}
@@ -887,6 +946,10 @@ where
     }
 
     fn handle_command(&mut self, command: DriverCommand) -> Result<(), QuicNodeEgressError> {
+        // The driver owns the node's clock. A caller's `now_us` is a request for no earlier
+        // than that time; callers that have no clock of their own pass 0, which would put the
+        // new association in the past and make every setup attempt fall due at once.
+        let clock = self.node.clock_us();
         match command {
             DriverCommand::Wake => {}
             DriverCommand::Telemetry { reply } => {
@@ -895,12 +958,24 @@ where
             DriverCommand::RemoveBearer { bearer, reply } => {
                 let _ = reply.send(self.node.remove_bearer(bearer));
             }
+            DriverCommand::Rows { reply } => {
+                let _ = reply.send((self.node.association_rows(), self.node.bearer_rows()));
+            }
+            DriverCommand::AddBearer { attach, reply } => {
+                let outcome = match attach.downcast::<Box<
+                    dyn FnOnce(&mut QuicNode<P, PACKET>) -> Result<BearerId, String> + Send,
+                >>() {
+                    Ok(attach) => attach(&mut self.node),
+                    Err(_) => Err("bearer was built for a different packet pool".to_string()),
+                };
+                let _ = reply.send(outcome);
+            }
             DriverCommand::Associate {
                 meta,
                 now_us,
                 reply,
             } => {
-                let _ = reply.send(self.node.associate(meta, now_us));
+                let _ = reply.send(self.node.associate(meta, now_us.max(clock)));
             }
             DriverCommand::AssociateRelayed {
                 meta,
@@ -915,7 +990,7 @@ where
                     destination_vip,
                     &hops,
                     return_hints,
-                    now_us,
+                    now_us.max(clock),
                 ));
             }
             DriverCommand::AddRelayedCircuit {
@@ -936,7 +1011,7 @@ where
                 now_us,
                 reply,
             } => {
-                let _ = reply.send(self.node.add_direct_circuit(association, next_hop, now_us));
+                let _ = reply.send(self.node.add_direct_circuit(association, next_hop, now_us.max(clock)));
             }
             DriverCommand::RetryDirectCircuit { circuit, reply } => {
                 let _ = reply.send(self.node.retry_direct_circuit(circuit));
@@ -950,7 +1025,7 @@ where
                 now_us,
                 reply,
             } => {
-                let _ = reply.send(self.node.resume_circuit(circuit, next_hop, now_us));
+                let _ = reply.send(self.node.resume_circuit(circuit, next_hop, now_us.max(clock)));
             }
             DriverCommand::CloseCircuit { circuit, reply } => {
                 let _ = reply.send(self.node.close_circuit(circuit));
@@ -1571,10 +1646,10 @@ where
                         Some(crate::node::NodeTimer::Egress(packet)) => {
                             self.submit_node_packet(packet)?;
                         }
-                        Some(crate::node::NodeTimer::BootstrapTimedOut { .. }) => {
-                            return Err(QuicNodeEgressError::AssociationTimedOut);
-                        }
-                        Some(crate::node::NodeTimer::IdleTimedOut { .. })
+                        // Retired by the node, which queued `SetupTimeout` for the owner; a
+                        // failed setup of one association does not stop the node.
+                        Some(crate::node::NodeTimer::BootstrapTimedOut { .. })
+                        | Some(crate::node::NodeTimer::IdleTimedOut { .. })
                         | Some(crate::node::NodeTimer::CircuitSetupTimedOut { .. })
                         | None => {}
                     }
@@ -1808,6 +1883,31 @@ mod tests {
             circuits[0].first_hop.peer_l2_address,
             address.peer_l2_address
         );
+    }
+
+    #[test]
+    fn bearer_rows_list_each_registered_bearer_and_an_unestablished_association_is_not_live() {
+        type RowsPool = PacketPool<8, { crate::DEFAULT_PACKET_POOL_SLOT_SIZE }>;
+        static ROWS_POOL: RowsPool = RowsPool::new();
+        let bearer_impl = FakePacketBearer::<RowsPool>::new(BearerName::new("rows-bearer").unwrap());
+        let mut node = QuicNode::<RowsPool>::new(&ROWS_POOL);
+        let bearer = node.add_bearer(bearer_impl).unwrap();
+        let bearers = node.bearer_rows();
+        assert_eq!(bearers.len(), 1);
+        assert_eq!(bearers[0].id, bearer);
+        assert_eq!(bearers[0].name.as_str(), "rows-bearer");
+        // A client association has no endpoint until it is established, so it is
+        // not yet a live association (the same rule `telemetry` applies).
+        node.associate(
+            PacketMeta {
+                bearer,
+                peer_l2_address: PeerL2Address::new(7).unwrap(),
+                received_at_us: 0,
+            },
+            0,
+        )
+        .unwrap();
+        assert!(node.association_rows().is_empty());
     }
 
     #[test]

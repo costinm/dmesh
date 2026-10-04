@@ -1,0 +1,54 @@
+[package]
+name = "android-control"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "android_control"
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = ["jni-wrapper"]
+jni-wrapper = ["dep:jni"]
+
+[dependencies]
+# ADB device layer: raw TCP -> A_CNXN -> A_STLS -> TLS-1.3 -> A_AUTH -> shell/sync.
+# The Android 11+ wireless *pairing* handshake (SPAKE2 over TLS) is implemented
+# in this crate (pairing.rs / spake2.rs) and is not part of adb_client.
+adb_client = { version = "3.2.3", default-features = false }
+
+tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "sync", "time"] }
+anyhow = "1.0"
+tracing = "0.1"
+clap = { version = "4", features = ["derive"] }
+
+# ADB key material (RSA-2048 adbkey) and pairing crypto.
+curve25519-dalek = "=5.0.0-pre.6"
+# `dig` variant (same crate `adb_client` uses) so `BigUint`/`ModInverse` line up.
+num-bigint = { version = "0.8.6", package = "num-bigint-dig" }
+num-traits = "0.2.19"
+sha2 = "0.10.9"
+sha1 = "0.10.7"
+rsa = "0.9.10"
+rand = "0.8.8"
+pkcs8 = "0.10.2"
+base64 = "0.22.1"
+aes-gcm = "0.10.3"
+hkdf = "0.12.4"
+
+# TLS 1.3 for the pairing channel and adb connect.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1"
+rustls-pemfile = "2"
+tokio-rustls = "0.26"
+rcgen = "0.14"
+
+# Host-side mDNS discovery of pairing/connect services.
+mdns-sd = "0.19"
+serde_json = "1"
+
+# Optional Java/Android wrapper
+jni = { version = "0.21.1", optional = true }
+
+[dev-dependencies]
+tempfile = "3"

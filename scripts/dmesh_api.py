@@ -6,8 +6,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
+# Groups documented outside the root API.md.
+GROUP_FILES = {'linux': 'crates/lmesh-wifi/API.md'}
+
+
 def extract(group: str, platform: str | None = None) -> str:
-    source = (ROOT / 'API.md').read_text()
+    source = (ROOT / GROUP_FILES.get(group, 'API.md')).read_text()
     start = f'<!-- dmesh-api:{group} -->\n'
     if source.count(start) != 1:
         raise ValueError(f'expected one {group} API section')

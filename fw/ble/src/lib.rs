@@ -48,6 +48,7 @@ extern "C" {
     fn dmesh_nimble_coc_send(data: *const c_uchar, len: c_ushort) -> c_int;
     fn dmesh_nimble_coc_tx_pending() -> c_int;
     fn dmesh_nimble_coc_encrypted() -> bool;
+    fn dmesh_nimble_clear_bonds() -> c_int;
     fn dmesh_nimble_start_scan(duration_ms: c_uint) -> c_int;
     fn dmesh_nimble_stop_scan() -> c_int;
     fn dmesh_nimble_start_advertising(
@@ -57,6 +58,11 @@ extern "C" {
         max_units: c_ushort,
     ) -> c_int;
     fn dmesh_nimble_stop_service() -> c_int;
+}
+
+/// Forget every BLE bond (stored peer keys).
+pub fn clear_bonds() -> bool {
+    unsafe { dmesh_nimble_clear_bonds() == 0 }
 }
 
 pub fn coc_encrypted() -> bool {

@@ -7,7 +7,8 @@ edition.workspace = true
 anyhow = "1.0"
 async-trait = "0.1"
 dmesh-server = { path = "../dmesh-server" }
-dmesh-rawnan = { path = "../rawnan" }
+dmesh-discovery = { path = "../dmesh-discovery", features = ["tokio"] }
+dmesh-rawnan = { path = "../rawnan", features = ["linux"] }
 quic-lite = { path = "../quic-lite", features = ["tokio"] }
 libc = "0.2"
 lmesh-wpa = { path = "../lmesh-wpa" }

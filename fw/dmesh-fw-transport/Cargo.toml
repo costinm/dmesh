@@ -15,10 +15,13 @@ name = "dmesh_fw_transport"
 path = "src/lib.rs"
 
 [features]
-default = ["uart-transport"]
+default = ["uart-transport", "espnow-transport", "probe"]
 # Main's framed UART bearer and direct diagnostic fallback. Recovery disables
 # this feature and uses only the ESP console for human-readable logs.
 uart-transport = []
+# Main-only bearer and application capabilities. Recovery leaves these off.
+espnow-transport = []
+probe = []
 
 [dependencies]
 quic-lite = { path = "../../crates/quic-lite" }

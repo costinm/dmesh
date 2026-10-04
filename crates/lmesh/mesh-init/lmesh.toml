@@ -7,7 +7,8 @@ ExecStart = "lmesh"
 WorkingDirectory = "/home/lmesh"
 User = "build"
 Group = "build"
-SupplementaryGroups = ["plugdev"]
+# plugdev: BLE/HCI; dialout: the USB serial ports of paired companions (companion.pair kind=uart).
+SupplementaryGroups = ["plugdev", "dialout"]
 Restart = "always"
 RestartSec = "1s"
 KillMode = "control-group"
@@ -30,9 +31,13 @@ MESH_LOG_FILE = "/home/lmesh/log/lmesh.log"
 # mesh-init inherits no useful PATH, so lmesh must receive it explicitly.
 PATH = "/ws/dmesh/target/x86_64-unknown-linux-musl/release:/ws/dmesh/target/nix/profile/bin:/nix/var/nix/profiles/default/bin:/usr/bin:/bin"
 # The binary owns its endpoint defaults: /run/mesh/lmesh/mesh.sock.cbor,
-# localhost HTTP 18981, and normal UDP/QUIC-lite 3336.
+# localhost HTTP 18981, and the DMesh UDP port 3339 shared with ESP32 and Android.
 # mesh-init supplies HOME and creates /run/mesh/lmesh before launch.
 # Change this per host; do not hardcode a physical wlan name in the binary.
+# Owned-device files written by companion.pair (mode 0600 files in a 0700 directory).
+DMESH_PAIRED_DEVICES_DIR = "/home/lmesh/etc/paired"
+# For companion-link debugging add QUIC_LITE_PCAP=<file.pcap> and UART_CODEC_LOG=<file> here
+# (both grow without limit; remove them again).
 LMESH_INTERFACES = "wlan0"
 LMESH_WIFI_IFACE = "wlan0"
 # `costin` is the shared UDP6 LAN label. This host reaches it through br-lan;

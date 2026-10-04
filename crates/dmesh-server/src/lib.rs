@@ -93,6 +93,8 @@ pub mod wake;
 #[cfg(feature = "std")]
 pub mod ble_service;
 #[cfg(feature = "std")]
+pub mod companion_pair;
+#[cfg(feature = "std")]
 pub mod companion_service;
 /// Typed request/response structs for every `portable` and `android` method,
 /// generated from `API.md` (serde plus `mesh::tagged::TaggedFields`).

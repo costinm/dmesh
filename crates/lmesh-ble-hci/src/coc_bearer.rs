@@ -1,13 +1,13 @@
 //! QUIC-lite bearer over one encrypted Linux BLE CoC packet channel.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use quic_lite::{
     BearerContext, BearerInfo, BearerName, EgressSubmission, PacketBearer, PacketEgress,
     PacketMeta, PacketPool, PacketSendOutcome, PacketSubmitError, PeerL2Address,
 };
 
-use crate::{COC_PACKET_MAX, CocChannel};
+use crate::coc::{COC_PACKET_MAX, CocChannel, DEFAULT_COC_PSM};
 
 /// One connected BLE CoC exposed as an opaque packet bearer.
 ///
@@ -16,21 +16,36 @@ use crate::{COC_PACKET_MAX, CocChannel};
 /// represented by a distinct `PeerL2Address`, consistent with UDP, ESP-NOW,
 /// multi-port UART, and Android's Java-owned BLE bearer.
 pub struct CocBearer {
-    channel: Arc<Mutex<CocChannel>>,
+    channel: Arc<CocChannel>,
     info: BearerInfo,
 }
 
 impl CocBearer {
-    /// Wrap an already encrypted, connected CoC. Pairing remains outside QUIC.
-    pub fn new(channel: CocChannel) -> Self {
+    /// Connect a CoC to `address` (a BLE address from a scan) on `psm`,
+    /// default 128. The link must negotiate encryption; BlueZ's agent owns user
+    /// consent and bond persistence. The bearer adds no cryptography of its own
+    /// and carries no credentials; the device decides what a peer may do.
+    pub fn connect(address: &str, psm: Option<u16>) -> anyhow::Result<Self> {
+        Ok(Self::new(CocChannel::connect(
+            address,
+            psm.unwrap_or(DEFAULT_COC_PSM),
+        )?))
+    }
+
+    pub(crate) fn channel(&self) -> Arc<CocChannel> {
+        self.channel.clone()
+    }
+
+    fn new(channel: CocChannel) -> Self {
         Self {
-            channel: Arc::new(Mutex::new(channel)),
+            channel: Arc::new(channel),
             info: BearerInfo {
                 name: BearerName::new("ble-coc").expect("static bearer name is valid"),
                 max_packet_size: COC_PACKET_MAX,
                 prefix_required: 0,
                 suffix_required: 0,
                 requires_packet_encryption: false,
+                // connect() refuses a link that did not negotiate encryption.
                 secure_link: true,
                 nominal_bitrate_bps: 1_000_000,
                 local_mac: None,
@@ -45,11 +60,7 @@ impl<B: AsRef<[u8]>> PacketEgress<B> for CocBearer {
         _peer: PeerL2Address,
         submission: EgressSubmission<B>,
     ) -> Result<(), PacketSubmitError<B>> {
-        let outcome = self
-            .channel
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .write_packet(submission.packet().bytes());
+        let outcome = self.channel.write_packet(submission.packet().bytes());
         submission.complete(
             if outcome.is_ok() {
                 PacketSendOutcome::Sent
@@ -81,10 +92,7 @@ where
                 let peer = PeerL2Address::new(1).expect("one is a valid CoC peer");
                 loop {
                     let packet = context.pool().build_packet(0, 0, |output| {
-                        channel
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .read_packet(output)
+                        channel.read_packet(output)
                     });
                     match packet {
                         Ok(packet) => context.enqueue_packet(

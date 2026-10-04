@@ -20,13 +20,14 @@ extern "C" {
         value: *const core::ffi::c_void,
         length: usize,
     ) -> i32;
+    fn nvs_erase_key(handle: u32, key: *const i8) -> i32;
     fn nvs_commit(handle: u32) -> i32;
     fn nvs_close(handle: u32);
 }
 
 const NVS_READONLY: i32 = 0;
 const NVS_READWRITE: i32 = 1;
-const SETTINGS_KEYS: [&[u8]; 8] = [
+const SETTINGS_KEYS: [&[u8]; 9] = [
     b"mode",
     b"name",
     b"domain",
@@ -35,6 +36,7 @@ const SETTINGS_KEYS: [&[u8]; 8] = [
     b"sta_server_port",
     b"ble.auto",
     b"quic.pool",
+    b"nan_dw_interval",
 ];
 // Private settings are write-only. `id_p256` is created internally and stored
 // as a binary NVS blob; it is never a settings transport value.
@@ -222,6 +224,7 @@ pub(crate) fn write_setting(key: &[u8], value: &[u8]) -> bool {
         b"sta_server_port" => parse_port(value).is_some(),
         b"ble.auto" => matches!(value, b"true" | b"false"),
         b"quic.pool" => parse_packet_pool_slots(value).is_some(),
+        b"nan_dw_interval" => matches!(value, b"1" | b"8" | b"16"),
         _ => false,
     };
     if !valid {
@@ -307,12 +310,40 @@ pub(crate) fn write_binary_setting(key: &[u8], value: &[u8]) -> bool {
     result
 }
 
+/// Erase one NVS key; one that was never written counts as erased.
+fn erase_key(namespace: &[u8], key: &[u8]) -> bool {
+    const NOT_FOUND: i32 = 0x1102;
+    let _ = unsafe { nvs_flash_init() };
+    let mut handle = 0_u32;
+    match unsafe { nvs_open(namespace.as_ptr().cast(), NVS_READWRITE, &mut handle) } {
+        0 => {}
+        NOT_FOUND => return true,
+        _ => return false,
+    }
+    let erased = matches!(unsafe { nvs_erase_key(handle, key.as_ptr().cast()) }, 0 | NOT_FOUND)
+        && unsafe { nvs_commit(handle) } == 0;
+    unsafe { nvs_close(handle) };
+    erased
+}
+
+/// Forget the shared secret and the control-plane root, returning the device to
+/// unpaired. The secret goes first: a failure part-way then leaves a device that
+/// still looks owned and can be unpaired again, not a half-erased one.
+/// Caller: the wired provisioning handler only.
+pub fn clear_pairing() -> bool {
+    erase_key(b"sec\0", SHARED_SECRET_NVS_KEY) && erase_key(b"dmesh\0", CONTROL_PLANE_NVS_KEY)
+}
+
 /// Commit credentials from the bearer-verified Main provisioning handler.
 /// The shared secret is the last NVS write: until it commits the device stays
 /// unpaired and a failed attempt can be repeated after another NAN invitation.
-pub fn install_pairing(name: &str, root_public_key: &[u8], secret: &[u8]) -> bool {
-    if !pairing_window_open()
-        || shared_secret_exists()
+///
+/// `replace` is for a physically attached host (UART/USB): it may set the
+/// secret of an already paired device and needs no pairing window, as that host
+/// could reflash the device anyway. Over a radio bearer (BLE) a device that has
+/// a secret, or has no open pairing window, refuses.
+pub fn install_pairing(name: &str, root_public_key: &[u8], secret: &[u8], replace: bool) -> bool {
+    if !replace && (!pairing_window_open() || shared_secret_exists())
         || secret.len() != 32
         || root_public_key.len() != 33
         || !matches!(root_public_key[0], 2 | 3)
@@ -419,6 +450,15 @@ pub(crate) fn apply_sta_profile_from_nvs(profile: &mut crate::TransportProfile) 
 pub(crate) struct BootPowerPolicy {
     pub(crate) sleepy: bool,
     pub(crate) soft_sleep: bool,
+}
+
+fn boot_nan_dw_interval() -> u8 {
+    let mut value = [0u8; 4];
+    match read_setting(b"nan_dw_interval", &mut value).map(|used| &value[..used]) {
+        Some(b"1") => 1,
+        Some(b"16") => 16,
+        _ => 8,
+    }
 }
 
 pub fn boot_ble_auto() -> bool {
@@ -548,6 +588,7 @@ pub(crate) fn send_transition_announce(
     now_active: bool,
     sta_active: bool,
 ) {
+    crate::wifi_nan_dw_capture_esp::set_now_cluster(now_active);
     if let Some((record, used)) = announce_record(kind, uptime_secs, 0, 0) {
         let _ = crate::wifi_nan_dw_capture_esp::configure_active_publish(
             crate::wifi_nan_dw_capture_esp::active_on_nan_channel(),
@@ -603,14 +644,11 @@ fn broadcast_udp_discovery_announce(record: &[u8]) -> bool {
 /// selected interval controls the next phase-locked wake; it must not change
 /// whether Main is allowed to sleep between those spans.
 pub(crate) fn is_sleepy_profile(profile: &crate::TransportProfile) -> bool {
-    profile.requested_transport == Some(dmesh_server::control::TransportKind::Nan)
+    profile.is_nan_only()
         && matches!(profile.nan_dw_interval, 1 | 8 | 16)
-        && profile.now == 2
-        && profile.ap == 0
         // Sleep is reserved for a NAN-only Wi-Fi personality. STA/AP/NOW
         // keep the radio reachable continuously; UART remains installed and
         // can receive whenever the CPU is awake, but does not prevent sleep.
-        && profile.ssid_len == 0
 }
 
 /// Physical light sleep is part of every explicit sleepy profile. UART0 and
@@ -804,6 +842,20 @@ pub(crate) fn maybe_enter_sleep(
     let after_resume_us = unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) as u64;
     let radio_resume_us = dw8_now_us().wrapping_sub(woke_us);
     DW8_LAST_RADIO_RESUME_US.store(radio_resume_us, Ordering::Release);
+    // Private soak diagnostics: sample the same heap projection as the public
+    // memory handler, without opening an association or allocating a log string.
+    static RESUME_SAMPLES: AtomicU32 = AtomicU32::new(0);
+    if RESUME_SAMPLES.fetch_add(1, Ordering::Relaxed) % 64 == 0 {
+        let memory = crate::shared_ingress_esp::memory_stats();
+        crate::commands::send_stats(&[
+            (b"nan heap free", u64::from(memory.free_internal_bytes)),
+            (b"nan heap minimum", u64::from(memory.min_free_internal_bytes)),
+            (b"nan heap largest", u64::from(memory.largest_internal_block_bytes)),
+            (b"nan main stack free", unsafe {
+                esp_idf_sys::uxTaskGetStackHighWaterMark2(core::ptr::null_mut()) as u64
+            }),
+        ]);
+    }
     crate::wifi_nan_dw_capture_esp::set_sleepy_dw_pair(*nan_now_started);
     // A rejected `esp_light_sleep_start` leaves the radio stopped above, so
     // it still requires exactly one recovery restart.  It is *not* a wake:
@@ -1057,8 +1109,6 @@ pub(crate) fn apply_nan_epoch(
     }
     if *nan_now_started {
         crate::wifi_esp::stop_sta_extensions();
-        crate::wifi_esp::stop_sta();
-        crate::wifi_esp::restart_sta_driver_runtime();
     }
     crate::core_runtime::prepare_espnow_association(profile);
     *nan_now_started =
@@ -1092,7 +1142,10 @@ pub(crate) fn apply_sta_nan_extensions(
     sta_extensions_enabled: &mut bool,
     applied_nan_dw_interval: &mut Option<u8>,
 ) {
-    if !wifi_started {
+    // STA setup is asynchronous. Installing discovery-window capture while
+    // authentication/association is in progress can pin the channel and abort
+    // that attempt. The connected event reconciles extensions once STA is live.
+    if !wifi_started || (wants_sta(profile) && !crate::wifi_esp::sta_associated()) {
         return;
     }
     if wants_sta_extensions(profile) != *sta_extensions_enabled {
@@ -1188,6 +1241,14 @@ fn start_nan_ap_raw_bearer_if_needed(profile: &crate::TransportProfile, state: &
 /// epoch. Called only for a queued profile generation that requests STA, or a
 /// deadline retry of that incomplete generation; it does not run on idle.
 fn start_sta_epoch(profile: &crate::TransportProfile, generation: u32, state: &mut MainRadioState) {
+    use dmesh_server::cbor::FieldValue::{Unsigned as U, Bool as B};
+    crate::wifi_esp::sta_diagnostic("wifi.sta_owner_start", &[
+        (1, U(generation as u64)), (2, U(state.applied_sta_start_generation as u64)),
+        (3, U(state.transition_announced_generation as u64)),
+        (4, B(state.wifi_started)), (5, B(state.nan_now_started)),
+        (6, B(state.sta_associated)), (7, B(crate::wifi_esp::sta_associated())),
+        (8, B(state.sta_retry_pending)), (9, U(state.sta_wake_retries_left as u64)),
+    ]);
     if NAN_WAKE_STA_REQUESTED.swap(false, Ordering::AcqRel) {
         state.sta_wake_retries_left = NAN_WAKE_STA_RETRY_BUDGET;
         crate::commands::send_stat(
@@ -1197,11 +1258,9 @@ fn start_sta_epoch(profile: &crate::TransportProfile, generation: u32, state: &m
     }
     if state.nan_now_started {
         crate::wifi_esp::stop_sta_extensions();
-        crate::wifi_esp::stop_sta();
         // Stopping a path does not discard the bearer-neutral QUIC
         // connection. A valid packet on the replacement path adopts that
         // path while retaining DCIDs, streams, and handler state.
-        crate::wifi_esp::restart_sta_driver_runtime();
         state.nan_now_started = false;
     }
     state.sta_associated = false;
@@ -1212,7 +1271,7 @@ fn start_sta_epoch(profile: &crate::TransportProfile, generation: u32, state: &m
             state.applied_nan_dw_interval = None;
         }
         crate::wifi_raw_udp6_esp::stop();
-        // Wi-Fi owns the complete driver/callback replacement.
+        // Wi-Fi updates association settings, retaining unchanged driver policy.
         crate::wifi_esp::replace_sta(profile);
     } else {
         crate::wifi_esp::init_sta(profile);
@@ -1254,13 +1313,19 @@ fn stop_sta_epoch_for_nan(
     now_ms: u64,
     state: &mut MainRadioState,
 ) {
+    use dmesh_server::cbor::FieldValue::{Unsigned as U, Bool as B};
+    crate::wifi_esp::sta_diagnostic("wifi.sta_owner_stop", &[
+        (1, U(generation as u64)), (2, B(wants_sta(profile))),
+        (3, B(state.sta_associated)), (4, B(crate::wifi_esp::sta_associated())),
+        (5, B(state.sta_retry_pending)), (6, U(crate::wifi_esp::sta_last_disconnect_reason() as u64)),
+    ]);
     if state.sta_extensions_enabled {
         crate::wifi_esp::stop_sta_extensions();
         state.sta_extensions_enabled = false;
         state.applied_nan_dw_interval = None;
     }
     crate::wifi_raw_udp6_esp::stop();
-    crate::wifi_esp::stop_sta();
+    crate::wifi_esp::disconnect_sta_retaining_driver();
     state.wifi_started = false;
     state.sta_associated = false;
     reset_sta_applied_state(
@@ -1730,6 +1795,53 @@ fn apply_sleep_boundary(
     if !is_sleepy_profile(profile) {
         return false;
     }
+    crate::wifi_nan_dw_capture_esp::set_sleepy_dw_pair(true);
+    // A wake admitted during this DW may have queued a newer STA profile.
+    // Do not sleep using the turn's stale NAN snapshot before applying it.
+    let latest_generation = crate::profile_store::generation();
+    if generation != latest_generation
+        || dmesh_server::main_runtime_state::nan_wake_hold_remaining(
+            now_ms as u32, NAN_WAKE_AWAKE_UNTIL_MS.load(Ordering::Acquire),
+        ) != 0
+    {
+        // Emit one observation per deferred desired generation, not a log
+        // per idle deadline. This distinguishes an unsettled control stream
+        // from an SDK/peripheral sleep veto without formatting or allocation.
+        static REPORTED_PENDING_GENERATION: AtomicU32 = AtomicU32::new(0);
+        if generation != latest_generation
+            && REPORTED_PENDING_GENERATION.swap(latest_generation, Ordering::Relaxed) != latest_generation
+        {
+            use dmesh_server::cbor::FieldValue::{Unsigned as U, Bool as B};
+            crate::wifi_esp::sta_diagnostic("wifi.pm_wait_profile", &[
+                (1, U(generation as u64)), (2, U(latest_generation as u64)),
+                (3, U(PROFILE_CHANGE_AFTER_RESPONSE.load(Ordering::Acquire) as u64)),
+                (4, U(now_ms)), (5, U(state.sleepy_awake_until_ms)),
+                (6, B(state.nan_now_started)), (7, B(state.wifi_started)),
+            ]);
+        }
+        return false;
+    }
+    if !soft_sleep && role == 1 && state.nan_now_started && !state.wifi_started {
+        // NAN-only is an unassociated STA radio, not an IP association. Keep
+        // the driver and interface installed. The DW owner uses PS_NONE while
+        // receiving NAN+NOW, then PS_MAX_MODEM; ESP-IDF's disconnected-STA PM
+        // and tickless idle release the radio/CPU between those one-shot
+        // deadlines. Stopping/restarting Wi-Fi here churned driver allocation
+        // on every DW and required an unnecessary cold-radio wake lead.
+        if dmesh_server::main_runtime_state::nan_idle_pm_ready(
+            now_ms, state.sleepy_awake_until_ms,
+            NAN_WAKE_AWAKE_UNTIL_MS.load(Ordering::Acquire), true,
+        ) {
+            if state.sleepy_awake_until_ms != 0 {
+                crate::uart_esp::suspend_for_light_sleep();
+                if crate::power_esp::configure(true) {
+                    state.sleepy_awake_until_ms = 0;
+                    crate::commands::send_response(b"nan idle PM armed: radio retained");
+                }
+            }
+        }
+        return false;
+    }
     // A selected beacon can prove the current NAN+NOW pair began earlier than
     // the conservative predicted phase. Honor only the bounded capture lease
     // published by that owner; without a selected beacon the original
@@ -1896,9 +2008,19 @@ static PROFILE_CHANGE_AFTER_RESPONSE: AtomicU32 = AtomicU32::new(0);
 /// request to abandon its new STA epoch after one failed association event.
 static NAN_WAKE_STA_REQUESTED: AtomicBool = AtomicBool::new(false);
 const NAN_WAKE_STA_RETRY_BUDGET: u8 = 3;
+static NAN_WAKE_AWAKE_UNTIL_MS: AtomicU32 = AtomicU32::new(0);
 
 pub(crate) fn note_nan_wake_sta_requested() {
+    let now = unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) as u64 / 1_000;
+    NAN_WAKE_AWAKE_UNTIL_MS.store(
+        (now as u32).wrapping_add(dmesh_server::main_runtime_state::NAN_WAKE_ACTIVE_MS),
+        Ordering::Release,
+    );
     NAN_WAKE_STA_REQUESTED.store(true, Ordering::Release);
+}
+
+pub(crate) fn clear_nan_wake_awake_lease() {
+    NAN_WAKE_AWAKE_UNTIL_MS.store(0, Ordering::Release);
 }
 /// Durable service work posted by ESP-IDF callbacks and the one-shot timer.
 ///
@@ -2005,11 +2127,19 @@ fn defer_profile_change_until_response(generation: u32) {
     PROFILE_CHANGE_AFTER_RESPONSE.store(generation, Ordering::Release);
 }
 
-/// Called at QUIC-lite's terminal-response delivery edge.  It is deliberately
-/// a no-op unless a stream control request committed a profile transition.
-pub(crate) fn profile_response_delivered() {
-    let generation = PROFILE_CHANGE_AFTER_RESPONSE.swap(0, Ordering::AcqRel);
-    if generation != 0 {
+/// Apply only the generation owned by this completed response. A concurrent
+/// settings read or an older response must not release a newer transition.
+fn profile_response_finished(generation: u32) {
+    let deferred = PROFILE_CHANGE_AFTER_RESPONSE.load(Ordering::Acquire);
+    let matched = PROFILE_CHANGE_AFTER_RESPONSE.compare_exchange(
+        generation, 0, Ordering::AcqRel, Ordering::Acquire,
+    ).is_ok();
+    use dmesh_server::cbor::FieldValue::{Unsigned as U, Bool as B};
+    crate::wifi_esp::sta_diagnostic("wifi.profile_response_finished", &[
+        (1, U(generation as u64)), (2, U(crate::profile_store::generation() as u64)),
+        (3, U(deferred as u64)), (4, B(matched)),
+    ]);
+    if matched {
         enqueue_profile_change(generation);
     }
 }
@@ -2042,6 +2172,8 @@ pub(crate) fn request_deadline_recheck() {
 /// ingress queue. The packet itself remains in the shared pool.
 pub(crate) fn request_quic_ingress() {
     enqueue_adapter_completion(DEADLINE_QUIC_INGRESS);
+    // Recovery has its own serialized owner, not Main's event queue.
+    crate::core_runtime::request_connection_deadline_recheck();
 }
 
 /// Wake the Main owner after the shared connection worker changed NOW
@@ -2263,15 +2395,21 @@ fn receive_tagged_control_with_delivery(
         if defer_until_response_delivery {
             defer_profile_change_until_response(generation);
         } else {
+            PROFILE_CHANGE_AFTER_RESPONSE.store(0, Ordering::Release);
             enqueue_profile_change(generation);
         }
+        use dmesh_server::cbor::FieldValue::{Unsigned as U, Bool as B};
+        crate::wifi_esp::sta_diagnostic("wifi.profile_request", &[
+            (1, U(generation as u64)), (2, B(defer_until_response_delivery)),
+            (3, B(is_sleepy_profile(&crate::profile_store::snapshot()))),
+        ]);
     }
     (response_len != 0).then(|| alloc::vec::Vec::from(&response[..response_len]))
 }
 
 /// The control component's handler for every delivery form. A stream request
-/// retains its requested profile until the terminal response is
-/// delivery-confirmed on that same stream. A connectionless message sends its
+/// retains its requested profile until the terminal response has finished
+/// on that same stream. A connectionless message sends its
 /// copied reply before returning, so its profile transition proceeds
 /// immediately without a QUIC ACK edge.
 pub(crate) fn receive_tagged_control(
@@ -2282,6 +2420,29 @@ pub(crate) fn receive_tagged_control(
         record,
         context.delivery == dmesh_server::registry::Delivery::Stream,
     )
+}
+
+/// Stream profile changes take effect after their normal response FIN, not
+/// after a removed transport-specific "delivery status" callback.
+struct MainControlHandler;
+
+impl dmesh_server::stream::StreamHandler for MainControlHandler {
+    fn open<'a>(&'a self, request: dmesh_server::stream::Request<'a>)
+        -> dmesh_server::stream::OpenFuture<'a>
+    {
+        use dmesh_server::stream::{Outcome, Response};
+        let before = crate::profile_store::generation();
+        let outcome = receive_tagged_control(request.record, request.context).map(|header| {
+            let response = Response::header(header);
+            let generation = crate::profile_store::generation();
+            let response = if request.context.delivery == dmesh_server::registry::Delivery::Stream
+                && generation != before {
+                response.after_finish(move || profile_response_finished(generation))
+            } else { response };
+            Outcome::Respond(response)
+        });
+        alloc::boxed::Box::pin(core::future::ready(outcome))
+    }
 }
 
 /// Encode the complete, bounded result of a control-stream operation.
@@ -2412,6 +2573,7 @@ pub(crate) fn receive_tagged_discovery_nodes(
         last_kind: 0,
         last_payload_len: 0,
         last_payload_hash: 0,
+        ..Default::default()
     }; crate::wifi_nan_dw_capture_esp::NAN_DEVICE_OBSERVATION_CAPACITY];
     let mut count = 0;
     for snapshot in snapshots.iter().flatten() {
@@ -2442,6 +2604,7 @@ pub(crate) fn receive_tagged_discovery_nodes(
             last_kind: snapshot.last_kind,
             last_payload_len: snapshot.last_payload_len,
             last_payload_hash: snapshot.last_payload_hash,
+            ..Default::default()
         };
         count += 1;
     }
@@ -3191,6 +3354,7 @@ pub(crate) struct MainRuntimeService {
 struct MainCoordinator {
     service: MainRuntimeService,
     radio: MainRadioState,
+    committed_profile: crate::TransportProfile,
     runtime_state: dmesh_server::main_runtime_state::MainRuntimeState,
     soft_sleep: bool,
     boot_radio_ready: Option<fn()>,
@@ -3258,12 +3422,17 @@ impl MainCoordinator {
             service_radio_deadline(deadline_services);
         }
         let now_ms = (unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) as u64) / 1_000;
-        let profile = crate::core_runtime::transport_profile_snapshot();
-        let generation = match event {
-            MainRuntimeEvent::Deadline { .. } | MainRuntimeEvent::AdapterComplete { .. } => {
-                self.radio.transition_announced_generation
-            }
-            MainRuntimeEvent::ProfileChanged { generation } => generation,
+        // Storage can contain a request whose response has not finished yet.
+        // Adapter completions must operate on the committed owner profile,
+        // not combine that pending profile with the previous generation.
+        let profile_changed = matches!(event, MainRuntimeEvent::ProfileChanged { generation }
+            if generation == crate::profile_store::generation()
+                && generation != PROFILE_CHANGE_AFTER_RESPONSE.load(Ordering::Acquire));
+        let (profile, generation) = if profile_changed {
+            self.committed_profile = crate::core_runtime::transport_profile_snapshot();
+            (self.committed_profile, crate::profile_store::generation())
+        } else {
+            (self.committed_profile, self.radio.transition_announced_generation)
         };
         if sta_lifecycle_completion
             && self.radio.wifi_started
@@ -3326,7 +3495,7 @@ impl MainCoordinator {
             profile,
             generation,
             now_ms,
-            profile_changed: matches!(event, MainRuntimeEvent::ProfileChanged { .. }),
+            profile_changed,
         }
     }
 
@@ -3355,16 +3524,23 @@ impl MainCoordinator {
             dmesh_server::main_runtime_state::MainEffect::None
         };
         if work.profile_changed {
+            // An explicit configuration starts a fresh attempt. The old
+            // failure's discovery cooldown applies only to automatic retries.
+            self.radio.sta_retry_pending = false;
+            self.radio.sta_retry_due = false;
+            crate::wifi_nan_dw_capture_esp::set_sleepy_dw_pair(is_sleepy_profile(&work.profile));
             // Only the explicit NAN-only sleepy profile enables automatic
             // CPU idle light sleep. Active profiles stay responsive even if
             // their radios momentarily have no peripheral PM lock.
-            let _ = crate::power_esp::configure(is_sleepy_profile(&work.profile));
+            // Preserve the explicit command grace, then arm NAN idle PM at
+            // the single owner deadline. Active personalities never arm it.
+            let _ = crate::power_esp::configure(false);
             if is_sleepy_profile(&work.profile) {
                 // Arm a single deadline after the radio transition settles.
                 // Without this, a volatile DW8 request has no subsequent
                 // Main-owner wake on which to evaluate explicit light sleep.
                 self.radio.sleepy_awake_until_ms = work.now_ms.saturating_add(DEBUG_AWAKE_GRACE_MS);
-                crate::commands::send_response(b"sleep DW armed: command window 5000ms");
+                crate::commands::send_stat(b"nan command grace_ms", DEBUG_AWAKE_GRACE_MS);
             }
             record_power_completion(&mut self.runtime_state);
         }
@@ -3455,25 +3631,20 @@ pub(crate) fn run_main_service(service: MainRuntimeService) {
     // In its absence Main retains the ordinary NAN/NOW startup and accepts a
     // later volatile transport.start command.
     let boot_power_policy = crate::main_runtime::boot_power_policy_from_nvs();
-    // A provisioned STA profile is an alternate always-reachable bearer, so
-    // it must not be hidden by a stale sleepy power setting. `sleepy` is only
-    // meaningful for the unassociated NAN-only boot personality.
-    let mut boot_sta_profile = crate::TransportProfile::new();
-    let has_provisioned_sta =
-        service.role == 1 && crate::sta_profile_esp::load(&mut boot_sta_profile);
-    let sleepy_boot = service.role == 1 && boot_power_policy.sleepy && !has_provisioned_sta;
+    // Stored credentials are available for a later NAN wake, not authority
+    // to override the explicit NVS NAN-only/sleepy boot personality.
+    let sleepy_boot = service.role == 1 && boot_power_policy.sleepy;
     // Automatic CPU idle sleep is selected before the Wi-Fi owner starts.
     // It is not the explicit DW physical-sleep policy: active peripherals
     // retain their own PM locks and prevent entry where needed.
-    let _ = crate::power_esp::configure(sleepy_boot);
+    let _ = crate::power_esp::configure(false);
     unsafe { esp_idf_sys::esp_rom_printf(b"DMESH main: power\n\0".as_ptr().cast()) };
     crate::profile_store::with_profile(|params| {
         params.command_mode = service.role == 2 || !sleepy_boot;
         if sleepy_boot {
-            // This branch is selected only when no complete STA profile was
-            // provisioned; sleepy boot is therefore strictly NAN-only.
+            let _ = crate::sta_profile_esp::load(params);
             params.requested_transport = Some(dmesh_server::control::TransportKind::Nan);
-            params.nan_dw_interval = 8;
+            params.nan_dw_interval = boot_nan_dw_interval();
             params.now = 2;
             params.ap = 0;
             // Sleepy mode is NAN-only at the Wi-Fi layer. Keep the UART
@@ -3518,23 +3689,18 @@ pub(crate) fn run_main_service(service: MainRuntimeService) {
         SyncFn(crate::main_runtime::receive_tagged_diagnostics),
     ));
     assert!(registry::register(
-        methods::FIRMWARE_IDENTITY,
-        SyncFn(crate::firmware_identity::receive_tagged_identity),
+        methods::TELEMETRY_DEVICE,
+        SyncFn(crate::device_telemetry::receive),
     ));
     assert!(registry::register_stream(
         methods::OBJECT_FLASH,
         dmesh_server::verified_object::FlashHandler(crate::flash::EspFlashPlatform),
     ));
     crate::quic_node_esp::register_probe_handlers();
-    assert!(registry::register_all(
-        &[
-            methods::SETTINGS_GET,
-            methods::SETTINGS_SET,
-            methods::SETTINGS_LIST,
-            methods::TRANSPORT_SET,
-        ],
-        SyncCtxFn(crate::main_runtime::receive_tagged_control),
-    ));
+    for method in [methods::SETTINGS_GET, methods::SETTINGS_SET,
+        methods::SETTINGS_LIST, methods::TRANSPORT_SET] {
+        assert!(registry::register_stream(method, MainControlHandler));
+    }
     // `discovery.nodes` is the bounded production inventory read used by a
     // relay controller to select its next hop. The compact direct form is
     // retained for UART/NAN/NOW diagnostics only; normal administration uses
@@ -3709,6 +3875,7 @@ pub(crate) fn run_main_service(service: MainRuntimeService) {
         boot_radio_ready: service.boot_radio_ready,
         service,
         radio: state,
+        committed_profile: initial_profile,
         runtime_state,
         soft_sleep,
         sidecar_notified_generation: 0,
@@ -3822,6 +3989,13 @@ fn service_requested_reset() {
     unsafe { esp_idf_sys::esp_restart() };
 }
 
+/// The common stream writer has finished the ordinary handler response.
+/// Wake Main's owner to perform the same orderly STA leave/reset as runtime.reset.
+pub(crate) fn request_reset_after_response() {
+    RESET_REQUESTED.store(true, Ordering::Release);
+    request_quic_ingress();
+}
+
 impl MainRadioState {
     /// Construct Main's initial unassociated epoch. Called exactly once after
     /// the boot profile has been applied and before any bearer can enqueue a
@@ -3863,7 +4037,13 @@ impl MainRadioState {
                 0
             },
             sleepy_blocker_reported_generation: 0,
-            sta_wake_retries_left: 0,
+            // A freshly rebooted STA can receive a temporary AP refusal while
+            // its previous association expires. Give boot the same finite
+            // reconnect allowance as directed activation before the normal
+            // five-minute discovery fallback. Success clears this allowance.
+            sta_wake_retries_left: if wants_sta(&crate::profile_store::snapshot()) {
+                NAN_WAKE_STA_RETRY_BUDGET
+            } else { 0 },
         }
     }
 }
@@ -4267,9 +4447,8 @@ pub(crate) fn receive_tagged_power_snapshot(
 }
 
 /// Serve the common packet-ingress memory watermark over any tagged bearer.
-/// The callback only copies atomics maintained by that worker; it neither
-/// allocates a packet slot nor waits on the worker queue, so querying memory
-/// cannot perturb the watermark being observed.
+/// Read pool counters and ESP-IDF heap observations without allocating a
+/// packet slot or waiting on an ingress worker (that worker is retired).
 ///
 /// Result fields (`telemetry.memory` in `API.md`, numbered from 1): `1`
 /// packet-pool slots, `2` free packet-pool slots, `3` admission drops, `4`

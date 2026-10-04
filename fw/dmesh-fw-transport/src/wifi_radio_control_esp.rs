@@ -156,6 +156,7 @@ fn policy_value(policy: RawWifiDwPolicy) -> u8 {
 /// Capture current radio state and monotonic raw action counters.  The
 /// snapshot is intentionally cheap and has no UART/CBOR side effect.
 pub fn snapshot() -> RawWifiSnapshot {
+    let sta_config = crate::wifi_esp::sta_driver_config();
     let (rx, drops, tx, failures) = crate::wifi_espnow_esp::stats();
     let (dispatcher, _tx_hook, parser_rejected, self_echo) =
         crate::wifi_espnow_esp::receive_diagnostics();
@@ -270,6 +271,20 @@ pub fn snapshot() -> RawWifiSnapshot {
         sta_raw_rx_enabled: Some(crate::wifi_raw_udp6_esp::started()),
         sta_connect_to_associated_ms: crate::wifi_esp::sta_connect_to_associated_ms(),
         sta_last_disconnect_reason: Some(crate::wifi_esp::sta_last_disconnect_reason()),
+        sta_connections: Some(crate::wifi_esp::sta_diagnostic_counters().0),
+        sta_disconnections: Some(crate::wifi_esp::sta_diagnostic_counters().1),
+        sta_last_event_disconnect_reason: Some(crate::wifi_esp::sta_diagnostic_counters().2),
+        sta_diagnostic_log_drops: Some(crate::wifi_esp::sta_diagnostic_counters().3),
+        sta_scan_rssi_threshold_dbm: sta_config.as_ref().map(|c| c.rssi_threshold),
+        sta_scan_authmode_threshold: sta_config.as_ref().map(|c| c.authmode_threshold),
+        sta_config_channel: sta_config.as_ref().map(|c| c.channel),
+        sta_config_bssid: sta_config.as_ref().map(|c| c.bssid),
+        sta_config_bssid_set: sta_config.as_ref().map(|c| c.bssid_set),
+        sta_scan_method: sta_config.as_ref().map(|c| c.scan_method),
+        sta_pmf_capable: sta_config.as_ref().map(|c| c.pmf_capable),
+        sta_pmf_required: sta_config.as_ref().map(|c| c.pmf_required),
+        sta_sae_pwe_method: sta_config.as_ref().map(|c| c.sae_pwe_method),
+        sta_config_ssid: sta_config.as_ref().map(|c| c.ssid),
         sta_ap_rssi_dbm: crate::wifi_esp::sta_ap_rssi_dbm(),
         max_tx_power_qdbm: crate::wifi_esp::max_tx_power_qdbm(),
         // Packet pacing is owned by quic-lite; the bearer exposes no burst

@@ -1,10 +1,11 @@
 //! Main-owned ESP power-management adapter.
 //!
-//! This module deliberately has no worker, callback, or periodic tick.  The
+//! This module deliberately has no worker or periodic tick. The
 //! Main coordinator calls it only after an explicit active/sleepy policy
 //! transition.  ESP-IDF then performs DFS/automatic idle sleep itself when it
-//! has no PM locks; the synchronized DW8 physical sleep remains an explicit
-//! Main effect in `main_runtime`.
+//! has no PM locks. An IDLE-task exit callback records private diagnostic
+//! observations without allocating or logging; legacy explicit sleep remains
+//! a separate Main effect in `main_runtime`.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -39,11 +40,43 @@ static LIGHT_SLEEP_ENTRIES: AtomicU32 = AtomicU32::new(0);
 static LIGHT_SLEEP_SKIPPED: AtomicU32 = AtomicU32::new(0);
 static LAST_SLEEP_REQUESTED_US: AtomicU32 = AtomicU32::new(0);
 static LAST_SLEEP_DURATION_US: AtomicU32 = AtomicU32::new(0);
+static AUTO_SLEEP_EXITS: AtomicU32 = AtomicU32::new(0);
+static AUTO_SLEEP_TOTAL_US: AtomicU32 = AtomicU32::new(0);
+static AUTO_SLEEP_LAST_US: AtomicU32 = AtomicU32::new(0);
+static AUTO_CALLBACK_REGISTERED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+// IDLE-task callback: do not allocate, log, or block here. The exit duration
+// is supplied by ESP-IDF, rather than inferred from configuration or uptime.
+// IDF also invokes this after a rejected attempt; ignore short returns, which
+// cannot demonstrate the inter-window sleep interval. These are long-return
+// observations, not an exact count of every successful sleep entry.
+unsafe extern "C" fn automatic_sleep_exit(duration_us: i64, _arg: *mut core::ffi::c_void) -> i32 {
+    if duration_us >= 10_000 {
+        let duration = duration_us.min(i64::from(u32::MAX)) as u32;
+        AUTO_SLEEP_LAST_US.store(duration, Ordering::Relaxed);
+        AUTO_SLEEP_TOTAL_US.fetch_add(duration, Ordering::Relaxed);
+        AUTO_SLEEP_EXITS.fetch_add(1, Ordering::Relaxed);
+    }
+    esp_idf_sys::ESP_OK
+}
+
+/// Private diagnostic snapshot; total microseconds wraps after about 71 min.
+pub(crate) fn automatic_sleep_metrics() -> (u32, u32, u32, bool) {
+    (AUTO_SLEEP_EXITS.load(Ordering::Relaxed), AUTO_SLEEP_TOTAL_US.load(Ordering::Relaxed),
+     AUTO_SLEEP_LAST_US.load(Ordering::Relaxed), AUTO_CALLBACK_REGISTERED.load(Ordering::Relaxed))
+}
 
 /// Apply Main's active or sleepy PM policy after a boot/profile transition.
 /// It is never called by packet ingress or a radio callback.  USB-JTAG and
 /// the explicit DW8 sleep effect remain separate from this CPU-idle policy.
 pub fn configure(sleepy: bool) -> bool {
+    if !AUTO_CALLBACK_REGISTERED.load(Ordering::Relaxed) {
+        let mut callbacks = esp_idf_sys::esp_pm_sleep_cbs_register_config_t::default();
+        callbacks.exit_cb = Some(automatic_sleep_exit);
+        if unsafe { esp_idf_sys::esp_pm_light_sleep_register_cbs(&mut callbacks) } == esp_idf_sys::ESP_OK {
+            AUTO_CALLBACK_REGISTERED.store(true, Ordering::Relaxed);
+        }
+    }
     let config = esp_idf_sys::esp_pm_config_t {
         max_freq_mhz: ACTIVE_MAX_MHZ,
         min_freq_mhz: ACTIVE_MIN_MHZ,

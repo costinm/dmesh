@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use mesh::message::{
-    FIELD_IFACE, FIELD_LEN, FIELD_MEDIUM, FIELD_NETWORK, FIELD_NODE, FIELD_PAYLOAD, FIELD_RADIO_ID,
-    FIELD_RSSI, FIELD_SNR, FIELD_STATUS, MeshMessage, MeshMessageCodec,
+    FIELD_IFACE, FIELD_LEN, FIELD_MEDIUM, FIELD_NODE, FIELD_PAYLOAD, FIELD_RADIO_ID, FIELD_RSSI,
+    FIELD_STATUS, MeshMessage, MeshMessageCodec,
 };
 #[cfg(test)]
 use p256::ecdsa::Signature;
@@ -12,26 +12,24 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::os::fd::RawFd;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, Ordering},
 };
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::net::UdpSocket;
+use std::time::{Duration, Instant};
 
 use crate::load_default_infrastructure_credentials;
+use dmesh_rawnan::linux::*;
 use crate::radio_protocol;
-use dmesh_rawnan::service::FollowupDedup;
-use dmesh_rawnan::{Action as RawNanAction, NanActivePublish, NanState, RxFrame as RawNanRxFrame};
+use dmesh_rawnan::{NanActivePublish, NanState};
 use dmesh_server::discovery::{
     DiscoveryObservation as CommonDiscoveryObservation, DiscoveryPacketKind, OBSERVATION_BSSID,
     OBSERVATION_PAYLOAD_FINGERPRINT, OBSERVATION_PEER,
 };
 use dmesh_server::raw_wifi::{
-    WIFI_LINK_METRICS_SCHEMA_VERSION, WifiCaptureCounters, WifiLinkMetrics,
+    WifiCaptureCounters, WifiLinkMetrics,
 };
 
 const DEFAULT_WIFI_IFACE: &str = "wlan1";
@@ -39,7 +37,6 @@ const DEFAULT_WIFI_IFACE: &str = "wlan1";
 // A 700 ms probe cadence walks that phase rather than repeatedly landing on a
 // fixed 250/500 ms boundary.
 const DEFAULT_HCI_DEV: u16 = 0;
-const DEFAULT_RAW_WIFI_CHANNEL: u8 = 6;
 const DMESH_P2P_SSID: &str = "DIRECT-dmesh";
 const DMESH_P2P_PASSPHRASE: &str = "untrusted-open-mode";
 const DMESH_P2P_FREQUENCY_MHZ: u32 = 2437;
@@ -65,25 +62,6 @@ const MAX_DISCOVERED_DEVICES: usize = 256;
 /// evidence for a new peer or a material change, but never turn periodic SDF
 /// receipt into an event-log/trace stream.
 const DISCOVERY_EVENT_MIN_INTERVAL_MS: u128 = 15 * 60 * 1_000;
-/// CIDs identify live QUIC associations, so wall-clock milliseconds are not
-/// sufficient: parallel HTTP calls can begin in the same tick and must never
-/// consume each other's Initial ACK. This allocator is process-local; the
-/// peer's normal Initial handling still makes CID collision/replacement an
-/// explicit QUIC event rather than a radio concern.
-/// Lazily seeded so a supervised lmesh-wifi restart does not reuse the same
-/// first client CID against a device that still retains its prior NOW
-/// association. Zero means unseeded; it is not a valid wire CID.
-/// Keep the action-bearer Initial CID in the established four-byte wire
-/// range. Some already-deployed peers do not yet accept the full variable
-/// width compact CID range. Millisecond low bits still make the allocation
-/// range change across ordinary service restarts; a peer retains an idle
-/// association for seconds, not the 4.6-hour seed wrap interval./// The smallest deployed ESP-NOW/action receive path has a bounded payload
-/// below a 256-byte QUIC STREAM packet once long-header/frame overhead is
-/// included. This is a path fact, not a probe personality: MeshClient will
-/// move it into QUIC-lite's negotiated Path metadata. Until then, preserve a
-/// portable 128-byte probe fragment on NOW rather than letting a user-facing
-/// 256-byte request turn into a peer reset on classic ESP32 firmware.
-const ACTION_PATH_MAX_PROBE_PACKET_SIZE: u16 = 128;
 /// Only a bounded tail is needed to restore the at-most-256 live inventory.
 /// This keeps a provisioned persistent change log from becoming an unbounded
 /// startup read after months of topology churn.
@@ -93,50 +71,9 @@ const MAX_DISCOVERY_LOG_RESTORE_BYTES: u64 = 64 * 1_024;
 /// older `LMESH_WIFI_DISCOVERY_LOG`) to a provisioned durable path; do not
 /// silently depend on `/var/log` being writable by the service account.
 const DEFAULT_DISCOVERY_CHANGE_LOG: &str = "/run/mesh/lmesh-wifi/discovery.jsonl";
-const ETH_P_ALL: u16 = 0x0003;
-const ETH_P_DMESH: u16 = 0x88b5;
-const ETHERNET_HEADER_LEN: usize = 14;
-const IEEE80211_LLC_SNAP_LEN: usize = 8;
-const PACKET_ADD_MEMBERSHIP: libc::c_int = 1;
-const PACKET_MR_MULTICAST: libc::c_ushort = 0;
 
-/// Map action-bearer metadata to the opaque handle retained by QUIC.
-/// Encoding and decoding remain in this adapter; the connection dispatcher
-/// only compares the handle and selects it for egress.
-fn action_path_id(peer: [u8; 6]) -> quic_lite::PeerL2Address {
-    let value = (2_u64 << 48)
-        | ((peer[0] as u64) << 40)
-        | ((peer[1] as u64) << 32)
-        | ((peer[2] as u64) << 24)
-        | ((peer[3] as u64) << 16)
-        | ((peer[4] as u64) << 8)
-        | peer[5] as u64;
-    quic_lite::PeerL2Address::new(value).expect("action path is nonzero")
-}
 
-/// Discovery/status records are raw tagged CBOR on ESP-NOW. Every other
-/// action payload is an opaque QUIC packet for the ESP-NOW bearer.
-fn action_payload_is_discovery(packet: &[u8]) -> bool {
-    !matches!(
-        dmesh_server::raw_wifi::classify_espnow_payload(packet),
-        dmesh_server::raw_wifi::EspNowPayloadClass::QuicDatagram
-    )
-}
 
-fn action_path_peer(path: quic_lite::PeerL2Address) -> Option<[u8; 6]> {
-    let value = path.value();
-    if (value >> 48) as u8 != 2 {
-        return None;
-    }
-    Some([
-        (value >> 40) as u8,
-        (value >> 32) as u8,
-        (value >> 24) as u8,
-        (value >> 16) as u8,
-        (value >> 8) as u8,
-        value as u8,
-    ])
-}
 
 /// Process-local adapter state around the shared, allocation-free capture
 /// counters. Each lmesh/lmesh-wifi process has one radio owner, while the
@@ -148,6 +85,18 @@ struct HostCaptureCounters {
     socket_bytes: u64,
     socket_max_packet_bytes: u32,
     action_candidates: u64,
+}
+
+/// Retained monitor-event counts of one interface.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RawEventCounts {
+    pub rx: u64,
+    pub dispatch: u64,
+    pub dispatch_errors: u64,
+    pub action_seen: u64,
+    pub monitor_frames: u64,
+    pub action_candidates: u64,
+    pub socket_packets: u64,
 }
 
 static HOST_CAPTURE_COUNTERS: std::sync::OnceLock<Mutex<HostCaptureCounters>> =
@@ -163,253 +112,155 @@ fn discovery_event_gate() -> &'static Mutex<BTreeMap<String, (u128, String)>> {
     DISCOVERY_EVENT_GATE.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-/// A monitor VIF receives every matching action frame, including delayed
-/// packets from a previous association and unrelated NAN/management traffic.
-/// These errors mean that a captured frame is not usable for this client. A
-/// monitor capture can contain a stale/partially received action frame even
-/// after the CID filter, so the bearer must wait for QUIC-lite recovery rather
-/// than fail the whole probe on one damaged RF datagram.
-fn raw_action_receive_error_is_ambient(error: quic_lite::Error) -> bool {
-    matches!(
-        error,
-        quic_lite::Error::WrongConnectionId
-            | quic_lite::Error::BootstrapInvalid
-            | quic_lite::Error::Truncated
-            | quic_lite::Error::Invalid
-    )
+
+
+
+
+
+
+/// The application side of the raw capture loops: events into the history, announces
+/// into the inventory, NOW control records and directed-discovery waiters.
+struct RadioHost {
+    history: Arc<Mutex<VecDeque<RadioEvent>>>,
+    discovered_devices: Arc<Mutex<DiscoveredDeviceRegistry>>,
+    espnow_ingress: Arc<Mutex<Option<Arc<dyn crate::espnow_bearer::EspNowIngress>>>>,
 }
 
-#[derive(Debug)]
-struct DatagramRun {
-    elapsed_us: u128,
-    tx_packets: u64,
-    /// Driver/socket transmission failures. A successful local write is not
-    /// proof that the frame reached the peer (especially for monitor inject).
-    tx_errors: u64,
-    /// Structured result of the most recent raw frame submission. This keeps
-    /// adapter errors (for example nl80211 EINVAL) visible to automated tests
-    /// without retaining packet bytes.
-    rx_packets: u64,
-    retransmit_packets: u64,
-    /// Set only when QUIC-lite recognized the opaque token advertised by the
-    /// peer in its OPEN_ACK.  A timeout or radio injection failure is not a
-    /// restart signal and must not cause an implicit request replay.
-    peer_restarted: bool,
-    error: Option<String>,
+fn announce_summary(announce: &dmesh_server::announce::Announce) -> Value {
+    json!({
+        "kind": announce.kind,
+        "device_id": hex_bytes(announce.device_id()),
+        "uptime_secs": announce.uptime_secs,
+        "wifi_channel": (announce.wifi_channel != 0).then_some(announce.wifi_channel),
+    })
 }
 
-const NETLINK_GENERIC: libc::c_int = 16;
-const NETLINK_EXT_ACK: libc::c_int = 11;
-const GENL_ID_CTRL: u16 = 16;
-const CTRL_CMD_GETFAMILY: u8 = 3;
-const CTRL_ATTR_FAMILY_ID: u16 = 1;
-const CTRL_ATTR_FAMILY_NAME: u16 = 2;
-const NLMSGERR_ATTR_MSG: u16 = 1;
-const NLMSGERR_ATTR_OFFS: u16 = 2;
-const NLMSGERR_ATTR_MISS_TYPE: u16 = 5;
-const NL80211_GENL_VERSION: u8 = 1;
-const NL80211_CMD_SET_WIPHY: u8 = 2;
-const NL80211_CMD_GET_INTERFACE: u8 = 5;
-// `NL80211_ATTR_TX_RATES` is interpreted only by this command.  Sending the
-// attribute in SET_WIPHY can ACK without constraining per-interface data TX.
-const NL80211_CMD_SET_TX_BITRATE_MASK: u8 = 57;
-const NL80211_CMD_SET_INTERFACE: u8 = 6;
-const NL80211_CMD_NEW_INTERFACE: u8 = 7;
-const NL80211_CMD_DEL_INTERFACE: u8 = 8;
-const NL80211_CMD_SET_POWER_SAVE: u8 = 61;
-const NL80211_CMD_REMAIN_ON_CHANNEL: u8 = 55;
-const NL80211_CMD_REGISTER_FRAME: u8 = 58;
-const NL80211_CMD_FRAME: u8 = 59;
-const NL80211_CMD_START_AP: u8 = 15;
-const NL80211_CMD_STOP_AP: u8 = 16;
-const NL80211_CMD_GET_STATION: u8 = 17;
-const NL80211_CMD_NEW_STATION: u8 = 19;
-const NL80211_CMD_DEL_STATION: u8 = 20;
-const NL80211_CMD_GET_SCAN: u8 = 32;
-const NL80211_CMD_TRIGGER_SCAN: u8 = 33;
-const NL80211_CMD_CONNECT: u8 = 46;
-const NL80211_ATTR_WIPHY: u16 = 1;
-const NL80211_ATTR_IFINDEX: u16 = 3;
-const NL80211_ATTR_IFNAME: u16 = 4;
-const NL80211_ATTR_IFTYPE: u16 = 5;
-const NL80211_ATTR_PS_STATE: u16 = 93;
-const NL80211_ATTR_WIPHY_TX_POWER_SETTING: u16 = 97;
-const NL80211_ATTR_WIPHY_TX_POWER_LEVEL: u16 = 98;
-// NL80211_ATTR_TX_RATES is the nested per-band rate policy used by `iw
-// set bitrates`.  Keep the values local rather than depending on libnl/iw.
-const NL80211_ATTR_TX_RATES: u16 = 90;
-const NL80211_ATTR_MAC: u16 = 6;
-const NL80211_ATTR_BEACON_INTERVAL: u16 = 12;
-const NL80211_ATTR_DTIM_PERIOD: u16 = 13;
-const NL80211_ATTR_BEACON_HEAD: u16 = 14;
-const NL80211_ATTR_BEACON_TAIL: u16 = 15;
-const NL80211_ATTR_STA_AID: u16 = 16;
-const NL80211_ATTR_STA_FLAGS2: u16 = 67;
-const NL80211_ATTR_STA_LISTEN_INTERVAL: u16 = 18;
-const NL80211_ATTR_STA_SUPPORTED_RATES: u16 = 19;
-const NL80211_ATTR_STA_INFO: u16 = 21;
-const NL80211_ATTR_HT_CAPABILITY: u16 = 31;
-const NL80211_ATTR_BSS_BASIC_RATES: u16 = 36;
-const NL80211_ATTR_WIPHY_FREQ: u16 = 38;
-const NL80211_ATTR_WIPHY_CHANNEL_TYPE: u16 = 39;
-const NL80211_ATTR_IE: u16 = 42;
-const NL80211_ATTR_SCAN_FREQUENCIES: u16 = 44;
-const NL80211_ATTR_SCAN_SSIDS: u16 = 45;
-const NL80211_ATTR_BSS: u16 = 47;
-const NL80211_ATTR_FREQ_FIXED: u16 = 60;
-const NL80211_ATTR_FRAME: u16 = 51;
-const NL80211_ATTR_SSID: u16 = 52;
-const NL80211_ATTR_AUTH_TYPE: u16 = 53;
-const NL80211_ATTR_CIPHER_SUITE_GROUP: u16 = 74;
-const NL80211_ATTR_DURATION: u16 = 87;
-const NL80211_ATTR_FRAME_MATCH: u16 = 91;
-const NL80211_ATTR_FRAME_TYPE: u16 = 101;
-const NL80211_ATTR_BSS_HT_OPMODE: u16 = 109;
-const NL80211_ATTR_OFFCHANNEL_TX_OK: u16 = 108;
-const NL80211_ATTR_HIDDEN_SSID: u16 = 126;
-const NL80211_ATTR_IE_PROBE_RESP: u16 = 127;
-const NL80211_ATTR_IE_ASSOC_RESP: u16 = 128;
-const NL80211_ATTR_STA_WME: u16 = 129;
-const NL80211_ATTR_STA_CAPABILITY: u16 = 171;
-const NL80211_ATTR_STA_EXT_CAPABILITY: u16 = 172;
-const NL80211_ATTR_TX_NO_CCK_RATE: u16 = 135;
-const NL80211_ATTR_DONT_WAIT_FOR_ACK: u16 = 142;
-const NL80211_ATTR_PROBE_RESP: u16 = 145;
-const NL80211_ATTR_RX_SIGNAL_DBM: u16 = 151;
-const NL80211_ATTR_CHANNEL_WIDTH: u16 = 159;
-const NL80211_ATTR_CENTER_FREQ1: u16 = 160;
-const NL80211_ATTR_SOCKET_OWNER: u16 = 204;
-const NL80211_ATTR_COOKIE: u16 = 88;
-const NL80211_BSS_BSSID: u16 = 1;
-const NL80211_BSS_FREQUENCY: u16 = 2;
-const NL80211_BSS_CAPABILITY: u16 = 5;
-const NL80211_BSS_INFORMATION_ELEMENTS: u16 = 6;
-const NL80211_BSS_SIGNAL_MBM: u16 = 7;
-const NL80211_BSS_SEEN_MS_AGO: u16 = 10;
-const NL80211_BSS_BEACON_IES: u16 = 11;
-const NL80211_AUTHTYPE_OPEN_SYSTEM: u32 = 0;
-const NL80211_HIDDEN_SSID_NOT_IN_USE: u32 = 0;
-const NL80211_PS_DISABLED: u32 = 0;
-const NL80211_PS_ENABLED: u32 = 1;
-const NL80211_CHAN_NO_HT: u32 = 0;
-const NL80211_CHAN_HT20: u32 = 1;
-const NL80211_CHAN_HT40PLUS: u32 = 3;
-const NL80211_CHAN_WIDTH_20_NOHT: u32 = 0;
-const NL80211_CHAN_WIDTH_20: u32 = 1;
-const NL80211_CHAN_WIDTH_40: u32 = 2;
-const WLAN_CIPHER_SUITE_WEP40: u32 = 0x000f_ac01;
-const NL80211_STA_INFO_INACTIVE_TIME: u16 = 1;
-const NL80211_STA_INFO_RX_BYTES: u16 = 2;
-const NL80211_STA_INFO_TX_BYTES: u16 = 3;
-const NL80211_STA_INFO_SIGNAL: u16 = 7;
-const NL80211_STA_INFO_TX_BITRATE: u16 = 8;
-const NL80211_STA_INFO_RX_PACKETS: u16 = 9;
-const NL80211_STA_INFO_TX_PACKETS: u16 = 10;
-const NL80211_STA_INFO_TX_RETRIES: u16 = 11;
-const NL80211_STA_INFO_TX_FAILED: u16 = 12;
-const NL80211_STA_INFO_SIGNAL_AVG: u16 = 13;
-const NL80211_STA_INFO_RX_BITRATE: u16 = 14;
-const NL80211_STA_INFO_CONNECTED_TIME: u16 = 16;
-const NL80211_STA_INFO_STA_FLAGS: u16 = 17;
-const NL80211_STA_INFO_RX_BYTES64: u16 = 23;
-const NL80211_STA_INFO_TX_BYTES64: u16 = 24;
-const NL80211_STA_INFO_EXPECTED_THROUGHPUT: u16 = 28;
-const NL80211_STA_INFO_RX_DROP_MISC: u16 = 29;
-const NL80211_STA_INFO_RX_DURATION: u16 = 32;
-const NL80211_STA_INFO_ACK_SIGNAL: u16 = 34;
-const NL80211_STA_INFO_ACK_SIGNAL_AVG: u16 = 35;
-const NL80211_STA_INFO_RX_MPDUS: u16 = 36;
-const NL80211_STA_INFO_FCS_ERROR_COUNT: u16 = 37;
-const NL80211_STA_INFO_TX_DURATION: u16 = 39;
-const NL80211_RATE_INFO_BITRATE: u16 = 1;
-const NL80211_RATE_INFO_MCS: u16 = 2;
-const NL80211_RATE_INFO_40_MHZ_WIDTH: u16 = 3;
-const NL80211_RATE_INFO_SHORT_GI: u16 = 4;
-const NL80211_RATE_INFO_BITRATE32: u16 = 5;
-const NL80211_RATE_INFO_VHT_MCS: u16 = 6;
-const NL80211_RATE_INFO_VHT_NSS: u16 = 7;
-const NL80211_TXRATE_LEGACY: u16 = 1;
-const NL80211_TXRATE_HT: u16 = 2;
-const NL80211_IFTYPE_STATION: u32 = 2;
-const NL80211_IFTYPE_AP: u32 = 3;
-const NL80211_IFTYPE_MONITOR: u32 = 6;
-const NL80211_IFTYPE_OCB: u32 = 11;
-const NL80211_STA_FLAG_AUTHORIZED: u32 = 1 << 1;
-const NL80211_STA_FLAG_SHORT_PREAMBLE: u32 = 1 << 2;
-const NL80211_STA_FLAG_WME: u32 = 1 << 3;
-const NL80211_STA_FLAG_AUTHENTICATED: u32 = 1 << 5;
-const NL80211_STA_FLAG_ASSOCIATED: u32 = 1 << 7;
-// The stable Recovery AP is a bulk-data HT20 network.  Do not admit CCK or
-// low OFDM fallbacks. The ESP C6 refuses association when 24 Mbps is present
-// in this AP's basic-rate set, so retain mandatory 6 Mbps solely for
-// BSS/control compatibility while excluding 9/12/18 Mbps and all CCK rates.
-// Optional data rates remain 24/36/48/54 plus HT. This rate set applies to
-// beacon, probe, association, and the nl80211 AP profile.
-const OPEN_AP_OFDM_BASIC_RATES: [u8; 1] = [0x8c];
-const OPEN_AP_OFDM_EXTENDED_RATES: [u8; 4] = [0x30, 0x48, 0x60, 0x6c];
-// The AP driver selects HT short-GI data rates when the peer supports them.
-// Advertise SGI-20 in the management IE as well: sending short-GI frames
-// after advertising no SGI leaves an ESP STA with a contradictory negotiated
-// PHY profile. HT40 additionally enables the matching SGI-40 bit below.
-const HOSTAPD_HT20_CAPABILITY: [u8; 28] = [
-    0x2d, 26, 0x2c, 0x00, 0x1b, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-];
+impl CaptureHost for RadioHost {
+    fn event(&self, event: dmesh_rawnan::linux::RadioEvent) {
+        let message = event.message.as_ref().map(|message| match message {
+            EventMessage::RawWifi { iface } => mesh_message_from_raw_wifi(&event.value, iface),
+            EventMessage::Mgmt {
+                source,
+                iface,
+                status,
+                rssi_dbm,
+            } => {
+                let mut message = MeshMessage::new(mesh::message::KIND_EVENT, MeshMessageCodec::Text)
+                    .field(FIELD_MEDIUM, "wifi")
+                    .field(FIELD_RADIO_ID, "sta")
+                    .field(FIELD_NODE, source)
+                    .field(FIELD_IFACE, iface)
+                    .field(FIELD_STATUS, status);
+                if let Some(signal) = rssi_dbm {
+                    message = message.field(FIELD_RSSI, signal.to_string());
+                }
+                message
+            }
+        });
+        push_radio_event(
+            &self.history,
+            RadioEvent {
+                ts_millis: event.ts_millis,
+                key: event.key,
+                source: event.source,
+                value: event.value,
+                message,
+            },
+        );
+    }
 
-// The manual AP SME must advertise the same width in beacon, probe, and
-// association response as nl80211 operates. Keep the shared channel-6 lab
-// and production default at HT20: NAN/NOW, STA, and AP must all share the
-// same 20 MHz channel without occupying the adjacent channel. HT40 is an
-// explicit opt-in for a dedicated AP experiment only.
-const DEFAULT_OPEN_AP_HT40: bool = false;
+    fn nan_announce(&self, peer: &str, bssid: Option<&str>, payloads: &[&[u8]]) -> NanAnnounce {
+        let decoded = payloads
+            .iter()
+            .filter_map(|payload| dmesh_server::announce::decode_announce(payload))
+            .find(|item| !is_placeholder_announce_id(item.device_id()));
+        let Some(announce) = decoded else {
+            return NanAnnounce::default();
+        };
+        if announce.has_identity() && !announce_identity_valid(announce) {
+            return NanAnnounce {
+                invalid_identity: true,
+                summary: None,
+            };
+        }
+        if !announce_identity_valid(announce) {
+            return NanAnnounce::default();
+        }
+        self.discovered_devices
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .observe_announce("nan", peer.to_owned(), bssid.map(str::to_owned), announce);
+        NanAnnounce {
+            invalid_identity: false,
+            summary: Some(announce_summary(&announce)),
+        }
+    }
 
-fn open_ap_basic_rates() -> &'static [u8] {
-    &OPEN_AP_OFDM_BASIC_RATES
+    fn nan_packet(&self, peer: &str, bssid: Option<&str>, kind: NanPacketKind, payload: &[u8]) {
+        let kind = match kind {
+            NanPacketKind::ActiveSubscribe => DiscoveryPacketKind::ActiveSubscribe,
+            NanPacketKind::Followup => DiscoveryPacketKind::Followup,
+        };
+        self.discovered_devices
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .observe_nan_packet(peer, bssid, kind, payload);
+    }
+
+    fn now_sync(&self, peer: [u8; 6], cluster_id: [u8; 6], service_info: &[u8]) {
+        if let Some(announce) = dmesh_server::announce::decode_announce(service_info)
+            && announce_identity_valid(announce)
+        {
+            self.discovered_devices
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .observe_announce(
+                    "now_sync",
+                    colon_mac(&peer),
+                    Some(colon_mac(&cluster_id)),
+                    announce,
+                );
+        }
+    }
+
+    fn now_discovery(&self, peer: [u8; 6], bssid: Option<[u8; 6]>, payload: &[u8]) -> Option<Vec<u8>> {
+        // NOW discovery is NAN's discovery in NOW's envelope: observe it like a NAN
+        // descriptor. Whatever is not an announce is not discovery and is ignored.
+        let announce = dmesh_server::announce::decode_announce(payload)?;
+        if !announce_identity_valid(announce) {
+            return None;
+        }
+        let bssid_text = bssid.map(|mac| colon_mac(&mac));
+        self.discovered_devices
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .observe_announce("now", colon_mac(&peer), bssid_text.clone(), announce);
+        push_radio_event(
+            &self.history,
+            RadioEvent {
+                ts_millis: now_millis(),
+                key: "wifi.raw.discovery".to_string(),
+                source: "now".to_string(),
+                value: json!({
+                    "ok": true,
+                    "bearer": "now",
+                    "peer": colon_mac(&peer),
+                    "bssid": bssid_text,
+                    "announce": announce_summary(&announce),
+                }),
+                message: None,
+            },
+        );
+        None
+    }
+
+    fn ingress(&self) -> Option<Arc<dyn crate::espnow_bearer::EspNowIngress>> {
+        self.espnow_ingress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
-
-const NLM_F_DUMP: u16 = 0x300;
-const NLA_F_NESTED: u16 = 1 << 15;
-// Netlink attributes reserve the high two type bits for NLA_F_NESTED and
-// NLA_F_NET_BYTEORDER.  Match the attribute number independently of those
-// flags; station/rate information is commonly nested.
-const NLA_TYPE_MASK: u16 = 0x3fff;
-const DMESH_ESPNOW_PREFIX: [u8; 4] = [0x7f, 0x18, 0xfe, 0x34];
-// rawnan owns the ESP-NOW-compatible action prefix.  Its current envelope is
-// category/OUI plus four random bytes; the vendor type lives in the first IE,
-// not after this prefix.
-const DMESH_VENDOR_ACTION_LEN: usize = 8;
-const DMESH_VENDOR_IE_LEN: usize = 7;
-const DMESH_MESH_DST4_BROADCAST: [u8; 4] = [0xff; 4];
-const DMESH_LEGACY_VENDOR_ACTION: [u8; 5] = [0x7f, 0x50, 0x6f, 0x9a, 0x42];
-const IEEE80211_ADDR1: usize = 4;
-const IEEE80211_ADDR2: usize = 10;
-const IEEE80211_ADDR3: usize = 16;
-const IEEE80211_BODY: usize = 24;
-const IEEE80211_ACTION_FRAME_TYPE: u16 = 0x00d0;
-const RAW_WIFI_BROADCAST: [u8; 6] = [0xff; 6];
-const RAW_WIFI_MULTICAST: [u8; 6] = [0x33, 0x33, 0x00, 0x00, 0x52, 0x27];
-const IEEE80211_LLC_SNAP_DMESH: [u8; IEEE80211_LLC_SNAP_LEN] = [
-    0xaa,
-    0xaa,
-    0x03,
-    0x00,
-    0x00,
-    0x00,
-    (ETH_P_DMESH >> 8) as u8,
-    ETH_P_DMESH as u8,
-];
-const IEEE80211_LLC_SNAP_IPV6: [u8; IEEE80211_LLC_SNAP_LEN] =
-    [0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x86, 0xdd];
-// Private experimental marker for raw NAN data tests.  The payload after
-// this eight-byte LLC value is quic-lite directly, not IPv6/UDP.
-const RAWNAN_LLC_DEFAULT: [u8; IEEE80211_LLC_SNAP_LEN] =
-    [0xaa, 0xaa, 0x03, 0xd0, 0x4d, 0x45, 0x53, 0x48];
-const RAW_ACTION_RESPONSE_REPETITIONS: usize = 1;
-const NLMSG_ERROR: u16 = 2;
-const NLMSG_DONE: u16 = 3;
-const NLM_F_REQUEST: u16 = 0x01;
-const NLM_F_ACK: u16 = 0x04;
-const IFF_UP: u32 = 0x1;
 
 /// Linux radio backend used by the lmesh JSONL methods.
 #[derive(Clone)]
@@ -420,16 +271,13 @@ pub struct RadioService {
     raw_wifi_listeners: Arc<Mutex<HashSet<String>>>,
     raw_wifi_stop_flags: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     espnow_ingress: Arc<Mutex<Option<Arc<dyn crate::espnow_bearer::EspNowIngress>>>>,
+    /// The application side of the raw capture loops.
+    capture_host: Arc<RadioHost>,
     rawnan_subscribers: Arc<Mutex<HashMap<String, usize>>>,
     rawnan_state: Arc<Mutex<NanState>>,
     active_nan_publish: Arc<Mutex<NanActivePublish>>,
     pending_nan_active_subscribe: Arc<Mutex<Option<PendingNanActiveSubscribe>>>,
     pending_nan_followups: Arc<Mutex<dmesh_rawnan::NanFollowupQueue>>,
-    /// Directed NOW discovery is connectionless, but it still has the common
-    /// tagged-CBOR request ID. Retain only a bounded one-shot waiter until
-    /// the raw action ingress admits the matching signed announce reply.
-    pending_now_discovery: Arc<Mutex<HashMap<u64, PendingNowDiscovery>>>,
-    next_direct_discovery_id: Arc<AtomicU64>,
     wifi_ap_handles: Arc<Mutex<BTreeMap<String, ApRuntime>>>,
     wpa_supplicants: Arc<Mutex<BTreeMap<String, lmesh_wpa::WpaSupplicant>>>,
     // A P2P group has a driver-created VIF and a distinct device address.
@@ -440,23 +288,7 @@ pub struct RadioService {
     ap_no_ht_stations: Arc<Mutex<HashSet<[u8; 6]>>>,
 }
 
-/// One caller-requested active NAN Subscribe. It retains only portable
-/// Service Info; the monitor builds a fresh frame at each confirmed DW using
-/// the current local MAC and cluster BSSID. Repeating through the next DW0 or
-/// DW8 lets sleepy peers see the same correlation ID without a timer or a
-/// second radio owner.
-#[derive(Clone, Debug)]
-struct PendingNanActiveSubscribe {
-    service_info: Vec<u8>,
-    request_id: u64,
-    sent_windows: u8,
-    last_slot: Option<u64>,
-}
 
-struct PendingNowDiscovery {
-    peer: [u8; 6],
-    reply: std::sync::mpsc::Sender<Value>,
-}
 
 impl Default for RadioService {
     fn default() -> Self {
@@ -489,7 +321,13 @@ struct DiscoveredDeviceRegistry {
     /// evidence (including non-DMesh APs) for probe health and selection.
     bss: BTreeMap<String, DiscoveredBss>,
     change_log: PathBuf,
+    /// Receives every announce this registry admits, so the shared discovery
+    /// engine sees what the NAN/NOW monitor sees.
+    sink: Option<AnnounceSink>,
 }
+
+/// `(source, peer, announce)` for each announce admitted from a radio bearer.
+pub type AnnounceSink = Arc<dyn Fn(&str, &str, dmesh_server::announce::Announce) + Send + Sync>;
 
 #[derive(Clone, Debug)]
 struct DiscoveredBss {
@@ -518,6 +356,7 @@ impl DiscoveredDeviceRegistry {
             devices: BTreeMap::new(),
             bss: BTreeMap::new(),
             change_log,
+            sink: None,
         };
         registry.restore_recent_devices();
         registry
@@ -722,6 +561,9 @@ impl DiscoveredDeviceRegistry {
         announce: dmesh_server::announce::Announce,
     ) {
         let device_id = hex_bytes(announce.device_id());
+        if let Some(sink) = &self.sink {
+            sink(source, &peer, announce);
+        }
         self.observe(DiscoveredDevice {
             device_id: device_id.clone(),
             last_seen_ms: now_millis(),
@@ -1167,109 +1009,11 @@ fn announce_identity_valid(announce: dmesh_server::announce::Announce) -> bool {
 }
 
 impl RadioService {
-    /// Resolve a signed observation to a provisioned controller-owned device.
-    /// The secret remains in the private inventory and is never returned.
-    pub fn require_owned_companion(&self, id: &str, vip6: Option<Ipv6Addr>) -> Result<Ipv6Addr> {
-        let devices = self
-            .discovered_devices
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let candidate = devices
-            .devices
-            .values()
-            .find_map(|device| {
-                let key = device.announce.get("public_key")?.as_str()?;
-                if key.is_empty() {
-                    return None;
-                }
-                let address = device
-                    .announce
-                    .get("vip6")?
-                    .as_str()?
-                    .parse::<Ipv6Addr>()
-                    .ok()?;
-                let matches_id = device.device_id == id
-                    || device.peer.eq_ignore_ascii_case(id)
-                    || device.announce.get("device_name").and_then(Value::as_str) == Some(id)
-                    || address.to_string() == id;
-                (matches_id && vip6.is_none_or(|expected| expected == address))
-                    .then(|| (device.device_id.clone(), address, key.to_owned()))
-            })
-            .ok_or_else(|| {
-                anyhow::anyhow!("companion has no matching signed discovery identity")
-            })?;
-        drop(devices);
-        let path = std::env::var_os("DMESH_PAIRED_DEVICES_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/home/system/etc/lmesh/paired"));
-        let owned = dmesh_server::discovery::PairedDevices::load(&path, &candidate.1.to_string())
-            .map_err(anyhow::Error::msg)?
-            .ok_or_else(|| anyhow::anyhow!("companion has no private pairing result"))?;
-        if owned.device_id != candidate.0 {
-            anyhow::bail!("paired device ID differs from signed observation");
-        }
-        if owned.secret.len() < 16 {
-            anyhow::bail!("owned companion has no provisioned control secret");
-        }
-        if !owned.public_key.is_empty()
-            && owned
-                .public_key
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>()
-                != candidate.2
-        {
-            anyhow::bail!("owned companion public key differs from its signed observation");
-        }
-        if owned
-            .vip6
-            .as_deref()
-            .is_some_and(|stored| stored != candidate.1.to_string())
-        {
-            anyhow::bail!("owned companion VIP differs from its signed observation");
-        }
-        Ok(candidate.1)
-    }
-    /// Admit a physical console line as the one-way log.record message.
-    pub fn record_uart_log(&self, path: &str, text: &str) {
-        use mesh::tagged::{NameOrTag, TaggedRecord};
-        let mut record = TaggedRecord {
-            component: NameOrTag::Tag(208),
-            method: NameOrTag::Tag(1),
-            ..Default::default()
-        };
-        record.env.insert(NameOrTag::Tag(1), json!(text));
-        record.env.insert(NameOrTag::Tag(2), json!(path));
-        record
-            .env
-            .insert(NameOrTag::Tag(3), json!(now_millis() as u64));
-        push_history_event(
-            &self.history,
-            "log.record",
-            mesh::tagged::to_json(&record, None),
-        );
-    }
 
-    /// Preserve an unsolicited raw tagged record as a normal message.
-    pub fn record_uart_message(&self, path: &str, packet: &[u8]) {
-        if let Some(announce) = dmesh_server::announce::decode_announce(packet) {
-            let _ = self.observe_discovered_announce("uart", path.to_owned(), None, announce);
-            return;
-        }
-        if let Ok(record) = mesh::cbor::decode_record(packet) {
-            if matches!(record.kind(), Ok(mesh::tagged::RecordKind::Message)) {
-                push_history_event(
-                    &self.history,
-                    "uart.message",
-                    mesh::tagged::to_json(&record, None),
-                );
-            }
-        }
-    }
     /// Presentation-safe, bearer-neutral discovery inventory. Native peer
     /// handles remain in adapter diagnostics so Android PeerHandle values and
     /// Linux/ESP MAC addresses never become incompatible UI identities.
-    pub fn radio_devices(&self) -> Value {
+    pub(crate) fn radio_devices(&self) -> Value {
         let entries = self
             .discovered_devices
             .lock()
@@ -1289,7 +1033,15 @@ impl RadioService {
     /// deliberately takes decoded data rather than a packet: Wi-Fi/UDP/control
     /// adapters retain ownership of their buffers and all update one device
     /// inventory with the same TTL, capacity, and durable change log.
-    pub fn observe_discovered_announce(
+    /// Install the sink that receives every announce the radio admits.
+    pub(crate) fn set_announce_sink(&self, sink: AnnounceSink) {
+        self.discovered_devices
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .sink = Some(sink);
+    }
+
+    pub(crate) fn observe_discovered_announce(
         &self,
         source: &str,
         peer: String,
@@ -1310,7 +1062,7 @@ impl RadioService {
     /// service.  The default is the driver's standard/automatic policy so
     /// Android-compatible NAN management and discovery are not forced to a
     /// DMesh-specific rate.  Targeted frames can opt into 12/24/54 Mbps.
-    pub fn apply_startup_rate_profile(&self, interfaces: &[String]) -> Vec<Value> {
+    pub(crate) fn apply_startup_rate_profile(&self, interfaces: &[String]) -> Vec<Value> {
         let profile =
             std::env::var("LMESH_WIFI_RATE_PROFILE").unwrap_or_else(|_| "auto".to_owned());
         let disable_b = std::env::var("LMESH_WIFI_DISABLE_80211B")
@@ -1358,7 +1110,7 @@ impl RadioService {
     /// diagnostics. `ht3-24` permits MCS3 plus a 24 Mbps OFDM association
     /// fallback, while still excluding lower HT and CCK data rates. Errors
     /// retain the kernel errno/extack text.
-    pub fn wifi_rate_profile(
+    pub(crate) fn wifi_rate_profile(
         &self,
         iface: Option<String>,
         profile: String,
@@ -1393,91 +1145,9 @@ impl RadioService {
         value
     }
 
-    /// Set the driver power-save policy through the same nl80211 owner that
-    /// starts the AP.  AP throughput tests must never depend on an
-    /// out-of-band `iw` command with different privileges.
-    pub fn wifi_power_save(&self, iface: Option<String>, enabled: bool) -> Value {
-        let iface = wifi_iface(iface);
-        let result = (|| -> Result<()> {
-            let ifindex = ifindex(&iface)?;
-            Nl80211Socket::open()?.set_power_save(ifindex, enabled)
-        })();
-        let (ok, error) = match result {
-            Ok(()) => (true, Value::Null),
-            Err(error) => (false, json!(format!("{error:#}"))),
-        };
-        let value = json!({
-            "ok": ok,
-            "backend": "linux_nl80211",
-            "iface": iface,
-            "power_save": enabled,
-            "error": error,
-        });
-        self.record("wifi.power_save", value.clone());
-        value
-    }
 
-    /// Limit AP transmit power through the Wi-Fi owner. `None` restores the
-    /// driver's automatic/regulatory choice; a requested limit is in dBm and
-    /// cannot raise it above that ceiling. This is intentionally separate
-    /// from STA power-save: it is a PHY diagnostic for near-field AP tests.
-    pub fn wifi_tx_power(&self, iface: Option<String>, dbm: Option<i16>) -> Value {
-        let iface = wifi_iface(iface);
-        let result = (|| -> Result<()> {
-            if let Some(dbm) = dbm
-                && !(-20..=30).contains(&dbm)
-            {
-                bail!("tx power must be between -20 and 30 dBm");
-            }
-            let ifindex = ifindex(&iface)?;
-            Nl80211Socket::open()?.set_tx_power_limit(ifindex, dbm)
-        })();
-        let (ok, error) = match result {
-            Ok(()) => (true, Value::Null),
-            Err(error) => (false, json!(format!("{error:#}"))),
-        };
-        let value = json!({
-            "ok": ok,
-            "backend": "linux_nl80211",
-            "iface": iface,
-            "limit_dbm": dbm,
-            "automatic": dbm.is_none(),
-            "error": error,
-        });
-        self.record("wifi.tx_power", value.clone());
-        value
-    }
 
-    /// Select HT or legacy association parameters for one AP station. The
-    /// setting takes effect on that station's next association.
-    pub fn wifi_ap_station_profile(&self, mac: String, ht: bool) -> Value {
-        let Some(mac) = parse_mac(Some(mac.trim())) else {
-            return json!({"ok": false, "error": "invalid station MAC"});
-        };
-        let mut stations = self
-            .ap_no_ht_stations
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        if ht {
-            stations.remove(&mac);
-        } else {
-            stations.insert(mac);
-        }
-        let value = json!({"ok": true, "station": colon_mac(&mac), "ht": ht,
-            "reassociate_required": true});
-        self.record("wifi.ap.station.profile", value.clone());
-        value
-    }
 
-    /// Create a Wi-Fi/NAN-only radio service from environment and optional
-    /// MESH_HOME/lmesh.toml config.
-    ///
-    /// Direct UART ownership belongs to `dmesh-cli`.  Keep this constructor
-    /// equivalent to the Wi-Fi-only form so a future caller cannot recreate
-    /// an extra physical-TTY reader merely by choosing a different factory.
-    pub fn from_environment() -> Self {
-        Self::from_environment_without_uart()
-    }
 
     /// Create a Wi-Fi-only backend. Serial devices are never part of this
     /// service; direct device sessions belong to `dmesh-cli`.
@@ -1486,14 +1156,14 @@ impl RadioService {
     /// [`Self::from_environment`].
     /// The standalone Wi-Fi service uses this constructor so it can own AP,
     /// STA, and NAN interfaces without taking UART devices or serial sockets.
-    pub fn from_environment_without_uart() -> Self {
+    pub(crate) fn from_environment_without_uart() -> Self {
         Self::from_environment_inner()
     }
 
     /// Build a Wi-Fi-only instance with a service-specific default discovery
     /// log. The explicit environment override stays shared, while independent
     /// supervised services never append duplicate `new` events to one file.
-    pub fn from_environment_with_discovery_log(default_change_log: impl Into<PathBuf>) -> Self {
+    pub(crate) fn from_environment_with_discovery_log(default_change_log: impl Into<PathBuf>) -> Self {
         Self::from_environment_inner_with_discovery_log(default_change_log.into())
     }
 
@@ -1502,15 +1172,24 @@ impl RadioService {
     }
 
     fn from_environment_inner_with_discovery_log(default_change_log: PathBuf) -> Self {
+        let history = Arc::new(Mutex::new(VecDeque::new()));
+        let discovered_devices = Arc::new(Mutex::new(DiscoveredDeviceRegistry::from_environment(
+            default_change_log,
+        )));
+        let espnow_ingress = Arc::new(Mutex::new(None));
+        let capture_host = Arc::new(RadioHost {
+            history: history.clone(),
+            discovered_devices: discovered_devices.clone(),
+            espnow_ingress: espnow_ingress.clone(),
+        });
         let service = Self {
-            history: Arc::new(Mutex::new(VecDeque::new())),
-            discovered_devices: Arc::new(Mutex::new(DiscoveredDeviceRegistry::from_environment(
-                default_change_log,
-            ))),
+            history,
+            discovered_devices,
+            capture_host,
             radios: Arc::new(load_radio_adapters()),
             raw_wifi_listeners: Arc::new(Mutex::new(HashSet::new())),
             raw_wifi_stop_flags: Arc::new(Mutex::new(HashMap::new())),
-            espnow_ingress: Arc::new(Mutex::new(None)),
+            espnow_ingress,
             rawnan_subscribers: Arc::new(Mutex::new(HashMap::new())),
             rawnan_state: Arc::new(Mutex::new(NanState::new(
                 dmesh_rawnan::NAN_CLUSTER_STALE_AFTER_US,
@@ -1522,8 +1201,6 @@ impl RadioService {
             pending_nan_followups: Arc::new(Mutex::new(dmesh_rawnan::NanFollowupQueue::new(
                 MAX_PENDING_NAN_FOLLOWUPS,
             ))),
-            pending_now_discovery: Arc::new(Mutex::new(HashMap::new())),
-            next_direct_discovery_id: Arc::new(AtomicU64::new(now_millis_u64().max(1))),
             wifi_ap_handles: Arc::new(Mutex::new(BTreeMap::new())),
             wpa_supplicants: Arc::new(Mutex::new(BTreeMap::new())),
             p2p_group_ifaces: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1533,7 +1210,7 @@ impl RadioService {
     }
 
     /// Attach the receive side of the executable-owned ESP-NOW bearer.
-    pub fn set_espnow_ingress(&self, ingress: Arc<dyn crate::espnow_bearer::EspNowIngress>) {
+    pub(crate) fn set_espnow_ingress(&self, ingress: Arc<dyn crate::espnow_bearer::EspNowIngress>) {
         *self
             .espnow_ingress
             .lock()
@@ -1541,7 +1218,7 @@ impl RadioService {
     }
 
     /// Return interface, capability, process-capability, and control status.
-    pub fn status(&self) -> Value {
+    pub(crate) fn status(&self) -> Value {
         let iface = wifi_iface(None);
         let link_local_v6 = ready_link_local_address(&iface).map(|address| address.to_string());
         let mac = iface_mac(&iface).ok().map(|address| colon_mac(&address));
@@ -1558,7 +1235,7 @@ impl RadioService {
 
     /// Common NAN state.  Device inventory deliberately stays in
     /// `discovery.nodes`: it is cross-bearer and must not be duplicated here.
-    pub fn nan_status(&self, iface: Option<String>) -> Value {
+    pub(crate) fn nan_status(&self, iface: Option<String>) -> Value {
         let raw = self.rawnan_status(iface);
         let mut status = serde_json::Map::new();
         // Monitor ownership and NAN synchronization are different facts: a
@@ -1623,52 +1300,10 @@ impl RadioService {
         Value::Object(status)
     }
 
-    /// ESP-NOW/action counters projected from the adapter's existing bounded
-    /// capture ledger. NAN-specific capture facts are intentionally excluded.
-    pub fn now_metrics(&self, iface: Option<String>) -> Value {
-        let raw = self.wifi_raw_metrics(iface);
-        json!({
-            "received": raw.get("rx").cloned().unwrap_or(Value::from(0)),
-            "action_seen": raw.get("action_seen").cloned().unwrap_or(Value::from(0)),
-            "dispatched": raw.get("dispatch").cloned().unwrap_or(Value::from(0)),
-            "dispatch_errors": raw.get("dispatch_errors").cloned().unwrap_or(Value::from(0)),
-        })
-    }
-
-    /// NAN-only counters; peer counts and peer records remain in
-    /// `discovery.nodes`.
-    pub fn nan_metrics(&self, _iface: Option<String>) -> Value {
-        let raw = host_capture_metrics_json();
-        let capture = raw.get("capture").unwrap_or(&Value::Null);
-        json!({
-            "received": capture.get("nan_rx").cloned().unwrap_or(Value::from(0)),
-            "beacons": capture.get("nan_beacons").cloned().unwrap_or(Value::from(0)),
-        })
-    }
-
-    /// Linux currently exposes one stable local-link counter: unmatched
-    /// discovery datagrams (stale peers still emitting the retired
-    /// QUIC direct-packet announce envelope).
-    pub fn udp6_metrics(&self) -> Value {
-        json!({
-            "announce_parse_errors": crate::mesh_core::announce_parse_errors(),
-        })
-    }
-
-    /// Project the existing common `WifiLinkMetrics` station records without
-    /// exposing hostapd/iw process diagnostics.
-    pub fn wifi_link_metrics(&self, iface: Option<String>) -> Value {
-        let stations = self.wifi_ap_stations(iface);
-        json!({
-            "schema_version": stations.get("link_metrics_schema_version").cloned().unwrap_or(Value::from(WIFI_LINK_METRICS_SCHEMA_VERSION)),
-            "links": stations.get("link_metrics").cloned().unwrap_or_else(|| Value::Array(Vec::new())),
-        })
-    }
-
     /// Return the shared raw-NAN filter state used by the Linux monitor.
     /// This is deliberately independent of any control daemon: the monitor
     /// observes NAN beacons and feeds them to dmesh-rawnan::NanState.
-    pub fn rawnan_status(&self, iface: Option<String>) -> Value {
+    pub(crate) fn rawnan_status(&self, iface: Option<String>) -> Value {
         let iface = wifi_iface(iface);
         let active_publish = self
             .active_nan_publish
@@ -1842,7 +1477,7 @@ impl RadioService {
     /// Replace the entire local active-Publish descriptor. Actual emission is
     /// deferred to the next confirmed NAN discovery window, never to a
     /// control request or an arbitrary wall-clock timer.
-    pub fn rawnan_active_publish_configure(
+    pub(crate) fn rawnan_active_publish_configure(
         &self,
         enabled: bool,
         service_info: &[u8],
@@ -1865,7 +1500,7 @@ impl RadioService {
     /// its configured STA profile.  The wire payload is deliberately the
     /// same target-checked `transport.set` used by ESP and Android; this
     /// method owns only host monitor scheduling and never changes local STA.
-    pub fn nan_wakeup(&self, target: String) -> Value {
+    pub(crate) fn nan_wakeup(&self, target: String) -> Value {
         let Some(target_mac) = parse_mac(Some(&target)) else {
             return json!({"ok": false, "error": "nan.wakeup to must be a MAC", "to": target});
         };
@@ -1889,6 +1524,7 @@ impl RadioService {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(PendingNanActiveSubscribe {
             service_info: record[..used].to_vec(),
+            target: None,
             request_id,
             sent_windows: 0,
             last_slot: None,
@@ -1907,7 +1543,7 @@ impl RadioService {
     /// Queue a pairing invitation for an unpaired device in the next NAN discovery
     /// window. The direct signed check still has to follow on the chosen
     /// provisioning bearer before any secret is generated or written.
-    pub fn nan_pair_wakeup(&self, target: String) -> Result<Value> {
+    pub(crate) fn nan_pair_wakeup(&self, target: String) -> Result<Value> {
         let target_mac = parse_mac(Some(&target)).context("pairing wake needs a target MAC")?;
         if target_mac == [0; 6] || target_mac[0] & 1 != 0 {
             anyhow::bail!("pairing wake target must be a unicast MAC");
@@ -1925,6 +1561,7 @@ impl RadioService {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(PendingNanActiveSubscribe {
             service_info: record[..used].to_vec(),
+            target: None,
             request_id,
             sent_windows: 0,
             last_slot: None,
@@ -1973,6 +1610,7 @@ impl RadioService {
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                 Some(PendingNanActiveSubscribe {
                     service_info: record[..used].to_vec(),
+                    target: None,
                     request_id: started_at,
                     sent_windows: 0,
                     last_slot: None,
@@ -2041,130 +1679,34 @@ impl RadioService {
     /// Return the administrative/carrier state without changing the
     /// interface. This is intentionally a small host diagnostic used before
     /// nl80211 frame tests.
-    pub fn wifi_interface_status(&self, iface: Option<String>) -> Value {
+    pub(crate) fn wifi_interface_status(&self, iface: Option<String>) -> Value {
         let iface = wifi_iface(iface);
         let link = interface_link_status(&iface);
         json!({ "ok": link.get("ok").and_then(Value::as_bool).unwrap_or(false), "iface": iface, "link": link })
     }
 
-    /// Health facts for the stable P2P GO plus monitor topology.  The anchor
-    /// is intentionally allowed to be down while the group child owns the
-    /// radio, so callers must not use the anchor link state as the sole
-    /// recovery signal once this topology is active.
-    pub fn p2p_monitor_health(&self, iface: Option<String>) -> Value {
-        let iface = wifi_iface(iface);
-        let wpa_active = self
-            .wpa_supplicants
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains_key(&iface);
-        let group_iface = self
-            .p2p_group_ifaces
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&iface)
-            .cloned();
-        let monitor_iface = monitor_iface_name(&iface);
-        let monitor_listener = self
-            .raw_wifi_listeners
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains(&format!("{iface}:monitor"));
-        json!({
-            "iface": iface,
-            "wpa_active": wpa_active,
-            "anchor_link": interface_link_status(&iface),
-            "p2p_group_iface": group_iface.as_ref(),
-            "p2p_group_link": group_iface.as_deref().map(interface_link_status),
-            "monitor_iface": monitor_iface,
-            "monitor_link": interface_link_status(&monitor_iface),
-            "monitor_listener": monitor_listener,
-        })
-    }
 
     /// Read the host's current netdev inventory through rtnetlink. This is a
     /// diagnostic/recovery surface only: it neither selects nor changes an
     /// interface, and lets a service report a USB radio that returned under a
     /// different kernel-assigned name.
-    pub fn wifi_interface_list(&self) -> Value {
+    pub(crate) fn wifi_interface_list(&self) -> Value {
         match list_rtnetlink_interfaces() {
             Ok(interfaces) => json!({"ok": true, "backend": "rtnetlink", "interfaces": interfaces}),
             Err(error) => json!({"ok": false, "backend": "rtnetlink", "error": error}),
         }
     }
 
-    pub fn wifi_interface_up(&self, iface: Option<String>) -> Value {
+    pub(crate) fn wifi_interface_up(&self, iface: Option<String>) -> Value {
         let iface = wifi_iface(iface);
         let result = link_state_result(&iface, true);
         json!({ "ok": result.get("ok").and_then(Value::as_bool).unwrap_or(false), "iface": iface, "link": result })
     }
 
-    /// Replace the owned interface with an 802.11 OCB (outside-context-of-a-
-    /// BSS) interface and join the requested frequency.  OCB has no AP,
-    /// association, WPA, or BSSID; it is useful for the shared open-medium
-    /// experiments.  This intentionally operates only on the lmesh-owned
-    /// interface.
-    pub fn wifi_ocb_start(
-        &self,
-        iface: Option<String>,
-        freq: Option<u32>,
-        bandwidth: Option<String>,
-    ) -> Value {
-        let iface = wifi_iface(iface);
-        let freq = freq.unwrap_or_else(|| channel_to_freq(DEFAULT_RAW_WIFI_CHANNEL));
-        let bandwidth = bandwidth.unwrap_or_else(|| "10MHz".to_owned());
-        let mut steps = Vec::new();
-        steps.push(link_state_result(&iface, false));
-        let set_type = ifindex(&iface).and_then(|ifindex| {
-            let socket = Nl80211Socket::open()?;
-            socket.set_interface_type(ifindex, NL80211_IFTYPE_OCB)
-        });
-        steps.push(match &set_type {
-            Ok(()) => json!({"program": "nl80211", "operation": "set_interface", "type": "ocb", "ok": true}),
-            Err(error) => json!({"program": "nl80211", "operation": "set_interface", "type": "ocb", "ok": false, "error": format!("{error:#}")}),
-        });
-        if set_type.is_ok() {
-            // Some drivers require JOIN_OCB while the netdev is administratively
-            // down, while others require it up. Try the documented iw operation
-            // first and only then raise the carrier.
-            let freq_text = freq.to_string();
-            let args = [
-                "dev",
-                iface.as_str(),
-                "ocb",
-                "join",
-                freq_text.as_str(),
-                bandwidth.as_str(),
-            ];
-            let join = run_command("iw", &args);
-            let joined = join.get("ok").and_then(Value::as_bool).unwrap_or(false);
-            steps.push(join);
-            steps.push(run_command("ip", &["link", "set", &iface, "up"]));
-            if !joined {
-                // Preserve the failed join and leave the interface state
-                // visible to the caller; do not silently fall back to AP/STA.
-            }
-        }
-        let ok = set_type.is_ok()
-            && steps
-                .iter()
-                .all(|step| step.get("ok").and_then(Value::as_bool).unwrap_or(false));
-        let result = json!({
-            "ok": ok,
-            "backend": "linux_nl80211",
-            "iface": iface,
-            "type": "ocb",
-            "freq": freq,
-            "bandwidth": bandwidth,
-            "steps": steps,
-        });
-        self.record("wifi.ocb.start", result.clone());
-        result
-    }
 
     /// Pin an owned interface to a 2.4 GHz channel using nl80211.  This is
     /// deliberately explicit: it changes only the requested owned interface.
-    pub fn wifi_interface_set_channel(&self, iface: Option<String>, channel: u8) -> Value {
+    pub(crate) fn wifi_interface_set_channel(&self, iface: Option<String>, channel: u8) -> Value {
         let iface = wifi_iface(iface);
         let channel = channel.clamp(1, 13);
         let freq = channel_to_freq(channel);
@@ -2247,7 +1789,7 @@ impl RadioService {
 
     /// Stop the monitor VIF owned by lmesh before changing the channel or
     /// switching the interface into AP/IBSS/P2P mode.
-    pub fn wifi_raw_stop(&self, iface: Option<String>) -> Value {
+    pub(crate) fn wifi_raw_stop(&self, iface: Option<String>) -> Value {
         let iface = wifi_iface(iface);
         let monitor = monitor_iface_name(&iface);
         // Stopping one physical path must not retire the logical QUIC
@@ -2294,41 +1836,76 @@ impl RadioService {
         result
     }
 
-    /// Summarize raw action receive/dispatch activity for E2E diagnostics.
-    /// Counters are derived from the bounded history and therefore allocate
-    /// nothing per packet or retain a second transport ledger.
-    pub fn wifi_raw_metrics(&self, iface: Option<String>) -> Value {
-        let iface = wifi_iface(iface);
+    /// Count the retained monitor events of `iface`.
+    fn raw_event_counts(&self, iface: &str) -> RawEventCounts {
         let history = self
             .history
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut rx = 0_u64;
-        let mut dispatch = 0_u64;
-        let mut dispatch_errors = 0_u64;
-        let mut action_seen = 0_u64;
-        let mut monitor_frames = 0_u64;
-        let mut action_candidates = 0_u64;
-        let mut socket_packets = 0_u64;
+        let mut counts = RawEventCounts::default();
         for event in history.iter() {
-            if !event.source.contains(&iface) {
+            if !event.source.contains(iface) {
                 continue;
             }
             match event.key.as_str() {
-                "wifi.raw.rx" => rx += 1,
+                "wifi.raw.rx" => counts.rx += 1,
                 "wifi.raw.dispatch" => {
-                    dispatch += 1;
+                    counts.dispatch += 1;
                     if event.value.get("ok").and_then(Value::as_bool) == Some(false) {
-                        dispatch_errors += 1;
+                        counts.dispatch_errors += 1;
                     }
                 }
-                "wifi.raw.action" => action_seen += 1,
-                "wifi.raw.monitor" => monitor_frames += 1,
-                "wifi.raw.socket" => socket_packets += 1,
-                "wifi.raw.action_candidate" => action_candidates += 1,
+                "wifi.raw.action" => counts.action_seen += 1,
+                "wifi.raw.monitor" => counts.monitor_frames += 1,
+                "wifi.raw.socket" => counts.socket_packets += 1,
+                "wifi.raw.action_candidate" => counts.action_candidates += 1,
                 _ => {}
             }
         }
+        counts
+    }
+
+    /// Typed counts for `telemetry.now` (no JSON).
+    pub(crate) fn now_counts(&self, iface: Option<String>) -> RawEventCounts {
+        self.raw_event_counts(&wifi_iface(iface))
+    }
+
+    /// Beacons the raw-NAN monitor captured, for `telemetry.nan`.
+    pub(crate) fn nan_beacons(&self) -> u64 {
+        host_capture_counters()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .capture
+            .nan_beacons
+    }
+
+    /// One typed record per AP station, for `telemetry.wifi_link`.
+    pub(crate) fn wifi_link_stations(&self, iface: Option<String>) -> Result<Vec<WifiLinkMetrics>> {
+        let iface = wifi_iface(iface);
+        let interface_index = ifindex(&iface)?;
+        let socket = Nl80211Socket::open()?;
+        let stations = socket.station_dump(interface_index)?;
+        Ok(stations
+            .iter()
+            .map(|station| station_link_metrics(station, interface_index))
+            .collect())
+    }
+
+    /// Summarize raw action receive/dispatch activity for E2E diagnostics.
+    /// Counters are derived from the bounded history and therefore allocate
+    /// nothing per packet or retain a second transport ledger.
+    pub(crate) fn wifi_raw_metrics(&self, iface: Option<String>) -> Value {
+        let iface = wifi_iface(iface);
+        let counts = self.raw_event_counts(&iface);
+        let RawEventCounts {
+            rx,
+            dispatch,
+            dispatch_errors,
+            action_seen,
+            monitor_frames,
+            action_candidates,
+            socket_packets,
+        } = counts;
         json!({
             "ok": true,
             "iface": iface,
@@ -2345,49 +1922,9 @@ impl RadioService {
         })
     }
 
-    /// Publish the stable host AP as a normal unsigned DMesh presence record.
-    /// lmesh owns wlan0, so this uses the AP MAC as its bounded local radio
-    /// identity.
-    /// The record is discovery metadata only; it is not an authentication
-    /// assertion and is emitted on the next confirmed NAN discovery window.
-    pub fn refresh_ap_presence(&self, uptime_secs: u64) -> Result<Value> {
-        let iface = wifi_iface(None);
-        let mac = iface_mac(&iface)?;
-        let ap = self.wifi_ap_status(Some(iface.clone()));
-        // Announce keeps a fixed, protocol-private 16-byte identity field.
-        // This AP-only publisher fills its leading bytes with the wlan MAC.
-        let mut device_id = [0_u8; 16];
-        device_id[..mac.len()].copy_from_slice(&mac);
-        let mut announce = dmesh_server::announce::Announce::discovery(
-            device_id,
-            mac.len() as u8,
-            uptime_secs.min(u64::from(u32::MAX)) as u32,
-        );
-        announce.set_probe_descriptor(
-            dmesh_server::announce::DEVICE_CLASS_HOST,
-            dmesh_server::probe::PROBE_CAP_NAN
-                | dmesh_server::probe::PROBE_CAP_NOW
-                | dmesh_server::probe::PROBE_CAP_AP
-                | dmesh_server::probe::PROBE_CAP_UDP6,
-        );
-        let _ = announce.set_device_name("lmesh-ap");
-        if let Some(ssid) = ap.get("ssid_default").and_then(Value::as_str) {
-            let _ = announce.set_network_name(ssid);
-        }
-        let mut wire = [0_u8; 384];
-        let used = dmesh_server::announce::encode(announce, &mut wire)
-            .ok_or_else(|| anyhow::anyhow!("encode stable AP presence"))?;
-        if used > dmesh_rawnan::NAN_ACTIVE_PUBLISH_MAX_LEN {
-            anyhow::bail!(
-                "stable AP presence is {used} bytes; NAN limit is {}",
-                dmesh_rawnan::NAN_ACTIVE_PUBLISH_MAX_LEN
-            );
-        }
-        self.rawnan_active_publish_configure(true, &wire[..used])
-    }
 
     /// Return recent radio method results and observed notifications.
-    pub fn history(&self, keys: Option<String>, limit: Option<usize>) -> Value {
+    pub(crate) fn history(&self, keys: Option<String>, limit: Option<usize>) -> Value {
         let keys = keys
             .unwrap_or_else(|| "messages,net,wifi,BLE,N".to_string())
             .split(',')
@@ -2408,47 +1945,10 @@ impl RadioService {
         json!({ "events": events })
     }
 
-    /// Bounded, oldest-last diagnostic history for the shared component-9
-    /// event/log-watch surface. `since_ms` filters by retained event time;
-    /// the returned cursor is the newest retained timestamp so a client can
-    /// resume from `since=cursor`.
-    pub fn diagnostic_events(&self, since_ms: Option<u64>, limit: Option<usize>) -> Value {
-        let limit = limit
-            .unwrap_or(16)
-            .clamp(1, dmesh_server::services::LOG_WATCH_MAX_RECORDS);
-        let since_ms = since_ms.unwrap_or(0);
-        let history = self
-            .history
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let selected: Vec<&RadioEvent> = history
-            .iter()
-            .filter(|event| event.ts_millis >= u128::from(since_ms))
-            .collect();
-        let start = selected.len().saturating_sub(limit);
-        let slice = &selected[start..];
-        let cursor = slice
-            .last()
-            .map(|event| u64::try_from(event.ts_millis).unwrap_or(u64::MAX))
-            .unwrap_or(since_ms);
-        let events = slice
-            .iter()
-            .map(|event| {
-                json!({
-                    "ts_millis": u64::try_from(event.ts_millis).unwrap_or(u64::MAX),
-                    "key": event.key,
-                    "source": event.source,
-                    "value": event.value,
-                })
-            })
-            .collect::<Vec<_>>();
-        json!({ "cursor": cursor, "events": events })
-    }
-
     /// Reset the process-local capture counters. QUIC-lite and discovery
     /// counters keep their own lifetime; this covers the raw-monitor ledger
     /// exposed through `radio.snapshot`.
-    pub fn reset_capture_counters(&self) -> Value {
+    pub(crate) fn reset_capture_counters(&self) -> Value {
         *host_capture_counters()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = HostCaptureCounters::default();
@@ -2458,7 +1958,7 @@ impl RadioService {
     /// Map the host capture ledger into the shared `radio.snapshot`
     /// vocabulary. Fields the Linux adapter cannot observe are omitted
     /// rather than synthesized as zero.
-    pub fn radio_snapshot(&self) -> Value {
+    pub(crate) fn radio_snapshot(&self) -> Value {
         let raw = self.wifi_raw_metrics(None);
         let capture = raw.get("capture").cloned().unwrap_or(Value::Null);
         let mut snapshot = serde_json::Map::new();
@@ -2487,117 +1987,12 @@ impl RadioService {
         Value::Object(snapshot)
     }
 
-    /// Return the configured local, remote, and future adapter inventory.
-    pub fn list_radios(&self) -> Value {
-        json!({ "radios": self.radios.as_ref() })
-    }
 
-    /// Return the current link table derived from recent radio observations.
-    pub fn links_list(&self, seen_within_sec: Option<u64>) -> Value {
-        let seen_within_sec = seen_within_sec.unwrap_or(21_600);
-        let neighbors = self.collect_neighbors(seen_within_sec);
-        let links = neighbors
-            .into_values()
-            .map(|neighbor| {
-                let radio = neighbor
-                    .medium
-                    .as_deref()
-                    .map(mesh_radio_name)
-                    .unwrap_or("unknown");
-                json!({
-                    "node": neighbor.node,
-                    "last_seen_ms": neighbor.last_seen_ms,
-                    "radio": radio,
-                    "medium": neighbor.medium,
-                    "network": neighbor.network,
-                    "radio_id": neighbor.radio_id,
-                    "rssi": neighbor.rssi,
-                    "snr": neighbor.snr,
-                    "source": neighbor.source,
-                    "last_event": neighbor.last_event,
-                    "selected": radio,
-                    "quality": link_quality(neighbor.rssi, neighbor.snr),
-                })
-            })
-            .collect::<Vec<_>>();
-        json!({
-            "ok": true,
-            "seen_within_sec": seen_within_sec,
-            "default_send_radio": "best",
-            "links": links,
-        })
-    }
 
-    /// Return recently observed neighbors from normalized radio messages.
-    pub fn neighbors(&self, seen_within_sec: Option<u64>) -> Value {
-        let seen_within_sec = seen_within_sec.unwrap_or(21_600);
-        let neighbors = self.collect_neighbors(seen_within_sec);
-        json!({
-            "seen_within_sec": seen_within_sec,
-            "neighbors": neighbors.into_values().collect::<Vec<_>>(),
-        })
-    }
 
-    fn collect_neighbors(&self, seen_within_sec: u64) -> BTreeMap<String, NeighborInfo> {
-        let window_ms = seen_within_sec.saturating_mul(1000);
-        let cutoff = now_millis_u64().saturating_sub(window_ms);
-        let mut neighbors: BTreeMap<String, NeighborInfo> = BTreeMap::new();
-        for event in self
-            .history
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-        {
-            if event.key == "wifi.raw.tx" {
-                continue;
-            }
-            if event.key == "wifi.raw.rx"
-                && event
-                    .value
-                    .get("payload_text")
-                    .and_then(Value::as_str)
-                    .is_some_and(|payload| payload.contains("source=lmesh"))
-            {
-                continue;
-            }
-            let Some(message) = &event.message else {
-                continue;
-            };
-            if message.timestamp_ms < cutoff {
-                continue;
-            }
-            let Some(node) = message
-                .field_value(FIELD_NODE)
-                .or_else(|| message.field_value(mesh::message::FIELD_PEER))
-            else {
-                continue;
-            };
-            if is_group_mac(node) {
-                continue;
-            }
-            let entry = neighbors
-                .entry(node.to_string())
-                .or_insert_with(|| NeighborInfo::new(node));
-            if message.timestamp_ms >= entry.last_seen_ms {
-                entry.last_seen_ms = message.timestamp_ms;
-                entry.medium = message.field_value(FIELD_MEDIUM).map(str::to_string);
-                entry.network = message.field_value(FIELD_NETWORK).map(str::to_string);
-                entry.radio_id = message.field_value(FIELD_RADIO_ID).map(str::to_string);
-                entry.rssi = message
-                    .field_value(FIELD_RSSI)
-                    .and_then(|value| value.parse().ok());
-                entry.snr = message
-                    .field_value(FIELD_SNR)
-                    .and_then(|value| value.parse().ok());
-                entry.source = Some(event.source.clone());
-                entry.last_event = Some(event.key.clone());
-            }
-        }
-        neighbors
-    }
 
     /// Fan out an active discovery request to the selected media.
-    pub fn discovery_active(&self, medium: Option<String>, to: Option<String>) -> Value {
+    pub(crate) fn discovery_active(&self, medium: Option<String>, to: Option<String>) -> Value {
         // An omitted medium means every currently registered, enabled radio.
         // It must not manufacture errors for optional LoRa/STA adapters that
         // are absent from this service instance.
@@ -2673,153 +2068,10 @@ impl RadioService {
         result
     }
 
-    /// Send a directed NOW active-discovery request and wait for its signed,
-    /// correlated announce response. A successful frame injection alone is
-    /// not a check: it says nothing about peer reception or the return path.
-    pub async fn directed_now_discovery(
-        &self,
-        medium: Option<String>,
-        destination: String,
-    ) -> Result<Value> {
-        // The public `to` address is the peer's ordinary stable Wi-Fi MAC.
-        // The raw action frame uses the ESP receive alias (the locally
-        // administered bit is flipped) as address-1.  Keep that conversion
-        // inside this frame-I/O adapter: callers and the association ledger
-        // must continue to key the peer by its ordinary address, which is
-        // also the source address on the reply.
-        let Some(peer) = parse_now_peer_address(&destination) else {
-            bail!("unsupported explicit discovery address: {destination}");
-        };
-        let request_id = self
-            .next_direct_discovery_id
-            .fetch_add(1, Ordering::Relaxed)
-            .max(1);
-        let (reply, receiver) = std::sync::mpsc::channel();
-        self.pending_now_discovery
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(request_id, PendingNowDiscovery { peer, reply });
 
-        let submission = self.send_directed_now_discovery(medium, &destination, request_id);
-        if submission["ok"] != true {
-            self.pending_now_discovery
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(&request_id);
-            bail!(
-                "directed NOW discovery was not submitted: {}",
-                submission["error"].as_str().unwrap_or("unknown send error")
-            );
-        }
-
-        let response =
-            tokio::task::spawn_blocking(move || receiver.recv_timeout(Duration::from_secs(3)))
-                .await
-                .context("directed NOW discovery waiter stopped")?
-                .map_err(|error| anyhow::anyhow!("directed NOW discovery timed out: {error}"));
-        self.pending_now_discovery
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&request_id);
-        let response = response?;
-        Ok(json!({
-            "ok": true,
-            "record": "announce.discovery",
-            "mode": "directed",
-            "to": destination,
-            "request_id": request_id,
-            "submission": submission,
-            "response": response,
-        }))
-    }
-
-    fn send_directed_now_discovery(
-        &self,
-        _medium: Option<String>,
-        destination: &str,
-        request_id: u64,
-    ) -> Value {
-        let mut record = [0u8; 96];
-        let Some(record_used) =
-            dmesh_server::announce::encode_discovery_request(request_id, &mut record)
-        else {
-            return json!({"ok": false, "error": "encode announce.discovery"});
-        };
-        let wire_destination = now_wire_destination(destination);
-        let iface = wifi_iface(None);
-        let source = match self.now_action_source(&iface) {
-            Ok(source) => colon_mac(&source),
-            Err(error) => {
-                return json!({"ok": false, "error": format!("NOW source MAC: {error:#}")});
-            }
-        };
-        self.wifi_raw_send(
-            None,
-            None,
-            Some(1),
-            Some(wire_destination),
-            Some(source),
-            Some("monitor".to_owned()),
-            None,
-            // ESP-NOW-compatible action traffic uses broadcast address-3
-            // even for a unicast receiver. This must match the firmware
-            // transmitter; using the selected peer as a BSSID makes C6 drop
-            // the action before the common direct dispatcher sees it.
-            Some("ff:ff:ff:ff:ff:ff".to_owned()),
-            None,
-            format!("hex:{}", hex_bytes(&record[..record_used])),
-            Some(6),
-        )
-    }
-
-    /// Ping/discover peers over one radio or all radios.
-    pub fn ping(
-        &self,
-        radio: Option<String>,
-        _wait_ms: Option<u64>,
-        _nonce: Option<String>,
-    ) -> Value {
-        let radio = normalize_radio(radio);
-        let selected = self
-            .radios
-            .iter()
-            .filter(|adapter| {
-                radio == "all"
-                    || radio == mesh_radio_name(&adapter.medium)
-                    || radio == adapter.medium
-                    || radio == adapter.kind
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut wifi_results = Vec::new();
-        for adapter in &selected {
-            let message = MeshMessage::new(mesh::message::KIND_DM_PING, MeshMessageCodec::Text)
-                .field(FIELD_MEDIUM, &adapter.medium)
-                .field(FIELD_RADIO_ID, &adapter.id)
-                .field(FIELD_STATUS, "queued");
-            self.record_message("ping", "local", message);
-            if adapter.medium == "wifi" || adapter.kind == "host-wifi" || radio == "nan" {
-                wifi_results.push(self.rawnan_status(None));
-            }
-        }
-        if (radio == "all" || radio == "nan" || radio == "best") && wifi_results.is_empty() {
-            wifi_results.push(self.rawnan_status(None));
-        }
-        let unavailable = unavailable_radios(&radio);
-        let result = json!({
-            "ok": true,
-            "radio": radio,
-            "sent": selected.len(),
-            "radios": selected,
-            "nan": wifi_results,
-            "unavailable": unavailable,
-        });
-        self.record("ping", result.clone());
-        result
-    }
 
     /// Send a payload over the selected radio, defaulting to current best.
-    pub fn send(
+    pub(crate) fn send(
         &self,
         radio: Option<String>,
         payload: String,
@@ -2892,36 +2144,6 @@ impl RadioService {
         response
     }
 
-    /// Forward one canonical tagged-CBOR record to an explicitly addressed
-    /// NAN peer.  This is intentionally a byte API: callers must not turn a
-    /// key-10 envelope `data` field into text just to cross the radio layer.
-    /// NAN follow-up service information has a bounded 231-byte payload, so
-    /// larger records are rejected here rather than silently truncated.
-    pub fn send_tagged_record(&self, destination: &str, record: &[u8]) -> Value {
-        let Some(target) = parse_device_id(Some(destination)) else {
-            return json!({
-                "ok": false,
-                "error": "tagged-CBOR forwarding requires a six-byte destination MAC",
-                "destination": destination,
-            });
-        };
-        let payload = match local_device_id().and_then(|source| {
-            radio_protocol::build_nan_followup("command_cbor", &source, &target, record)
-        }) {
-            Ok(payload) => payload,
-            Err(error) => {
-                return json!({
-                    "ok": false,
-                    "destination": destination,
-                    "record_len": record.len(),
-                    "error": error.to_string(),
-                });
-            }
-        };
-        let result = self.send_nan_followup(target, &payload);
-        self.record("mesh.tagged.forward", result.clone());
-        result
-    }
 
     /// Send one DMesh NAN Follow-up during the selected cluster's DW. The
     /// caller supplies the DMesh envelope, while this Wi-Fi owner adds the
@@ -3033,7 +2255,7 @@ impl RadioService {
     }
 
     /// Return or record an explicit link steering hint.
-    pub fn link_steer(
+    pub(crate) fn link_steer(
         &self,
         node: Option<String>,
         radio: Option<String>,
@@ -3067,29 +2289,12 @@ impl RadioService {
         result
     }
 
-    /// Start an open AP on the default channel using direct nl80211.
-    pub fn wifi_ap_start_open(&self, iface: Option<String>, ssid: Option<String>) -> Value {
-        self.wifi_ap_start_open_with_width(iface, ssid, None, DEFAULT_OPEN_AP_HT40, 100)
-    }
 
-    /// Start an open AP on a 2.4 GHz channel using direct nl80211.
-    ///
-    /// Keep the selected channel with the AP runtime: the manually generated
-    /// management responses must describe the same channel as the beacon.
-    pub fn wifi_ap_start_open_on_channel(
-        &self,
-        iface: Option<String>,
-        ssid: Option<String>,
-        requested_channel: Option<u8>,
-        ht40: Option<bool>,
-    ) -> Value {
-        self.wifi_ap_start_open_on_channel_with_interval(iface, ssid, requested_channel, ht40, 100)
-    }
 
     /// Start an open AP with a runtime beacon interval. Larger intervals are
     /// useful for raw-action throughput experiments because they reduce AP
     /// beacon contention without changing the radio channel or transport.
-    pub fn wifi_ap_start_open_on_channel_with_interval(
+    pub(crate) fn wifi_ap_start_open_on_channel_with_interval(
         &self,
         iface: Option<String>,
         ssid: Option<String>,
@@ -3110,7 +2315,7 @@ impl RadioService {
     /// station anchor. The anchor remains a station VIF throughout; callers
     /// can therefore stop/restart the AP without changing primary STA
     /// ownership or leaving AP state on the physical interface.
-    pub fn wifi_ap_start_open_on_child(
+    pub(crate) fn wifi_ap_start_open_on_child(
         &self,
         anchor_iface: Option<String>,
         ssid: Option<String>,
@@ -3271,11 +2476,10 @@ impl RadioService {
                     bail!("nl80211 start open AP returned no selected profile");
                 }
                 let mgmt_iface = iface.clone();
-                let history = self.history.clone();
-                let discovered_devices = self.discovered_devices.clone();
+                let history: Arc<dyn CaptureHost> = self.capture_host.clone();
                 let rawnan_state = self.rawnan_state.clone();
                 let active_nan_publish = self.active_nan_publish.clone();
-                let pending_nan_active_subscribe = self.pending_nan_active_subscribe.clone();
+                let _pending_nan_active_subscribe = self.pending_nan_active_subscribe.clone();
                 let pending_nan_followups = self.pending_nan_followups.clone();
                 let ap_no_ht_stations = self.ap_no_ht_stations.clone();
                 let stop = Arc::new(AtomicBool::new(false));
@@ -3287,10 +2491,8 @@ impl RadioService {
                         ifindex,
                         mac,
                         history,
-                        discovered_devices,
                         rawnan_state,
                         active_nan_publish,
-                        pending_nan_active_subscribe,
                         pending_nan_followups,
                         ap_no_ht_stations,
                         channel,
@@ -3359,7 +2561,7 @@ impl RadioService {
     }
 
     /// Stop AP operation on an interface.
-    pub fn wifi_ap_stop(&self, iface: Option<String>) -> Value {
+    pub(crate) fn wifi_ap_stop(&self, iface: Option<String>) -> Value {
         let iface = wifi_iface(iface);
         self.stop_ap_runtime(&iface);
         let result = ifindex(&iface)
@@ -3470,327 +2672,17 @@ impl RadioService {
         raw_wifi_source(None, anchor_iface).map(|mac| (mac, "interface_mac"))
     }
 
-    /// NOW is an independent packet bearer, not a NAN/P2P service action.
-    /// Its source must be the anchor radio identity that owns the monitor
-    /// injection path.  A P2P-GO child MAC is appropriate for NAN Service
-    /// Discovery, but some drivers do not put arbitrary vendor action frames
-    /// using that child address on air or deliver their replies to the anchor
-    /// monitor.  Keep this choice inside the frame adapter; the shared QUIC
-    /// association only receives the opaque NOW path.
-    fn now_action_source(&self, anchor_iface: &str) -> Result<[u8; 6]> {
-        raw_wifi_source(None, anchor_iface)
-    }
 
-    /// Return basic AP defaults and station metrics where available.
-    pub fn wifi_ap_status(&self, iface: Option<String>) -> Value {
-        let iface = wifi_iface(iface);
-        let wpa_active = self
-            .wpa_supplicants
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains_key(&iface);
-        let p2p_group_iface = self
-            .p2p_group_ifaces
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&iface)
-            .cloned();
-        let p2p_group_mac = p2p_group_iface
-            .as_deref()
-            .and_then(|group_iface| iface_mac(group_iface).ok());
-        let mac = iface_mac(&iface).ok();
-        let stations = ifindex(&iface)
-            .and_then(|ifindex| {
-                let socket = Nl80211Socket::open()?;
-                socket.station_dump(ifindex)
-            })
-            .ok();
-        let channel = self
-            .wifi_ap_handles
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&iface)
-            .map(|runtime| runtime.channel)
-            .unwrap_or(DEFAULT_RAW_WIFI_CHANNEL);
-        let result = json!({
-            "ok": true,
-            "backend": if wpa_active { "wpa_supplicant" } else { "linux_nl80211" },
-            "iface": iface,
-            "ssid_default": if wpa_active { DMESH_P2P_SSID.to_owned() } else { default_open_ap_ssid(&iface) },
-            "channel": channel,
-            "freq": channel_to_freq(channel),
-            "bssid": mac.map(|mac| colon_mac(&mac)),
-            "auth": if wpa_active { "wpa2-psk" } else { "open" },
-            "p2p_active": p2p_group_iface.is_some(),
-            "p2p_group_iface": p2p_group_iface,
-            "p2p_group_mac": p2p_group_mac.map(|mac| colon_mac(&mac)),
-            "stations": stations,
-        });
-        self.record("wifi.ap.status", result.clone());
-        result
-    }
 
-    /// Return associated station metrics for an AP interface.
-    pub fn wifi_ap_stations(&self, iface: Option<String>) -> Value {
-        let iface = wifi_iface(iface);
-        let result = ifindex(&iface)
-            .and_then(|ifindex| {
-                let socket = Nl80211Socket::open()?;
-                socket
-                    .station_dump(ifindex)
-                    .map(|stations| (ifindex, stations))
-            })
-            .map(|(interface_index, stations)| {
-                let link_metrics: Vec<WifiLinkMetrics> = stations
-                    .iter()
-                    .map(|station| station_link_metrics(station, interface_index))
-                    .collect();
-                for station in &stations {
-                    if let Some(mac) = station.get("mac").and_then(Value::as_str) {
-                        let mut message =
-                            MeshMessage::new(mesh::message::KIND_EVENT, MeshMessageCodec::Text)
-                                .field(FIELD_MEDIUM, "wifi")
-                                .field(FIELD_RADIO_ID, "sta")
-                                .field(FIELD_NODE, mac);
-                        if let Some(signal) = station.get("signal_dbm").and_then(Value::as_i64) {
-                            message = message.field(FIELD_RSSI, signal.to_string());
-                        }
-                        self.record_message("wifi.ap.station", &iface, message);
-                    }
-                }
-                json!({
-                    "ok": true,
-                    "backend": "linux_nl80211",
-                    "iface": iface,
-                    "link_metrics_schema_version": WIFI_LINK_METRICS_SCHEMA_VERSION,
-                    "link_metrics": link_metrics,
-                    "stations": stations,
-                })
-            })
-            .unwrap_or_else(|error| {
-                json!({
-                    "ok": false,
-                    "backend": "linux_nl80211",
-                    "iface": iface,
-                    "error": format!("{error:#}"),
-                })
-            });
-        self.record("wifi.ap.stations", result.clone());
-        result
-    }
 
-    /// Experimentally add a station entry without observing auth/assoc.
-    pub fn wifi_ap_station_add(
-        &self,
-        iface: Option<String>,
-        mac: String,
-        aid: Option<u16>,
-    ) -> Value {
-        let iface = wifi_iface(iface);
-        let Some(mac_bytes) = parse_mac(Some(&mac)) else {
-            return json!({
-                "ok": false,
-                "backend": "linux_nl80211",
-                "iface": iface,
-                "mac": mac,
-                "error": "invalid station MAC",
-            });
-        };
-        let aid = aid.unwrap_or(1).clamp(1, 2007);
-        let result = ifindex(&iface)
-            .and_then(|ifindex| {
-                let socket = Nl80211Socket::open()?;
-                socket.add_station_minimal(ifindex, mac_bytes, aid)
-            })
-            .map(|_| {
-                json!({
-                    "ok": true,
-                    "backend": "linux_nl80211",
-                    "iface": iface,
-                    "mac": colon_mac(&mac_bytes),
-                    "aid": aid,
-                    "mode": "experimental_no_assoc",
-                })
-            })
-            .unwrap_or_else(|error| {
-                json!({
-                    "ok": false,
-                    "backend": "linux_nl80211",
-                    "iface": iface,
-                    "mac": colon_mac(&mac_bytes),
-                    "aid": aid,
-                    "mode": "experimental_no_assoc",
-                    "error": format!("{error:#}"),
-                })
-            });
-        self.record("wifi.ap.station.add", result.clone());
-        result
-    }
 
-    /// Remove one associated station without stopping the AP.
-    pub fn wifi_ap_station_remove(&self, iface: Option<String>, mac: String) -> Value {
-        let iface = wifi_iface(iface);
-        let Some(mac_bytes) = parse_mac(Some(&mac)) else {
-            return json!({
-                "ok": false,
-                "backend": "linux_nl80211",
-                "iface": iface,
-                "mac": mac,
-                "error": "invalid station MAC",
-            });
-        };
-        let result = ifindex(&iface)
-            .and_then(|ifindex| {
-                let socket = Nl80211Socket::open()?;
-                socket.remove_station(ifindex, mac_bytes)
-            })
-            .map(|_| {
-                json!({
-                    "ok": true,
-                    "backend": "linux_nl80211",
-                    "iface": iface,
-                    "mac": colon_mac(&mac_bytes),
-                })
-            })
-            .unwrap_or_else(|error| {
-                json!({
-                    "ok": false,
-                    "backend": "linux_nl80211",
-                    "iface": iface,
-                    "mac": colon_mac(&mac_bytes),
-                    "error": format!("{error:#}"),
-                })
-            });
-        self.record("wifi.ap.station.remove", result.clone());
-        result
-    }
 
-    /// Remove all associated stations without stopping the AP.
-    pub fn wifi_ap_station_remove_all(&self, iface: Option<String>) -> Value {
-        let iface = wifi_iface(iface);
-        let result = ifindex(&iface)
-            .and_then(|ifindex| {
-                let socket = Nl80211Socket::open()?;
-                socket.flush_stations(ifindex)
-            })
-            .map(|_| {
-                json!({
-                    "ok": true,
-                    "backend": "linux_nl80211",
-                    "iface": iface,
-                })
-            })
-            .unwrap_or_else(|error| {
-                json!({
-                    "ok": false,
-                    "backend": "linux_nl80211",
-                    "iface": iface,
-                    "error": format!("{error:#}"),
-                })
-            });
-        self.record("wifi.ap.station.remove_all", result.clone());
-        result
-    }
 
-    /// Discover AP candidates without replacing the current transport epoch.
-    ///
-    /// `passive=true` returns the existing monitor observations.  An active
-    /// request uses one bounded nl80211 scan on the selected 2.4 GHz channels;
-    /// it does not start an AP, create a monitor VIF, or invoke a host command.
-    /// The result keeps all BSS entries plus DMesh subsets so a probe can pick
-    /// a candidate and issue the separate `transport.set` transition.
-    pub fn wifi_scan(
-        &self,
-        iface: Option<String>,
-        ssid: Option<String>,
-        channel: Option<u8>,
-        passive: bool,
-    ) -> Value {
-        let iface = wifi_iface(iface);
-        let channel = channel.filter(|channel| (1..=13).contains(channel));
-        let result = if passive {
-            let status = self.rawnan_status(Some(iface.clone()));
-            let entries = status["observed_aps"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-            discovery_result(
-                iface.clone(),
-                "passive_monitor",
-                ssid,
-                channel,
-                true,
-                status["listener"].as_bool().unwrap_or(false),
-                entries,
-                None,
-            )
-        } else {
-            if self
-                .wifi_ap_handles
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .contains_key(&iface)
-            {
-                return json!({
-                    "ok": false,
-                    "backend": "linux_nl80211",
-                    "iface": iface,
-                    "mechanism": "ssid_scan",
-                    "error": "active scan requires the owned AP to be down",
-                });
-            }
-            let scan = ifindex(&iface).and_then(|ifindex| {
-                let socket = Nl80211Socket::open()?;
-                socket.trigger_scan(ifindex, ssid.as_deref(), channel)?;
-                // cfg80211 completes asynchronously.  A bounded delay avoids
-                // subscribing a long-lived event listener solely for a probe,
-                // then GET_SCAN returns the kernel BSS cache atomically.
-                std::thread::sleep(Duration::from_millis(1_200));
-                socket.scan_dump(ifindex)
-            });
-            match scan {
-                Ok(entries) => {
-                    let seen = now_millis();
-                    {
-                        let mut registry = self
-                            .discovered_devices
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        for entry in &entries {
-                            registry.observe_bss("active_ssid_scan", entry, seen);
-                        }
-                    }
-                    discovery_result(
-                        iface.clone(),
-                        "linux_nl80211",
-                        ssid,
-                        channel,
-                        false,
-                        true,
-                        entries,
-                        Some("ssid_scan"),
-                    )
-                }
-                Err(error) => json!({
-                    "ok": false,
-                    "backend": "linux_nl80211",
-                    "iface": iface,
-                    "ssid_filter": ssid,
-                    "channel": channel,
-                    "passive": false,
-                    "mechanism": "ssid_scan",
-                    "error": format!("{error:#}"),
-                }),
-            }
-        };
-        self.record("wifi.scan", result.clone());
-        result
-    }
 
     /// Join an open AP as a station on its passive-observed channel. A BSSID
     /// constraint avoids an active scan and makes the final association
     /// evidence specific to the requested AP rather than any matching SSID.
-    pub fn wifi_sta_join_open(
+    pub(crate) fn wifi_sta_join_open(
         &self,
         iface: Option<String>,
         ssid: String,
@@ -3892,7 +2784,7 @@ impl RadioService {
     /// STA children, AP runtime, and WPA child.  In particular, a failed WPA
     /// attempt must not leave a managed VIF behind to poison the next AP or
     /// STA transition on the same wiphy.
-    pub fn wifi_sta_transport_start(
+    pub(crate) fn wifi_sta_transport_start(
         &self,
         iface: Option<String>,
         ssid: String,
@@ -4090,7 +2982,7 @@ impl RadioService {
     /// Start the AP-equivalent half of a common transport epoch. The selected
     /// backend is service policy; a supplied PSK is volatile and otherwise
     /// the common DMesh P2P default is used.
-    pub fn wifi_p2p_transport_start(
+    pub(crate) fn wifi_p2p_transport_start(
         &self,
         iface: Option<String>,
         backend: &str,
@@ -4396,51 +3288,10 @@ impl RadioService {
         ))
     }
 
-    /// Return station-mode association metrics for the current AP peer.
-    pub fn wifi_sta_status(&self, iface: Option<String>) -> Value {
-        let iface = wifi_iface(iface);
-        let result = ifindex(&iface)
-            .and_then(|ifindex| {
-                let socket = Nl80211Socket::open()?;
-                socket.station_dump(ifindex)
-            })
-            .map(|peers| {
-                for peer in &peers {
-                    if let Some(mac) = peer.get("mac").and_then(Value::as_str) {
-                        let mut message =
-                            MeshMessage::new(mesh::message::KIND_EVENT, MeshMessageCodec::Text)
-                                .field(FIELD_MEDIUM, "wifi")
-                                .field(FIELD_RADIO_ID, "sta")
-                                .field(FIELD_NODE, mac);
-                        if let Some(signal) = peer.get("signal_dbm").and_then(Value::as_i64) {
-                            message = message.field(FIELD_RSSI, signal.to_string());
-                        }
-                        self.record_message("wifi.sta.peer", &iface, message);
-                    }
-                }
-                json!({
-                    "ok": true,
-                    "backend": "linux_nl80211",
-                    "iface": iface,
-                    "associated": !peers.is_empty(),
-                    "peers": peers,
-                })
-            })
-            .unwrap_or_else(|error| {
-                json!({
-                    "ok": false,
-                    "backend": "linux_nl80211",
-                    "iface": iface,
-                    "error": format!("{error:#}"),
-                })
-            });
-        self.record("wifi.sta.status", result.clone());
-        result
-    }
 
     /// Configure a static IPv4 address through the capability-bearing service
     /// using rtnetlink. Callers own route/DHCP policy.
-    pub fn wifi_sta_configure_ipv4(
+    pub(crate) fn wifi_sta_configure_ipv4(
         &self,
         iface: Option<String>,
         address: String,
@@ -4479,148 +3330,14 @@ impl RadioService {
         result
     }
 
-    /// Listen for DMesh Ethernet frames on the normal AP/STA netdev path.
-    pub fn wifi_data_listen(&self, iface: Option<String>, listen_sec: Option<u64>) -> Value {
-        let iface = wifi_iface(iface);
-        let listen_sec = listen_sec.unwrap_or(DEFAULT_RAW_WIFI_LISTEN_SECS).max(1);
-        let listener_key = format!("{iface}:data");
-        {
-            let mut listeners = self
-                .raw_wifi_listeners
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !listeners.insert(listener_key.clone()) {
-                return json!({
-                    "ok": true,
-                    "backend": "linux_af_packet_data",
-                    "iface": iface,
-                    "listen_sec": listen_sec,
-                    "already_running": true,
-                });
-            }
-        }
 
-        match DataSocket::open(&iface) {
-            Ok(socket) => {
-                let receive_addresses = raw_wifi_receive_addresses(&iface);
-                let memberships = receive_addresses
-                    .iter()
-                    .map(|address| {
-                        json!({
-                            "mac": colon_mac(address),
-                            "result": result_json(socket.add_multicast(*address)),
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                let history = self.history.clone();
-                let listeners = self.raw_wifi_listeners.clone();
-                let iface_for_thread = iface.clone();
-                let listener_key_for_thread = listener_key.clone();
-                std::thread::spawn(move || {
-                    data_receive_loop(
-                        socket,
-                        &iface_for_thread,
-                        history,
-                        Duration::from_secs(listen_sec),
-                    );
-                    listeners
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .remove(&listener_key_for_thread);
-                });
-                let result = json!({
-                    "ok": true,
-                    "backend": "linux_af_packet_data",
-                    "iface": iface,
-                    "listen_sec": listen_sec,
-                    "ethertype": format!("0x{ETH_P_DMESH:04x}"),
-                    "receive_addresses": receive_addresses
-                        .iter()
-                        .map(colon_mac)
-                        .collect::<Vec<_>>(),
-                    "memberships": memberships,
-                    "note": "normal AP/STA netdev listener; delivery depends on driver data path association/state",
-                });
-                self.record("wifi.data.listen", result.clone());
-                result
-            }
-            Err(error) => {
-                self.raw_wifi_listeners
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .remove(&listener_key);
-                json!({
-                    "ok": false,
-                    "backend": "linux_af_packet_data",
-                    "iface": iface,
-                    "error": format!("{error:#}"),
-                })
-            }
-        }
-    }
-
-    /// Send a DMesh Ethernet frame on the normal AP/STA netdev path.
-    pub fn wifi_data_send(
-        &self,
-        iface: Option<String>,
-        destination: Option<String>,
-        payload: String,
-    ) -> Value {
-        let iface = wifi_iface(iface);
-        let destination = raw_wifi_destination(destination.as_deref(), "multicast_data");
-        let source = match iface_mac(&iface) {
-            Ok(source) => source,
-            Err(error) => {
-                return json!({
-                    "ok": false,
-                    "backend": "linux_af_packet_data",
-                    "iface": iface,
-                    "error": format!("{error:#}"),
-                });
-            }
-        };
-        let frame = build_dmesh_ethernet_frame(destination, source, payload.as_bytes());
-        let result = match DataSocket::open(&iface).and_then(|socket| socket.send(&frame)) {
-            Ok(written) => json!({
-                "ok": true,
-                "backend": "linux_af_packet_data",
-                "iface": iface,
-                "destination": colon_mac(&destination),
-                "source": colon_mac(&source),
-                "ethertype": format!("0x{ETH_P_DMESH:04x}"),
-                "payload_len": payload.len(),
-                "frame_len": frame.len(),
-                "written": written,
-            }),
-            Err(error) => json!({
-                "ok": false,
-                "backend": "linux_af_packet_data",
-                "iface": iface,
-                "destination": colon_mac(&destination),
-                "source": colon_mac(&source),
-                "error": format!("{error:#}"),
-            }),
-        };
-        self.record_message(
-            "wifi.data.tx",
-            "host-wifi",
-            MeshMessage::new(mesh::message::KIND_EVENT, MeshMessageCodec::Text)
-                .field(FIELD_MEDIUM, "wifi")
-                .field(FIELD_IFACE, &iface)
-                .field(mesh::message::FIELD_PEER, colon_mac(&destination))
-                .field(FIELD_LEN, payload.len())
-                .field(FIELD_PAYLOAD, payload),
-        );
-        self.record("wifi.data.tx", result.clone());
-        result
-    }
 
     /// Start a direct nl80211 listener for ESP32 DMesh vendor action frames.
     ///
     /// This listener deliberately consumes an existing monitor fixture.  The
     /// managed service prepares that fixture at startup; packet tests must not
     /// change host radio state by asking for a listener.
-    pub fn wifi_raw_listen(
+    pub(crate) fn wifi_raw_listen(
         &self,
         iface: Option<String>,
         channel: Option<u8>,
@@ -4664,8 +3381,7 @@ impl RadioService {
             require_existing_monitor_iface(&monitor_iface).and_then(|setup| {
                 let socket = MonitorRxSocket::open(&monitor_iface)?;
                 socket.set_receive_timeout(Duration::from_millis(100))?;
-                let history = self.history.clone();
-                let discovered_devices = self.discovered_devices.clone();
+                let history: Arc<dyn CaptureHost> = self.capture_host.clone();
                 let listeners = self.raw_wifi_listeners.clone();
                 let stop_flags = self.raw_wifi_stop_flags.clone();
                 let iface_for_thread = iface.clone();
@@ -4673,29 +3389,39 @@ impl RadioService {
                 let listener_key_for_thread = listener_key.clone();
                 let rawnan_state = self.rawnan_state.clone();
                 let active_nan_publish = self.active_nan_publish.clone();
-                let pending_nan_active_subscribe = self.pending_nan_active_subscribe.clone();
+                let _pending_nan_active_subscribe = self.pending_nan_active_subscribe.clone();
                 let pending_nan_followups = self.pending_nan_followups.clone();
-                let pending_now_discovery = self.pending_now_discovery.clone();
-                let espnow_ingress = self.espnow_ingress.clone();
                 let p2p_group_ifaces = self.p2p_group_ifaces.clone();
                 let stop_flag = Arc::new(AtomicBool::new(false));
                 stop_flags
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .insert(listener_key.clone(), stop_flag.clone());
+                // The discovery windows are served by the shared scheduler, locked to the
+                // DW derived from the NAN beacons.
+                {
+                    let schedule = WindowSchedule {
+                        iface: iface.clone(),
+                        monitor_iface: monitor_iface.clone(),
+                        nan: self.rawnan_state.clone(),
+                        publish: self.active_nan_publish.clone(),
+                        subscribe: self.pending_nan_active_subscribe.clone(),
+                        now_discovery: Arc::new(Mutex::new(None)),
+                        now_publish: Arc::new(Mutex::new(None)),
+                        followups: self.pending_nan_followups.clone(),
+                    };
+                    let (host, stop) = (history.clone(), stop_flag.clone());
+                    std::thread::spawn(move || run_window_scheduler(schedule, host, stop));
+                }
                 std::thread::spawn(move || {
                     monitor_receive_loop(
                         socket,
                         &iface_for_thread,
                         &monitor_for_thread,
                         history,
-                        discovered_devices,
                         rawnan_state,
                         active_nan_publish,
-                        pending_nan_active_subscribe,
                         pending_nan_followups,
-                        pending_now_discovery,
-                        espnow_ingress,
                         p2p_group_ifaces,
                         stop_flag,
                     );
@@ -4728,7 +3454,7 @@ impl RadioService {
                     Ok(socket)
                 })
                 .map(|socket| {
-                    let history = self.history.clone();
+                    let history: Arc<dyn CaptureHost> = self.capture_host.clone();
                     let listeners = self.raw_wifi_listeners.clone();
                     let iface_for_thread = iface.clone();
                     let listener_key_for_thread = listener_key.clone();
@@ -4788,7 +3514,7 @@ impl RadioService {
     /// its mode or monitor VIF. Some adapters suppress beacons on an active
     /// monitor used for NOW TX, while nl80211 can still deliver registered
     /// management frames on the managed/AP interface.
-    pub fn wifi_nan_beacon_listen(&self, iface: Option<String>) -> Value {
+    pub(crate) fn wifi_nan_beacon_listen(&self, iface: Option<String>) -> Value {
         let iface = wifi_iface(iface);
         let listener_key = format!("{iface}:nl80211_nan_beacon");
         if !self
@@ -4805,8 +3531,7 @@ impl RadioService {
         });
         match socket {
             Ok(socket) => {
-                let history = self.history.clone();
-                let discovered_devices = self.discovered_devices.clone();
+                let history: Arc<dyn CaptureHost> = self.capture_host.clone();
                 let rawnan_state = self.rawnan_state.clone();
                 let pending_nan_followups = self.pending_nan_followups.clone();
                 let listeners = self.raw_wifi_listeners.clone();
@@ -4816,9 +3541,9 @@ impl RadioService {
                         socket,
                         &iface_for_thread,
                         history,
-                        discovered_devices,
                         rawnan_state,
                         pending_nan_followups,
+                        Arc::new(AtomicBool::new(false)),
                     );
                     listeners
                         .lock()
@@ -4841,7 +3566,7 @@ impl RadioService {
     /// `lmesh` radio.  This is service-startup policy, not a packet-test
     /// operation: it may recreate the service-owned monitor and pin it to the
     /// requested channel before listeners attach.
-    pub fn prepare_raw_monitor_fixture(&self, iface: Option<String>, channel: Option<u8>) -> Value {
+    pub(crate) fn prepare_raw_monitor_fixture(&self, iface: Option<String>, channel: Option<u8>) -> Value {
         let iface = wifi_iface(iface);
         let channel = raw_wifi_channel(channel);
         let monitor_iface = monitor_iface_name(&iface);
@@ -4896,7 +3621,7 @@ impl RadioService {
     /// Create the same long-lived NAN+NOW monitor alongside an AP. Unlike the
     /// AP-off fixture this retains the managed parent: the AP owns the
     /// channel and the active monitor follows it for on-channel NOW TX.
-    pub fn prepare_ap_raw_monitor_fixture(
+    pub(crate) fn prepare_ap_raw_monitor_fixture(
         &self,
         iface: Option<String>,
         channel: Option<u8>,
@@ -4926,62 +3651,10 @@ impl RadioService {
         }
     }
 
-    /// Attach a live raw-NAN subscriber to the permanent monitor fixture.
-    /// The AP/monitor lifecycle is managed outside subscriptions so a client
-    /// disconnect cannot perturb the RF setup used by other tests or NOW.
-    pub fn rawnan_subscription_start(
-        &self,
-        config: &mesh::local_trace::TraceConfig,
-    ) -> Option<String> {
-        let target = config
-            .targets
-            .iter()
-            .find(|target| target.starts_with("dmesh.event.wifi.rawnan"))?;
-        let _ = target;
-        let iface = wifi_iface(None);
-        let mut subscribers = self
-            .rawnan_subscribers
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let count = subscribers.entry(iface.clone()).or_insert(0);
-        *count += 1;
-        let first = *count == 1;
-        drop(subscribers);
-        if first {
-            let result = self.wifi_raw_listen(
-                Some(iface.clone()),
-                Some(6),
-                Some(DEFAULT_RAW_WIFI_LISTEN_SECS),
-                Some("monitor".to_owned()),
-            );
-            if !result.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-                self.rawnan_subscription_stop(&iface);
-                return None;
-            }
-        }
-        Some(iface)
-    }
 
-    /// Release a live raw-NAN subscription. The permanent monitor remains up
-    /// after the final subscriber disconnects.
-    pub fn rawnan_subscription_stop(&self, iface: &str) {
-        {
-            let mut subscribers = self
-                .rawnan_subscribers
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let Some(count) = subscribers.get_mut(iface) else {
-                return;
-            };
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                subscribers.remove(iface);
-            }
-        }
-    }
 
     /// Send an ESP32-compatible DMesh vendor action frame.
-    pub fn wifi_raw_send(
+    pub(crate) fn wifi_raw_send(
         &self,
         iface: Option<String>,
         channel: Option<u8>,
@@ -5253,7 +3926,7 @@ impl RadioService {
     /// The `monitor` bearer expects an 802.11 frame without radiotap. The
     /// `af_packet` bearer expects a complete Ethernet frame and writes it
     /// directly to the named netdev (useful for AP/STA data-path tests).
-    pub fn wifi_raw_send_frame(
+    pub(crate) fn wifi_raw_send_frame(
         &self,
         iface: Option<String>,
         channel: Option<u8>,
@@ -5379,137 +4052,6 @@ impl RadioService {
         result
     }
 
-    /// Capture beacon and probe-response management frames through an AF_PACKET monitor socket.
-    pub fn wifi_mgmt_capture(
-        &self,
-        iface: Option<String>,
-        channel: Option<u8>,
-        capture_ms: Option<u64>,
-        max_frames: Option<usize>,
-        active: Option<bool>,
-    ) -> Result<Value> {
-        let iface = wifi_iface(iface);
-        let channel = raw_wifi_channel(channel);
-        let capture_ms = capture_ms.unwrap_or(4_000).clamp(100, 60_000);
-        let max_frames = max_frames.unwrap_or(32).clamp(1, 512);
-        let monitor_iface = monitor_iface_name(&iface);
-        let active = active.unwrap_or(false);
-        if active {
-            bail!(
-                "active monitor capture is an operator radio transition; use the permanent monitor fixture"
-            );
-        }
-        // Capture is a read-only diagnostic.  Do not let an E2E caller create
-        // or reconfigure a monitor as a side effect of observing packets.
-        let setup = require_existing_monitor_iface(&monitor_iface)?;
-        let socket = MonitorRxSocket::open(&monitor_iface)?;
-        let deadline = std::time::Instant::now() + Duration::from_millis(capture_ms);
-        let mut buf = [0_u8; 4096];
-        let mut frames = Vec::new();
-        while frames.len() < max_frames {
-            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
-                break;
-            };
-            if remaining.is_zero() {
-                break;
-            }
-            match socket.recv_timeout(&mut buf, remaining.min(Duration::from_millis(250)))? {
-                Some(0) | None => continue,
-                Some(len) => {
-                    let packet = &buf[..len];
-                    let Some(frame) = ieee80211_frame(packet) else {
-                        continue;
-                    };
-                    let subtype = frame_subtype(frame);
-                    // Include action frames as well as beacons/probe
-                    // responses. Host NOW/NAN validation needs an RF-level
-                    // capture before any DMesh-specific parser decides
-                    // whether a payload is a usable command.
-                    if frame_type(frame) != 0 || !matches!(subtype, 5 | 8 | 13) {
-                        continue;
-                    }
-                    frames.push(parse_management_frame(
-                        frame,
-                        &iface,
-                        "linux_af_packet_monitor",
-                    ));
-                }
-            }
-        }
-        // A passive scan is not available on these active AP interfaces, but
-        // the permanent monitor already observes the same beacon/probe
-        // traffic. Normalize that capture into one observation per BSSID for
-        // the control-plane probe without discarding its underlying frames.
-        let mut aps = BTreeMap::<String, Value>::new();
-        for frame in &frames {
-            if !matches!(
-                frame.get("kind").and_then(Value::as_str),
-                Some("beacon" | "probe_resp")
-            ) {
-                continue;
-            }
-            let Some(bssid) = frame.get("bssid").and_then(Value::as_str) else {
-                continue;
-            };
-            aps.insert(
-                bssid.to_owned(),
-                json!({
-                    "bssid": bssid,
-                    "ssid": frame.get("ssid").cloned().unwrap_or(Value::Null),
-                    "channel": frame.get("channel").cloned().unwrap_or(Value::Null),
-                    "beacon_interval": frame.get("fixed")
-                        .and_then(|fixed| fixed.get("beacon_interval"))
-                        .cloned().unwrap_or(Value::Null),
-                }),
-            );
-        }
-        let direct = aps
-            .values()
-            .filter(|ap| {
-                ap.get("ssid")
-                    .and_then(Value::as_str)
-                    .is_some_and(|ssid| ssid.starts_with("DIRECT-"))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let direct_dmesh = direct
-            .iter()
-            .filter(|ap| {
-                ap.get("ssid")
-                    .and_then(Value::as_str)
-                    .is_some_and(|ssid| ssid.ends_with("-dmesh"))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let dmesh = aps
-            .values()
-            .filter(|ap| {
-                ap.get("ssid")
-                    .and_then(Value::as_str)
-                    .is_some_and(|ssid| ssid.ends_with("-dmesh") || ssid.starts_with("dmesh-"))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let result = json!({
-            "ok": true,
-            "backend": "linux_af_packet_monitor",
-            "iface": iface,
-            "monitor_iface": monitor_iface,
-            "channel": channel,
-            "capture_ms": capture_ms,
-            "max_frames": max_frames,
-            "frame_count": frames.len(),
-            "ap_count": aps.len(),
-            "aps": aps.into_values().collect::<Vec<_>>(),
-            "direct": direct,
-            "direct_dmesh": direct_dmesh,
-            "dmesh": dmesh,
-            "setup": setup,
-            "frames": frames,
-        });
-        self.record("wifi.mgmt.capture", result.clone());
-        Ok(result)
-    }
 
     fn record(&self, key: &str, value: Value) {
         self.push_event(RadioEvent {
@@ -5543,21 +4085,6 @@ impl RadioService {
     }
 }
 
-fn push_history_event(history: &Arc<Mutex<VecDeque<RadioEvent>>>, key: &str, value: Value) {
-    let mut history = history
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    history.push_back(RadioEvent {
-        ts_millis: now_millis(),
-        key: key.to_owned(),
-        source: "local".to_owned(),
-        value,
-        message: None,
-    });
-    while history.len() > MAX_HISTORY {
-        history.pop_front();
-    }
-}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RadioEvent {
@@ -5583,34 +4110,7 @@ pub struct RadioAdapter {
     enabled: bool,
 }
 
-#[derive(Debug, Serialize)]
-struct NeighborInfo {
-    node: String,
-    last_seen_ms: u64,
-    medium: Option<String>,
-    network: Option<String>,
-    radio_id: Option<String>,
-    rssi: Option<i32>,
-    snr: Option<f32>,
-    source: Option<String>,
-    last_event: Option<String>,
-}
 
-impl NeighborInfo {
-    fn new(node: &str) -> Self {
-        Self {
-            node: node.to_string(),
-            last_seen_ms: 0,
-            medium: None,
-            network: None,
-            radio_id: None,
-            rssi: None,
-            snr: None,
-            source: None,
-            last_event: None,
-        }
-    }
-}
 
 fn normalize_radio(radio: Option<String>) -> String {
     let radio = radio
@@ -5633,76 +4133,10 @@ fn medium_to_radio(medium: &str) -> String {
     }
 }
 
-fn mesh_radio_name(medium: &str) -> &'static str {
-    match medium {
-        "wifi" | "nan" => "nan",
-        "ble" => "ble",
-        "serial" => "serial",
-        "remote" => "remote",
-        "mcast" => "mcast",
-        _ => "unknown",
-    }
-}
 
-fn unavailable_radios(radio: &str) -> Vec<Value> {
-    let mut unavailable = Vec::new();
-    if radio == "all" || radio == "lora" {
-        unavailable.push(json!({
-            "radio": "lora",
-            "ok": false,
-            "error": "host LoRA send/listen is not implemented in lmesh yet",
-        }));
-    }
-    if radio == "all" || radio == "sta" {
-        unavailable.push(json!({
-            "radio": "sta",
-            "ok": false,
-            "error": "open AP/STA attachment is not implemented in lmesh yet",
-        }));
-    }
-    unavailable
-}
 
-fn link_quality(rssi: Option<i32>, snr: Option<f32>) -> &'static str {
-    if let Some(snr) = snr {
-        if snr >= 8.0 {
-            return "good";
-        }
-        if snr >= 2.0 {
-            return "fair";
-        }
-        return "poor";
-    }
-    if let Some(rssi) = rssi {
-        if rssi >= -60 {
-            return "good";
-        }
-        if rssi >= -75 {
-            return "fair";
-        }
-        return "poor";
-    }
-    "unknown"
-}
 
-fn is_group_mac(mac: &str) -> bool {
-    let Some(first) = mac.split(':').next() else {
-        return false;
-    };
-    u8::from_str_radix(first, 16)
-        .map(|byte| byte & 1 == 1)
-        .unwrap_or(false)
-}
 
-fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
-}
 
 /// Decode the `hex:` payload accepted by raw Wi-Fi diagnostics.  This is a
 /// raw-radio utility, independent of the retired UART forwarding layer.
@@ -5832,13 +4266,6 @@ fn sanitize_radio_id(path: &str) -> String {
         .to_string()
 }
 
-fn monitor_iface_name(iface: &str) -> String {
-    if iface.ends_with("mon") {
-        iface.to_string()
-    } else {
-        format!("{iface}mon")
-    }
-}
 
 /// The station keeps the configured service interface.  A concurrent AP is
 /// an explicitly service-owned sibling VIF, never a second configurable name.
@@ -5866,57 +4293,9 @@ fn wpa_owner_iface_names(anchor_iface: &str, legacy_sta_iface: &str) -> Vec<Stri
     owners
 }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct GenlMsgHdr {
-    cmd: u8,
-    version: u8,
-    reserved: u16,
-}
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct NlAttrHdr {
-    nla_len: u16,
-    nla_type: u16,
-}
 
-/// Build the nested 2.4 GHz rate attributes used by `NL80211_ATTR_TX_RATES`.
-/// This is kept independent of the socket so host tests cover the exact
-/// no-legacy HT diagnostic payload before it is sent to the live AP.
-fn tx_rate_profile_band(
-    rate_mbps: Option<u8>,
-    ht_mcs: Option<u8>,
-    disable_b: bool,
-) -> Option<Vec<u8>> {
-    if rate_mbps.is_none() && ht_mcs.is_none() && !disable_b {
-        return None;
-    }
-    let mut band = Vec::new();
-    if let Some(rate) = rate_mbps {
-        append_attr(&mut band, NL80211_TXRATE_LEGACY, &[rate.saturating_mul(2)]);
-    } else if disable_b && ht_mcs.is_none() {
-        // OFDM-only 2.4 GHz policy: exclude 1/2/5.5/11 Mbps CCK while
-        // retaining the normal OFDM fallback ladder.
-        let rates: Vec<u8> = [6_u8, 9, 12, 18, 24, 36, 48, 54]
-            .into_iter()
-            .map(|rate| rate.saturating_mul(2))
-            .collect();
-        append_attr(&mut band, NL80211_TXRATE_LEGACY, &rates);
-    }
-    if let Some(mcs) = ht_mcs {
-        // Exact HT-only diagnostic: leave legacy data rates out of this
-        // rate-control profile so rate fallback cannot hide a low-MCS result.
-        // AP management/control retains its BSS basic-rate policy separately.
-        append_attr(&mut band, NL80211_TXRATE_HT, &[mcs]);
-    }
-    Some(band)
-}
 
-struct Nl80211Socket {
-    fd: RawFd,
-    family_id: u16,
-}
 
 struct ApRuntime {
     _owner_socket: Nl80211Socket,
@@ -5928,5828 +4307,137 @@ struct ApRuntime {
     join: Option<std::thread::JoinHandle<()>>,
 }
 
-struct ApStartProfile {
-    name: &'static str,
-    probe_resp: bool,
-    channel_type: u32,
-    channel_width: u32,
-    explicit_width: bool,
-    freq_fixed: bool,
-    hostapd_ies: bool,
-    hostapd_crypto: bool,
-    hostapd_tail: bool,
-    capability: u16,
-}
-
-#[derive(Clone)]
-struct RawWifiTxOptions {
-    variant: String,
-    include_freq: bool,
-    duration_ms: Option<u32>,
-    offchannel_tx_ok: bool,
-    dont_wait_for_ack: bool,
-    tx_no_cck_rate: bool,
-}
-
-impl RawWifiTxOptions {
-    fn from_variant(
-        variant: Option<&str>,
-        listen_sec: u64,
-        tx_duration_ms: Option<u32>,
-    ) -> Result<Self> {
-        // Host raw NOW/NAN has no association requirement.  The monitor
-        // injector is therefore the default: nl80211 management-frame TX is
-        // retained as an explicit driver experiment, but returns ENOTCONN on
-        // an unassociated adapter and must not be the production host path.
-        let variant = variant.unwrap_or("monitor").trim();
-        let duration_ms = tx_duration_ms
-            .unwrap_or_else(|| listen_sec.saturating_mul(1000).min(u32::MAX as u64) as u32);
-        let options = match variant {
-            "" | "standard" => Self {
-                variant: "standard".to_string(),
-                include_freq: true,
-                duration_ms: Some(duration_ms),
-                offchannel_tx_ok: true,
-                dont_wait_for_ack: false,
-                tx_no_cck_rate: false,
-            },
-            "zero_duration" => Self {
-                variant: variant.to_string(),
-                include_freq: true,
-                duration_ms: Some(0),
-                offchannel_tx_ok: true,
-                dont_wait_for_ack: false,
-                tx_no_cck_rate: false,
-            },
-            "no_duration" => Self {
-                variant: variant.to_string(),
-                include_freq: true,
-                duration_ms: None,
-                offchannel_tx_ok: true,
-                dont_wait_for_ack: false,
-                tx_no_cck_rate: false,
-            },
-            "no_offchannel" => Self {
-                variant: variant.to_string(),
-                include_freq: true,
-                duration_ms: Some(duration_ms),
-                offchannel_tx_ok: false,
-                dont_wait_for_ack: false,
-                tx_no_cck_rate: false,
-            },
-            "minimal" => Self {
-                variant: variant.to_string(),
-                include_freq: true,
-                duration_ms: None,
-                offchannel_tx_ok: false,
-                dont_wait_for_ack: false,
-                tx_no_cck_rate: false,
-            },
-            "dont_wait_ack" => Self {
-                variant: variant.to_string(),
-                include_freq: true,
-                duration_ms: Some(duration_ms),
-                offchannel_tx_ok: true,
-                dont_wait_for_ack: true,
-                tx_no_cck_rate: false,
-            },
-            "dont_wait_no_duration" => Self {
-                variant: variant.to_string(),
-                include_freq: true,
-                duration_ms: None,
-                offchannel_tx_ok: true,
-                dont_wait_for_ack: true,
-                tx_no_cck_rate: false,
-            },
-            "dont_wait_minimal" => Self {
-                variant: variant.to_string(),
-                include_freq: true,
-                duration_ms: None,
-                offchannel_tx_ok: false,
-                dont_wait_for_ack: true,
-                tx_no_cck_rate: false,
-            },
-            "onchannel" => Self {
-                variant: variant.to_string(),
-                include_freq: false,
-                duration_ms: None,
-                offchannel_tx_ok: false,
-                dont_wait_for_ack: false,
-                tx_no_cck_rate: false,
-            },
-            "onchannel_noack" | "noack_onchannel" => Self {
-                variant: variant.to_string(),
-                include_freq: false,
-                duration_ms: None,
-                offchannel_tx_ok: false,
-                dont_wait_for_ack: true,
-                tx_no_cck_rate: false,
-            },
-            "dont_wait_no_cck" => Self {
-                variant: variant.to_string(),
-                include_freq: true,
-                duration_ms: None,
-                offchannel_tx_ok: true,
-                dont_wait_for_ack: true,
-                tx_no_cck_rate: true,
-            },
-            "no_cck" => Self {
-                variant: variant.to_string(),
-                include_freq: true,
-                duration_ms: Some(duration_ms),
-                offchannel_tx_ok: true,
-                dont_wait_for_ack: false,
-                tx_no_cck_rate: true,
-            },
-            "no_freq" => Self {
-                variant: variant.to_string(),
-                include_freq: false,
-                duration_ms: Some(duration_ms),
-                offchannel_tx_ok: true,
-                dont_wait_for_ack: false,
-                tx_no_cck_rate: false,
-            },
-            "monitor" => Self {
-                variant: variant.to_string(),
-                include_freq: false,
-                duration_ms: None,
-                offchannel_tx_ok: false,
-                dont_wait_for_ack: true,
-                tx_no_cck_rate: false,
-            },
-            "monitor_active" => Self {
-                variant: variant.to_string(),
-                include_freq: false,
-                duration_ms: None,
-                offchannel_tx_ok: false,
-                dont_wait_for_ack: true,
-                tx_no_cck_rate: false,
-            },
-            "action" | "send_action" => Self {
-                variant: variant.to_string(),
-                include_freq: false,
-                duration_ms: None,
-                offchannel_tx_ok: false,
-                dont_wait_for_ack: false,
-                tx_no_cck_rate: false,
-            },
-            "multicast_data" => Self {
-                variant: variant.to_string(),
-                include_freq: false,
-                duration_ms: None,
-                offchannel_tx_ok: false,
-                dont_wait_for_ack: true,
-                tx_no_cck_rate: false,
-            },
-            "multicast_data_active" => Self {
-                variant: variant.to_string(),
-                include_freq: false,
-                duration_ms: None,
-                offchannel_tx_ok: false,
-                dont_wait_for_ack: true,
-                tx_no_cck_rate: false,
-            },
-            "sta_multicast_llc" => Self {
-                variant: variant.to_string(),
-                include_freq: false,
-                duration_ms: None,
-                offchannel_tx_ok: false,
-                dont_wait_for_ack: true,
-                tx_no_cck_rate: false,
-            },
-            "sta_multicast_llc_active" => Self {
-                variant: variant.to_string(),
-                include_freq: false,
-                duration_ms: None,
-                offchannel_tx_ok: false,
-                dont_wait_for_ack: true,
-                tx_no_cck_rate: false,
-            },
-            "sta_direct_llc" => Self {
-                variant: variant.to_string(),
-                include_freq: false,
-                duration_ms: None,
-                offchannel_tx_ok: false,
-                dont_wait_for_ack: true,
-                tx_no_cck_rate: false,
-            },
-            "sta_direct_llc_active" => Self {
-                variant: variant.to_string(),
-                include_freq: false,
-                duration_ms: None,
-                offchannel_tx_ok: false,
-                dont_wait_for_ack: true,
-                tx_no_cck_rate: false,
-            },
-            "nan_data" => Self {
-                variant: variant.to_string(),
-                include_freq: false,
-                duration_ms: None,
-                offchannel_tx_ok: false,
-                dont_wait_for_ack: true,
-                tx_no_cck_rate: false,
-            },
-            "nan_data_active" => Self {
-                variant: variant.to_string(),
-                include_freq: false,
-                duration_ms: None,
-                offchannel_tx_ok: false,
-                dont_wait_for_ack: true,
-                tx_no_cck_rate: false,
-            },
-            "nan_data_raw"
-            | "nan_data_raw_active"
-            | "nan_data_multicast"
-            | "nan_data_multicast_active" => Self {
-                variant: variant.to_string(),
-                include_freq: false,
-                duration_ms: None,
-                offchannel_tx_ok: false,
-                dont_wait_for_ack: true,
-                tx_no_cck_rate: false,
-            },
-            "roc" => Self {
-                variant: variant.to_string(),
-                include_freq: true,
-                duration_ms: Some(tx_duration_ms.unwrap_or(10)),
-                offchannel_tx_ok: true,
-                dont_wait_for_ack: true,
-                tx_no_cck_rate: false,
-            },
-            "pyroute2" => Self {
-                variant: variant.to_string(),
-                include_freq: true,
-                duration_ms: Some(duration_ms),
-                offchannel_tx_ok: false,
-                dont_wait_for_ack: false,
-                tx_no_cck_rate: false,
-            },
-            other => bail!(
-                "unknown tx_variant {other:?}; expected standard, zero_duration, no_duration, no_offchannel, minimal, dont_wait_ack, dont_wait_no_duration, dont_wait_minimal, onchannel, onchannel_noack, action, send_action, dont_wait_no_cck, no_cck, no_freq, monitor, monitor_active, multicast_data, multicast_data_active, sta_multicast_llc, sta_multicast_llc_active, sta_direct_llc, sta_direct_llc_active, nan_data, nan_data_active, nan_data_raw, nan_data_raw_active, nan_data_multicast, nan_data_multicast_active, roc, or pyroute2"
-            ),
-        };
-        Ok(options)
-    }
-
-    fn as_json(&self) -> Value {
-        json!({
-            "include_freq": self.include_freq,
-            "duration_ms": self.duration_ms,
-            "offchannel_tx_ok": self.offchannel_tx_ok,
-            "dont_wait_for_ack": self.dont_wait_for_ack,
-            "tx_no_cck_rate": self.tx_no_cck_rate,
-        })
-    }
-}
-
-impl Nl80211Socket {
-    fn open() -> Result<Self> {
-        let fd = unsafe {
-            libc::socket(
-                libc::AF_NETLINK,
-                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-                NETLINK_GENERIC,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("failed to open NETLINK_GENERIC socket");
-        }
-        let enable: libc::c_int = 1;
-        unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_NETLINK,
-                NETLINK_EXT_ACK,
-                &enable as *const libc::c_int as *const libc::c_void,
-                std::mem::size_of_val(&enable) as libc::socklen_t,
-            );
-        }
-        let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
-        addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
-        addr.nl_pid = 0;
-        addr.nl_groups = 0;
-        let rc = unsafe {
-            libc::bind(
-                fd,
-                &addr as *const libc::sockaddr_nl as *const libc::sockaddr,
-                std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
-            )
-        };
-        if rc < 0 {
-            let error = std::io::Error::last_os_error();
-            unsafe {
-                libc::close(fd);
-            }
-            return Err(error).context("failed to bind NETLINK_GENERIC socket");
-        }
-        let mut socket = Self { fd, family_id: 0 };
-        let family_id = socket.resolve_family("nl80211")?;
-        socket.family_id = family_id;
-        Ok(socket)
-    }
-
-    fn resolve_family(&self, name: &str) -> Result<u16> {
-        let mut payload = genl_payload(CTRL_CMD_GETFAMILY, 2);
-        let mut name_bytes = name.as_bytes().to_vec();
-        name_bytes.push(0);
-        append_attr(&mut payload, CTRL_ATTR_FAMILY_NAME, &name_bytes);
-        self.send_genl(GENL_ID_CTRL, libc::NLM_F_REQUEST as u16, 1, &payload)?;
-        let response = self.recv_netlink()?;
-        let attrs = genl_attrs(&response)?;
-        for (kind, value) in attrs {
-            if kind == CTRL_ATTR_FAMILY_ID && value.len() >= 2 {
-                return Ok(u16::from_ne_bytes([value[0], value[1]]));
-            }
-        }
-        bail!("nl80211 generic netlink family id not found")
-    }
-
-    fn register_dmesh_action(&self, ifindex: u32) -> Result<()> {
-        let mut matches = vec![
-            dmesh_vendor_action_header(RAW_WIFI_BROADCAST),
-            dmesh_vendor_action_header(RAW_WIFI_MULTICAST),
-        ];
-        if let Some(iface) = ifname_from_ifindex(ifindex) {
-            if let Ok(mac) = iface_mac(&iface) {
-                matches.push(dmesh_vendor_action_header(mac));
-                matches.push(dmesh_vendor_action_header(raw_receive_mac(mac)));
-            }
-        }
-        let mut registered = 0;
-        for frame_match in matches {
-            match self.register_frame(ifindex, IEEE80211_ACTION_FRAME_TYPE, &frame_match) {
-                Ok(()) => registered += 1,
-                Err(error) if error.to_string().contains("Match already configured") => {}
-                Err(error) if registered == 0 => return Err(error),
-                Err(_) => {}
-            }
-        }
-        Ok(())
-    }
-
-    fn register_nan_discovery_frames(&self, ifindex: u32) -> Result<()> {
-        // The fallback receives both NAN timing beacons and Service Discovery
-        // Frames.  Some adapters suppress management RX on an active monitor
-        // VIF, while still delivering registered frames on the base interface.
-        // Register only the NAN public/vendor action categories rather than a
-        // catch-all action frame so normal P2P/WPA traffic cannot fill this
-        // discovery path.
-        for (frame_type, frame_match) in [
-            (0x0080, &[][..]),
-            (IEEE80211_ACTION_FRAME_TYPE, &[0x04][..]),
-            (IEEE80211_ACTION_FRAME_TYPE, &[0x7f][..]),
-        ] {
-            match self.register_frame(ifindex, frame_type, frame_match) {
-                Ok(()) => {}
-                Err(error) if error.to_string().contains("Match already configured") => {}
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(())
-    }
-
-    /// Match raw-NAN USD frames while retaining the
-    /// ESP-NOW/DMesh vendor-action registrations on the same nl80211 socket.
-    fn register_open_ap_sme_frames(&self, ifindex: u32) -> Vec<Value> {
-        // AP SME, NAN public, and DMesh/ESP-NOW vendor actions share this
-        // nl80211 receive socket; the broad public/vendor matches cover all
-        // of them without duplicate registrations.
-        let registrations: [(&str, u16, &[u8]); 17] = [
-            ("auth_open", 0x00b0, &[0x00, 0x00]),
-            ("assoc_req", 0x0000, &[]),
-            ("reassoc_req", 0x0020, &[]),
-            ("disassoc", 0x00a0, &[]),
-            ("deauth", 0x00c0, &[]),
-            ("probe_req", 0x0040, &[]),
-            // NAN discovery/beacon frames are ordinary management beacons;
-            // receive them on the same AP-SME socket as AP management.
-            ("beacon", 0x0080, &[]),
-            ("action_public", IEEE80211_ACTION_FRAME_TYPE, &[0x04]),
-            (
-                "action_radio_measurement",
-                IEEE80211_ACTION_FRAME_TYPE,
-                &[0x05, 0x01],
-            ),
-            (
-                "action_link_measurement",
-                IEEE80211_ACTION_FRAME_TYPE,
-                &[0x05, 0x03],
-            ),
-            (
-                "action_neighbor_report",
-                IEEE80211_ACTION_FRAME_TYPE,
-                &[0x05, 0x04],
-            ),
-            (
-                "action_fast_bss_transition",
-                IEEE80211_ACTION_FRAME_TYPE,
-                &[0x06],
-            ),
-            ("action_sa_query", IEEE80211_ACTION_FRAME_TYPE, &[0x08]),
-            (
-                "action_protected_dual",
-                IEEE80211_ACTION_FRAME_TYPE,
-                &[0x09],
-            ),
-            ("action_wnm", IEEE80211_ACTION_FRAME_TYPE, &[0x0a]),
-            ("action_fils", IEEE80211_ACTION_FRAME_TYPE, &[0x11]),
-            ("action_vendor", IEEE80211_ACTION_FRAME_TYPE, &[0x7f]),
-        ];
-        let mut reports = Vec::new();
-        for (idx, (name, frame_type, frame_match)) in registrations.iter().enumerate() {
-            match self.register_frame_with_seq(
-                ifindex,
-                *frame_type,
-                frame_match,
-                20_u32.saturating_add(idx as u32),
-            ) {
-                Ok(()) => reports.push(json!({
-                    "name": name,
-                    "ok": true,
-                    "frame_type": format!("0x{frame_type:04x}"),
-                    "match_hex": hex_bytes(frame_match),
-                })),
-                Err(error) if *name == "beacon" => reports.push(json!({
-                    "name": name,
-                    "ok": false,
-                    "required": false,
-                    "frame_type": format!("0x{frame_type:04x}"),
-                    "match_hex": hex_bytes(frame_match),
-                    "error": format!("{error:#}"),
-                })),
-                Err(error) if format!("{error:#}").contains("Operation already in progress") => {
-                    reports.push(json!({
-                        "name": name,
-                        "ok": true,
-                        "already_registered": true,
-                        "frame_type": format!("0x{frame_type:04x}"),
-                        "match_hex": hex_bytes(frame_match),
-                    }))
-                }
-                Err(error) => reports.push(json!({
-                    "name": name,
-                    "ok": false,
-                    "frame_type": format!("0x{frame_type:04x}"),
-                    "match_hex": hex_bytes(frame_match),
-                    "error": format!("{error:#}"),
-                })),
-            }
-        }
-        reports
-    }
-
-    fn register_frame(&self, ifindex: u32, frame_type: u16, frame_match: &[u8]) -> Result<()> {
-        self.register_frame_with_seq(ifindex, frame_type, frame_match, 2)
-    }
-
-    fn register_frame_with_seq(
-        &self,
-        ifindex: u32,
-        frame_type: u16,
-        frame_match: &[u8],
-        seq: u32,
-    ) -> Result<()> {
-        let mut payload = genl_payload(NL80211_CMD_REGISTER_FRAME, NL80211_GENL_VERSION);
-        append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
-        append_attr(
-            &mut payload,
-            NL80211_ATTR_FRAME_TYPE,
-            &frame_type.to_ne_bytes(),
-        );
-        append_attr(&mut payload, NL80211_ATTR_FRAME_MATCH, frame_match);
-        self.send_genl(
-            self.family_id,
-            (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
-            seq,
-            &payload,
-        )?;
-        self.recv_ack()
-    }
-
-    fn remain_on_channel(&self, ifindex: u32, freq: u32, duration_ms: u32) -> Result<u64> {
-        let mut payload = genl_payload(NL80211_CMD_REMAIN_ON_CHANNEL, NL80211_GENL_VERSION);
-        append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
-        append_attr(&mut payload, NL80211_ATTR_WIPHY_FREQ, &freq.to_ne_bytes());
-        append_attr(
-            &mut payload,
-            NL80211_ATTR_DURATION,
-            &duration_ms.to_ne_bytes(),
-        );
-        self.send_genl(
-            self.family_id,
-            (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
-            4,
-            &payload,
-        )?;
-        let response = self
-            .recv_reply()
-            .context("nl80211 remain-on-channel failed")?;
-        let cookie = genl_attrs(&response)?
-            .into_iter()
-            .find_map(|(kind, value)| {
-                (kind & NLA_TYPE_MASK == NL80211_ATTR_COOKIE && value.len() >= 8)
-                    .then(|| u64::from_ne_bytes(value[..8].try_into().unwrap()))
-            })
-            .ok_or_else(|| anyhow::anyhow!("nl80211 remain-on-channel returned no cookie"))?;
-        let settle_ms = duration_ms.saturating_div(2).clamp(1, 20);
-        std::thread::sleep(Duration::from_millis(settle_ms as u64));
-        Ok(cookie)
-    }
-
-    fn set_interface_type(&self, ifindex: u32, iftype: u32) -> Result<()> {
-        let mut payload = genl_payload(NL80211_CMD_SET_INTERFACE, NL80211_GENL_VERSION);
-        append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
-        append_attr(&mut payload, NL80211_ATTR_IFTYPE, &iftype.to_ne_bytes());
-        self.send_genl(
-            self.family_id,
-            (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
-            5,
-            &payload,
-        )?;
-        self.recv_ack().context("nl80211 set interface type failed")
-    }
-
-    fn delete_interface(&self, ifindex: u32) -> Result<()> {
-        let mut payload = genl_payload(NL80211_CMD_DEL_INTERFACE, NL80211_GENL_VERSION);
-        append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
-        self.send_genl(
-            self.family_id,
-            (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
-            7,
-            &payload,
-        )?;
-        self.recv_ack().context("nl80211 delete interface failed")
-    }
-
-    fn interface_wiphy(&self, ifindex: u32) -> Result<u32> {
-        let mut payload = genl_payload(NL80211_CMD_GET_INTERFACE, NL80211_GENL_VERSION);
-        append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
-        self.send_genl(self.family_id, libc::NLM_F_REQUEST as u16, 8, &payload)?;
-        let response = self.recv_reply().context("nl80211 get interface failed")?;
-        genl_attrs(&response)?
-            .into_iter()
-            .find_map(|(kind, value)| {
-                (kind & NLA_TYPE_MASK == NL80211_ATTR_WIPHY && value.len() >= 4)
-                    .then(|| u32::from_ne_bytes(value[..4].try_into().unwrap()))
-            })
-            .ok_or_else(|| anyhow::anyhow!("nl80211 get interface returned no wiphy"))
-    }
-
-    fn new_interface(&self, wiphy: u32, name: &str, iftype: u32) -> Result<()> {
-        if name.is_empty() || name.len() > libc::IFNAMSIZ - 1 || name.as_bytes().contains(&0) {
-            bail!("invalid child interface name {name:?}");
-        }
-        let mut payload = genl_payload(NL80211_CMD_NEW_INTERFACE, NL80211_GENL_VERSION);
-        append_attr(&mut payload, NL80211_ATTR_WIPHY, &wiphy.to_ne_bytes());
-        let mut nul_name = Vec::with_capacity(name.len() + 1);
-        nul_name.extend_from_slice(name.as_bytes());
-        nul_name.push(0);
-        append_attr(&mut payload, NL80211_ATTR_IFNAME, &nul_name);
-        append_attr(&mut payload, NL80211_ATTR_IFTYPE, &iftype.to_ne_bytes());
-        self.send_genl(
-            self.family_id,
-            (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
-            9,
-            &payload,
-        )?;
-        self.recv_ack().context("nl80211 new interface failed")
-    }
-
-    fn recv_reply(&self) -> Result<Vec<u8>> {
-        loop {
-            let response = self.recv_netlink_raw()?;
-            if let Some(error) = netlink_error(&response) {
-                bail!(
-                    "netlink error: {}{}",
-                    std::io::Error::from_raw_os_error(error),
-                    netlink_extack_message(&response)
-                );
-            }
-            if genl_header(&response).is_some() {
-                return Ok(response);
-            }
-        }
-    }
-
-    fn set_channel_ht20(&self, ifindex: u32, freq: u32) -> Result<()> {
-        let mut payload = genl_payload(NL80211_CMD_SET_WIPHY, NL80211_GENL_VERSION);
-        append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
-        append_attr(&mut payload, NL80211_ATTR_WIPHY_FREQ, &freq.to_ne_bytes());
-        append_attr(
-            &mut payload,
-            NL80211_ATTR_WIPHY_CHANNEL_TYPE,
-            &NL80211_CHAN_HT20.to_ne_bytes(),
-        );
-        append_attr(
-            &mut payload,
-            NL80211_ATTR_CHANNEL_WIDTH,
-            &NL80211_CHAN_WIDTH_20.to_ne_bytes(),
-        );
-        append_attr(&mut payload, NL80211_ATTR_CENTER_FREQ1, &freq.to_ne_bytes());
-        self.send_genl(
-            self.family_id,
-            (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
-            16,
-            &payload,
-        )?;
-        self.recv_ack().context("nl80211 set HT20 channel failed")
-    }
-
-    fn set_channel_ht40_plus(&self, ifindex: u32, freq: u32) -> Result<()> {
-        let mut payload = genl_payload(NL80211_CMD_SET_WIPHY, NL80211_GENL_VERSION);
-        append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
-        append_attr(&mut payload, NL80211_ATTR_WIPHY_FREQ, &freq.to_ne_bytes());
-        append_attr(
-            &mut payload,
-            NL80211_ATTR_WIPHY_CHANNEL_TYPE,
-            &NL80211_CHAN_HT40PLUS.to_ne_bytes(),
-        );
-        append_attr(
-            &mut payload,
-            NL80211_ATTR_CHANNEL_WIDTH,
-            &NL80211_CHAN_WIDTH_40.to_ne_bytes(),
-        );
-        append_attr(
-            &mut payload,
-            NL80211_ATTR_CENTER_FREQ1,
-            &(freq + 10).to_ne_bytes(),
-        );
-        self.send_genl(
-            self.family_id,
-            (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
-            16,
-            &payload,
-        )?;
-        self.recv_ack().context("nl80211 set HT40+ channel failed")
-    }
-
-    /// Set the per-wiphy 2.4 GHz TX-rate allow-list. Legacy rates are encoded
-    /// in 500-kbit/s units; HT rates are MCS indexes. Omitting both restores
-    /// the driver's automatic rate policy.
-    fn set_tx_rate_profile(
-        &self,
-        ifindex: u32,
-        rate_mbps: Option<u8>,
-        ht_mcs: Option<u8>,
-        disable_b: bool,
-    ) -> Result<()> {
-        let mut payload = genl_payload(NL80211_CMD_SET_TX_BITRATE_MASK, NL80211_GENL_VERSION);
-        append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
-        if let Some(band) = tx_rate_profile_band(rate_mbps, ht_mcs, disable_b) {
-            let mut bands = Vec::new();
-            append_attr(&mut bands, 1 << 15, &band); // NL80211_BAND_2GHZ | NLA_F_NESTED
-            append_attr(&mut payload, NL80211_ATTR_TX_RATES | (1 << 15), &bands);
-        }
-        self.send_genl(
-            self.family_id,
-            (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
-            17,
-            &payload,
-        )?;
-        self.recv_ack()
-            .context("nl80211 set TX rate profile failed")
-    }
-
-    fn set_power_save(&self, ifindex: u32, enabled: bool) -> Result<()> {
-        let mut payload = genl_payload(NL80211_CMD_SET_POWER_SAVE, NL80211_GENL_VERSION);
-        append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
-        let state = if enabled {
-            NL80211_PS_ENABLED
-        } else {
-            NL80211_PS_DISABLED
-        };
-        append_attr(&mut payload, NL80211_ATTR_PS_STATE, &state.to_ne_bytes());
-        self.send_genl(
-            self.family_id,
-            (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
-            18,
-            &payload,
-        )?;
-        self.recv_ack().context("nl80211 set power-save failed")
-    }
-
-    /// `NL80211_TX_POWER_LIMITED` is a ceiling in mBm.  It preserves the
-    /// regulatory limit and is suitable for a near-field overload A/B;
-    /// omitting the level selects `NL80211_TX_POWER_AUTOMATIC`.
-    fn set_tx_power_limit(&self, ifindex: u32, dbm: Option<i16>) -> Result<()> {
-        let mut payload = genl_payload(NL80211_CMD_SET_WIPHY, NL80211_GENL_VERSION);
-        append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
-        let setting: u32 = if dbm.is_some() { 1 } else { 0 };
-        append_attr(
-            &mut payload,
-            NL80211_ATTR_WIPHY_TX_POWER_SETTING,
-            &setting.to_ne_bytes(),
-        );
-        if let Some(dbm) = dbm {
-            let mbm = i32::from(dbm).saturating_mul(100);
-            append_attr(
-                &mut payload,
-                NL80211_ATTR_WIPHY_TX_POWER_LEVEL,
-                &mbm.to_ne_bytes(),
-            );
-        }
-        self.send_genl(
-            self.family_id,
-            (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
-            19,
-            &payload,
-        )?;
-        self.recv_ack().context("nl80211 set TX power failed")
-    }
-
-    fn start_open_ap(
-        &self,
-        ifindex: u32,
-        mac: [u8; 6],
-        ssid: &str,
-        channel: u8,
-        freq: u32,
-        ht40: bool,
-        beacon_interval_tu: u16,
-    ) -> std::result::Result<Value, (anyhow::Error, Vec<Value>)> {
-        let esp_beacon_head =
-            build_open_beacon_head(mac, ssid, channel).map_err(|error| (error, Vec::new()))?;
-        let hostapd_beacon_head =
-            build_open_beacon_head_with_capability(mac, ssid, channel, 0x0401)
-                .map_err(|error| (error, Vec::new()))?;
-        let esp_beacon_tail = esp_open_ap_beacon_tail_for_device(mac, channel);
-        let hostapd_beacon_tail = hostapd_open_ap_beacon_tail_for_device(mac, channel, ht40);
-        let esp_probe_ies = esp_open_ap_probe_ies_for_device(ssid, mac, channel)
-            .map_err(|error| (error, Vec::new()))?;
-        let esp_probe_resp =
-            build_open_probe_resp_with_ies(mac, ssid, channel, 0x0421, &esp_probe_ies)
-                .map_err(|error| (error, Vec::new()))?;
-        let hostapd_probe_ies = hostapd_open_ap_probe_ies_for_device(ssid, mac, channel, ht40)
-            .map_err(|error| (error, Vec::new()))?;
-        let hostapd_probe_resp =
-            build_open_probe_resp_with_ies(mac, ssid, channel, 0x0401, &hostapd_probe_ies)
-                .map_err(|error| (error, Vec::new()))?;
-        let profiles = [
-            ApStartProfile {
-                name: "hostapd_exact_ht",
-                probe_resp: true,
-                channel_type: if ht40 {
-                    NL80211_CHAN_HT40PLUS
-                } else {
-                    NL80211_CHAN_HT20
-                },
-                channel_width: if ht40 {
-                    NL80211_CHAN_WIDTH_40
-                } else {
-                    NL80211_CHAN_WIDTH_20
-                },
-                explicit_width: false,
-                freq_fixed: false,
-                hostapd_ies: true,
-                hostapd_crypto: true,
-                hostapd_tail: true,
-                capability: 0x0401,
-            },
-            ApStartProfile {
-                name: "hostapd_exact_noht",
-                probe_resp: true,
-                channel_type: NL80211_CHAN_NO_HT,
-                channel_width: NL80211_CHAN_WIDTH_20_NOHT,
-                explicit_width: false,
-                freq_fixed: false,
-                hostapd_ies: true,
-                hostapd_crypto: true,
-                hostapd_tail: true,
-                capability: 0x0401,
-            },
-            ApStartProfile {
-                name: "hostapd_noht",
-                probe_resp: true,
-                channel_type: NL80211_CHAN_NO_HT,
-                channel_width: NL80211_CHAN_WIDTH_20_NOHT,
-                explicit_width: false,
-                freq_fixed: false,
-                hostapd_ies: false,
-                hostapd_crypto: false,
-                hostapd_tail: false,
-                capability: 0x0421,
-            },
-            ApStartProfile {
-                name: "hostapd_noht_no_probe",
-                probe_resp: false,
-                channel_type: NL80211_CHAN_NO_HT,
-                channel_width: NL80211_CHAN_WIDTH_20_NOHT,
-                explicit_width: false,
-                freq_fixed: false,
-                hostapd_ies: false,
-                hostapd_crypto: false,
-                hostapd_tail: false,
-                capability: 0x0421,
-            },
-            ApStartProfile {
-                name: "esp_ht20",
-                probe_resp: true,
-                channel_type: NL80211_CHAN_HT20,
-                channel_width: NL80211_CHAN_WIDTH_20,
-                explicit_width: false,
-                freq_fixed: false,
-                hostapd_ies: false,
-                hostapd_crypto: false,
-                hostapd_tail: false,
-                capability: 0x0421,
-            },
-            ApStartProfile {
-                name: "esp_ht20_no_probe",
-                probe_resp: false,
-                channel_type: NL80211_CHAN_HT20,
-                channel_width: NL80211_CHAN_WIDTH_20,
-                explicit_width: false,
-                freq_fixed: false,
-                hostapd_ies: false,
-                hostapd_crypto: false,
-                hostapd_tail: false,
-                capability: 0x0421,
-            },
-            ApStartProfile {
-                name: "explicit_20_noht",
-                probe_resp: true,
-                channel_type: NL80211_CHAN_NO_HT,
-                channel_width: NL80211_CHAN_WIDTH_20_NOHT,
-                explicit_width: true,
-                freq_fixed: true,
-                hostapd_ies: false,
-                hostapd_crypto: false,
-                hostapd_tail: false,
-                capability: 0x0421,
-            },
-            ApStartProfile {
-                name: "explicit_20_ht",
-                probe_resp: true,
-                channel_type: NL80211_CHAN_HT20,
-                channel_width: NL80211_CHAN_WIDTH_20,
-                explicit_width: true,
-                freq_fixed: true,
-                hostapd_ies: false,
-                hostapd_crypto: false,
-                hostapd_tail: false,
-                capability: 0x0421,
-            },
-        ];
-        let mut attempts = Vec::new();
-        let mut last_error = None;
-        for (idx, profile) in profiles.iter().enumerate() {
-            let mut payload = genl_payload(NL80211_CMD_START_AP, NL80211_GENL_VERSION);
-            append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
-            append_attr(&mut payload, NL80211_ATTR_WIPHY_FREQ, &freq.to_ne_bytes());
-            append_attr(
-                &mut payload,
-                NL80211_ATTR_WIPHY_CHANNEL_TYPE,
-                &profile.channel_type.to_ne_bytes(),
-            );
-            if profile.explicit_width {
-                append_attr(
-                    &mut payload,
-                    NL80211_ATTR_CHANNEL_WIDTH,
-                    &profile.channel_width.to_ne_bytes(),
-                );
-                append_attr(
-                    &mut payload,
-                    NL80211_ATTR_CENTER_FREQ1,
-                    &(if ht40 { freq + 10 } else { freq }).to_ne_bytes(),
-                );
-            }
-            if profile.freq_fixed {
-                append_attr(&mut payload, NL80211_ATTR_FREQ_FIXED, &[]);
-            }
-            append_attr(
-                &mut payload,
-                NL80211_ATTR_BEACON_INTERVAL,
-                &u32::from(beacon_interval_tu).to_ne_bytes(),
-            );
-            append_attr(&mut payload, NL80211_ATTR_DTIM_PERIOD, &1_u32.to_ne_bytes());
-            let beacon_head = if profile.capability == 0x0401 {
-                &hostapd_beacon_head
-            } else {
-                &esp_beacon_head
-            };
-            let beacon_tail = if profile.hostapd_tail {
-                &hostapd_beacon_tail
-            } else {
-                &esp_beacon_tail
-            };
-            append_attr(&mut payload, NL80211_ATTR_BEACON_HEAD, beacon_head);
-            append_attr(&mut payload, NL80211_ATTR_BEACON_TAIL, beacon_tail);
-            if profile.probe_resp {
-                let probe_resp = if profile.hostapd_tail {
-                    &hostapd_probe_resp
-                } else {
-                    &esp_probe_resp
-                };
-                append_attr(&mut payload, NL80211_ATTR_PROBE_RESP, probe_resp);
-            }
-            if profile.hostapd_ies {
-                let ies = hostapd_open_ap_extra_ies();
-                append_attr(&mut payload, NL80211_ATTR_IE, &ies);
-                append_attr(&mut payload, NL80211_ATTR_IE_PROBE_RESP, &ies);
-                append_attr(&mut payload, NL80211_ATTR_IE_ASSOC_RESP, &ies);
-                append_attr(
-                    &mut payload,
-                    NL80211_ATTR_BSS_HT_OPMODE,
-                    &0_u16.to_ne_bytes(),
-                );
-            }
-            append_attr(&mut payload, NL80211_ATTR_SSID, ssid.as_bytes());
-            append_attr(
-                &mut payload,
-                NL80211_ATTR_HIDDEN_SSID,
-                &NL80211_HIDDEN_SSID_NOT_IN_USE.to_ne_bytes(),
-            );
-            append_attr(
-                &mut payload,
-                NL80211_ATTR_AUTH_TYPE,
-                &NL80211_AUTHTYPE_OPEN_SYSTEM.to_ne_bytes(),
-            );
-            append_attr(
-                &mut payload,
-                NL80211_ATTR_BSS_BASIC_RATES,
-                open_ap_basic_rates(),
-            );
-            if profile.hostapd_crypto {
-                append_attr(
-                    &mut payload,
-                    NL80211_ATTR_CIPHER_SUITE_GROUP,
-                    &WLAN_CIPHER_SUITE_WEP40.to_ne_bytes(),
-                );
-            }
-            append_attr(&mut payload, NL80211_ATTR_SOCKET_OWNER, &[]);
-            let send = self.send_genl(
-                self.family_id,
-                (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
-                6 + idx as u32,
-                &payload,
-            );
-            let result = send.and_then(|_| self.recv_ack());
-            match result {
-                Ok(()) => {
-                    attempts.push(json!({
-                        "profile": profile.name,
-                        "ok": true,
-                        "probe_resp": profile.probe_resp,
-                        "channel_type": profile.channel_type,
-                        "channel_width": profile.channel_width,
-                        "explicit_width": profile.explicit_width,
-                        "freq_fixed": profile.freq_fixed,
-                        "hostapd_ies": profile.hostapd_ies,
-                        "hostapd_crypto": profile.hostapd_crypto,
-                        "hostapd_tail": profile.hostapd_tail,
-                        "capability": format!("0x{:04x}", profile.capability),
-                        "beacon_head_len": beacon_head.len(),
-                        "beacon_tail_len": beacon_tail.len(),
-                    }));
-                    return Ok(json!({
-                        "selected": profile.name,
-                        "attempts": attempts,
-                    }));
-                }
-                Err(error) => {
-                    let message = format!("{error:#}");
-                    attempts.push(json!({
-                        "profile": profile.name,
-                        "ok": false,
-                        "probe_resp": profile.probe_resp,
-                        "channel_type": profile.channel_type,
-                        "channel_width": profile.channel_width,
-                        "explicit_width": profile.explicit_width,
-                        "freq_fixed": profile.freq_fixed,
-                        "hostapd_ies": profile.hostapd_ies,
-                        "hostapd_crypto": profile.hostapd_crypto,
-                        "hostapd_tail": profile.hostapd_tail,
-                        "capability": format!("0x{:04x}", profile.capability),
-                        "beacon_head_len": beacon_head.len(),
-                        "beacon_tail_len": beacon_tail.len(),
-                        "error": message,
-                    }));
-                    last_error = Some(error.context("nl80211 start open AP failed"));
-                }
-            }
-        }
-        Err((
-            last_error.unwrap_or_else(|| anyhow::anyhow!("nl80211 start open AP had no profiles")),
-            attempts,
-        ))
-    }
-
-    fn stop_ap(&self, ifindex: u32) -> Result<()> {
-        let mut payload = genl_payload(NL80211_CMD_STOP_AP, NL80211_GENL_VERSION);
-        append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
-        self.send_genl(
-            self.family_id,
-            (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
-            7,
-            &payload,
-        )?;
-        self.recv_ack().context("nl80211 stop AP failed")
-    }
-
-    fn flush_stations(&self, ifindex: u32) -> Result<()> {
-        let mut payload = genl_payload(NL80211_CMD_DEL_STATION, NL80211_GENL_VERSION);
-        append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
-        self.send_genl(
-            self.family_id,
-            (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
-            17,
-            &payload,
-        )?;
-        self.recv_ack()
-            .context("nl80211 flush station table failed")
-    }
-
-    fn remove_station(&self, ifindex: u32, mac: [u8; 6]) -> Result<()> {
-        let mut payload = genl_payload(NL80211_CMD_DEL_STATION, NL80211_GENL_VERSION);
-        append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
-        append_attr(&mut payload, NL80211_ATTR_MAC, &mac);
-        self.send_genl(
-            self.family_id,
-            (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
-            18,
-            &payload,
-        )?;
-        self.recv_ack().context("nl80211 remove station failed")
-    }
-
-    fn connect_open(
-        &self,
-        ifindex: u32,
-        ssid: &str,
-        freq: u32,
-        bssid: Option<[u8; 6]>,
-    ) -> Result<()> {
-        let mut payload = genl_payload(NL80211_CMD_CONNECT, NL80211_GENL_VERSION);
-        append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
-        append_attr(&mut payload, NL80211_ATTR_SSID, ssid.as_bytes());
-        append_attr(&mut payload, NL80211_ATTR_WIPHY_FREQ, &freq.to_ne_bytes());
-        if let Some(bssid) = bssid {
-            append_attr(&mut payload, NL80211_ATTR_MAC, &bssid);
-        }
-        append_attr(
-            &mut payload,
-            NL80211_ATTR_AUTH_TYPE,
-            &NL80211_AUTHTYPE_OPEN_SYSTEM.to_ne_bytes(),
-        );
-        self.send_genl(
-            self.family_id,
-            (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
-            8,
-            &payload,
-        )?;
-        self.recv_ack().context("nl80211 open STA connect failed")
-    }
-
-    fn station_dump(&self, ifindex: u32) -> Result<Vec<Value>> {
-        let mut payload = genl_payload(NL80211_CMD_GET_STATION, NL80211_GENL_VERSION);
-        append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
-        self.send_genl(
-            self.family_id,
-            (libc::NLM_F_REQUEST as u16) | NLM_F_DUMP,
-            9,
-            &payload,
-        )?;
-        self.recv_station_dump()
-            .context("nl80211 station dump failed")
-    }
-
-    fn trigger_scan(&self, ifindex: u32, ssid: Option<&str>, channel: Option<u8>) -> Result<()> {
-        let mut payload = genl_payload(NL80211_CMD_TRIGGER_SCAN, NL80211_GENL_VERSION);
-        append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
-
-        // nl80211 requires at least one SSID entry.  A zero-length entry is
-        // the kernel API spelling for a wildcard SSID probe.
-        let mut ssids = Vec::new();
-        append_attr(&mut ssids, 1, ssid.unwrap_or("").as_bytes());
-        append_attr(&mut payload, NL80211_ATTR_SCAN_SSIDS | NLA_F_NESTED, &ssids);
-
-        // Host open-DMesh STA currently associates on 2.4 GHz only.  Limit
-        // the probe to that supported channel set rather than disrupting a
-        // multi-band adapter with an unbounded scan.
-        let channels: Vec<u8> = channel.map_or_else(|| (1..=13).collect(), |channel| vec![channel]);
-        let mut frequencies = Vec::new();
-        for (index, channel) in channels.into_iter().enumerate() {
-            append_attr(
-                &mut frequencies,
-                (index + 1) as u16,
-                &channel_to_freq(channel).to_ne_bytes(),
-            );
-        }
-        append_attr(
-            &mut payload,
-            NL80211_ATTR_SCAN_FREQUENCIES | NLA_F_NESTED,
-            &frequencies,
-        );
-        self.send_genl(
-            self.family_id,
-            (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
-            33,
-            &payload,
-        )?;
-        self.recv_ack().context("nl80211 trigger scan failed")
-    }
-
-    fn scan_dump(&self, ifindex: u32) -> Result<Vec<Value>> {
-        let mut payload = genl_payload(NL80211_CMD_GET_SCAN, NL80211_GENL_VERSION);
-        append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
-        self.send_genl(
-            self.family_id,
-            (libc::NLM_F_REQUEST as u16) | NLM_F_DUMP,
-            34,
-            &payload,
-        )?;
-        self.recv_scan_dump().context("nl80211 scan dump failed")
-    }
-
-    fn add_station_minimal(&self, ifindex: u32, mac: [u8; 6], aid: u16) -> Result<()> {
-        self.add_station(
-            ifindex, mac, aid, None, None, None, None, None, false, false,
-        )
-    }
-
-    fn add_station_from_assoc(
-        &self,
-        ifindex: u32,
-        mac: [u8; 6],
-        frame: &[u8],
-        allow_ht: bool,
-    ) -> Result<()> {
-        let capability = read_u16_at(frame, IEEE80211_BODY);
-        let listen_interval = read_u16_at(frame, IEEE80211_BODY + 2);
-        let ies_offset = if frame_subtype(frame) == 2 {
-            IEEE80211_BODY + 10
-        } else {
-            IEEE80211_BODY + 4
-        };
-        let ies = frame.get(ies_offset..).unwrap_or_default();
-        let ht_capability = allow_ht.then(|| management_ie_bytes(ies, 45)).flatten();
-        let extended_capability = management_ie_bytes(ies, 127);
-        let mut supported_rates = Vec::with_capacity(16);
-        if let Some(rates) = management_ie_bytes(ies, 1) {
-            supported_rates.extend_from_slice(rates);
-        }
-        if let Some(rates) = management_ie_bytes(ies, 50) {
-            supported_rates.extend_from_slice(rates);
-        }
-        let wme = management_ie_bytes(ies, 221)
-            .is_some_and(|value| value.len() >= 4 && value[..4] == [0x00, 0x50, 0xf2, 0x02]);
-        let short_preamble = capability.is_some_and(|value| value & (1 << 5) != 0);
-        self.add_station(
-            ifindex,
-            mac,
-            1,
-            capability,
-            listen_interval,
-            ht_capability,
-            extended_capability,
-            (!supported_rates.is_empty()).then_some(supported_rates.as_slice()),
-            wme,
-            short_preamble,
-        )
-    }
-
-    fn add_station(
-        &self,
-        ifindex: u32,
-        mac: [u8; 6],
-        aid: u16,
-        capability: Option<u16>,
-        listen_interval: Option<u16>,
-        ht_capability: Option<&[u8]>,
-        extended_capability: Option<&[u8]>,
-        supported_rates: Option<&[u8]>,
-        wme: bool,
-        short_preamble: bool,
-    ) -> Result<()> {
-        let mut payload = genl_payload(NL80211_CMD_NEW_STATION, NL80211_GENL_VERSION);
-        append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
-        append_attr(&mut payload, NL80211_ATTR_MAC, &mac);
-        append_attr(&mut payload, NL80211_ATTR_STA_AID, &aid.to_ne_bytes());
-        append_attr(
-            &mut payload,
-            NL80211_ATTR_STA_LISTEN_INTERVAL,
-            &listen_interval.unwrap_or(10).to_ne_bytes(),
-        );
-        append_attr(
-            &mut payload,
-            NL80211_ATTR_STA_SUPPORTED_RATES,
-            supported_rates.unwrap_or(&OPEN_AP_OFDM_BASIC_RATES),
-        );
-        if let Some(capability) = capability {
-            append_attr(
-                &mut payload,
-                NL80211_ATTR_STA_CAPABILITY,
-                &capability.to_ne_bytes(),
-            );
-        }
-        if let Some(ht_capability) = ht_capability.filter(|value| value.len() == 26) {
-            append_attr(&mut payload, NL80211_ATTR_HT_CAPABILITY, ht_capability);
-        }
-        if let Some(extended_capability) = extended_capability {
-            append_attr(
-                &mut payload,
-                NL80211_ATTR_STA_EXT_CAPABILITY,
-                extended_capability,
-            );
-        }
-        let mut station_flags = NL80211_STA_FLAG_AUTHORIZED
-            | NL80211_STA_FLAG_AUTHENTICATED
-            | NL80211_STA_FLAG_ASSOCIATED;
-        if wme {
-            station_flags |= NL80211_STA_FLAG_WME;
-        }
-        if short_preamble {
-            station_flags |= NL80211_STA_FLAG_SHORT_PREAMBLE;
-        }
-        if wme {
-            let mut wme_attributes = Vec::with_capacity(16);
-            append_attr(&mut wme_attributes, 1, &[0]);
-            append_attr(&mut wme_attributes, 2, &[0]);
-            append_attr(
-                &mut payload,
-                NL80211_ATTR_STA_WME | (1 << 15),
-                &wme_attributes,
-            );
-        }
-        let mut flags_update = Vec::with_capacity(8);
-        flags_update.extend_from_slice(&station_flags.to_ne_bytes());
-        flags_update.extend_from_slice(&station_flags.to_ne_bytes());
-        append_attr(&mut payload, NL80211_ATTR_STA_FLAGS2, &flags_update);
-        self.send_genl(
-            self.family_id,
-            (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
-            10,
-            &payload,
-        )?;
-        self.recv_ack()
-            .context("nl80211 add minimal station failed")
-    }
-
-    fn send_frame(
-        &self,
-        ifindex: u32,
-        freq: u32,
-        options: &RawWifiTxOptions,
-        frame: &[u8],
-        tx_rate_mbps: Option<u8>,
-    ) -> Result<()> {
-        let mut payload = genl_payload(NL80211_CMD_FRAME, NL80211_GENL_VERSION);
-        append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
-        if options.include_freq {
-            append_attr(&mut payload, NL80211_ATTR_WIPHY_FREQ, &freq.to_ne_bytes());
-        }
-        if let Some(duration_ms) = options.duration_ms {
-            append_attr(
-                &mut payload,
-                NL80211_ATTR_DURATION,
-                &duration_ms.to_ne_bytes(),
-            );
-        }
-        append_attr(&mut payload, NL80211_ATTR_FRAME, frame);
-        if options.offchannel_tx_ok {
-            append_attr(&mut payload, NL80211_ATTR_OFFCHANNEL_TX_OK, &[]);
-        }
-        if options.dont_wait_for_ack {
-            append_attr(&mut payload, NL80211_ATTR_DONT_WAIT_FOR_ACK, &[]);
-        }
-        if options.tx_no_cck_rate {
-            append_attr(&mut payload, NL80211_ATTR_TX_NO_CCK_RATE, &[]);
-        }
-        if let Some(rate) = tx_rate_mbps {
-            if !matches!(rate, 6 | 9 | 12 | 18 | 24 | 36 | 48 | 54) {
-                bail!("unsupported per-frame legacy rate {rate} Mbps");
-            }
-            let mut band = Vec::new();
-            append_attr(&mut band, 1, &[rate.saturating_mul(2)]); // TXRATE_LEGACY, 500 kbit/s units
-            let mut bands = Vec::new();
-            append_attr(&mut bands, 1 << 15, &band); // 2 GHz band, nested
-            append_attr(&mut payload, NL80211_ATTR_TX_RATES | (1 << 15), &bands);
-        }
-        self.send_genl(
-            self.family_id,
-            (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
-            3,
-            &payload,
-        )?;
-        self.recv_ack().context("nl80211 frame TX failed")
-    }
-
-    fn send_mgmt_frame(&self, ifindex: u32, frame: &[u8], tx_rate_mbps: Option<u8>) -> Result<()> {
-        let mut payload = genl_payload(NL80211_CMD_FRAME, NL80211_GENL_VERSION);
-        append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
-        // The AP SME response is emitted while the phy is also carrying the
-        // NAN monitor path.  Supplying the already-owned channel and a short
-        // on-channel duration makes this an explicit managed-interface TX
-        // request; mt76 otherwise intermittently returns ENOMEM for the
-        // otherwise valid frame while it is draining monitor traffic.
-        let freq = channel_to_freq(DEFAULT_RAW_WIFI_CHANNEL);
-        append_attr(&mut payload, NL80211_ATTR_WIPHY_FREQ, &freq.to_ne_bytes());
-        append_attr(&mut payload, NL80211_ATTR_DURATION, &100_u32.to_ne_bytes());
-        append_attr(&mut payload, NL80211_ATTR_FRAME, frame);
-        if let Some(rate) = tx_rate_mbps {
-            if !matches!(rate, 6 | 9 | 12 | 18 | 24 | 36 | 48 | 54) {
-                bail!("unsupported per-frame legacy rate {rate} Mbps");
-            }
-            let mut band = Vec::new();
-            append_attr(&mut band, 1, &[rate.saturating_mul(2)]);
-            let mut bands = Vec::new();
-            append_attr(&mut bands, 1 << 15, &band);
-            append_attr(&mut payload, NL80211_ATTR_TX_RATES | (1 << 15), &bands);
-        }
-        // Management TX is transiently rejected with ENOMEM when the driver
-        // is draining a burst of NAN/raw frames. Auth/association responses
-        // must not be lost in that window: retry the same bounded request so
-        // an ESP STA can complete its open-AP handshake.
-        for attempt in 0..20 {
-            self.send_genl(
-                self.family_id,
-                (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
-                18 + attempt,
-                &payload,
-            )?;
-            match self.recv_ack() {
-                Ok(()) => return Ok(()),
-                Err(error)
-                    if attempt < 19
-                        && (error.to_string().contains("Out of memory")
-                            || error.to_string().contains("os error 12")) =>
-                {
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Err(error) => {
-                    return Err(error).context("nl80211 management frame TX failed");
-                }
-            }
-        }
-        unreachable!()
-    }
-
-    fn recv_frame(&self) -> Result<Vec<u8>> {
-        self.recv_frame_with_signal().map(|(frame, _)| frame)
-    }
-
-    fn recv_frame_with_signal(&self) -> Result<(Vec<u8>, Option<i32>)> {
-        loop {
-            let response = self.recv_netlink()?;
-            let Some(header) = genl_header(&response) else {
-                continue;
-            };
-            if header.cmd != NL80211_CMD_FRAME {
-                continue;
-            }
-            let mut frame = None;
-            let mut rx_signal_dbm = None;
-            for (kind, value) in genl_attrs(&response)? {
-                match kind {
-                    NL80211_ATTR_FRAME => frame = Some(value.to_vec()),
-                    NL80211_ATTR_RX_SIGNAL_DBM if value.len() >= 4 => {
-                        rx_signal_dbm =
-                            Some(i32::from_ne_bytes([value[0], value[1], value[2], value[3]]));
-                    }
-                    _ => {}
-                }
-            }
-            if let Some(frame) = frame {
-                return Ok((frame, rx_signal_dbm));
-            }
-        }
-    }
-
-    fn send_genl(&self, nlmsg_type: u16, flags: u16, seq: u32, payload: &[u8]) -> Result<()> {
-        let header = libc::nlmsghdr {
-            nlmsg_len: (std::mem::size_of::<libc::nlmsghdr>() + payload.len()) as u32,
-            nlmsg_type,
-            nlmsg_flags: flags,
-            nlmsg_seq: seq,
-            nlmsg_pid: 0,
-        };
-        let mut request = Vec::with_capacity(header.nlmsg_len as usize);
-        append_struct(&mut request, &header);
-        request.extend_from_slice(payload);
-        let mut kernel: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
-        kernel.nl_family = libc::AF_NETLINK as libc::sa_family_t;
-        kernel.nl_pid = 0;
-        kernel.nl_groups = 0;
-        let written = unsafe {
-            libc::sendto(
-                self.fd,
-                request.as_ptr() as *const libc::c_void,
-                request.len(),
-                0,
-                &kernel as *const libc::sockaddr_nl as *const libc::sockaddr,
-                std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
-            )
-        };
-        if written < 0 {
-            let os_error = std::io::Error::last_os_error();
-            bail!(
-                "failed to send netlink request type={} len={} flags=0x{:x}: {}",
-                nlmsg_type,
-                request.len(),
-                flags,
-                os_error
-            );
-        }
-        Ok(())
-    }
-
-    fn recv_netlink(&self) -> Result<Vec<u8>> {
-        let buf = self.recv_netlink_raw()?;
-        if let Some(error) = netlink_error(&buf) {
-            bail!(
-                "netlink error: {}{}",
-                std::io::Error::from_raw_os_error(error),
-                netlink_extack_message(&buf)
-            );
-        }
-        Ok(buf)
-    }
-
-    fn recv_ack(&self) -> Result<()> {
-        loop {
-            let response = self.recv_netlink_raw()?;
-            let mut offset = 0;
-            while offset + std::mem::size_of::<libc::nlmsghdr>() <= response.len() {
-                let header = unsafe {
-                    std::ptr::read_unaligned(response[offset..].as_ptr() as *const libc::nlmsghdr)
-                };
-                let len = header.nlmsg_len as usize;
-                if len < std::mem::size_of::<libc::nlmsghdr>() || offset + len > response.len() {
-                    break;
-                }
-                let msg = &response[offset..offset + len];
-                if header.nlmsg_type == NLMSG_ERROR {
-                    if let Some(error) = netlink_error(msg) {
-                        bail!(
-                            "netlink error: {}{}",
-                            std::io::Error::from_raw_os_error(error),
-                            netlink_extack_message(msg)
-                        );
-                    }
-                    if netlink_is_ack(msg) {
-                        return Ok(());
-                    }
-                }
-                offset += nlmsg_align(len);
-            }
-        }
-    }
-
-    fn recv_station_dump(&self) -> Result<Vec<Value>> {
-        let mut stations = Vec::new();
-        loop {
-            let response = self.recv_netlink_raw()?;
-            let mut offset = 0;
-            while offset + std::mem::size_of::<libc::nlmsghdr>() <= response.len() {
-                let header = unsafe {
-                    std::ptr::read_unaligned(response[offset..].as_ptr() as *const libc::nlmsghdr)
-                };
-                let len = header.nlmsg_len as usize;
-                if len < std::mem::size_of::<libc::nlmsghdr>() || offset + len > response.len() {
-                    break;
-                }
-                let msg = &response[offset..offset + len];
-                if header.nlmsg_type == libc::NLMSG_DONE as u16 {
-                    return Ok(stations);
-                }
-                if header.nlmsg_type == NLMSG_ERROR {
-                    if let Some(error) = netlink_error(msg) {
-                        bail!(
-                            "netlink error: {}{}",
-                            std::io::Error::from_raw_os_error(error),
-                            netlink_extack_message(msg)
-                        );
-                    }
-                } else if header.nlmsg_type == self.family_id {
-                    stations.push(parse_station_dump_message(msg)?);
-                }
-                offset += nlmsg_align(len);
-            }
-        }
-    }
-
-    fn recv_scan_dump(&self) -> Result<Vec<Value>> {
-        let mut bsses = Vec::new();
-        loop {
-            let response = self.recv_netlink_raw()?;
-            let mut offset = 0;
-            while offset + std::mem::size_of::<libc::nlmsghdr>() <= response.len() {
-                let header = unsafe {
-                    std::ptr::read_unaligned(response[offset..].as_ptr() as *const libc::nlmsghdr)
-                };
-                let len = header.nlmsg_len as usize;
-                if len < std::mem::size_of::<libc::nlmsghdr>() || offset + len > response.len() {
-                    break;
-                }
-                let msg = &response[offset..offset + len];
-                if header.nlmsg_type == libc::NLMSG_DONE as u16 {
-                    return Ok(bsses);
-                }
-                if header.nlmsg_type == NLMSG_ERROR {
-                    if let Some(error) = netlink_error(msg) {
-                        bail!(
-                            "netlink error: {}{}",
-                            std::io::Error::from_raw_os_error(error),
-                            netlink_extack_message(msg)
-                        );
-                    }
-                } else if header.nlmsg_type == self.family_id {
-                    if let Some(bss) = parse_scan_dump_message(msg)? {
-                        bsses.push(bss);
-                    }
-                }
-                offset += nlmsg_align(len);
-            }
-        }
-    }
-
-    fn recv_netlink_raw(&self) -> Result<Vec<u8>> {
-        let mut buf = vec![0_u8; 65536];
-        // Requests are sent with sendto() on an unconnected generic-netlink
-        // socket. Use recvfrom() symmetrically; recv() returns ENOTCONN on
-        // kernels that do not implicitly connect AF_NETLINK sockets.
-        let mut peer: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
-        let mut peer_len = std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
-        let read = unsafe {
-            libc::recvfrom(
-                self.fd,
-                buf.as_mut_ptr() as *mut libc::c_void,
-                buf.len(),
-                0,
-                &mut peer as *mut libc::sockaddr_nl as *mut libc::sockaddr,
-                &mut peer_len,
-            )
-        };
-        if read < 0 {
-            return Err(std::io::Error::last_os_error()).context("failed to receive netlink reply");
-        }
-        buf.truncate(read as usize);
-        Ok(buf)
-    }
-
-    fn set_receive_timeout(&self, timeout: Duration) -> Result<()> {
-        let micros = timeout.as_micros().min(i64::MAX as u128) as i64;
-        let value = libc::timeval {
-            tv_sec: micros / 1_000_000,
-            tv_usec: micros % 1_000_000,
-        };
-        let result = unsafe {
-            libc::setsockopt(
-                self.fd,
-                libc::SOL_SOCKET,
-                libc::SO_RCVTIMEO,
-                &value as *const libc::timeval as *const libc::c_void,
-                std::mem::size_of_val(&value) as libc::socklen_t,
-            )
-        };
-        if result < 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("failed to set nl80211 receive timeout");
-        }
-        Ok(())
-    }
-}
-
-impl Drop for Nl80211Socket {
-    fn drop(&mut self) {
-        unsafe {
-            libc::close(self.fd);
-        }
-    }
-}
-
-struct MonitorTxSocket {
-    fd: RawFd,
-}
-
-struct MonitorRxSocket {
-    fd: RawFd,
-}
-
-struct DataSocket {
-    fd: RawFd,
-    ifindex: u32,
-}
-
-#[repr(C)]
-struct PacketMreq {
-    mr_ifindex: libc::c_int,
-    mr_type: libc::c_ushort,
-    mr_alen: libc::c_ushort,
-    mr_address: [libc::c_uchar; 8],
-}
-
-impl MonitorTxSocket {
-    fn open(iface: &str) -> Result<Self> {
-        let ifindex = ifindex(iface)?;
-        let fd = unsafe {
-            libc::socket(
-                libc::AF_PACKET,
-                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-                (ETH_P_ALL.to_be()) as i32,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("failed to open AF_PACKET raw socket for monitor TX");
-        }
-        let addr = libc::sockaddr_ll {
-            sll_family: libc::AF_PACKET as libc::sa_family_t,
-            sll_protocol: ETH_P_ALL.to_be(),
-            sll_ifindex: ifindex as i32,
-            sll_hatype: 0,
-            sll_pkttype: 0,
-            sll_halen: 0,
-            sll_addr: [0; 8],
-        };
-        let rc = unsafe {
-            libc::bind(
-                fd,
-                &addr as *const libc::sockaddr_ll as *const libc::sockaddr,
-                std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
-            )
-        };
-        if rc < 0 {
-            let error = std::io::Error::last_os_error();
-            unsafe {
-                libc::close(fd);
-            }
-            return Err(error).with_context(|| format!("failed to bind AF_PACKET to {iface}"));
-        }
-        Ok(Self { fd })
-    }
-
-    fn send(&self, packet: &[u8]) -> Result<usize> {
-        // The monitor socket is already bound to its VIF and protocol.  Use
-        // the connected-style write rather than a destination-less sendto:
-        // mt7921u accepts the latter locally without placing the radiotap
-        // packet on the driver TX queue.
-        let written = unsafe {
-            libc::send(
-                self.fd,
-                packet.as_ptr() as *const libc::c_void,
-                packet.len(),
-                libc::MSG_DONTWAIT,
-            )
-        };
-        if written < 0 {
-            Err(std::io::Error::last_os_error()).context("failed to send monitor frame")
-        } else {
-            Ok(written as usize)
-        }
-    }
-}
-
-impl MonitorRxSocket {
-    fn open(iface: &str) -> Result<Self> {
-        let ifindex = ifindex(iface)?;
-        let fd = unsafe {
-            libc::socket(
-                libc::AF_PACKET,
-                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-                (ETH_P_ALL.to_be()) as i32,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("failed to open AF_PACKET raw socket for monitor RX");
-        }
-        let addr = libc::sockaddr_ll {
-            sll_family: libc::AF_PACKET as libc::sa_family_t,
-            sll_protocol: ETH_P_ALL.to_be(),
-            sll_ifindex: ifindex as i32,
-            sll_hatype: 0,
-            sll_pkttype: 0,
-            sll_halen: 0,
-            sll_addr: [0; 8],
-        };
-        let rc = unsafe {
-            libc::bind(
-                fd,
-                &addr as *const libc::sockaddr_ll as *const libc::sockaddr,
-                std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
-            )
-        };
-        if rc < 0 {
-            let error = std::io::Error::last_os_error();
-            unsafe {
-                libc::close(fd);
-            }
-            return Err(error).with_context(|| format!("failed to bind AF_PACKET to {iface}"));
-        }
-        // Bursty action responses can arrive while the callback is parsing
-        // and re-encoding a QUIC datagram. Increase the kernel receive queue
-        // so a short userspace scheduling delay is measured as QUIC loss only
-        // when the RF frame was actually missed, not as AF_PACKET overflow.
-        let receive_buffer: libc::c_int = 1 << 20;
-        unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_RCVBUF,
-                &receive_buffer as *const libc::c_int as *const libc::c_void,
-                std::mem::size_of_val(&receive_buffer) as libc::socklen_t,
-            );
-        }
-        Ok(Self { fd })
-    }
-
-    fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let read =
-            unsafe { libc::recv(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
-        if read < 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(read as usize)
-        }
-    }
-
-    fn set_receive_timeout(&self, timeout: Duration) -> Result<()> {
-        let micros = timeout.as_micros().min(i64::MAX as u128) as i64;
-        let value = libc::timeval {
-            tv_sec: micros / 1_000_000,
-            tv_usec: micros % 1_000_000,
-        };
-        let rc = unsafe {
-            libc::setsockopt(
-                self.fd,
-                libc::SOL_SOCKET,
-                libc::SO_RCVTIMEO,
-                &value as *const libc::timeval as *const libc::c_void,
-                std::mem::size_of_val(&value) as libc::socklen_t,
-            )
-        };
-        if rc < 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("failed to set monitor RX timeout");
-        }
-        Ok(())
-    }
-
-    fn recv_timeout(&self, buf: &mut [u8], timeout: Duration) -> Result<Option<usize>> {
-        let millis = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
-        let mut pollfd = libc::pollfd {
-            fd: self.fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let rc = unsafe { libc::poll(&mut pollfd, 1, millis) };
-        if rc < 0 {
-            return Err(std::io::Error::last_os_error()).context("poll monitor RX socket failed");
-        }
-        if rc == 0 {
-            return Ok(None);
-        }
-        self.recv(buf)
-            .map(Some)
-            .context("recv monitor RX socket failed")
-    }
-}
-
-impl DataSocket {
-    fn open(iface: &str) -> Result<Self> {
-        let ifindex = ifindex(iface)?;
-        let fd = unsafe {
-            libc::socket(
-                libc::AF_PACKET,
-                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-                (ETH_P_ALL.to_be()) as i32,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("failed to open AF_PACKET raw socket for data path");
-        }
-        let addr = libc::sockaddr_ll {
-            sll_family: libc::AF_PACKET as libc::sa_family_t,
-            sll_protocol: ETH_P_ALL.to_be(),
-            sll_ifindex: ifindex as i32,
-            sll_hatype: 0,
-            sll_pkttype: 0,
-            sll_halen: 0,
-            sll_addr: [0; 8],
-        };
-        let rc = unsafe {
-            libc::bind(
-                fd,
-                &addr as *const libc::sockaddr_ll as *const libc::sockaddr,
-                std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
-            )
-        };
-        if rc < 0 {
-            let error = std::io::Error::last_os_error();
-            unsafe {
-                libc::close(fd);
-            }
-            return Err(error).with_context(|| format!("failed to bind AF_PACKET to {iface}"));
-        }
-        Ok(Self { fd, ifindex })
-    }
-
-    fn add_multicast(&self, address: [u8; 6]) -> Result<()> {
-        let mut mreq = PacketMreq {
-            mr_ifindex: self.ifindex as libc::c_int,
-            mr_type: PACKET_MR_MULTICAST,
-            mr_alen: 6,
-            mr_address: [0; 8],
-        };
-        mreq.mr_address[..6].copy_from_slice(&address);
-        let rc = unsafe {
-            libc::setsockopt(
-                self.fd,
-                libc::SOL_PACKET,
-                PACKET_ADD_MEMBERSHIP,
-                &mreq as *const PacketMreq as *const libc::c_void,
-                std::mem::size_of::<PacketMreq>() as libc::socklen_t,
-            )
-        };
-        if rc < 0 {
-            return Err(std::io::Error::last_os_error()).with_context(|| {
-                format!("failed to add packet multicast {}", colon_mac(&address))
-            });
-        }
-        Ok(())
-    }
-
-    fn send(&self, packet: &[u8]) -> Result<usize> {
-        let written = unsafe {
-            libc::send(
-                self.fd,
-                packet.as_ptr() as *const libc::c_void,
-                packet.len(),
-                0,
-            )
-        };
-        if written < 0 {
-            Err(std::io::Error::last_os_error()).context("failed to send data frame")
-        } else {
-            Ok(written as usize)
-        }
-    }
-
-    fn recv_timeout(&self, buf: &mut [u8], timeout: Duration) -> Result<Option<usize>> {
-        let millis = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
-        let mut pollfd = libc::pollfd {
-            fd: self.fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let rc = unsafe { libc::poll(&mut pollfd, 1, millis) };
-        if rc < 0 {
-            return Err(std::io::Error::last_os_error()).context("poll data RX socket failed");
-        }
-        if rc == 0 {
-            return Ok(None);
-        }
-        let read =
-            unsafe { libc::recv(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
-        if read < 0 {
-            Err(std::io::Error::last_os_error()).context("recv data RX socket failed")
-        } else {
-            Ok(Some(read as usize))
-        }
-    }
-}
-
-impl Drop for MonitorTxSocket {
-    fn drop(&mut self) {
-        unsafe {
-            libc::close(self.fd);
-        }
-    }
-}
-
-impl Drop for MonitorRxSocket {
-    fn drop(&mut self) {
-        unsafe {
-            libc::close(self.fd);
-        }
-    }
-}
-
-impl Drop for DataSocket {
-    fn drop(&mut self) {
-        unsafe {
-            libc::close(self.fd);
-        }
-    }
-}
-
-fn send_monitor_frame(
-    iface: &str,
-    channel: u8,
-    frame: &[u8],
-    tx_rate_mbps: Option<u8>,
-) -> Result<Value> {
-    let monitor_iface = monitor_iface_name(iface);
-    // NAN receive and NOW TX use one service-owned monitor fixture. A packet
-    // send must not replace it: that used to turn a working broad NAN receive
-    // setup into a TX-only active monitor, and it made a test request alter
-    // host radio state. Service startup owns the one-time fixture setup.
-    let setup = require_existing_monitor_iface(&monitor_iface)?;
-    let packet = build_radiotap_packet_at_rate(frame, tx_rate_mbps)?;
-    let socket = MonitorTxSocket::open(&monitor_iface)?;
-    let written = socket.send(&packet)?;
-    if written != packet.len() {
-        bail!(
-            "short monitor frame write: wrote {written}, expected {}",
-            packet.len()
-        );
-    }
-    Ok(json!({
-        "iface": monitor_iface,
-        "channel": channel,
-        "packet_len": packet.len(),
-        "setup": setup,
-    }))
-}
-
-fn ensure_monitor_iface(
-    base_iface: &str,
-    monitor_iface: &str,
-    channel: u8,
-    active: bool,
-    recreate: bool,
-    exclusive_phy: bool,
-) -> Result<Value> {
-    // Public raw-radio calls may name either the owned base (`wlan0`) or its
-    // conventional monitor child (`wlan0mon`).  A monitor cannot create or
-    // own another monitor VIF, so always perform VIF lifecycle operations on
-    // the base in the latter case.
-    let base_iface = base_iface.strip_suffix("mon").unwrap_or(base_iface);
-    // `send_monitor_frame` is on the packet path. Once the listener/client
-    // has prepared the VIF, repeating `ip`/`iw` setup for every response adds
-    // hundreds of milliseconds and can itself perturb the radio. Reuse the
-    // existing VIF for the non-recreate path; explicit active-mode startup
-    // still takes the full lifecycle below when the caller requested it.
-    if !recreate && ifindex(monitor_iface).is_ok() {
-        return Ok(json!({
-            "iface": monitor_iface,
-            "reused": true,
-            "channel": channel,
-            "active": true,
-        }));
-    }
-    let mut steps = Vec::new();
-    // A monitor VIF can exist while its parent is administratively down. For
-    // active raw-NAN operation the dedicated radio must be owned by monitor
-    // mode: leaving the managed parent up makes channel selection succeed only
-    // nominally and packets are looped back to AF_PACKET without reaching RF.
-    // An active monitor must own the PHY.  In particular, do not bring the
-    // managed parent up before replacing a passive monitor: mac80211 then
-    // keeps the old VIF busy and AF_PACKET reports a successful local write
-    // without an RF transmit.  Take the parent down first, replace the VIF,
-    // then bring only the active monitor up.
-    if active && recreate && exclusive_phy {
-        steps.push(link_state_result(base_iface, false));
-    } else {
-        steps.push(link_state_result(base_iface, true));
-    }
-    if recreate && ifindex(monitor_iface).is_ok() {
-        steps.push(link_state_result(monitor_iface, false));
-        let delete = ifindex(monitor_iface)
-            .and_then(|index| Nl80211Socket::open()?.delete_interface(index))
-            .map(|_| {
-                json!({
-                    "ok": true,
-                    "backend": "nl80211",
-                    "operation": "del_interface",
-                    "iface": monitor_iface,
-                })
-            })
-            .unwrap_or_else(|error| {
-                json!({
-                    "ok": false,
-                    "backend": "nl80211",
-                    "operation": "del_interface",
-                    "iface": monitor_iface,
-                    "error": format!("{error:#}"),
-                })
-            });
-        steps.push(delete);
-    }
-    if ifindex(monitor_iface).is_err() {
-        let create = ifindex(base_iface)
-            .and_then(|index| {
-                let socket = Nl80211Socket::open()?;
-                let wiphy = socket.interface_wiphy(index)?;
-                socket
-                    .new_interface(wiphy, monitor_iface, NL80211_IFTYPE_MONITOR)
-                    .map(|_| wiphy)
-            })
-            .map(|wiphy| {
-                json!({
-                    "ok": true,
-                    "backend": "nl80211",
-                    "operation": "new_interface",
-                    "type": "monitor",
-                    "iface": monitor_iface,
-                    "wiphy": wiphy,
-                })
-            })
-            .unwrap_or_else(|error| {
-                json!({
-                    "ok": false,
-                    "backend": "nl80211",
-                    "operation": "new_interface",
-                    "type": "monitor",
-                    "iface": monitor_iface,
-                    "error": format!("{error:#}"),
-                })
-            });
-        steps.push(create);
-    }
-    steps.push(link_state_result(monitor_iface, true));
-    if active && !recreate && exclusive_phy {
-        steps.push(link_state_result(base_iface, false));
-    }
-    let channel_step = ifindex(monitor_iface)
-        .and_then(|index| Nl80211Socket::open()?.set_channel_ht20(index, channel_to_freq(channel)))
-        .map(|_| {
-            json!({
-                "program": "nl80211",
-                "operation": "set_channel_ht20",
-                "iface": monitor_iface,
-                "channel": channel,
-                "ok": true,
-            })
-        })
-        .unwrap_or_else(|error| {
-            json!({
-                "program": "nl80211",
-                "operation": "set_channel_ht20",
-                "iface": monitor_iface,
-                "channel": channel,
-                "ok": false,
-                "error": format!("{error:#}"),
-            })
-        });
-    let channel_busy = !channel_step
-        .get("ok")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-        && channel_step
-            .get("error")
-            .and_then(Value::as_str)
-            .map(|error| error.contains("busy"))
-            .unwrap_or(false);
-    steps.push(channel_step);
-    if channel_busy {
-        steps.push(json!({
-            "program": "nl80211",
-            "operation": "set_channel_ht20",
-            "iface": monitor_iface,
-            "channel": channel,
-            "ok": true,
-            "skipped": true,
-            "reason": "base interface owns the channel; monitor follows it",
-        }));
-    }
-    // The managed parent is deliberately down for an active monitor.  Pin the
-    // final monitor VIF through nl80211 as well: several USB drivers accept
-    // the earlier parent-VIF channel request but leave the newly-created
-    // monitor with no operational channel and silently consume AF_PACKET TX.
-    let monitor_channel = ifindex(monitor_iface).and_then(|ifindex| {
-        let socket = Nl80211Socket::open()?;
-        socket.set_channel_ht20(ifindex, channel_to_freq(channel))
-    });
-    steps.push(match monitor_channel {
-        Ok(()) => json!({
-            "program": "nl80211",
-            "operation": "set_channel_ht20",
-            "iface": monitor_iface,
-            "channel": channel,
-            "ok": true,
-        }),
-        Err(error) => json!({
-            "program": "nl80211",
-            "operation": "set_channel_ht20",
-            "iface": monitor_iface,
-            "channel": channel,
-            "ok": false,
-            "error": format!("{error:#}"),
-        }),
-    });
-    let channel_ok = steps.iter().any(|step| {
-        step.get("ok").and_then(Value::as_bool).unwrap_or(false)
-            && step.get("operation").and_then(Value::as_str) == Some("set_channel_ht20")
-    });
-    let failed = steps
-        .iter()
-        .filter(|step| {
-            if step.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-                return false;
-            }
-            let is_channel_busy = step.get("operation").and_then(Value::as_str)
-                == Some("set_channel_ht20")
-                && step
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .map(|error| error.contains("busy"))
-                    .unwrap_or(false);
-            if is_channel_busy && channel_ok {
-                return false;
-            }
-            true
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if !failed.is_empty() {
-        bail!(
-            "failed to prepare monitor interface {monitor_iface}: {}",
-            json!(failed)
-        );
-    }
-    Ok(json!(steps))
-}
-
-/// Test-facing monitor users may only consume the persistent fixture.  Radio
-/// setup is deliberately kept out of this helper so a listener/check/probe
-/// request cannot disturb a live AP or make a passive local loopback appear
-/// to be an RF result.
-fn require_existing_monitor_iface(monitor_iface: &str) -> Result<Value> {
-    ifindex(monitor_iface)?;
-    Ok(json!({
-        "iface": monitor_iface,
-        "reused": true,
-        "lifecycle": "externally_prepared",
-    }))
-}
-
-fn run_command(program: &str, args: &[&str]) -> Value {
-    // Deliberately retained as a structured compatibility response for old
-    // methods, but never executes a host command. Wi-Fi state is owned by
-    // nl80211/rtnetlink; wpa_supplicant is the only permitted child process.
-    json!({
-        "program": program,
-        "args": args,
-        "ok": false,
-        "error": "host command execution is disabled; use nl80211/rtnetlink",
-    })
-}
-
-fn build_radiotap_packet(frame: &[u8]) -> Vec<u8> {
-    // Keep the explicit legacy rate used by the original working lmesh NAN
-    // injector. Some monitor drivers accept the AF_PACKET write but do not
-    // put a TX_FLAGS-only packet on the air.
-    build_radiotap_packet_at_rate(frame, None).expect("default radiotap rate is valid")
-}
-
-/// Return true for NAN beacons and NAN public action frames.  NAN uses the
-/// Wi-Fi Alliance OUI in address3 (the cluster BSSID); ordinary AP beacons and
-/// unrelated public actions must retain the caller/driver rate policy.
-fn is_nan_control_frame(frame: &[u8]) -> bool {
-    frame.len() >= 24
-        && frame_type(frame) == 0
-        && matches!(frame_subtype(frame), 8 | 13)
-        && frame[16..19] == [0x50, 0x6f, 0x9a]
-}
-
-fn build_radiotap_packet_at_rate(frame: &[u8], rate_mbps: Option<u8>) -> Result<Vec<u8>> {
-    build_radiotap_packet_at_rate_with_ack(frame, rate_mbps, false)
-}
-
-fn build_radiotap_packet_at_rate_with_ack(
-    frame: &[u8],
-    rate_mbps: Option<u8>,
-    request_ack: bool,
-) -> Result<Vec<u8>> {
-    let rate_mbps = rate_mbps.unwrap_or(1);
-    if !matches!(
-        rate_mbps,
-        1 | 2 | 5 | 6 | 9 | 11 | 12 | 18 | 24 | 36 | 48 | 54
-    ) {
-        bail!("unsupported radiotap legacy rate {rate_mbps} Mbps");
-    }
-    let mut packet = Vec::with_capacity(12 + frame.len());
-    packet.extend_from_slice(&[
-        0x00,
-        0x00, // radiotap version, pad
-        0x0c,
-        0x00, // radiotap length
-        0x04,
-        0x80,
-        0x00,
-        0x00,                        // present: RATE and TX_FLAGS
-        rate_mbps.saturating_mul(2), // RATE in 500 kbps units
-        0x00,                        // pad TX_FLAGS to u16 alignment
-        if request_ack { 0x00 } else { 0x08 },
-        0x00, // TX_FLAGS: request MAC ACK for unicast, no ACK for broadcast
-    ]);
-    packet.extend_from_slice(frame);
-    Ok(packet)
-}
-
-fn genl_payload(cmd: u8, version: u8) -> Vec<u8> {
-    let mut payload = Vec::new();
-    append_struct(
-        &mut payload,
-        &GenlMsgHdr {
-            cmd,
-            version,
-            reserved: 0,
-        },
-    );
-    payload
-}
-
-fn append_attr(out: &mut Vec<u8>, kind: u16, value: &[u8]) {
-    let len = std::mem::size_of::<NlAttrHdr>() + value.len();
-    append_struct(
-        out,
-        &NlAttrHdr {
-            nla_len: len as u16,
-            nla_type: kind,
-        },
-    );
-    out.extend_from_slice(value);
-    while out.len() % 4 != 0 {
-        out.push(0);
-    }
-}
-
-fn netlink_payload(response: &[u8]) -> Result<&[u8]> {
-    if response.len() < std::mem::size_of::<libc::nlmsghdr>() {
-        bail!("short netlink message");
-    }
-    let header = unsafe { std::ptr::read_unaligned(response.as_ptr() as *const libc::nlmsghdr) };
-    let len = header.nlmsg_len as usize;
-    if len < std::mem::size_of::<libc::nlmsghdr>() || len > response.len() {
-        bail!("invalid netlink message length {len}");
-    }
-    Ok(&response[std::mem::size_of::<libc::nlmsghdr>()..len])
-}
-
-fn genl_header(response: &[u8]) -> Option<GenlMsgHdr> {
-    let payload = netlink_payload(response).ok()?;
-    if payload.len() < std::mem::size_of::<GenlMsgHdr>() {
-        return None;
-    }
-    Some(unsafe { std::ptr::read_unaligned(payload.as_ptr() as *const GenlMsgHdr) })
-}
-
-fn genl_attrs(response: &[u8]) -> Result<Vec<(u16, &[u8])>> {
-    let payload = netlink_payload(response)?;
-    if payload.len() < std::mem::size_of::<GenlMsgHdr>() {
-        bail!("short generic netlink message");
-    }
-    parse_attrs(&payload[std::mem::size_of::<GenlMsgHdr>()..])
-}
-
-fn parse_station_dump_message(response: &[u8]) -> Result<Value> {
-    let mut mac = None;
-    let mut station_info = Vec::new();
-    for (kind, value) in genl_attrs(response)? {
-        match kind & NLA_TYPE_MASK {
-            NL80211_ATTR_MAC if value.len() >= 6 => {
-                let mut station_mac = [0_u8; 6];
-                station_mac.copy_from_slice(&value[..6]);
-                mac = Some(colon_mac(&station_mac));
-            }
-            NL80211_ATTR_STA_INFO => station_info = parse_attrs(value)?,
-            _ => {}
-        }
-    }
-    let mut out = serde_json::Map::new();
-    if let Some(mac) = mac {
-        out.insert("mac".to_string(), Value::String(mac));
-    }
-    for (kind, value) in station_info {
-        match kind & NLA_TYPE_MASK {
-            NL80211_STA_INFO_INACTIVE_TIME => {
-                insert_u32(&mut out, "inactive_ms", value);
-            }
-            NL80211_STA_INFO_RX_BYTES => {
-                insert_u32(&mut out, "rx_bytes", value);
-            }
-            NL80211_STA_INFO_TX_BYTES => {
-                insert_u32(&mut out, "tx_bytes", value);
-            }
-            NL80211_STA_INFO_SIGNAL => {
-                if let Some(signal) = value.first() {
-                    out.insert("signal_dbm".to_string(), json!(*signal as i8));
-                }
-            }
-            NL80211_STA_INFO_RX_PACKETS => {
-                insert_u32(&mut out, "rx_packets", value);
-            }
-            NL80211_STA_INFO_TX_PACKETS => {
-                insert_u32(&mut out, "tx_packets", value);
-            }
-            NL80211_STA_INFO_TX_RETRIES => {
-                insert_u32(&mut out, "tx_retries", value);
-            }
-            NL80211_STA_INFO_TX_FAILED => {
-                insert_u32(&mut out, "tx_failed", value);
-            }
-            NL80211_STA_INFO_SIGNAL_AVG => {
-                if let Some(signal) = value.first() {
-                    out.insert("signal_avg_dbm".to_string(), json!(*signal as i8));
-                }
-            }
-            NL80211_STA_INFO_TX_BITRATE => {
-                if let Ok(rate_attributes) = parse_attrs(value) {
-                    insert_station_rate_info(&mut out, "tx", &rate_attributes);
-                }
-            }
-            NL80211_STA_INFO_RX_BITRATE => {
-                if let Ok(rate_attributes) = parse_attrs(value) {
-                    insert_station_rate_info(&mut out, "rx", &rate_attributes);
-                }
-            }
-            NL80211_STA_INFO_CONNECTED_TIME => {
-                insert_u32(&mut out, "connected_sec", value);
-            }
-            NL80211_STA_INFO_STA_FLAGS if value.len() >= 8 => {
-                let mask = u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
-                let set = u32::from_ne_bytes([value[4], value[5], value[6], value[7]]);
-                out.insert("wmm".to_string(), json!(set & NL80211_STA_FLAG_WME != 0));
-                out.insert(
-                    "authorized".to_string(),
-                    json!(set & NL80211_STA_FLAG_AUTHORIZED != 0),
-                );
-                out.insert("station_flags_mask".to_string(), json!(mask));
-            }
-            NL80211_STA_INFO_RX_BYTES64 => {
-                insert_u64(&mut out, "rx_bytes", value);
-            }
-            NL80211_STA_INFO_TX_BYTES64 => {
-                insert_u64(&mut out, "tx_bytes", value);
-            }
-            // These driver-maintained aggregates explain why application
-            // goodput can be far below the last selected MCS.  They are
-            // intentionally reported only by the command-rate AP status
-            // endpoint, never from a packet hot path.
-            NL80211_STA_INFO_EXPECTED_THROUGHPUT => {
-                insert_u32(&mut out, "expected_throughput_kbit_s", value);
-            }
-            NL80211_STA_INFO_RX_DROP_MISC => {
-                insert_u64(&mut out, "rx_drop_misc", value);
-            }
-            NL80211_STA_INFO_RX_DURATION => {
-                insert_u64(&mut out, "rx_airtime_us", value);
-            }
-            NL80211_STA_INFO_ACK_SIGNAL => {
-                if let Some(signal) = value.first() {
-                    out.insert("ack_signal_dbm".to_string(), json!(*signal as i8));
-                }
-            }
-            NL80211_STA_INFO_ACK_SIGNAL_AVG => {
-                if let Some(signal) = value.first() {
-                    out.insert("ack_signal_avg_dbm".to_string(), json!(*signal as i8));
-                }
-            }
-            NL80211_STA_INFO_RX_MPDUS => {
-                insert_u32(&mut out, "rx_mpdus", value);
-            }
-            NL80211_STA_INFO_FCS_ERROR_COUNT => {
-                insert_u32(&mut out, "rx_fcs_errors", value);
-            }
-            NL80211_STA_INFO_TX_DURATION => {
-                insert_u64(&mut out, "tx_airtime_us", value);
-            }
-            _ => {}
-        }
-    }
-    Ok(Value::Object(out))
-}
-
-fn parse_scan_dump_message(response: &[u8]) -> Result<Option<Value>> {
-    let bss = genl_attrs(response)?
-        .into_iter()
-        .find_map(|(kind, value)| ((kind & NLA_TYPE_MASK) == NL80211_ATTR_BSS).then_some(value));
-    let Some(bss) = bss else {
-        return Ok(None);
-    };
-    let mut bssid = None;
-    let mut frequency = None;
-    let mut capability = None;
-    let mut signal_dbm = None;
-    let mut seen_ms_ago = None;
-    let mut information_elements = None;
-    let mut beacon_elements = None;
-    for (kind, value) in parse_attrs(bss)? {
-        match kind & NLA_TYPE_MASK {
-            NL80211_BSS_BSSID if value.len() >= 6 => {
-                let mut mac = [0_u8; 6];
-                mac.copy_from_slice(&value[..6]);
-                bssid = Some(colon_mac(&mac));
-            }
-            NL80211_BSS_FREQUENCY if value.len() >= 4 => {
-                frequency = Some(u32::from_ne_bytes(
-                    value[..4].try_into().expect("four bytes"),
-                ));
-            }
-            NL80211_BSS_CAPABILITY if value.len() >= 2 => {
-                capability = Some(u16::from_ne_bytes(
-                    value[..2].try_into().expect("two bytes"),
-                ));
-            }
-            NL80211_BSS_SIGNAL_MBM if value.len() >= 4 => {
-                let mbm = i32::from_ne_bytes(value[..4].try_into().expect("four bytes"));
-                signal_dbm = Some(mbm as f64 / 100.0);
-            }
-            NL80211_BSS_SEEN_MS_AGO if value.len() >= 4 => {
-                seen_ms_ago = Some(u32::from_ne_bytes(
-                    value[..4].try_into().expect("four bytes"),
-                ));
-            }
-            NL80211_BSS_INFORMATION_ELEMENTS => information_elements = Some(value),
-            NL80211_BSS_BEACON_IES => beacon_elements = Some(value),
-            _ => {}
-        }
-    }
-    let elements = information_elements.or(beacon_elements);
-    let ssid = elements.and_then(ssid_from_information_elements);
-    let Some(bssid) = bssid else {
-        return Ok(None);
-    };
-    let mut out = serde_json::Map::new();
-    out.insert("bssid".to_owned(), json!(bssid));
-    if let Some(ssid) = ssid {
-        out.insert("ssid".to_owned(), json!(ssid));
-    }
-    if let Some(frequency) = frequency {
-        out.insert("frequency_mhz".to_owned(), json!(frequency));
-        if let Some(channel) = freq_to_channel(frequency) {
-            out.insert("channel".to_owned(), json!(channel));
-        }
-    }
-    // IEEE 802.11 Capability Information bit 4 is Privacy. Preserve the
-    // advertised RSN AKM where available: ESP STA selection needs to
-    // distinguish WPA2-PSK, WPA3-SAE, and transition-mode APs instead of
-    // treating every protected BSS as one opaque class.
-    out.insert(
-        "auth".to_owned(),
-        json!(match (
-            capability,
-            elements.and_then(rsn_auth_from_information_elements)
-        ) {
-            (Some(bits), _) if bits & (1 << 4) == 0 => "open",
-            (_, Some(auth)) => auth,
-            _ => "protected",
-        }),
-    );
-    if let Some(signal_dbm) = signal_dbm {
-        out.insert("signal_dbm".to_owned(), json!(signal_dbm));
-    }
-    if let Some(seen_ms_ago) = seen_ms_ago {
-        out.insert("seen_ms_ago".to_owned(), json!(seen_ms_ago));
-    }
-    Ok(Some(Value::Object(out)))
-}
-
-fn ssid_from_information_elements(mut bytes: &[u8]) -> Option<String> {
-    while bytes.len() >= 2 {
-        let element_id = bytes[0];
-        let length = bytes[1] as usize;
-        bytes = &bytes[2..];
-        if length > bytes.len() {
-            return None;
-        }
-        let value = &bytes[..length];
-        bytes = &bytes[length..];
-        if element_id == 0 {
-            return std::str::from_utf8(value).ok().map(ToOwned::to_owned);
-        }
-    }
-    None
-}
-
-/// Return the PSK/SAE portion of a standard RSN IE without retaining the raw
-/// management frame. The result is intentionally small and suitable for the
-/// public `wifi.scan` observation API.
-fn rsn_auth_from_information_elements(mut bytes: &[u8]) -> Option<&'static str> {
-    while bytes.len() >= 2 {
-        let element_id = bytes[0];
-        let length = usize::from(bytes[1]);
-        bytes = &bytes[2..];
-        if length > bytes.len() {
-            return None;
-        }
-        let value = &bytes[..length];
-        bytes = &bytes[length..];
-        if element_id != 48 || value.len() < 10 {
-            continue;
-        }
-        // RSN: version (2), group cipher (4), pairwise count (2), pairwise
-        // suites (4*n), AKM count (2), then AKM suites (4*n). Suite type 2
-        // is PSK and 8 is SAE under the IEEE 00:0f:ac OUI.
-        let pairwise = usize::from(u16::from_le_bytes([value[6], value[7]]));
-        let akm_count_at = 8usize.checked_add(pairwise.checked_mul(4)?)?;
-        let akm_start = akm_count_at.checked_add(2)?;
-        if akm_start > value.len() || akm_count_at + 2 > value.len() {
-            return None;
-        }
-        let akm_count = usize::from(u16::from_le_bytes([
-            value[akm_count_at],
-            value[akm_count_at + 1],
-        ]));
-        let akm_end = akm_start.checked_add(akm_count.checked_mul(4)?)?;
-        if akm_end > value.len() {
-            return None;
-        }
-        let mut psk = false;
-        let mut sae = false;
-        for suite in value[akm_start..akm_end].chunks_exact(4) {
-            if suite[..3] != [0x00, 0x0f, 0xac] {
-                continue;
-            }
-            psk |= suite[3] == 2;
-            sae |= suite[3] == 8;
-        }
-        return Some(match (psk, sae) {
-            (true, true) => "wpa2-wpa3-psk",
-            (true, false) => "wpa2-psk",
-            (false, true) => "wpa3-sae",
-            (false, false) => "rsn",
-        });
-    }
-    None
-}
-
-fn discovery_result(
-    iface: String,
-    backend: &'static str,
-    ssid: Option<String>,
-    channel: Option<u8>,
-    passive: bool,
-    ok: bool,
-    entries: Vec<Value>,
-    mechanism: Option<&'static str>,
-) -> Value {
-    let entries = entries
-        .into_iter()
-        .filter(|entry| {
-            channel.is_none()
-                || entry.get("channel").and_then(Value::as_u64) == channel.map(u64::from)
-        })
-        .filter(|entry| {
-            ssid.as_deref()
-                .is_none_or(|wanted| entry.get("ssid").and_then(Value::as_str) == Some(wanted))
-        })
-        .collect::<Vec<_>>();
-    let direct = entries
-        .iter()
-        .filter(|entry| {
-            entry
-                .get("ssid")
-                .and_then(Value::as_str)
-                .is_some_and(|ssid| ssid.to_ascii_lowercase().starts_with("direct-"))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let direct_dmesh = direct
-        .iter()
-        .filter(|entry| {
-            entry
-                .get("ssid")
-                .and_then(Value::as_str)
-                .is_some_and(|ssid| ssid.to_ascii_lowercase().contains("dmesh"))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let dmesh = entries
-        .iter()
-        .filter(is_open_dmesh_entry)
-        .cloned()
-        .collect::<Vec<_>>();
-    json!({
-        "ok": ok,
-        "backend": backend,
-        "iface": iface,
-        "ssid_filter": ssid,
-        "channel": channel,
-        "passive": passive,
-        "mechanism": mechanism,
-        "count": entries.len(),
-        "channel_ap_count": entries.len(),
-        "entries": entries,
-        "direct": direct,
-        "direct_dmesh": direct_dmesh,
-        "dmesh": dmesh,
-    })
-}
-
-fn is_open_dmesh_entry(entry: &&Value) -> bool {
-    entry.get("auth").and_then(Value::as_str) == Some("open")
-        && entry
-            .get("ssid")
-            .and_then(Value::as_str)
-            .is_some_and(|ssid| {
-                let ssid = ssid.to_ascii_lowercase();
-                ssid.contains("dmesh")
-            })
-}
-
-/// Convert a raw nl80211 station record into the shared optional link-metrics
-/// vocabulary.  The original station JSON remains available for compatibility,
-/// but exporters should consume this record so ESP-side observations and host
-/// MAC telemetry do not grow separate metric names.
-fn station_link_metrics(station: &Value, interface_index: u32) -> WifiLinkMetrics {
-    let unsigned = |key| station.get(key).and_then(Value::as_u64);
-    let signed = |key| {
-        station
-            .get(key)
-            .and_then(Value::as_i64)
-            .and_then(|value| i8::try_from(value).ok())
-    };
-    let mut metrics = WifiLinkMetrics::new();
-    metrics.interface_index = Some(interface_index);
-    metrics.peer_mac = station
-        .get("mac")
-        .and_then(Value::as_str)
-        .and_then(|mac| parse_mac(Some(mac)));
-    metrics.rx_bytes = unsigned("rx_bytes");
-    metrics.tx_bytes = unsigned("tx_bytes");
-    metrics.rx_packets = unsigned("rx_packets");
-    metrics.tx_packets = unsigned("tx_packets");
-    metrics.mac_tx_retries = unsigned("tx_retries");
-    metrics.mac_tx_failed = unsigned("tx_failed");
-    metrics.rx_dropped = unsigned("rx_drop_misc");
-    metrics.rx_airtime_us = unsigned("rx_airtime_us");
-    metrics.tx_airtime_us = unsigned("tx_airtime_us");
-    metrics.signal_dbm = signed("signal_dbm");
-    metrics.signal_avg_dbm = signed("signal_avg_dbm");
-    metrics.ack_signal_dbm = signed("ack_signal_dbm");
-    metrics.ack_signal_avg_dbm = signed("ack_signal_avg_dbm");
-    metrics.rx_bitrate_kbit_s = unsigned("rx_bitrate_kbit_s");
-    metrics.tx_bitrate_kbit_s = unsigned("tx_bitrate_kbit_s");
-    metrics.expected_throughput_kbit_s = unsigned("expected_throughput_kbit_s");
-    metrics
-}
-
-/// Preserve PHY metadata alongside the calculated rate.  A value such as
-/// 26 Mbps is ambiguous on its own: it can be legacy or HT MCS 3.  Exposing
-/// this in the stable AP status avoids using a legacy-rate assumption to tune
-/// the Recovery data path.
-fn insert_station_rate_info(
-    out: &mut serde_json::Map<String, Value>,
-    direction: &str,
-    attributes: &[(u16, &[u8])],
-) {
-    let attr = |kind| {
-        attributes
-            .iter()
-            .find(|(attribute_kind, _)| *attribute_kind & NLA_TYPE_MASK == kind)
-            .map(|(_, value)| *value)
-    };
-    let bitrate = attr(NL80211_RATE_INFO_BITRATE32)
-        .filter(|value| value.len() >= 4)
-        .map(|value| u32::from_ne_bytes([value[0], value[1], value[2], value[3]]) * 100)
-        .or_else(|| {
-            attr(NL80211_RATE_INFO_BITRATE)
-                .filter(|value| value.len() >= 2)
-                .map(|value| u16::from_ne_bytes([value[0], value[1]]) as u32 * 100)
-        });
-    if let Some(bitrate) = bitrate {
-        out.insert(format!("{direction}_bitrate_kbit_s"), json!(bitrate));
-    }
-    if let Some(mcs) = attr(NL80211_RATE_INFO_MCS).and_then(|value| value.first()) {
-        out.insert(format!("{direction}_phy"), json!("ht"));
-        out.insert(format!("{direction}_mcs"), json!(*mcs));
-        out.insert(
-            format!("{direction}_width_mhz"),
-            json!(if attr(NL80211_RATE_INFO_40_MHZ_WIDTH).is_some() {
-                40
-            } else {
-                20
-            }),
-        );
-        out.insert(
-            format!("{direction}_short_gi"),
-            json!(attr(NL80211_RATE_INFO_SHORT_GI).is_some()),
-        );
-    } else if let (Some(mcs), Some(nss)) = (
-        attr(NL80211_RATE_INFO_VHT_MCS).and_then(|value| value.first()),
-        attr(NL80211_RATE_INFO_VHT_NSS).and_then(|value| value.first()),
-    ) {
-        out.insert(format!("{direction}_phy"), json!("vht"));
-        out.insert(format!("{direction}_mcs"), json!(*mcs));
-        out.insert(format!("{direction}_nss"), json!(*nss));
-    }
-}
-
-fn insert_u32(out: &mut serde_json::Map<String, Value>, key: &str, value: &[u8]) {
-    if value.len() >= 4 {
-        out.insert(
-            key.to_string(),
-            json!(u32::from_ne_bytes([value[0], value[1], value[2], value[3]])),
-        );
-    }
-}
-
-fn insert_u64(out: &mut serde_json::Map<String, Value>, key: &str, value: &[u8]) {
-    if value.len() >= 8 {
-        out.insert(
-            key.to_string(),
-            json!(u64::from_ne_bytes([
-                value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
-            ])),
-        );
-    }
-}
-
-fn insert_u16_at(out: &mut serde_json::Map<String, Value>, key: &str, bytes: &[u8], offset: usize) {
-    if let Some(value) = read_u16_at(bytes, offset) {
-        out.insert(key.to_string(), json!(value));
-    }
-}
-
-fn read_u16_at(bytes: &[u8], offset: usize) -> Option<u16> {
-    Some(u16::from_le_bytes(
-        bytes.get(offset..offset + 2)?.try_into().ok()?,
-    ))
-}
-
-fn read_u64_at(bytes: &[u8], offset: usize) -> Option<u64> {
-    Some(u64::from_le_bytes(
-        bytes.get(offset..offset + 8)?.try_into().ok()?,
-    ))
-}
-
-fn parse_attrs(mut bytes: &[u8]) -> Result<Vec<(u16, &[u8])>> {
-    let mut attrs = Vec::new();
-    while bytes.len() >= std::mem::size_of::<NlAttrHdr>() {
-        let header = unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const NlAttrHdr) };
-        let len = header.nla_len as usize;
-        if len < std::mem::size_of::<NlAttrHdr>() || len > bytes.len() {
-            break;
-        }
-        attrs.push((
-            header.nla_type,
-            &bytes[std::mem::size_of::<NlAttrHdr>()..len],
-        ));
-        let aligned = (len + 3) & !3;
-        if aligned > bytes.len() {
-            break;
-        }
-        bytes = &bytes[aligned..];
-    }
-    Ok(attrs)
-}
-
-fn netlink_error(response: &[u8]) -> Option<i32> {
-    if response.len() < std::mem::size_of::<libc::nlmsghdr>() + 4 {
-        return None;
-    }
-    let header = unsafe { std::ptr::read_unaligned(response.as_ptr() as *const libc::nlmsghdr) };
-    if header.nlmsg_type != NLMSG_ERROR {
-        return None;
-    }
-    let offset = std::mem::size_of::<libc::nlmsghdr>();
-    let error = unsafe { std::ptr::read_unaligned(response[offset..].as_ptr() as *const i32) };
-    (error < 0).then_some(-error)
-}
-
-fn netlink_extack_message(response: &[u8]) -> String {
-    let Some(attrs) = netlink_extack_attrs(response) else {
-        return String::new();
-    };
-    let mut details = Vec::new();
-    for (kind, value) in attrs {
-        match kind {
-            NLMSGERR_ATTR_MSG => {
-                let text = String::from_utf8_lossy(trim_nul(value)).trim().to_string();
-                if !text.is_empty() {
-                    details.push(format!("msg={text:?}"));
-                }
-            }
-            NLMSGERR_ATTR_OFFS if value.len() >= 4 => {
-                let offset = u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
-                details.push(format!("offset={offset}"));
-            }
-            NLMSGERR_ATTR_MISS_TYPE if value.len() >= 4 => {
-                let attr = u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
-                details.push(format!("missing_attr={attr}"));
-            }
-            _ => {}
-        }
-    }
-    if details.is_empty() {
-        String::new()
-    } else {
-        format!(" ({})", details.join(", "))
-    }
-}
-
-fn netlink_extack_attrs(response: &[u8]) -> Option<Vec<(u16, &[u8])>> {
-    let header_len = std::mem::size_of::<libc::nlmsghdr>();
-    let error_len = std::mem::size_of::<i32>();
-    if response.len() < header_len + error_len + header_len {
-        return None;
-    }
-    let header = unsafe { std::ptr::read_unaligned(response.as_ptr() as *const libc::nlmsghdr) };
-    if header.nlmsg_type != NLMSG_ERROR {
-        return None;
-    }
-    let original_offset = header_len + error_len;
-    let original = unsafe {
-        std::ptr::read_unaligned(response[original_offset..].as_ptr() as *const libc::nlmsghdr)
-    };
-    let full_original_error_len = nlmsg_align(error_len + original.nlmsg_len as usize);
-    let compact_error_len = nlmsg_align(error_len + header_len);
-    for ext_offset in [
-        header_len + full_original_error_len,
-        header_len + compact_error_len,
-    ] {
-        if ext_offset < response.len()
-            && let Ok(attrs) = parse_attrs(&response[ext_offset..])
-            && !attrs.is_empty()
-        {
-            return Some(attrs);
-        }
-    }
-    None
-}
-
-fn trim_nul(value: &[u8]) -> &[u8] {
-    match value.iter().position(|byte| *byte == 0) {
-        Some(pos) => &value[..pos],
-        None => value,
-    }
-}
-
-fn nlmsg_align(len: usize) -> usize {
-    (len + 3) & !3
-}
-
-fn netlink_is_ack(response: &[u8]) -> bool {
-    if response.len() < std::mem::size_of::<libc::nlmsghdr>() + 4 {
-        return false;
-    }
-    let header = unsafe { std::ptr::read_unaligned(response.as_ptr() as *const libc::nlmsghdr) };
-    if header.nlmsg_type != NLMSG_ERROR {
-        return false;
-    }
-    let offset = std::mem::size_of::<libc::nlmsghdr>();
-    let error = unsafe { std::ptr::read_unaligned(response[offset..].as_ptr() as *const i32) };
-    error == 0
-}
-
-fn nl80211_receive_loop(
-    socket: Nl80211Socket,
-    iface: &str,
-    history: Arc<Mutex<VecDeque<RadioEvent>>>,
-) {
-    loop {
-        match socket.recv_frame() {
-            Ok(frame) => {
-                if let Some(value) = parse_dmesh_vendor_action(&frame, iface) {
-                    let message = mesh_message_from_raw_wifi(&value, iface);
-                    push_radio_event(
-                        &history,
-                        RadioEvent {
-                            ts_millis: now_millis(),
-                            key: "wifi.raw.rx".to_string(),
-                            source: iface.to_string(),
-                            value,
-                            message: Some(message),
-                        },
-                    );
-                }
-            }
-            Err(error) => {
-                push_radio_event(
-                    &history,
-                    RadioEvent {
-                        ts_millis: now_millis(),
-                        key: "wifi.raw.listen.error".to_string(),
-                        source: iface.to_string(),
-                        value: json!({ "ok": false, "iface": iface, "error": error.to_string() }),
-                        message: None,
-                    },
-                );
-                break;
-            }
-        }
-    }
-}
-
-/// Feed registered management beacons into the same NAN state machine as the
-/// monitor path. This owns no interface lifecycle and is intentionally a
-/// fallback for adapters whose active monitor VIF drops beacon RX.
-fn nl80211_nan_beacon_receive_loop(
-    socket: Nl80211Socket,
-    iface: &str,
-    history: Arc<Mutex<VecDeque<RadioEvent>>>,
-    discovered_devices: Arc<Mutex<DiscoveredDeviceRegistry>>,
-    rawnan_state: Arc<Mutex<NanState>>,
-    pending_nan_followups: Arc<Mutex<dmesh_rawnan::NanFollowupQueue>>,
-) {
-    let _ = socket.set_receive_timeout(Duration::from_millis(250));
-    let mut followup_dedup = FollowupDedup::new(256);
-    loop {
-        match socket.recv_frame_with_signal() {
-            Ok((frame, rx_signal_dbm)) => {
-                match frame_subtype(&frame) {
-                    8 => {
-                        if let Some(beacon) =
-                            handle_beacon_frame(&frame, iface, rx_signal_dbm, &rawnan_state)
-                        {
-                            push_radio_event(
-                                &history,
-                                RadioEvent {
-                                    ts_millis: now_millis(),
-                                    key: "wifi.rawnan.beacon".to_string(),
-                                    source: iface.to_string(),
-                                    value: beacon,
-                                    message: None,
-                                },
-                            );
-                        }
-                    }
-                    13 => {
-                        // This is the base-interface fallback for adapters
-                        // that do not mirror NAN SDFs to the monitor VIF.
-                        // It shares the semantic registry/deduplication path
-                        // with monitor and AP-SME ingress.  The fallback does
-                        // not transmit follow-ups: a received active request
-                        // is reported as such instead of claiming a response
-                        // from a monitor that did not receive the frame.
-                        record_nan_discovery(
-                            &frame,
-                            iface,
-                            iface_mac(iface).ok(),
-                            iface,
-                            &history,
-                            &discovered_devices,
-                            &rawnan_state,
-                            None,
-                            &pending_nan_followups,
-                            &mut followup_dedup,
-                            |_| Err(anyhow::anyhow!("nl80211 NAN fallback has no TX lane")),
-                        );
-                        if let Some(action) =
-                            handle_action_frame(&frame, iface, rx_signal_dbm, &rawnan_state)
-                        {
-                            push_radio_event(
-                                &history,
-                                RadioEvent {
-                                    ts_millis: now_millis(),
-                                    key: "wifi.rawnan.action".to_string(),
-                                    source: iface.to_string(),
-                                    value: action,
-                                    message: None,
-                                },
-                            );
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Err(error)
-                if error
-                    .to_string()
-                    .contains("Resource temporarily unavailable") =>
-            {
-                continue;
-            }
-            Err(error) => {
-                push_radio_event(
-                    &history,
-                    RadioEvent {
-                        ts_millis: now_millis(),
-                        key: "wifi.rawnan.beacon_listener.error".to_string(),
-                        source: iface.to_string(),
-                        value: json!({"ok": false, "error": error.to_string()}),
-                        message: None,
-                    },
-                );
-                break;
-            }
-        }
-    }
-}
-
-fn ap_mgmt_receive_loop(
-    socket: Nl80211Socket,
-    iface: &str,
-    ifindex: u32,
-    ap_mac: [u8; 6],
-    history: Arc<Mutex<VecDeque<RadioEvent>>>,
-    discovered_devices: Arc<Mutex<DiscoveredDeviceRegistry>>,
-    rawnan_state: Arc<Mutex<NanState>>,
-    active_nan_publish: Arc<Mutex<NanActivePublish>>,
-    pending_nan_active_subscribe: Arc<Mutex<Option<PendingNanActiveSubscribe>>>,
-    pending_nan_followups: Arc<Mutex<dmesh_rawnan::NanFollowupQueue>>,
-    ap_no_ht_stations: Arc<Mutex<HashSet<[u8; 6]>>>,
-    channel: u8,
-    ht40: bool,
-    stop: Arc<AtomicBool>,
-) {
-    let _ = socket.set_receive_timeout(Duration::from_millis(100));
-    // AP-mode management RX is a real NAN ingress lane on adapters that do
-    // not mirror public actions to the monitor child. Keep the same bounded
-    // follow-up deduplication as the monitor path so AP and unassociated
-    // hosts expose one discovery contract.
-    let mut followup_dedup = FollowupDedup::new(256);
-    loop {
-        if stop.load(Ordering::Acquire) {
-            break;
-        }
-        match socket.recv_frame_with_signal() {
-            Ok((frame, rx_signal_dbm)) => {
-                let mut value = parse_management_frame(&frame, iface, "linux_nl80211_ap_sme");
-                if frame_subtype(&frame) == 8
-                    && let Some(beacon) =
-                        handle_beacon_frame(&frame, iface, rx_signal_dbm, &rawnan_state)
-                    && let Some(object) = value.as_object_mut()
-                {
-                    object.insert("beacon_sync".to_string(), beacon);
-                }
-                if frame_subtype(&frame) == 8 {
-                    drain_active_nan_publish(
-                        ap_mac,
-                        iface,
-                        &history,
-                        &rawnan_state,
-                        &active_nan_publish,
-                        |publish| send_monitor_frame(iface, channel, publish, Some(6)).map(|_| ()),
-                    );
-                    drain_pending_nan_active_subscribe(
-                        ap_mac,
-                        iface,
-                        &history,
-                        &rawnan_state,
-                        &pending_nan_active_subscribe,
-                        |subscribe| {
-                            send_monitor_frame(iface, channel, subscribe, Some(6)).map(|_| ())
-                        },
-                    );
-                    drain_pending_nan_followups(
-                        ap_mac,
-                        iface,
-                        &history,
-                        &rawnan_state,
-                        &pending_nan_followups,
-                        |response| {
-                            send_monitor_frame(iface, channel, response, Some(6)).map(|_| ())
-                        },
-                    );
-                }
-                if frame_subtype(&frame) == 13 {
-                    if let Some(action) =
-                        handle_action_frame(&frame, iface, rx_signal_dbm, &rawnan_state)
-                        && let Some(object) = value.as_object_mut()
-                    {
-                        object.insert("action_frame".to_string(), action);
-                    }
-                    if let Some(response) = build_dmesh_p2p_sd_response(ap_mac, &frame) {
-                        let tx =
-                            send_open_ap_mgmt_response(&socket, iface, ifindex, channel, &response);
-                        if let Some(object) = value.as_object_mut() {
-                            // This proves that a validated DMesh GAS request
-                            // reached shared host ingress and its matching
-                            // DNS-SD/CBOR public-action response was emitted.
-                            object.insert(
-                                "p2p_sd_response".to_string(),
-                                json!({
-                                    "kind": "gas_initial_response_dmesh",
-                                    "frame_len": response.len(),
-                                    "tx": tx,
-                                }),
-                            );
-                        }
-                    }
-                    // The AP management socket may be the only receiver to
-                    // see a host-generated SDF. Feed it through the same
-                    // semantic event/follow-up path as monitor ingress;
-                    // sending a response reuses the permanent monitor and
-                    // never changes AP or interface state.
-                    record_nan_discovery(
-                        &frame,
-                        iface,
-                        Some(ap_mac),
-                        iface,
-                        &history,
-                        &discovered_devices,
-                        &rawnan_state,
-                        Some(&active_nan_publish),
-                        &pending_nan_followups,
-                        &mut followup_dedup,
-                        |response| {
-                            send_monitor_frame(iface, channel, response, Some(6)).map(|_| ())
-                        },
-                    );
-                }
-                if ap_sme_station_departed(frame_subtype(&frame))
-                    && let Some(sta_mac) = mac_at(&frame, IEEE80211_ADDR2)
-                    && let Some(object) = value.as_object_mut()
-                {
-                    // nl80211's AP SME does not remove a userspace-added
-                    // station entry when the STA sends disassoc/deauth.  A
-                    // retained entry made the next ESP association unreliable
-                    // until an operator manually removed it.  The operation
-                    // is idempotent, and association still replaces any
-                    // remaining entry as its separate recovery path.
-                    let removed = Nl80211Socket::open()
-                        .and_then(|socket| socket.remove_station(ifindex, sta_mac))
-                        .is_ok();
-                    object.insert("station_removed".to_string(), json!(removed));
-                }
-                if let Some(response) = handle_open_ap_sme_frame(
-                    &socket,
-                    iface,
-                    ifindex,
-                    ap_mac,
-                    &frame,
-                    &ap_no_ht_stations,
-                    channel,
-                    ht40,
-                ) && let Some(object) = value.as_object_mut()
-                {
-                    object.insert("sme_response".to_string(), response);
-                }
-                if let Some(signal) = rx_signal_dbm
-                    && let Some(object) = value.as_object_mut()
-                {
-                    object.insert("rx_signal_dbm".to_string(), json!(signal));
-                }
-                let source = value
-                    .get("source")
-                    .and_then(Value::as_str)
-                    .unwrap_or(iface)
-                    .to_string();
-                let mut message =
-                    MeshMessage::new(mesh::message::KIND_EVENT, MeshMessageCodec::Text)
-                        .field(FIELD_MEDIUM, "wifi")
-                        .field(FIELD_RADIO_ID, "sta")
-                        .field(FIELD_NODE, &source)
-                        .field(FIELD_IFACE, iface)
-                        .field(
-                            FIELD_STATUS,
-                            value.get("kind").and_then(Value::as_str).unwrap_or("mgmt"),
-                        );
-                if let Some(signal) = rx_signal_dbm {
-                    message = message.field(FIELD_RSSI, signal.to_string());
-                }
-                let beacon_sync = (frame_subtype(&frame) == 8)
-                    .then(|| value.get("beacon_sync").cloned())
-                    .flatten();
-                push_radio_event(
-                    &history,
-                    RadioEvent {
-                        ts_millis: now_millis(),
-                        key: "wifi.ap.mgmt".to_string(),
-                        source: iface.to_string(),
-                        value,
-                        message: Some(message),
-                    },
-                );
-                if dmesh_rawnan::is_nan_beacon(&frame) {
-                    if let Some(beacon_sync) = beacon_sync {
-                        push_radio_event(
-                            &history,
-                            RadioEvent {
-                                ts_millis: now_millis(),
-                                key: "wifi.rawnan.beacon".to_string(),
-                                source: iface.to_string(),
-                                value: beacon_sync,
-                                message: None,
-                            },
-                        );
-                    }
-                }
-            }
-            Err(error) => {
-                if stop.load(Ordering::Acquire)
-                    || error.downcast_ref::<std::io::Error>().is_some_and(|error| {
-                        error.kind() == std::io::ErrorKind::WouldBlock
-                            || error.kind() == std::io::ErrorKind::TimedOut
-                    })
-                {
-                    continue;
-                }
-                push_radio_event(
-                    &history,
-                    RadioEvent {
-                        ts_millis: now_millis(),
-                        key: "wifi.ap.mgmt.error".to_string(),
-                        source: iface.to_string(),
-                        value: json!({ "ok": false, "iface": iface, "error": error.to_string() }),
-                        message: None,
-                    },
-                );
-                break;
-            }
-        }
-    }
-}
-
-/// Send the active discovery Subscribe in every confirmed DW until the next
-/// DW0/DW8 boundary. This is deliberately beacon-driven: it gives always-awake
-/// peers the first window and guarantees the sleepy DW0/DW8 profile gets one
-/// chance, without an unsynchronised retry timer.
-fn drain_pending_nan_active_subscribe<F>(
-    local: [u8; 6],
-    event_source: &str,
-    history: &Arc<Mutex<VecDeque<RadioEvent>>>,
-    rawnan_state: &Arc<Mutex<NanState>>,
-    pending: &Arc<Mutex<Option<PendingNanActiveSubscribe>>>,
-    mut send_subscribe: F,
-) where
-    F: FnMut(&[u8]) -> Result<()>,
-{
-    let now_us = now_micros_u64();
-    let Some((last_beacon_us, tsf_us, period_us)) = rawnan_state
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .nan_sync_timing()
-    else {
-        return;
-    };
-    let dwell_age_us = now_us.saturating_sub(last_beacon_us);
-    if !dmesh_rawnan::beacon_dwell_open(dwell_age_us) {
-        return;
-    }
-    let Some(slot) = dmesh_rawnan::beacon_slot(tsf_us, period_us) else {
-        return;
-    };
-    let bssid = rawnan_state
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .sync_bssid()
-        .map(|mac| mac.0);
-    let Some(bssid) = bssid else {
-        return;
-    };
-    let Some(item) = ({
-        let guard = pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard
-            .as_ref()
-            .filter(|item| item.last_slot != Some(slot))
-            .cloned()
-    }) else {
-        return;
-    };
-    let result = (|| {
-        let frame = dmesh_rawnan::build_nan_usd_sdf_with_bssid(
-            dmesh_rawnan::NAN_DISCOVERY_MAC,
-            local,
-            bssid,
-            dmesh_rawnan::DMESH_SERVICE_ID,
-            9,
-            0x11,
-            &item.service_info,
-        );
-        send_subscribe(&frame)
-    })();
-    let terminal_window = slot % 8 == 0;
-    let mut guard = pending
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if guard
-        .as_ref()
-        .is_some_and(|current| current.request_id == item.request_id)
-    {
-        if terminal_window {
-            *guard = None;
-        } else if let Some(current) = guard.as_mut() {
-            current.last_slot = Some(slot);
-            current.sent_windows = current.sent_windows.saturating_add(1);
-        }
-    }
-    push_radio_event(
-        history,
-        RadioEvent {
-            ts_millis: now_millis(),
-            key: "wifi.rawnan.active_subscribe_tx".to_string(),
-            source: event_source.to_string(),
-            value: json!({
-                "ok": result.is_ok(),
-                "request_id": item.request_id,
-                "control_len": item.service_info.len(),
-                "slot": slot,
-                "terminal_dw0_or_dw8": terminal_window,
-                "sent_windows_before": item.sent_windows,
-                "dwell_age_us": dwell_age_us,
-                "error": result.err().map(|error| format!("{error:#}")),
-            }),
-            message: None,
-        },
-    );
-}
-
-/// Queue a bounded NAN payload until a beacon confirms that the selected DW
-/// is open. `dmesh_rawnan` owns deduplication and replacement semantics;
-/// this Wi-Fi adapter supplies the current timestamp and performs frame TX.
-fn queue_nan_followup(
-    pending: &Arc<Mutex<dmesh_rawnan::NanFollowupQueue>>,
-    destination: [u8; 6],
-    instance: u8,
-    requestor_instance: u8,
-    payload: Vec<u8>,
-) -> bool {
-    let mut queue = pending
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    !matches!(
-        queue.enqueue(dmesh_rawnan::NanFollowupIntent {
-            destination,
-            instance,
-            requestor_instance,
-            payload,
-            queued_at_us: now_micros_u64(),
-        }),
-        dmesh_rawnan::NanFollowupEnqueue::Duplicate
-    )
-}
-
-/// Send up to four queued active-subscribe responses during the current DW.
-/// Both AP-SME and monitor ingress invoke this after a beacon, so a driver
-/// that only exposes one of those receive paths still completes discovery.
-fn drain_pending_nan_followups<F>(
-    local: [u8; 6],
-    event_source: &str,
-    history: &Arc<Mutex<VecDeque<RadioEvent>>>,
-    rawnan_state: &Arc<Mutex<NanState>>,
-    pending: &Arc<Mutex<dmesh_rawnan::NanFollowupQueue>>,
-    mut send_followup: F,
-) where
-    F: FnMut(&[u8]) -> Result<()>,
-{
-    let now_us = now_micros_u64();
-    let timing = rawnan_state
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .nan_sync_timing();
-    let Some((last_beacon_us, _, _)) = timing else {
-        return;
-    };
-    let dwell_age_us = now_us.saturating_sub(last_beacon_us);
-    if !dmesh_rawnan::beacon_dwell_open(dwell_age_us) {
-        return;
-    }
-    let bssid = rawnan_state
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .sync_bssid()
-        .map(|mac| mac.0);
-    let Some(bssid) = bssid else {
-        return;
-    };
-    let queued = pending
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take_up_to(4);
-    for item in queued {
-        let age_us = now_us.saturating_sub(item.queued_at_us);
-        let result = (|| {
-            let frame = dmesh_rawnan::build_nan_followup_sdf_for_requestor(
-                item.destination,
-                local,
-                bssid,
-                dmesh_rawnan::DMESH_SERVICE_ID,
-                item.instance,
-                item.requestor_instance,
-                &item.payload,
-            );
-            send_followup(&frame)
-        })();
-        push_radio_event(
-            history,
-            RadioEvent {
-                ts_millis: now_millis(),
-                key: "wifi.rawnan.followup_tx".to_string(),
-                source: event_source.to_string(),
-                value: json!({
-                    "ok": result.is_ok(),
-                    "queued": true,
-                    "peer": colon_mac(&item.destination),
-                    "bytes": item.payload.len(),
-                    "queued_age_us": age_us,
-                    "dwell_age_us": dwell_age_us,
-                    "error": result.err().map(|error| format!("{error:#}")),
-                }),
-                message: None,
-            },
-        );
-    }
-}
-
-/// Emit a configured active Publish only after a beacon has opened the
-/// selected discovery window. The configuration stores Service Info rather
-/// than an 802.11 frame, so every send uses the current MAC/BSSID and follows
-/// an association or cluster transition safely.
-fn drain_active_nan_publish<F>(
-    local: [u8; 6],
-    event_source: &str,
-    history: &Arc<Mutex<VecDeque<RadioEvent>>>,
-    rawnan_state: &Arc<Mutex<NanState>>,
-    active_publish: &Arc<Mutex<NanActivePublish>>,
-    mut send_publish: F,
-) where
-    F: FnMut(&[u8]) -> Result<()>,
-{
-    let now_us = now_micros_u64();
-    let timing = rawnan_state
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .nan_sync_timing();
-    let Some((last_beacon_us, _, _)) = timing else {
-        return;
-    };
-    let dwell_age_us = now_us.saturating_sub(last_beacon_us);
-    if !dmesh_rawnan::beacon_dwell_open(dwell_age_us) {
-        return;
-    }
-    let bssid = rawnan_state
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .sync_bssid()
-        .map(|mac| mac.0);
-    let Some(bssid) = bssid else {
-        return;
-    };
-    let now_ms = now_millis_u64();
-    let (instance, service_info) = {
-        let publish = active_publish
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(service_info) = publish.due(now_ms) else {
-            return;
-        };
-        (publish.instance(), service_info.to_vec())
-    };
-    let result = (|| {
-        let frame = dmesh_rawnan::build_nan_publish_sdf(
-            dmesh_rawnan::NAN_DISCOVERY_MAC,
-            local,
-            bssid,
-            dmesh_rawnan::DMESH_SERVICE_ID,
-            instance,
-            &service_info,
-        );
-        send_publish(&frame)
-    })();
-    if result.is_ok() {
-        active_publish
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .mark_sent(now_ms);
-    }
-    push_radio_event(
-        history,
-        RadioEvent {
-            ts_millis: now_millis(),
-            key: "wifi.rawnan.publish_tx".to_string(),
-            source: event_source.to_string(),
-            value: json!({
-                "ok": result.is_ok(),
-                "instance": instance,
-                "service_info_len": service_info.len(),
-                "dwell_age_us": dwell_age_us,
-                "error": result.err().map(|error| format!("{error:#}")),
-            }),
-            message: None,
-        },
-    );
-}
-
-/// Emit the bounded, bearer-neutral NAN discovery receipt shared by the
-/// permanent monitor and AP-management RX paths. `send_followup` is supplied
-/// by the Wi-Fi owner so a received active subscribe is answered through the
-/// already-prepared monitor during the current discovery window.
-fn record_nan_discovery<F>(
-    frame: &[u8],
-    iface: &str,
-    local_mac: Option<[u8; 6]>,
-    event_source: &str,
-    history: &Arc<Mutex<VecDeque<RadioEvent>>>,
-    discovered_devices: &Arc<Mutex<DiscoveredDeviceRegistry>>,
-    rawnan_state: &Arc<Mutex<NanState>>,
-    active_nan_publish: Option<&Arc<Mutex<NanActivePublish>>>,
-    pending_nan_followups: &Arc<Mutex<dmesh_rawnan::NanFollowupQueue>>,
-    followup_dedup: &mut FollowupDedup,
-    mut send_followup: F,
-) where
-    F: FnMut(&[u8]) -> Result<()>,
-{
-    if frame_subtype(frame) != 13 {
-        return;
-    }
-    let descriptors = dmesh_rawnan::service_descriptors(frame);
-    let dmesh = descriptors
-        .iter()
-        .find(|item| item.service_id == dmesh_rawnan::DMESH_SERVICE_ID)
-        .map(|item| item.descriptor);
-    let decoded_announce = descriptors
-        .iter()
-        .filter_map(|item| dmesh_server::announce::decode_announce(item.descriptor.payload))
-        .find(|item| !is_placeholder_announce_id(item.device_id()));
-    // Invalid signed SDFs used to disappear at this boundary, making an RF
-    // delivery failure indistinguishable from a crypto failure. Keep the
-    // bounded discovery event (and its normal per-peer rate limit) so the
-    // operator can see the rejection without retaining packet payloads.
-    let invalid_identity = decoded_announce
-        .map(|item| item.has_identity() && !announce_identity_valid(item))
-        .unwrap_or(false);
-    if invalid_identity && let Some(source) = mac_at(frame, IEEE80211_ADDR2) {
-        push_radio_event(
-            history,
-            RadioEvent {
-                ts_millis: now_millis(),
-                key: "wifi.rawnan.discovery".to_string(),
-                source: iface.to_string(),
-                value: json!({
-                    "ok": false,
-                    "bearer": "nan",
-                    "peer": colon_mac(&source),
-                    "reason": "invalid_identity",
-                }),
-                message: None,
-            },
-        );
-    }
-    let announce = decoded_announce.filter(|item| announce_identity_valid(*item));
-    if let Some(announce) = announce
-        && let Some(source) = mac_at(frame, IEEE80211_ADDR2)
-    {
-        let bssid = mac_at(frame, IEEE80211_ADDR3).map(|mac| colon_mac(&mac));
-        discovered_devices
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .observe_announce("nan", colon_mac(&source), bssid, announce);
-    }
-    let active_subscribe =
-        dmesh_rawnan::active_subscribe_service_info(frame, dmesh_rawnan::DMESH_SERVICE_ID);
-    // The permanent monitor reflects our own active Subscribe. It is not a
-    // remote request and must never consume a follow-up slot or be reported
-    // as discovery evidence. A real peer has a different address2.
-    if active_subscribe.is_some() && mac_at(frame, IEEE80211_ADDR2) == local_mac {
-        return;
-    }
-    if dmesh.is_none() && announce.is_none() && active_subscribe.is_none() {
-        return;
-    }
-    let Some(descriptor) = dmesh.or_else(|| descriptors.first().map(|item| item.descriptor)) else {
-        return;
-    };
-    let followup = dmesh_rawnan::followup_service_info(frame, dmesh_rawnan::DMESH_SERVICE_ID)
-        .and_then(dmesh_rawnan::parse_dmesh_nan_followup);
-    if let Some(source) = mac_at(frame, IEEE80211_ADDR2) {
-        let peer = colon_mac(&source);
-        let bssid = mac_at(frame, IEEE80211_ADDR3).map(|mac| colon_mac(&mac));
-        let packet = active_subscribe
-            .map(|item| (DiscoveryPacketKind::ActiveSubscribe, item.service_info))
-            .or_else(|| {
-                followup
-                    .as_ref()
-                    .map(|item| (DiscoveryPacketKind::Followup, item.payload))
-            });
-        if let Some((kind, payload)) = packet {
-            discovered_devices
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .observe_nan_packet(&peer, bssid.as_deref(), kind, payload);
-        }
-    }
-    let duplicate = followup.as_ref().is_some_and(|item| {
-        followup_dedup.is_duplicate(item.device_id, item.seq, item.msg_type, item.payload)
-    });
-    let now_us = now_micros_u64();
-    let dw_open = rawnan_state
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .nan_sync_timing()
-        .is_some_and(|(last_beacon_us, _tsf_us, _period_us)| {
-            dmesh_rawnan::beacon_dwell_open(now_us.saturating_sub(last_beacon_us))
-        });
-    if let Some(subscription) = active_subscribe {
-        let peer = mac_at(frame, IEEE80211_ADDR2);
-        let bssid = mac_at(frame, IEEE80211_ADDR3);
-        if let (Some(peer), Some(bssid), Some(local)) = (peer, bssid, local_mac) {
-            let publish = active_nan_publish.and_then(|publish| {
-                let publish = publish
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                (publish.enabled() && !publish.service_info().is_empty())
-                    .then(|| (publish.instance(), publish.service_info().to_vec()))
-            });
-            if let Some((publish_instance, service_info)) = publish {
-                let result = dmesh_rawnan::build_dmesh_followup_payload(
-                    7,
-                    now_millis_u64() as u16,
-                    local,
-                    peer,
-                    &service_info,
-                )
-                .and_then(|payload| {
-                    if dw_open {
-                        let response = dmesh_rawnan::build_nan_followup_sdf_for_requestor(
-                            peer,
-                            local,
-                            bssid,
-                            dmesh_rawnan::DMESH_SERVICE_ID,
-                            publish_instance,
-                            subscription.instance,
-                            &payload,
-                        );
-                        send_followup(&response)
-                    } else if queue_nan_followup(
-                        pending_nan_followups,
-                        peer,
-                        publish_instance,
-                        subscription.instance,
-                        payload,
-                    ) {
-                        Ok(())
-                    } else {
-                        Ok(())
-                    }
-                });
-                push_radio_event(
-                    history,
-                    RadioEvent {
-                        ts_millis: now_millis(),
-                        key: "wifi.rawnan.followup_tx".to_string(),
-                        source: event_source.to_string(),
-                        value: json!({
-                            "ok": result.is_ok(),
-                            "queued": result.is_ok() && !dw_open,
-                            "peer": colon_mac(&peer),
-                            "bytes": service_info.len(),
-                            "error": result.err().map(|error| format!("{error:#}")),
-                        }),
-                        message: None,
-                    },
-                );
-            } else {
-                push_radio_event(
-                    history,
-                    RadioEvent {
-                        ts_millis: now_millis(),
-                        key: "wifi.rawnan.followup_tx".to_string(),
-                        source: event_source.to_string(),
-                        value: json!({
-                            "ok": false,
-                            "peer": colon_mac(&peer),
-                            "error": "active NAN discovery has no local announce to return",
-                        }),
-                        message: None,
-                    },
-                );
-            }
-        } else {
-            push_radio_event(
-                history,
-                RadioEvent {
-                    ts_millis: now_millis(),
-                    key: "wifi.rawnan.followup_tx".to_string(),
-                    source: event_source.to_string(),
-                    value: json!({
-                        "ok": false,
-                        "queued": false,
-                        "error": "active Subscribe response lacks peer, cluster BSSID, or local interface MAC",
-                        "peer": mac_at(frame, IEEE80211_ADDR2).map(|mac| colon_mac(&mac)),
-                        "bssid": mac_at(frame, IEEE80211_ADDR3).map(|mac| colon_mac(&mac)),
-                    }),
-                    message: None,
-                },
-            );
-            // The discovery event below remains the RX proof even if this
-            // adapter cannot originate a directed response.
-        }
-    }
-    push_radio_event(
-        history,
-        RadioEvent {
-            ts_millis: now_millis(),
-            key: "wifi.rawnan.discovery".to_string(),
-            source: event_source.to_string(),
-            value: json!({
-                "ok": true,
-                "backend": "rawnan_host",
-                "iface": iface,
-                "synchronized": true,
-                "peer": mac_at(frame, IEEE80211_ADDR2).map(|mac| colon_mac(&mac)),
-                "bssid": mac_at(frame, IEEE80211_ADDR3).map(|mac| colon_mac(&mac)),
-                "frame_len": frame.len(),
-                "frame_hex": hex_bytes(&frame[..frame.len().min(256)]),
-                "control": descriptor.control,
-                "services": descriptors.iter().map(|item| json!({
-                    "service_id": hex_bytes(&item.service_id),
-                    "control": item.descriptor.control,
-                    "service_info_hex": hex_bytes(item.descriptor.payload),
-                })).collect::<Vec<_>>(),
-                "service_info_hex": hex_bytes(descriptor.payload),
-                "announce": announce.map(|item| json!({
-                    "kind": item.kind,
-                    "device_id": hex_bytes(item.device_id()),
-                    "uptime_secs": item.uptime_secs,
-                    "wifi_channel": (item.wifi_channel != 0).then_some(item.wifi_channel),
-                })),
-                "active_subscribe": active_subscribe.map(|item| json!({
-                    "instance": item.instance,
-                    "requestor_instance": item.requestor_instance,
-                    "service_info_hex": hex_bytes(item.service_info),
-                })),
-                "duplicate": duplicate,
-                "followup": followup.map(|item| json!({
-                    "msg_type": item.msg_type,
-                    "seq": item.seq,
-                    "device_id": colon_mac(&item.device_id),
-                    "target_id": colon_mac(&item.target_id),
-                    "payload_len": item.payload.len(),
-                    "payload_hex": hex_bytes(item.payload),
-                })),
-                "peer_availability": peer_availability_name(dmesh_rawnan::peer_availability(frame)),
-                "service_id": hex_bytes(&dmesh_rawnan::DMESH_SERVICE_ID),
-            }),
-            message: None,
-        },
-    );
-}
-
-/// Classify every received 802.11 action frame in one place. AP management
-/// responses remain handled by `handle_open_ap_sme_frame`; this function is
-/// deliberately receive-only and covers NAN public/vendor actions and the
-/// DMesh/ESP-NOW action marker without creating a second read loop.
-fn handle_action_frame(
-    frame: &[u8],
-    iface: &str,
-    rx_signal_dbm: Option<i32>,
-    rawnan_state: &Arc<Mutex<NanState>>,
-) -> Option<Value> {
-    if frame_type(frame) != 0 || frame_subtype(frame) != 13 {
-        return None;
-    }
-    let nan_kind = dmesh_rawnan::classify(frame);
-    let nan_action = rawnan_state
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .observe(RawNanRxFrame {
-            bytes: frame,
-            rssi_dbm: rx_signal_dbm
-                .unwrap_or(0)
-                .clamp(i8::MIN as i32, i8::MAX as i32) as i8,
-            timestamp_us: now_micros_u64(),
-        });
-    let source = mac_at(frame, IEEE80211_ADDR2).map(|mac| colon_mac(&mac));
-    let destination = mac_at(frame, IEEE80211_ADDR1).map(|mac| colon_mac(&mac));
-    let bssid = mac_at(frame, IEEE80211_ADDR3).map(|mac| colon_mac(&mac));
-    let mut result = json!({
-        "ok": true,
-        "protocol": "80211_action",
-        "iface": iface,
-        "source": source,
-        "destination": destination,
-        "bssid": bssid,
-        "frame_len": frame.len(),
-        "category": frame.get(IEEE80211_BODY).copied(),
-        "nan_kind": match nan_kind {
-            dmesh_rawnan::FrameKind::Beacon => "beacon",
-            dmesh_rawnan::FrameKind::Sdf => "service_discovery",
-            dmesh_rawnan::FrameKind::Followup => "followup",
-            dmesh_rawnan::FrameKind::P2p => "p2p",
-            dmesh_rawnan::FrameKind::Gas => "gas",
-            dmesh_rawnan::FrameKind::Other => "other",
-        },
-        "nan_filter_action": match nan_action {
-            RawNanAction::None => "none",
-            RawNanAction::ArmA3(_) => "arm_a3",
-            RawNanAction::DropForeign => "drop_foreign",
-            RawNanAction::Rediscover => "rediscover",
-        },
-        "p2p_gas_initial_request": dmesh_rawnan::is_gas_initial_request(frame),
-    });
-    if let Some(signal) = rx_signal_dbm
-        && let Some(object) = result.as_object_mut()
-    {
-        object.insert("rx_signal_dbm".to_string(), json!(signal));
-    }
-    if let Some(vendor) = parse_dmesh_wifi_frame(frame, iface, "linux_nl80211_ap_sme")
-        && let Some(object) = result.as_object_mut()
-    {
-        object.insert("dmesh".to_string(), vendor);
-    }
-    Some(result)
-}
-
-/// A user-space AP must retire its nl80211 station entry when a peer leaves.
-/// Auth/association are handled separately by `handle_open_ap_sme_frame`.
-fn ap_sme_station_departed(subtype: u8) -> bool {
-    matches!(subtype, 10 | 12)
-}
-
-fn handle_open_ap_sme_frame(
-    socket: &Nl80211Socket,
-    iface: &str,
-    ifindex: u32,
-    ap_mac: [u8; 6],
-    frame: &[u8],
-    ap_no_ht_stations: &Arc<Mutex<HashSet<[u8; 6]>>>,
-    channel: u8,
-    ht40: bool,
-) -> Option<Value> {
-    if frame_type(frame) != 0 {
-        return None;
-    }
-    let sta_mac = mac_at(frame, IEEE80211_ADDR2)?;
-    let subtype = frame_subtype(frame);
-    let response = match subtype {
-        4 if dmesh_rawnan::is_p2p_probe_request(frame) => {
-            // P2P peer discovery uses a management Probe Request, not an
-            // action frame. Respond on the AP's already-registered nl80211
-            // management socket with device/channel discovery attributes.
-            // This does not form a group or answer the later GAS SD request.
-            let response = build_p2p_probe_response(ap_mac, sta_mac, channel)
-                .expect("bounded P2P probe response");
-            let tx = send_open_ap_mgmt_response(socket, iface, ifindex, channel, &response);
-            json!({
-                "kind": "p2p_probe_response",
-                "destination": colon_mac(&sta_mac),
-                "channel": channel,
-                "frame_len": response.len(),
-                "tx": tx,
-            })
-        }
-        11 => {
-            if read_u16_at(frame, IEEE80211_BODY) != Some(NL80211_AUTHTYPE_OPEN_SYSTEM as u16) {
-                return None;
-            }
-            let response = build_open_auth_response(ap_mac, sta_mac);
-            let tx = send_open_ap_mgmt_response(socket, iface, ifindex, channel, &response);
-            json!({
-                "kind": "auth_resp",
-                "association_attempt": true,
-                "destination": colon_mac(&sta_mac),
-                "frame_len": response.len(),
-                "tx": tx,
-            })
-        }
-        0 | 2 => {
-            let aid = 1_u16;
-            let allow_ht = !ap_no_ht_stations
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .contains(&sta_mac);
-            let add_station = Nl80211Socket::open()
-                .and_then(|socket| {
-                    // A station entry can survive an ESP reset or a prior
-                    // monitor-fallback association. Replace it before
-                    // applying the new association parameters; otherwise
-                    // mt76x2u accepts the response but sends reason-8
-                    // disassociation about a second later.
-                    let _ = socket.remove_station(ifindex, sta_mac);
-                    socket.add_station_from_assoc(ifindex, sta_mac, frame, allow_ht)
-                })
-                .map(|_| json!({ "ok": true }))
-                .unwrap_or_else(|error| json!({ "ok": false, "error": format!("{error:#}") }));
-            let response = build_open_assoc_response(ap_mac, sta_mac, aid, allow_ht, channel, ht40);
-            let tx = send_open_ap_mgmt_response(socket, iface, ifindex, channel, &response);
-            json!({
-                "kind": "assoc_resp",
-                "association_attempt": true,
-                "destination": colon_mac(&sta_mac),
-                "aid": aid,
-                "ht": allow_ht,
-                "add_station": add_station,
-                "frame_len": response.len(),
-                "tx": tx,
-            })
-        }
-        _ => return None,
-    };
-    Some(response)
-}
-
-/// Build a directed P2P discovery Probe Response for one received P2P Probe
-/// Request. The common codec owns the vendor IE; this Linux adapter only owns
-/// the management header and on-channel transmission.
-fn build_p2p_probe_response(source: [u8; 6], destination: [u8; 6], channel: u8) -> Result<Vec<u8>> {
-    let mut frame = mgmt_frame_header(5, destination, source, source);
-    frame.extend_from_slice(&[0; 8]);
-    frame.extend_from_slice(&100_u16.to_le_bytes());
-    frame.extend_from_slice(&0x0421_u16.to_le_bytes());
-    frame.extend_from_slice(&[0, 7]);
-    frame.extend_from_slice(b"DIRECT-");
-    frame.extend_from_slice(&[1, OPEN_AP_OFDM_BASIC_RATES.len() as u8]);
-    frame.extend_from_slice(&OPEN_AP_OFDM_BASIC_RATES);
-    frame.extend_from_slice(&[3, 1, channel]);
-    let mut p2p = [0u8; 64];
-    let used = dmesh_rawnan::p2p::encode_discovery_advertisement(&mut p2p, source, channel)
-        .map_err(|error| anyhow::anyhow!("P2P probe-response IE: {error:?}"))?;
-    frame.extend_from_slice(&p2p[..used]);
-    Ok(frame)
-}
-
-/// Build a successful `dmesh._dmesh._tcp` DNS-SD response for a received P2P
-/// SD request. The portable codec validates and echoes the query key and
-/// transaction; this Linux adapter supplies only the management header.
-fn build_dmesh_p2p_sd_response(source: [u8; 6], request: &[u8]) -> Option<Vec<u8>> {
-    let destination = mac_at(request, IEEE80211_ADDR2)?;
-    let mut frame = mgmt_frame_header(13, destination, source, source);
-    let mut presence = [0u8; 18];
-    let presence_len =
-        dmesh_rawnan::p2p::encode_dmesh_service_presence_txt(&mut presence, &source).ok()?;
-    let mut body = [0u8; 192];
-    let used = dmesh_rawnan::p2p::encode_dmesh_dns_sd_gas_initial_response(
-        &mut body,
-        request,
-        &presence[..presence_len],
-    )
-    .ok()?;
-    frame.extend_from_slice(&body[..used]);
-    Some(frame)
-}
-
-fn send_open_ap_mgmt_response(
-    socket: &Nl80211Socket,
-    iface: &str,
-    ifindex: u32,
-    channel: u8,
-    frame: &[u8],
-) -> Value {
-    match socket.send_mgmt_frame(ifindex, frame, None) {
-        Ok(()) => json!({ "ok": true, "backend": "linux_nl80211" }),
-        Err(error) => {
-            // Some mac80211 drivers reject the minimal CMD_FRAME form while
-            // an AP SME is active, but accept the fully-qualified on-channel
-            // form used by the normal raw TX path. Try that before falling
-            // back to monitor injection (which may be looped back rather than
-            // emitted when the managed AP owns the parent interface).
-            let options = RawWifiTxOptions {
-                variant: "ap_sme".to_owned(),
-                include_freq: true,
-                duration_ms: Some(100),
-                offchannel_tx_ok: false,
-                dont_wait_for_ack: true,
-                tx_no_cck_rate: false,
-            };
-            // mt76x2u can reject NL80211_CMD_FRAME with ENOMEM while its
-            // management-TX context is busy.  The same physical radio can
-            // still inject a short on-channel control frame through a
-            // monitor VIF, which is also the NAN raw-frame path. Keep this a
-            // narrow fallback for AP SME responses rather than changing the
-            // normal NAN TX policy.
-            match send_monitor_frame(iface, channel, frame, None) {
-                Ok(monitor) => json!({
-                    "ok": true,
-                    "backend": "linux_monitor_ap_sme_fallback",
-                    "nl80211_error": format!("{error:#}"),
-                    "monitor": monitor,
-                }),
-                Err(monitor_error) => {
-                    if socket
-                        .send_frame(ifindex, channel_to_freq(channel), &options, frame, None)
-                        .is_ok()
-                    {
-                        json!({
-                            "ok": true,
-                            "backend": "linux_nl80211_ap_sme_explicit_channel",
-                            "nl80211_error": format!("{error:#}"),
-                            "monitor_error": format!("{monitor_error:#}"),
-                        })
-                    } else {
-                        json!({
-                            "ok": false,
-                            "backend": "linux_nl80211",
-                            "error": format!("{error:#}"),
-                            "monitor_fallback_error": format!("{monitor_error:#}"),
-                        })
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Encode and send one bearer-neutral QUIC datagram as an ESP-NOW-like
-/// action. Keeping this in one helper makes immediate responses and timer
-/// retransmissions use identical address/rate/framing behavior.
-/// Persistent transmit path for the ESP-NOW QUIC bearer. Creating an AF_PACKET
-/// socket for every datagram can race driver context changes and lose packets;
-/// retain the bound monitor socket between submissions. A failed submission
-/// retires the socket so the next QUIC retry can reopen it after radio/VIF
-/// recreation.
-pub(crate) struct RawActionTransmitter {
-    iface: String,
-    socket: Option<MonitorTxSocket>,
-}
-
-impl RawActionTransmitter {
-    pub(crate) fn new(iface: String) -> Self {
-        Self {
-            iface,
-            socket: None,
-        }
-    }
-
-    pub(crate) fn send(
-        &mut self,
-        peer: [u8; 6],
-        payload: &[u8],
-        tx_rate_mbps: u8,
-    ) -> std::result::Result<(), RawActionSubmitError> {
-        if self.socket.is_none() {
-            let monitor_iface = monitor_iface_name(&self.iface);
-            self.socket = Some(
-                MonitorTxSocket::open(&monitor_iface).map_err(RawActionSubmitError::Failed)?,
-            );
-        }
-        let result = send_raw_action_datagram_on_socket(
-            &self.iface,
-            self.socket.as_ref().expect("socket opened above"),
-            peer,
-            payload,
-            tx_rate_mbps,
-        );
-        match result {
-            Ok(()) => Ok(()),
-            Err(error) if raw_action_error_is_would_block(&error) => {
-                Err(RawActionSubmitError::WouldBlock)
-            }
-            Err(error) => {
-                self.socket.take();
-                Err(RawActionSubmitError::Failed(error))
-            }
-        }
-    }
-}
-
-pub(crate) enum RawActionSubmitError {
-    WouldBlock,
-    Failed(anyhow::Error),
-}
-
-fn raw_action_error_is_would_block(error: &anyhow::Error) -> bool {
-    error
-        .downcast_ref::<std::io::Error>()
-        .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
-}
-
-/// Send using a caller-owned AF_PACKET socket.  The receive loop sends both
-/// immediate QUIC responses and PTO retransmissions; keeping one bound socket
-/// for that loop avoids repeated socket/bind setup and, more importantly,
-/// avoids dropping packets while the driver is switching between short-lived
-/// transmit contexts.
-fn send_raw_action_datagram_on_socket(
-    iface: &str,
-    socket: &MonitorTxSocket,
-    peer: [u8; 6],
-    payload: &[u8],
-    tx_rate_mbps: u8,
-) -> Result<()> {
-    let local = iface_mac(iface).with_context(|| format!("missing local MAC for {iface}"))?;
-    let mut action = [0_u8; quic_lite::DEFAULT_MAX_PACKET_SIZE + 64];
-    let destination = raw_action_response_address(peer);
-    let action_len = dmesh_rawnan::espnow::encode_action_frame(
-        &mut action,
-        destination,
-        local,
-        [0xff; 6],
-        payload,
-    )
-    .map_err(|error| anyhow::anyhow!("raw NOW response frame: {error:?}"))?;
-    let packet = build_radiotap_packet_at_rate_with_ack(
-        &action[..action_len],
-        Some(tx_rate_mbps),
-        // Replies use the same DMesh NOW no-MAC-ACK policy as requests.
-        false,
-    )?;
-    for repetition in 0..raw_action_response_repetitions() {
-        if repetition != 0 {
-            // A duplicate sent back-to-back can be discarded by the
-            // monitor/driver queue as one write.  A short gap makes this a
-            // real independent on-air attempt while retaining one shared
-            // QUIC packet buffer.
-            std::thread::sleep(Duration::from_millis(raw_action_burst_gap_ms()));
-        }
-        let written = socket.send(&packet)?;
-        if written != packet.len() {
-            bail!(
-                "short raw NOW response write: wrote {written}, expected {}",
-                packet.len()
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Address-1 used for a host-originated NOW QUIC packet. QUIC is directed
-/// unicast; the receive alias is reserved for the separate discovery probe
-/// and remains available only as an explicit diagnostic override.
-fn raw_action_response_address(peer: [u8; 6]) -> [u8; 6] {
-    raw_action_response_address_with_alias_override(
-        peer,
-        std::env::var("DMESH_RAW_ACTION_RESPONSE_A1").as_deref() == Ok("receive_alias"),
-    )
-}
-
-fn raw_action_response_address_with_alias_override(
-    peer: [u8; 6],
-    use_receive_alias: bool,
-) -> [u8; 6] {
-    if use_receive_alias {
-        raw_receive_mac(peer)
-    } else {
-        directed_now_destination(peer)
-    }
-}
-
-fn raw_action_burst_gap_ms() -> u64 {
-    std::env::var("DMESH_RAW_ACTION_BURST_GAP_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(2)
-        .min(100)
-}
-
-fn raw_action_response_repetitions() -> usize {
-    std::env::var("DMESH_RAW_ACTION_RESPONSE_REPETITIONS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(RAW_ACTION_RESPONSE_REPETITIONS)
-        .clamp(1, 8)
-}
-
-/// Automated host comparisons may adjust the association burst without
-/// rebuilding either supervised service. The shared default remains the
-/// normal eight-packet profile; this is a diagnostic knob, not a retained
-/// one-packet stop-and-wait policy.
-fn radiotap_rate_mbps(packet: &[u8]) -> Option<u8> {
-    if packet.len() < 9 || packet[0] != 0 || packet[1] != 0 {
-        return None;
-    }
-    let present = u32::from_le_bytes(packet.get(4..8)?.try_into().ok()?);
-    if present & (1 << 2) == 0 {
-        return None;
-    }
-    let rate = packet[8] / 2;
-    matches!(rate, 1 | 2 | 5 | 6 | 9 | 11 | 12 | 18 | 24 | 36 | 48 | 54).then_some(rate)
-}
-
-fn monitor_receive_loop(
-    socket: MonitorRxSocket,
-    iface: &str,
-    monitor_iface: &str,
-    history: Arc<Mutex<VecDeque<RadioEvent>>>,
-    discovered_devices: Arc<Mutex<DiscoveredDeviceRegistry>>,
-    rawnan_state: Arc<Mutex<NanState>>,
-    active_nan_publish: Arc<Mutex<NanActivePublish>>,
-    pending_nan_active_subscribe: Arc<Mutex<Option<PendingNanActiveSubscribe>>>,
-    pending_nan_followups: Arc<Mutex<dmesh_rawnan::NanFollowupQueue>>,
-    pending_now_discovery: Arc<Mutex<HashMap<u64, PendingNowDiscovery>>>,
-    espnow_ingress: Arc<Mutex<Option<Arc<dyn crate::espnow_bearer::EspNowIngress>>>>,
-    p2p_group_ifaces: Arc<Mutex<BTreeMap<String, String>>>,
-    stop_flag: Arc<AtomicBool>,
-) {
-    let receive_addresses = raw_wifi_receive_addresses(iface);
-    let mut local_action_addresses = receive_addresses.clone();
-    if let Some(group_iface) = p2p_group_ifaces
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(iface)
-        .cloned()
-        && let Ok(group_mac) = iface_mac(&group_iface)
-    {
-        local_action_addresses.push(group_mac);
-    }
-    // A P2P GO has a distinct group address.  NAN action frames injected
-    // through the anchor monitor must use that address2: using the dormant
-    // anchor MAC is locally echoed but not admitted by peer NAN engines.
-    let nan_tx_mac = p2p_group_ifaces
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(iface)
-        .and_then(|group_iface| iface_mac(group_iface).ok())
-        .or_else(|| iface_mac(iface).ok());
-    let mut followup_dedup = FollowupDedup::new(256);
-    let mut buf = [0_u8; 4096];
-    let mut last_action_rate = 1_u8;
-    let tx_socket = MonitorTxSocket::open(monitor_iface).ok();
-    loop {
-        if stop_flag.load(Ordering::Acquire) {
-            break;
-        }
-        match socket.recv(&mut buf) {
-            Ok(0) => continue,
-            Ok(len) => {
-                let packet = &buf[..len];
-                if let Some(rate) = radiotap_rate_mbps(packet) {
-                    last_action_rate = rate;
-                }
-                push_radio_event(
-                    &history,
-                    RadioEvent {
-                        ts_millis: now_millis(),
-                        key: "wifi.raw.socket".to_string(),
-                        source: monitor_iface.to_string(),
-                        value: json!({"packet_len": len}),
-                        message: None,
-                    },
-                );
-                if let Some(frame) = ieee80211_frame(packet) {
-                    // Keep bounded receive-path evidence separate from the
-                    // parsed DMesh events. This distinguishes a monitor
-                    // socket/driver delivery problem from action-parser or
-                    // QUIC dispatch rejection without retaining packet data.
-                    push_radio_event(
-                        &history,
-                        RadioEvent {
-                            ts_millis: now_millis(),
-                            key: "wifi.raw.monitor".to_string(),
-                            source: monitor_iface.to_string(),
-                            value: json!({
-                                "frame_len": frame.len(),
-                                "frame_type": frame_type(frame),
-                                "frame_subtype": frame_subtype(frame),
-                            }),
-                            message: None,
-                        },
-                    );
-                    if frame_subtype(frame) == 13 {
-                        push_radio_event(
-                            &history,
-                            RadioEvent {
-                                ts_millis: now_millis(),
-                                key: "wifi.raw.action_candidate".to_string(),
-                                source: monitor_iface.to_string(),
-                                value: json!({"frame_len": frame.len()}),
-                                message: None,
-                            },
-                        );
-                    }
-                    // A NAN cluster beacon is preferred, but a normal AP
-                    // beacon is the deliberate timing fallback when no
-                    // Android NAN publisher is present.  Feed both through
-                    // the shared state machine; it selects the NAN cluster
-                    // when one appears and otherwise retains the AP TSF.
-                    if frame_subtype(frame) == 8 {
-                        if let Some(beacon) = handle_beacon_frame(frame, iface, None, &rawnan_state)
-                        {
-                            push_radio_event(
-                                &history,
-                                RadioEvent {
-                                    ts_millis: now_millis(),
-                                    key: "wifi.rawnan.beacon".to_string(),
-                                    source: monitor_iface.to_string(),
-                                    value: beacon,
-                                    message: None,
-                                },
-                            );
-                        }
-                        if let Some(local) = nan_tx_mac {
-                            drain_active_nan_publish(
-                                local,
-                                monitor_iface,
-                                &history,
-                                &rawnan_state,
-                                &active_nan_publish,
-                                |publish| {
-                                    let packet = build_radiotap_packet_at_rate(publish, Some(6))?;
-                                    let socket = tx_socket.as_ref().ok_or_else(|| {
-                                        anyhow::anyhow!("monitor TX socket unavailable")
-                                    })?;
-                                    socket.send(&packet).and_then(|written| {
-                                        (written == packet.len()).then_some(()).ok_or_else(|| {
-                                            anyhow::anyhow!("short NAN Publish write")
-                                        })
-                                    })
-                                },
-                            );
-                            drain_pending_nan_active_subscribe(
-                                local,
-                                monitor_iface,
-                                &history,
-                                &rawnan_state,
-                                &pending_nan_active_subscribe,
-                                |subscribe| {
-                                    let packet = build_radiotap_packet_at_rate(subscribe, Some(6))?;
-                                    let socket = tx_socket.as_ref().ok_or_else(|| {
-                                        anyhow::anyhow!("monitor TX socket unavailable")
-                                    })?;
-                                    socket.send(&packet).and_then(|written| {
-                                        (written == packet.len()).then_some(()).ok_or_else(|| {
-                                            anyhow::anyhow!("short NAN Subscribe write")
-                                        })
-                                    })
-                                },
-                            );
-                            drain_pending_nan_followups(
-                                local,
-                                monitor_iface,
-                                &history,
-                                &rawnan_state,
-                                &pending_nan_followups,
-                                |response| {
-                                    let packet = build_radiotap_packet_at_rate(response, Some(6))?;
-                                    let socket = tx_socket.as_ref().ok_or_else(|| {
-                                        anyhow::anyhow!("monitor TX socket unavailable")
-                                    })?;
-                                    socket.send(&packet).and_then(|written| {
-                                        (written == packet.len()).then_some(()).ok_or_else(|| {
-                                            anyhow::anyhow!("short NAN follow-up write")
-                                        })
-                                    })
-                                },
-                            );
-                        }
-                    }
-                    let action = rawnan_state
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .observe(RawNanRxFrame {
-                            bytes: frame,
-                            rssi_dbm: 0,
-                            timestamp_us: now_micros_u64(),
-                        });
-                    // AP-management and monitor ingress deliberately share
-                    // one semantic path: a packet observed twice is still
-                    // marked duplicate at the follow-up layer, instead of
-                    // two copies silently evolving different CBOR fields.
-                    if frame_subtype(frame) == 13 {
-                        record_nan_discovery(
-                            frame,
-                            iface,
-                            nan_tx_mac,
-                            monitor_iface,
-                            &history,
-                            &discovered_devices,
-                            &rawnan_state,
-                            Some(&active_nan_publish),
-                            &pending_nan_followups,
-                            &mut followup_dedup,
-                            |response| {
-                                let packet = build_radiotap_packet_at_rate(response, Some(6))?;
-                                let socket = tx_socket.as_ref().ok_or_else(|| {
-                                    anyhow::anyhow!("monitor TX socket unavailable")
-                                })?;
-                                socket.send(&packet).and_then(|written| {
-                                    (written == packet.len())
-                                        .then_some(())
-                                        .ok_or_else(|| anyhow::anyhow!("short NAN follow-up write"))
-                                })
-                            },
-                        );
-                    }
-                    // NAN data frames are selected by the cluster BSSID, not
-                    // by the host's ordinary receive MAC.  Admit raw data
-                    // payloads as well as the legacy IPv6/UDP diagnostic.
-                    let nan_data = is_nan_data_frame(frame);
-                    // `local_action_addresses` includes the P2P-GO address
-                    // when the monitor is anchored on its parent interface.
-                    // A NOW peer replies to the source address it observed,
-                    // which is that GO address; filtering only the anchor
-                    // aliases here silently dropped the reply before the
-                    // bearer-neutral QUIC dispatcher could receive it.
-                    if raw_wifi_receive_address_allowed(frame, &local_action_addresses) || nan_data
-                    {
-                        if let Some(mut value) =
-                            parse_dmesh_wifi_frame(frame, iface, "linux_af_packet_monitor")
-                        {
-                            if let Some(object) = value.as_object_mut() {
-                                object.insert(
-                                    "nan_action".to_string(),
-                                    json!(match action {
-                                        RawNanAction::None => "none",
-                                        RawNanAction::ArmA3(_) => "arm_a3",
-                                        RawNanAction::DropForeign => "drop_foreign",
-                                        RawNanAction::Rediscover => "rediscover",
-                                    }),
-                                );
-                            }
-                            let message = mesh_message_from_raw_wifi(&value, iface);
-                            push_radio_event(
-                                &history,
-                                RadioEvent {
-                                    ts_millis: now_millis(),
-                                    key: "wifi.raw.rx".to_string(),
-                                    source: monitor_iface.to_string(),
-                                    value,
-                                    message: Some(message),
-                                },
-                            );
-                        }
-                    }
-                    // ESP-NOW-compatible action frames carry complete
-                    // QUIC-lite datagrams. Dispatch them above the radio
-                    // adapter, exactly as firmware does, and emit a response
-                    // on this same bearer/path. The dispatcher is lazy and
-                    // bounded; receiving ambient management traffic does not
-                    // allocate a connection or a packet queue.
-                    // ESP-NOW-compatible action frames may be delivered by a
-                    // monitor driver with Address-1 rewritten (notably for
-                    // broadcast action traffic). The vendor-action parser is
-                    // the admission check for this bearer; do not apply the
-                    // ordinary data-MAC filter before classifying it.
-                    let ingress = espnow_ingress
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .clone();
-                    if let Some(ingress) = ingress {
-                        ingress.receive_action_frame(
-                            frame,
-                            now_micros_u64(),
-                            &mut |peer, packet| {
-                        // The monitor VIF reflects locally injected frames.
-                        // Keep it observable, but separate it from received
-                        // peer actions so NOW receive metrics cannot mistake
-                        // our own TX echo for evidence of RF delivery.
-                        if local_action_addresses.iter().any(|local| *local == peer) {
-                            push_radio_event(
-                                &history,
-                                RadioEvent {
-                                    ts_millis: now_millis(),
-                                    key: "wifi.raw.action.reflection".to_string(),
-                                    source: monitor_iface.to_string(),
-                                    value: json!({
-                                        "peer": colon_mac(&peer),
-                                        "payload_len": packet.len(),
-                                    }),
-                                    message: None,
-                                },
-                            );
-                            return false;
-                        }
-                        let local_source = iface_mac(iface).ok();
-                        push_radio_event(
-                            &history,
-                            RadioEvent {
-                                ts_millis: now_millis(),
-                                key: "wifi.raw.action".to_string(),
-                                source: monitor_iface.to_string(),
-                                value: json!({
-                                    "peer": colon_mac(&peer),
-                                    "local": local_source.map(|mac| colon_mac(&mac)),
-                                    "payload_len": packet.len(),
-                                }),
-                                message: None,
-                            },
-                        );
-                        let admission = dmesh_server::raw_wifi::classify_espnow_payload(packet);
-                        if admission == dmesh_server::raw_wifi::EspNowPayloadClass::NowSync {
-                            let Some(sync) = dmesh_rawnan::parse_now_sync_body(packet) else {
-                                return false;
-                            };
-                            handle_now_sync_as_nan(peer, &sync, now_micros_u64(), &rawnan_state);
-                            if let Some(announce) =
-                                dmesh_server::announce::decode_announce(sync.service_info)
-                                && announce_identity_valid(announce)
-                            {
-                                discovered_devices
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                    .observe_announce(
-                                        "now_sync",
-                                        colon_mac(&peer),
-                                        Some(colon_mac(&sync.cluster_id)),
-                                        announce,
-                                    );
-                            }
-                            return false;
-                        }
-                        // NOW discovery is raw tagged CBOR, just like NAN SDEA
-                        // discovery; it is not a QUIC packet.
-                        if admission == dmesh_server::raw_wifi::EspNowPayloadClass::TaggedControl {
-                            let payload = packet;
-                            // Admit it before the raw endpoint so action-frame
-                            // discovery updates the same registry as NAN SDF.
-                            if let Some(announce) = dmesh_server::announce::decode_announce(payload)
-                                && announce_identity_valid(announce)
-                            {
-                                let bssid =
-                                    mac_at(frame, IEEE80211_ADDR3).map(|mac| colon_mac(&mac));
-                                let peer_text = colon_mac(&peer);
-                                discovered_devices
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                    .observe_announce(
-                                        "now",
-                                        peer_text.clone(),
-                                        bssid.clone(),
-                                        announce,
-                                    );
-                                // A directed check is complete only when this is
-                                // the signed announce carrying its request ID and
-                                // it arrived from the selected NOW peer. Ordinary
-                                // unsolicited announcements still update the
-                                // inventory above, but never satisfy a check.
-                                if let Some(request_id) = dmesh_server::tagged::decode(payload)
-                                    .and_then(|record| record.id)
-                                {
-                                    let pending = pending_now_discovery
-                                        .lock()
-                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                        .remove(&request_id);
-                                    if let Some(waiter) = pending {
-                                        if waiter.peer == peer {
-                                            let _ = waiter.reply.send(json!({
-                                            "authenticated": true,
-                                            "source": peer_text,
-                                            "announce": {
-                                                "kind": announce.kind,
-                                                "device_id": hex_bytes(announce.device_id()),
-                                                "device_name": announce.device_name(),
-                                                "uptime_secs": announce.uptime_secs,
-                                                "wifi_channel": (announce.wifi_channel != 0).then_some(announce.wifi_channel),
-                                            },
-                                        }));
-                                        } else {
-                                            // Preserve the waiter when an attacker
-                                            // or an unrelated peer reuses an ID.
-                                            pending_now_discovery
-                                                .lock()
-                                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                                .insert(request_id, waiter);
-                                        }
-                                    }
-                                }
-                                push_radio_event(
-                                    &history,
-                                    RadioEvent {
-                                        ts_millis: now_millis(),
-                                        key: "wifi.raw.discovery".to_string(),
-                                        source: monitor_iface.to_string(),
-                                        value: json!({
-                                            "ok": true,
-                                            "bearer": "now",
-                                            "peer": colon_mac(&peer),
-                                            "bssid": bssid,
-                                            "announce": {
-                                                "device_id": hex_bytes(announce.device_id()),
-                                                "kind": announce.kind,
-                                                "wifi_channel": (announce.wifi_channel != 0).then_some(announce.wifi_channel),
-                                                "uptime_secs": announce.uptime_secs,
-                                            },
-                                        }),
-                                        message: None,
-                                    },
-                                );
-                                return false;
-                            }
-                            // A newly booted device emits the same bounded CBOR
-                            // status and identity records over NOW as UART. They
-                            // are discovery records, not malformed QUIC-lite
-                            // datagrams, so publish them before raw dispatch.
-                            if let Some(message) =
-                                dmesh_server::services::decode_status_text(payload)
-                            {
-                                push_radio_event(
-                                    &history,
-                                    RadioEvent {
-                                        ts_millis: now_millis(),
-                                        key: "wifi.raw.boot".to_string(),
-                                        source: monitor_iface.to_string(),
-                                        value: json!({
-                                            "peer": colon_mac(&peer),
-                                            "message": String::from_utf8_lossy(message),
-                                        }),
-                                        message: None,
-                                    },
-                                );
-                                return false;
-                            }
-                            // A direct envelope has either updated presence above
-                            // or is a separately allowlisted connectionless
-                            // operation. It is never a normal association frame.
-                            // In particular, do not hand its inner tagged record
-                            // to the QUIC dispatcher, and do not make ordinary
-                            // short-header QUIC packets pass this direct decoder.
-                            return false;
-                        }
-                        admission == dmesh_server::raw_wifi::EspNowPayloadClass::QuicDatagram
-                            },
-                        );
-                        continue;
-                    }
-                    if !matches!(action, RawNanAction::None) {
-                        push_radio_event(
-                            &history,
-                            RadioEvent {
-                                ts_millis: now_millis(),
-                                key: "wifi.rawnan.rx".to_string(),
-                                source: monitor_iface.to_string(),
-                                value: json!({
-                                    "ok": true,
-                                    "backend": "rawnan_host",
-                                    "frame_len": frame.len(),
-                                    "frame_hex": hex_bytes(&frame[..frame.len().min(256)]),
-                                    "addr1": mac_at(frame, IEEE80211_ADDR1).map(|mac| colon_mac(&mac)),
-                                    "addr2": mac_at(frame, IEEE80211_ADDR2).map(|mac| colon_mac(&mac)),
-                                    "addr3": mac_at(frame, IEEE80211_ADDR3).map(|mac| colon_mac(&mac)),
-                                    "cluster_bssid": rawnan_state
-                                        .lock()
-                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                        .cluster()
-                                        .map(|mac| colon_mac(&mac.0)),
-                                    "nan_action": match action {
-                                        RawNanAction::ArmA3(_) => "arm_a3",
-                                        RawNanAction::DropForeign => "drop_foreign",
-                                        RawNanAction::Rediscover => "rediscover",
-                                        RawNanAction::None => "none",
-                                    },
-                                }),
-                                message: None,
-                            },
-                        );
-                    }
-                }
-            }
-            Err(error)
-                if error.kind() == std::io::ErrorKind::WouldBlock
-                    || error.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                continue;
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                continue;
-            }
-            Err(error) => {
-                push_radio_event(
-                    &history,
-                    RadioEvent {
-                        ts_millis: now_millis(),
-                        key: "wifi.raw.listen.error".to_string(),
-                        source: monitor_iface.to_string(),
-                        value: json!({
-                            "ok": false,
-                            "iface": iface,
-                            "monitor_iface": monitor_iface,
-                            "error": error.to_string()
-                        }),
-                        message: None,
-                    },
-                );
-                break;
-            }
-        }
-    }
-}
-
-/// Consume management beacons for the shared raw-NAN synchronization state.
-/// USD action frames are intentionally not treated as a timing source: sleepy
-/// peers need the cluster/AP beacon TSF and interval to schedule their wake
-/// window and follow-up transmission.
-fn handle_beacon_frame(
-    frame: &[u8],
-    iface: &str,
-    rx_signal_dbm: Option<i32>,
-    rawnan_state: &Arc<Mutex<NanState>>,
-) -> Option<Value> {
-    if frame_type(frame) != 0 || frame_subtype(frame) != 8 {
-        return None;
-    }
-    let rx = RawNanRxFrame {
-        bytes: frame,
-        rssi_dbm: rx_signal_dbm
-            .unwrap_or(0)
-            .clamp(i8::MIN as i32, i8::MAX as i32) as i8,
-        timestamp_us: now_micros_u64(),
-    };
-    let action = if dmesh_rawnan::is_nan_beacon(frame) {
-        rawnan_state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .observe(rx)
-    } else {
-        rawnan_state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .observe_ap_beacon(rx);
-        RawNanAction::None
-    };
-    let bssid = mac_at(frame, IEEE80211_ADDR3).map(|mac| colon_mac(&mac));
-    let nan = dmesh_rawnan::is_nan_beacon(frame);
-    let parsed = parse_management_frame(frame, iface, "passive_monitor");
-    Some(json!({
-        "ok": true,
-        "backend": "rawnan_host",
-        "iface": iface,
-        "source": mac_at(frame, IEEE80211_ADDR2).map(|mac| colon_mac(&mac)),
-        "bssid": bssid,
-        "ssid": parsed.get("ssid").cloned().unwrap_or(Value::Null),
-        "channel": parsed.get("channel").cloned().unwrap_or(Value::Null),
-        "sync_source": if nan { "nan_cluster" } else { "ap_anchor" },
-        "nan_beacon": nan,
-        "tsf_us": dmesh_rawnan::beacon_tsf_us(frame),
-        "beacon_interval_tu": dmesh_rawnan::beacon_interval_tu(frame),
-        "rx_signal_dbm": rx_signal_dbm,
-        "nan_action": match action {
-            RawNanAction::None => "none",
-            RawNanAction::ArmA3(_) => "arm_a3",
-            RawNanAction::DropForeign => "drop_foreign",
-            RawNanAction::Rediscover => "rediscover",
-        },
-    }))
-}
-
-/// Hand a validated NOW synchronization record to the NAN timing owner.
-///
-/// Keeping this boundary explicit prevents the ESP-NOW bearer from growing a
-/// second wake scheduler. The eventual implementation belongs beside NAN
-/// beacon/SDF admission because both inputs drive the same four-second sleepy
-/// discovery-window state.
-fn handle_now_sync_as_nan(
-    peer: [u8; 6],
-    sync: &dmesh_rawnan::NowSyncFrame<'_>,
-    received_at_us: u64,
-    rawnan_state: &Arc<Mutex<NanState>>,
-) {
-    let _ = (peer, sync, received_at_us, rawnan_state);
-    // TODO: Project this NOW-sync record into the NAN owner's equivalent
-    // beacon observation (cluster ID, anchor master, TSF, interval, flags and
-    // local receive timestamp), then feed `service_info` through the same
-    // semantic path as a NAN SDF. `NanState` must remain the sole scheduler
-    // for the 4-second wake window; do not create an ESP-NOW-specific timer.
-}
-
-fn is_nan_data_frame(frame: &[u8]) -> bool {
-    if frame.len() < IEEE80211_BODY + IEEE80211_LLC_SNAP_LEN
-        || frame_type(frame) != 2
-        || mac_at(frame, IEEE80211_ADDR3).map(|bssid| bssid[..3] == [0x50, 0x6f, 0x9a])
-            != Some(true)
-    {
-        return false;
-    }
-    true
-}
-
-fn parse_ethernet_trace(packet: &[u8], iface: &str) -> Option<Value> {
-    if packet.len() < ETHERNET_HEADER_LEN {
-        return None;
-    }
-    Some(json!({
-        "ok": true,
-        "backend": "linux_af_packet_data",
-        "iface": iface,
-        "source": colon_mac(&packet[6..12].try_into().ok()?),
-        "destination": colon_mac(&packet[..6].try_into().ok()?),
-        "ethertype": format!("0x{:04x}", u16::from_be_bytes([packet[12], packet[13]])),
-        "frame_len": packet.len(),
-        "payload_prefix": hex_bytes(&packet[ETHERNET_HEADER_LEN..packet.len().min(ETHERNET_HEADER_LEN + 128)]),
-    }))
-}
-
-fn data_receive_loop(
-    socket: DataSocket,
-    iface: &str,
-    history: Arc<Mutex<VecDeque<RadioEvent>>>,
-    listen_for: Duration,
-) {
-    let receive_addresses = raw_wifi_receive_addresses(iface);
-    let stop_at = SystemTime::now() + listen_for;
-    let mut buf = [0_u8; 4096];
-    loop {
-        let remaining = stop_at
-            .duration_since(SystemTime::now())
-            .unwrap_or_else(|_| Duration::from_millis(0));
-        if remaining.is_zero() {
-            break;
-        }
-        match socket.recv_timeout(&mut buf, remaining.min(Duration::from_millis(500))) {
-            Ok(Some(0)) | Ok(None) => continue,
-            Ok(Some(len)) => {
-                let packet = &buf[..len];
-                if let Some(value) = parse_dmesh_ethernet_frame(packet, iface, &receive_addresses) {
-                    let message = mesh_message_from_raw_wifi(&value, iface);
-                    push_radio_event(
-                        &history,
-                        RadioEvent {
-                            ts_millis: now_millis(),
-                            key: "wifi.data.rx".to_string(),
-                            source: iface.to_string(),
-                            value,
-                            message: Some(message),
-                        },
-                    );
-                } else if let Some(value) = parse_ethernet_trace(packet, iface) {
-                    // Keep ordinary ARP/IP traffic visible during STA/AP
-                    // diagnostics without pretending it is a DMesh payload.
-                    // The listener is explicitly requested and bounded, so
-                    // this does not add a permanent packet-history flood.
-                    push_radio_event(
-                        &history,
-                        RadioEvent {
-                            ts_millis: now_millis(),
-                            key: "wifi.data.trace".to_string(),
-                            source: iface.to_string(),
-                            value,
-                            message: None,
-                        },
-                    );
-                }
-            }
-            Err(error) => {
-                push_radio_event(
-                    &history,
-                    RadioEvent {
-                        ts_millis: now_millis(),
-                        key: "wifi.data.listen.error".to_string(),
-                        source: iface.to_string(),
-                        value: json!({
-                            "ok": false,
-                            "iface": iface,
-                            "error": error.to_string()
-                        }),
-                        message: None,
-                    },
-                );
-                break;
-            }
-        }
-    }
-}
-
-fn raw_wifi_receive_addresses(iface: &str) -> Vec<[u8; 6]> {
-    match iface_mac(iface) {
-        Ok(mac) => vec![mac, raw_receive_mac(mac), RAW_WIFI_MULTICAST],
-        Err(_) => vec![RAW_WIFI_MULTICAST],
-    }
-}
-
-fn raw_wifi_receive_address_allowed(frame: &[u8], addresses: &[[u8; 6]]) -> bool {
-    let Some(destination) = mac_at(frame, IEEE80211_ADDR1) else {
-        return false;
-    };
-    addresses.iter().any(|address| *address == destination)
-}
-
-fn ieee80211_frame(packet: &[u8]) -> Option<&[u8]> {
-    if packet.len() < IEEE80211_BODY {
-        return None;
-    }
-    if let Some(radiotap_len) = radiotap_len(packet) {
-        let frame = packet.get(radiotap_len..)?;
-        return is_plausible_80211_frame(frame).then_some(strip_valid_fcs(frame));
-    }
-    if is_plausible_80211_frame(packet) {
-        return Some(strip_valid_fcs(packet));
-    }
-    None
-}
-
-/// Monitor-mode captures commonly include the four-byte 802.11 FCS while
-/// nl80211 action-frame events do not.  Keep the frame boundary consistent
-/// before handing a vendor payload to the CBOR dispatcher.  Verify the CRC
-/// instead of blindly dropping four bytes: injected frames and drivers that
-/// suppress FCS must remain usable, and arbitrary payloads may legitimately
-/// end in four bytes.
-fn strip_valid_fcs(frame: &[u8]) -> &[u8] {
-    if frame.len() <= IEEE80211_BODY + 4 {
-        return frame;
-    }
-    let split = frame.len() - 4;
-    let expected = u32::from_le_bytes([
-        frame[split],
-        frame[split + 1],
-        frame[split + 2],
-        frame[split + 3],
-    ]);
-    (crc32_ieee(&frame[..split]) == expected)
-        .then_some(&frame[..split])
-        .unwrap_or(frame)
-}
-
-fn crc32_ieee(bytes: &[u8]) -> u32 {
-    let mut crc = 0xffff_ffff;
-    for byte in bytes {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            crc = if crc & 1 != 0 {
-                (crc >> 1) ^ 0xedb8_8320
-            } else {
-                crc >> 1
-            };
-        }
-    }
-    !crc
-}
-
-fn radiotap_len(packet: &[u8]) -> Option<usize> {
-    if packet.len() < 8 || packet[0] != 0 {
-        return None;
-    }
-    let len = u16::from_le_bytes([packet[2], packet[3]]) as usize;
-    (len >= 8 && len < packet.len()).then_some(len)
-}
-
-fn is_plausible_80211_frame(frame: &[u8]) -> bool {
-    if frame.len() < IEEE80211_BODY {
-        return false;
-    }
-    matches!(frame_type(frame), 0..=2)
-}
-
-fn parse_dmesh_vendor_action(frame: &[u8], iface: &str) -> Option<Value> {
-    parse_dmesh_wifi_frame(frame, iface, "linux_nl80211")
-}
-
-fn parse_dmesh_wifi_frame(frame: &[u8], iface: &str, backend: &str) -> Option<Value> {
-    // The raw NOW bearer is a standard 802.11 public/vendor action whose
-    // payload is owned by `rawnan::espnow`. Parse it before the legacy DMesh
-    // vendor-marker path so host monitor events expose the exact complete
-    // QUIC-lite datagram that firmware receives.
-    // The older DMesh marker has a deliberate fixed header.  Check it first:
-    // its bytes can otherwise be interpreted as a permissive ESP-NOW IE by
-    // the generic parser, losing the marker and destination metadata.
-    let has_legacy_dmesh_marker = frame
-        .get(IEEE80211_BODY..)
-        .and_then(parse_dmesh_vendor_action_header)
-        .is_some();
-    if !has_legacy_dmesh_marker
-        && let Some((source, payload)) = dmesh_rawnan::espnow::parse_action_frame(frame)
-    {
-        let destination = mac_at(frame, IEEE80211_ADDR1)?;
-        let bssid = mac_at(frame, IEEE80211_ADDR3)?;
-        return Some(json!({
-            "protocol": "dmesh_wifi_raw",
-            "layout": "espnow_action",
-            "backend": backend,
-            "encapsulation": "espnow_v2_vendor_ie",
-            "iface": iface,
-            "frame_type": frame_type(frame),
-            "frame_subtype": frame_subtype(frame),
-            "source": colon_mac(&source),
-            "destination": colon_mac(&destination),
-            "bssid": colon_mac(&bssid),
-            "payload_len": payload.len(),
-            "payload": hex_bytes(payload),
-        }));
-    }
-    if frame.len() <= IEEE80211_BODY + DMESH_LEGACY_VENDOR_ACTION.len() {
-        return None;
-    }
-    let mut body = &frame[IEEE80211_BODY..];
-    let encapsulation = if body.starts_with(&IEEE80211_LLC_SNAP_IPV6) {
-        return parse_nan_ipv6_udp_frame(frame, iface, backend);
-    } else if body.starts_with(&IEEE80211_LLC_SNAP_DMESH) {
-        body = &body[IEEE80211_LLC_SNAP_LEN..];
-        "llc_snap"
-    } else if body.len() >= IEEE80211_LLC_SNAP_LEN && body[..3] == [0xaa, 0xaa, 0x03] {
-        // Experimental NAN data uses an LLC/SNAP prefix. Do not treat every
-        // unknown action body as LLC: the ESP-NOW-compatible vendor action
-        // header starts with 7f and must continue to the marker parser below.
-        let llc = &body[..IEEE80211_LLC_SNAP_LEN];
-        body = &body[IEEE80211_LLC_SNAP_LEN..];
-        let source = mac_at(frame, IEEE80211_ADDR2)?;
-        let destination = mac_at(frame, IEEE80211_ADDR1)?;
-        let bssid = mac_at(frame, IEEE80211_ADDR3)?;
-        return Some(json!({
-            "protocol": "dmesh_wifi_raw",
-            "layout": "nan_raw_data",
-            "backend": backend,
-            "encapsulation": "llc_experimental",
-            "iface": iface,
-            "frame_type": frame_type(frame),
-            "frame_subtype": frame_subtype(frame),
-            "source": colon_mac(&source),
-            "destination": colon_mac(&destination),
-            "bssid": colon_mac(&bssid),
-            "llc": hex_bytes(llc),
-            "payload_len": body.len(),
-            "payload": hex_bytes(body),
-            "payload_text": String::from_utf8_lossy(body).trim(),
-        }));
-    } else {
-        "vendor_action"
-    };
-    let header = parse_dmesh_vendor_action_header(body)?;
-    let payload = &body[header.header_len..];
-    let source = mac_at(frame, IEEE80211_ADDR2)?;
-    let destination = mac_at(frame, IEEE80211_ADDR1)?;
-    let bssid = mac_at(frame, IEEE80211_ADDR3)?;
-    let layout = if frame_type(frame) == 2 {
-        "multicast_data"
-    } else {
-        "vendor_action"
-    };
-    Some(json!({
-        "protocol": "dmesh_wifi_raw",
-        "layout": layout,
-        "backend": backend,
-        "encapsulation": encapsulation,
-        "iface": iface,
-        "frame_type": frame_type(frame),
-        "frame_subtype": frame_subtype(frame),
-        "source": colon_mac(&source),
-        "destination": colon_mac(&destination),
-        "bssid": colon_mac(&bssid),
-        "vendor_marker": header.marker,
-        "mesh_dst4": hex_bytes(&header.mesh_dst4),
-        "payload_len": payload.len(),
-        "payload": hex_bytes(payload),
-        "payload_text": String::from_utf8_lossy(payload).trim(),
-    }))
-}
-
-fn parse_nan_ipv6_udp_frame(frame: &[u8], iface: &str, backend: &str) -> Option<Value> {
-    let body = frame.get(IEEE80211_BODY + IEEE80211_LLC_SNAP_LEN..)?;
-    if body.len() < 48 || body[0] >> 4 != 6 || body[6] != 17 {
-        return None;
-    }
-    let payload_len = u16::from_be_bytes([body[4], body[5]]) as usize;
-    if payload_len < 8 || body.len() < 40 + payload_len {
-        return None;
-    }
-    let udp = &body[40..40 + payload_len];
-    let source = mac_at(frame, IEEE80211_ADDR2)?;
-    let destination = mac_at(frame, IEEE80211_ADDR1)?;
-    let bssid = mac_at(frame, IEEE80211_ADDR3)?;
-    let payload = &udp[8..];
-    Some(json!({
-        "protocol": "dmesh_wifi_raw",
-        "layout": "nan_ipv6_udp",
-        "backend": backend,
-        "encapsulation": "llc_snap_ipv6",
-        "iface": iface,
-        "frame_type": frame_type(frame),
-        "frame_subtype": frame_subtype(frame),
-        "source": colon_mac(&source),
-        "destination": colon_mac(&destination),
-        "bssid": colon_mac(&bssid),
-        "ipv6_source": format_ipv6(&body[8..24]),
-        "ipv6_destination": format_ipv6(&body[24..40]),
-        "udp_source": u16::from_be_bytes([udp[0], udp[1]]),
-        "udp_destination": u16::from_be_bytes([udp[2], udp[3]]),
-        "payload_len": payload.len(),
-        "payload": hex_bytes(payload),
-        "payload_text": String::from_utf8_lossy(payload).trim(),
-    }))
-}
-
-fn format_ipv6(bytes: &[u8]) -> String {
-    bytes
-        .chunks_exact(2)
-        .map(|part| format!("{:x}", u16::from_be_bytes([part[0], part[1]])))
-        .collect::<Vec<_>>()
-        .join(":")
-}
-
-fn parse_dmesh_ethernet_frame(
-    frame: &[u8],
-    iface: &str,
-    receive_addresses: &[[u8; 6]],
-) -> Option<Value> {
-    if frame.len() <= ETHERNET_HEADER_LEN + DMESH_LEGACY_VENDOR_ACTION.len() {
-        return None;
-    }
-    let destination = mac_at(frame, 0)?;
-    if !receive_addresses
-        .iter()
-        .any(|address| *address == destination)
-    {
-        return None;
-    }
-    let source = mac_at(frame, 6)?;
-    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
-    if ethertype != ETH_P_DMESH {
-        return None;
-    }
-    let body = &frame[ETHERNET_HEADER_LEN..];
-    let header = parse_dmesh_vendor_action_header(body)?;
-    let payload = &body[header.header_len..];
-    Some(json!({
-        "protocol": "dmesh_wifi_data",
-        "layout": "ethernet",
-        "backend": "linux_af_packet_data",
-        "encapsulation": "ethernet",
-        "iface": iface,
-        "source": colon_mac(&source),
-        "destination": colon_mac(&destination),
-        "ethertype": format!("0x{ethertype:04x}"),
-        "vendor_marker": header.marker,
-        "mesh_dst4": hex_bytes(&header.mesh_dst4),
-        "payload_len": payload.len(),
-        "payload": hex_bytes(payload),
-        "payload_text": String::from_utf8_lossy(payload).trim(),
-    }))
-}
-
-struct DmeshWifiHeader {
-    header_len: usize,
-    marker: &'static str,
-    mesh_dst4: [u8; 4],
-}
-
-fn parse_dmesh_vendor_action_header(body: &[u8]) -> Option<DmeshWifiHeader> {
-    if body.len() >= DMESH_VENDOR_ACTION_LEN
-        && body[..DMESH_ESPNOW_PREFIX.len()] == DMESH_ESPNOW_PREFIX
-    {
-        // Native action frames continue with one ESP-NOW vendor IE.  The
-        // Ethernet/LLC diagnostic encapsulation uses the same eight-byte
-        // marker directly, so only skip the IE when it is actually present.
-        let header_len = if body.len() >= DMESH_VENDOR_ACTION_LEN + DMESH_VENDOR_IE_LEN
-            && body[DMESH_VENDOR_ACTION_LEN] == 0xdd
-            && body[DMESH_VENDOR_ACTION_LEN + 2..DMESH_VENDOR_ACTION_LEN + 5]
-                == DMESH_ESPNOW_PREFIX[1..]
-            && body[DMESH_VENDOR_ACTION_LEN + 5] == 0x04
-        {
-            DMESH_VENDOR_ACTION_LEN + DMESH_VENDOR_IE_LEN
-        } else {
-            DMESH_VENDOR_ACTION_LEN
-        };
-        return Some(DmeshWifiHeader {
-            header_len,
-            marker: "espnow_dmesh",
-            mesh_dst4: [body[4], body[5], body[6], body[7]],
-        });
-    }
-    if body.starts_with(&DMESH_LEGACY_VENDOR_ACTION) {
-        return Some(DmeshWifiHeader {
-            header_len: DMESH_LEGACY_VENDOR_ACTION.len(),
-            marker: "legacy_dmesh",
-            mesh_dst4: [0xff; 4],
-        });
-    }
-    None
-}
-
-fn parse_management_frame(frame: &[u8], iface: &str, backend: &str) -> Value {
-    let subtype = frame_subtype(frame);
-    let kind = match subtype {
-        0 => "assoc_req",
-        1 => "assoc_resp",
-        2 => "reassoc_req",
-        3 => "reassoc_resp",
-        4 => "probe_req",
-        5 => "probe_resp",
-        8 => "beacon",
-        10 => "disassoc",
-        11 => "auth",
-        12 => "deauth",
-        13 => "action",
-        _ => "mgmt",
-    };
-    let destination = mac_at(frame, IEEE80211_ADDR1).unwrap_or([0; 6]);
-    let source = mac_at(frame, IEEE80211_ADDR2).unwrap_or([0; 6]);
-    let bssid = mac_at(frame, IEEE80211_ADDR3).unwrap_or([0; 6]);
-    let mut fixed = serde_json::Map::new();
-    let ies_start = match subtype {
-        0 => {
-            insert_u16_at(&mut fixed, "capability", frame, IEEE80211_BODY);
-            insert_u16_at(&mut fixed, "listen_interval", frame, IEEE80211_BODY + 2);
-            IEEE80211_BODY + 4
-        }
-        1 | 3 => {
-            insert_u16_at(&mut fixed, "capability", frame, IEEE80211_BODY);
-            insert_u16_at(&mut fixed, "status_code", frame, IEEE80211_BODY + 2);
-            insert_u16_at(&mut fixed, "aid", frame, IEEE80211_BODY + 4);
-            IEEE80211_BODY + 6
-        }
-        2 => {
-            insert_u16_at(&mut fixed, "capability", frame, IEEE80211_BODY);
-            insert_u16_at(&mut fixed, "listen_interval", frame, IEEE80211_BODY + 2);
-            if let Some(current_ap) = mac_at(frame, IEEE80211_BODY + 4) {
-                fixed.insert("current_ap".to_string(), json!(colon_mac(&current_ap)));
-            }
-            IEEE80211_BODY + 10
-        }
-        4 => IEEE80211_BODY,
-        5 | 8 => {
-            if let Some(timestamp) = read_u64_at(frame, IEEE80211_BODY) {
-                fixed.insert("timestamp".to_string(), json!(timestamp));
-            }
-            insert_u16_at(&mut fixed, "beacon_interval", frame, IEEE80211_BODY + 8);
-            insert_u16_at(&mut fixed, "capability", frame, IEEE80211_BODY + 10);
-            IEEE80211_BODY + 12
-        }
-        10 | 12 => {
-            insert_u16_at(&mut fixed, "reason_code", frame, IEEE80211_BODY);
-            IEEE80211_BODY + 2
-        }
-        11 => {
-            insert_u16_at(&mut fixed, "auth_algorithm", frame, IEEE80211_BODY);
-            insert_u16_at(&mut fixed, "auth_transaction", frame, IEEE80211_BODY + 2);
-            insert_u16_at(&mut fixed, "status_code", frame, IEEE80211_BODY + 4);
-            IEEE80211_BODY + 6
-        }
-        13 => {
-            if let Some(category) = frame.get(IEEE80211_BODY) {
-                fixed.insert("category".to_string(), json!(*category));
-            }
-            frame.len()
-        }
-        _ => frame.len(),
-    };
-    let ies = if ies_start <= frame.len() {
-        parse_wifi_ies(&frame[ies_start..])
-    } else {
-        Vec::new()
-    };
-    let ssid = ies
-        .iter()
-        .find(|ie| ie.get("id").and_then(Value::as_u64) == Some(0))
-        .and_then(|ie| ie.get("text"))
-        .cloned()
-        .unwrap_or(Value::Null);
-    let channel = ies
-        .iter()
-        .find(|ie| ie.get("id").and_then(Value::as_u64) == Some(3))
-        .and_then(|ie| ie.get("bytes").and_then(Value::as_array))
-        .and_then(|bytes| bytes.first().and_then(Value::as_u64));
-    json!({
-        "kind": kind,
-        "backend": backend,
-        "iface": iface,
-        "frame_type": frame_type(frame),
-        "frame_subtype": subtype,
-        "destination": colon_mac(&destination),
-        "source": colon_mac(&source),
-        "bssid": colon_mac(&bssid),
-        "fixed": fixed,
-        "ssid": ssid,
-        "channel": channel,
-        "len": frame.len(),
-        "frame": hex_bytes(frame),
-        "ies": ies,
-    })
-}
-
-fn parse_wifi_ies(mut bytes: &[u8]) -> Vec<Value> {
-    let mut ies = Vec::new();
-    while bytes.len() >= 2 {
-        let id = bytes[0];
-        let len = bytes[1] as usize;
-        bytes = &bytes[2..];
-        if bytes.len() < len {
-            ies.push(json!({
-                "id": id,
-                "name": wifi_ie_name(id),
-                "truncated": true,
-                "want_len": len,
-                "remaining": bytes.len(),
-            }));
-            break;
-        }
-        let data = &bytes[..len];
-        let mut value = json!({
-            "id": id,
-            "name": wifi_ie_name(id),
-            "len": len,
-            "hex": hex_bytes(data),
-            "bytes": data.iter().map(|byte| json!(*byte)).collect::<Vec<_>>(),
-        });
-        if id == 0 {
-            value["text"] = json!(String::from_utf8_lossy(data));
-        }
-        if id == 1 || id == 50 {
-            value["rates_mbps"] = json!(
-                data.iter()
-                    .map(|rate| ((*rate & 0x7f) as f32) / 2.0)
-                    .collect::<Vec<_>>()
-            );
-        }
-        ies.push(value);
-        bytes = &bytes[len..];
-    }
-    ies
-}
-
-fn management_ie_bytes(mut bytes: &[u8], wanted_id: u8) -> Option<&[u8]> {
-    while bytes.len() >= 2 {
-        let id = bytes[0];
-        let length = bytes[1] as usize;
-        bytes = &bytes[2..];
-        if bytes.len() < length {
-            return None;
-        }
-        let value = &bytes[..length];
-        if id == wanted_id {
-            return Some(value);
-        }
-        bytes = &bytes[length..];
-    }
-    None
-}
-
-fn parse_iw_scan(output: &str) -> Vec<Value> {
-    let mut entries = Vec::new();
-    let mut current: Option<serde_json::Map<String, Value>> = None;
-    for line in output.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("BSS ") {
-            let bssid = rest.split("(on").next().unwrap_or(rest).trim();
-            if parse_mac(Some(bssid)).is_none() {
-                continue;
-            }
-            if let Some(entry) = current.take() {
-                entries.push(Value::Object(entry));
-            }
-            let mut entry = serde_json::Map::new();
-            entry.insert("bssid".to_string(), json!(bssid));
-            continue_if_bss_iface(rest, &mut entry);
-            current = Some(entry);
-            continue;
-        }
-        let Some(entry) = current.as_mut() else {
-            continue;
-        };
-        if let Some(ssid) = trimmed.strip_prefix("SSID:") {
-            entry.insert("ssid".to_string(), json!(ssid.trim()));
-        } else if let Some(signal) = trimmed.strip_prefix("signal:") {
-            if let Some(dbm) = signal
-                .split_whitespace()
-                .next()
-                .and_then(|value| value.parse::<f64>().ok())
-            {
-                entry.insert("signal_dbm".to_string(), json!(dbm));
-            }
-        } else if let Some(freq) = trimmed.strip_prefix("freq:") {
-            if let Ok(freq) = freq.trim().parse::<u32>() {
-                entry.insert("freq".to_string(), json!(freq));
-                if let Some(channel) = freq_to_channel(freq) {
-                    entry.insert("channel".to_string(), json!(channel));
-                }
-            }
-        } else if let Some(channel) = trimmed.strip_prefix("* primary channel:") {
-            if let Ok(channel) = channel.trim().parse::<u8>() {
-                entry.insert("channel".to_string(), json!(channel));
-            }
-        } else if let Some(capability) = trimmed.strip_prefix("capability:") {
-            entry.insert("capability".to_string(), json!(capability.trim()));
-        } else if trimmed == "RSN:" {
-            entry.insert("auth".to_string(), json!("wpa2"));
-        } else if trimmed == "WPA:" {
-            entry.insert("auth".to_string(), json!("wpa"));
-        }
-    }
-    if let Some(entry) = current.take() {
-        entries.push(Value::Object(entry));
-    }
-    for entry in &mut entries {
-        if entry.get("auth").is_none() {
-            entry["auth"] = json!("open");
-        }
-    }
-    entries
-}
-
-fn continue_if_bss_iface(rest: &str, entry: &mut serde_json::Map<String, Value>) {
-    if let Some(iface) = rest
-        .split("(on ")
-        .nth(1)
-        .and_then(|part| part.split(')').next())
-    {
-        entry.insert("iface".to_string(), json!(iface));
-    }
-}
-
-fn freq_to_channel(freq: u32) -> Option<u8> {
-    match freq {
-        2484 => Some(14),
-        2412..=2472 => Some(((freq - 2407) / 5) as u8),
-        5180..=5895 => Some(((freq - 5000) / 5) as u8),
-        5955..=7115 => Some(((freq - 5950) / 5) as u8),
-        _ => None,
-    }
-}
-
-fn wifi_ie_name(id: u8) -> &'static str {
-    match id {
-        0 => "ssid",
-        1 => "supported_rates",
-        3 => "ds_parameter_set",
-        5 => "tim",
-        42 => "erp",
-        45 => "ht_capabilities",
-        48 => "rsn",
-        50 => "extended_supported_rates",
-        61 => "ht_operation",
-        127 => "extended_capabilities",
-        221 => "vendor_specific",
-        _ => "unknown",
-    }
-}
-
-fn build_open_beacon_head(mac: [u8; 6], ssid: &str, channel: u8) -> Result<Vec<u8>> {
-    build_open_beacon_head_with_capability(mac, ssid, channel, 0x0421)
-}
-
-fn build_open_beacon_head_with_capability(
-    mac: [u8; 6],
-    ssid: &str,
-    channel: u8,
-    capability: u16,
-) -> Result<Vec<u8>> {
-    if ssid.len() > 32 {
-        bail!("SSID is too long for 802.11 beacon: {}", ssid.len());
-    }
-    let mut frame = Vec::with_capacity(48 + ssid.len());
-    frame.extend_from_slice(&[0x80, 0x00, 0x00, 0x00]);
-    frame.extend_from_slice(&RAW_WIFI_BROADCAST);
-    frame.extend_from_slice(&mac);
-    frame.extend_from_slice(&mac);
-    frame.extend_from_slice(&[0x00, 0x00]);
-    frame.extend_from_slice(&[0; 8]);
-    frame.extend_from_slice(&100_u16.to_le_bytes());
-    frame.extend_from_slice(&capability.to_le_bytes());
-    frame.extend_from_slice(&esp_open_ap_beacon_head_ies(ssid, channel)?);
-    Ok(frame)
-}
-
-fn build_open_probe_resp(mac: [u8; 6], ssid: &str, channel: u8) -> Result<Vec<u8>> {
-    build_open_probe_resp_with_ies(
-        mac,
-        ssid,
-        channel,
-        0x0421,
-        &esp_open_ap_probe_ies(ssid, channel)?,
-    )
-}
-
-fn build_open_probe_resp_with_ies(
-    mac: [u8; 6],
-    ssid: &str,
-    _channel: u8,
-    capability: u16,
-    ies: &[u8],
-) -> Result<Vec<u8>> {
-    if ssid.len() > 32 {
-        bail!("SSID is too long for 802.11 probe response: {}", ssid.len());
-    }
-    let mut frame = Vec::with_capacity(160 + ssid.len());
-    frame.extend_from_slice(&[0x50, 0x00, 0x00, 0x00]);
-    frame.extend_from_slice(&RAW_WIFI_BROADCAST);
-    frame.extend_from_slice(&mac);
-    frame.extend_from_slice(&mac);
-    frame.extend_from_slice(&[0x00, 0x00]);
-    frame.extend_from_slice(&[0; 8]);
-    frame.extend_from_slice(&100_u16.to_le_bytes());
-    frame.extend_from_slice(&capability.to_le_bytes());
-    frame.extend_from_slice(ies);
-    Ok(frame)
-}
-
-fn build_open_auth_response(ap: [u8; 6], sta: [u8; 6]) -> Vec<u8> {
-    let mut frame = mgmt_frame_header(0x0b, sta, ap, ap);
-    frame.extend_from_slice(&(NL80211_AUTHTYPE_OPEN_SYSTEM as u16).to_le_bytes());
-    frame.extend_from_slice(&2_u16.to_le_bytes());
-    frame.extend_from_slice(&0_u16.to_le_bytes());
-    frame
-}
-
-/// Return stations that should use legacy (non-HT) association parameters.
-///
-/// The AP advertises HT20 globally, but a manually managed nl80211 AP can
-/// still have a particular station/driver with unreliable aggregation or
-/// Block-ACK behavior. Keep the normal HT20 path as the default and allow a
-/// targeted workaround without lowering the rate for every station.
-/// `LMESH_WIFI_AP_NO_HT_STATIONS` is a comma-separated list of MAC addresses.
-fn ap_no_ht_stations() -> HashSet<[u8; 6]> {
-    std::env::var("LMESH_WIFI_AP_NO_HT_STATIONS")
-        .ok()
-        .into_iter()
-        .flat_map(|value| value.split(',').map(str::to_string).collect::<Vec<_>>())
-        .filter_map(|value| parse_mac(Some(value.trim())))
-        .collect()
-}
-
-fn build_open_assoc_response(
-    ap: [u8; 6],
-    sta: [u8; 6],
-    aid: u16,
-    allow_ht: bool,
-    channel: u8,
-    ht40: bool,
-) -> Vec<u8> {
-    let mut frame = mgmt_frame_header(0x01, sta, ap, ap);
-    frame.extend_from_slice(&0x0401_u16.to_le_bytes());
-    frame.extend_from_slice(&0_u16.to_le_bytes());
-    frame.extend_from_slice(&(0xc000 | (aid & 0x3fff)).to_le_bytes());
-    frame.push(0x01);
-    frame.push(OPEN_AP_OFDM_BASIC_RATES.len() as u8);
-    frame.extend_from_slice(&OPEN_AP_OFDM_BASIC_RATES);
-    frame.push(0x32);
-    frame.push(OPEN_AP_OFDM_EXTENDED_RATES.len() as u8);
-    frame.extend_from_slice(&OPEN_AP_OFDM_EXTENDED_RATES);
-    // Match the HT20 capability advertised in the beacon. Without an HT
-    // Capabilities element in the association response, a station can
-    // associate successfully but remain on legacy rates.
-    if allow_ht {
-        frame.extend_from_slice(&hostapd_open_ap_ht_capability(ht40));
-        frame.extend_from_slice(&hostapd_open_ap_ht_operation(channel, ht40));
-    }
-    frame.extend_from_slice(&hostapd_open_ap_extra_ies());
-    // The beacon/probe templates advertise WMM, so the manually generated
-    // association response must carry the matching WMM Parameter element too.
-    // Without it, Linux reports WMM/WME=no for the station even though the AP
-    // beacon contains the element; that disables the normal Wi-Fi QoS/Block
-    // ACK path and is especially costly for a direct Wi-Fi transfer.
-    frame.extend_from_slice(&wmm_parameter_ie());
-    frame
-}
-
-fn hostapd_open_ap_ht_operation(channel: u8, ht40: bool) -> [u8; 24] {
-    let mut ie = [
-        0x3d, 22, channel, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    ];
-    if ht40 {
-        ie[3] = 0x05;
-    }
-    ie
-}
-
-fn hostapd_open_ap_ht_capability(ht40: bool) -> [u8; 28] {
-    let mut ie = HOSTAPD_HT20_CAPABILITY;
-    if ht40 {
-        ie[2] |= 0x42;
-    }
-    ie
-}
-
-fn mgmt_frame_header(subtype: u8, addr1: [u8; 6], addr2: [u8; 6], addr3: [u8; 6]) -> Vec<u8> {
-    let frame_control = ((subtype as u16) << 4).to_le_bytes();
-    let mut frame = Vec::with_capacity(64);
-    frame.extend_from_slice(&frame_control);
-    frame.extend_from_slice(&[0x00, 0x00]);
-    frame.extend_from_slice(&addr1);
-    frame.extend_from_slice(&addr2);
-    frame.extend_from_slice(&addr3);
-    frame.extend_from_slice(&[0x00, 0x00]);
-    frame
-}
-
-fn esp_open_ap_beacon_head_ies(ssid: &str, channel: u8) -> Result<Vec<u8>> {
-    if ssid.len() > 32 {
-        bail!("SSID is too long for 802.11 IE: {}", ssid.len());
-    }
-    let mut ies = Vec::with_capacity(32 + ssid.len());
-    ies.push(0x00);
-    ies.push(ssid.len() as u8);
-    ies.extend_from_slice(ssid.as_bytes());
-    ies.push(0x01);
-    ies.push(OPEN_AP_OFDM_BASIC_RATES.len() as u8);
-    ies.extend_from_slice(&OPEN_AP_OFDM_BASIC_RATES);
-    ies.push(0x03);
-    ies.push(1);
-    ies.push(channel);
-    Ok(ies)
-}
-
-fn esp_open_ap_beacon_tail(channel: u8) -> Vec<u8> {
-    let mut ies = Vec::with_capacity(92);
-    ies.push(0x2a);
-    ies.push(1);
-    ies.push(0x00);
-    ies.push(0x32);
-    ies.push(OPEN_AP_OFDM_EXTENDED_RATES.len() as u8);
-    ies.extend_from_slice(&OPEN_AP_OFDM_EXTENDED_RATES);
-    ies.push(0x2d);
-    ies.push(26);
-    ies.extend_from_slice(&[
-        0x6e, 0x11, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    ]);
-    ies.push(0x3d);
-    ies.push(22);
-    ies.extend_from_slice(&[
-        channel, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    ]);
-    ies.push(0x7f);
-    ies.push(9);
-    ies.extend_from_slice(&[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
-    ies.push(0xdd);
-    ies.push(24);
-    ies.extend_from_slice(&[
-        0x00, 0x50, 0xf2, 0x02, 0x01, 0x01, 0x04, 0x00, 0x03, 0xa4, 0x00, 0x00, 0x27, 0xa4, 0x00,
-        0x00, 0x42, 0x43, 0x5e, 0x00, 0x62, 0x32, 0x2f, 0x00,
-    ]);
-    // Passive P2P presence only.  It keeps the AP discoverable on channel 6
-    // without starting a probe, GAS, P2P SD, or group-negotiation exchange.
-    // Those stateful frames are controller-triggered Phase-2 work.
-    ies.extend_from_slice(&dmesh_rawnan::p2p::PASSIVE_DISCOVERY_IE);
-    ies
-}
-
-/// Replace the static capability-only marker with the complete device/channel
-/// advertisement when a real AP MAC is available. Android creates a P2P peer
-/// only after it sees Device Info and Listen Channel, not capability alone.
-fn esp_open_ap_beacon_tail_for_device(mac: [u8; 6], channel: u8) -> Vec<u8> {
-    let mut ies = esp_open_ap_beacon_tail(channel);
-    let marker = dmesh_rawnan::p2p::PASSIVE_DISCOVERY_IE.len();
-    ies.truncate(ies.len().saturating_sub(marker));
-    let mut p2p = [0u8; 64];
-    let used = dmesh_rawnan::p2p::encode_discovery_advertisement(&mut p2p, mac, channel)
-        .expect("bounded P2P discovery IE");
-    ies.extend_from_slice(&p2p[..used]);
-    ies
-}
-
-fn hostapd_open_ap_beacon_tail(channel: u8, ht40: bool) -> Vec<u8> {
-    let mut ies = Vec::with_capacity(101);
-    ies.push(0x2a);
-    ies.push(1);
-    ies.push(0x04);
-    ies.push(0x32);
-    ies.push(OPEN_AP_OFDM_EXTENDED_RATES.len() as u8);
-    ies.extend_from_slice(&OPEN_AP_OFDM_EXTENDED_RATES);
-    ies.push(0x3b);
-    ies.push(2);
-    ies.extend_from_slice(&[0x51, 0x00]);
-    ies.extend_from_slice(&hostapd_open_ap_ht_capability(ht40));
-    ies.extend_from_slice(&hostapd_open_ap_ht_operation(channel, ht40));
-    ies.extend_from_slice(&hostapd_open_ap_extra_ies());
-    ies.push(0xdd);
-    ies.push(24);
-    ies.extend_from_slice(&[
-        0x00, 0x50, 0xf2, 0x02, 0x01, 0x01, 0x01, 0x00, 0x03, 0xa4, 0x00, 0x00, 0x27, 0xa4, 0x00,
-        0x00, 0x42, 0x43, 0x5e, 0x00, 0x62, 0x32, 0x2f, 0x00,
-    ]);
-    // Match the ESP-compatible and hostapd-compatible templates: any DMesh
-    // AP passively exposes the same P2P capability marker in beacon and
-    // probe-response IEs, while active P2P remains controller initiated.
-    ies.extend_from_slice(&dmesh_rawnan::p2p::PASSIVE_DISCOVERY_IE);
-    ies
-}
-
-fn hostapd_open_ap_beacon_tail_for_device(mac: [u8; 6], channel: u8, ht40: bool) -> Vec<u8> {
-    let mut ies = hostapd_open_ap_beacon_tail(channel, ht40);
-    let marker = dmesh_rawnan::p2p::PASSIVE_DISCOVERY_IE.len();
-    ies.truncate(ies.len().saturating_sub(marker));
-    let mut p2p = [0u8; 64];
-    let used = dmesh_rawnan::p2p::encode_discovery_advertisement(&mut p2p, mac, channel)
-        .expect("bounded P2P discovery IE");
-    ies.extend_from_slice(&p2p[..used]);
-    ies
-}
-
-fn hostapd_open_ap_probe_ies(ssid: &str, channel: u8, ht40: bool) -> Result<Vec<u8>> {
-    let mut ies = esp_open_ap_beacon_head_ies(ssid, channel)?;
-    ies.extend_from_slice(&hostapd_open_ap_beacon_tail(channel, ht40));
-    Ok(ies)
-}
-
-fn hostapd_open_ap_probe_ies_for_device(
-    ssid: &str,
-    mac: [u8; 6],
-    channel: u8,
-    ht40: bool,
-) -> Result<Vec<u8>> {
-    let mut ies = esp_open_ap_beacon_head_ies(ssid, channel)?;
-    ies.extend_from_slice(&hostapd_open_ap_beacon_tail_for_device(mac, channel, ht40));
-    Ok(ies)
-}
-
-fn hostapd_open_ap_extra_ies() -> [u8; 10] {
-    [0x7f, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40]
-}
-
-fn wmm_parameter_ie() -> [u8; 26] {
-    [
-        0xdd, 0x18, 0x00, 0x50, 0xf2, 0x02, 0x01, 0x01, 0x01, 0x00, 0x03, 0xa4, 0x00, 0x00, 0x27,
-        0xa4, 0x00, 0x00, 0x42, 0x43, 0x5e, 0x00, 0x62, 0x32, 0x2f, 0x00,
-    ]
-}
-
-fn esp_open_ap_probe_ies(ssid: &str, channel: u8) -> Result<Vec<u8>> {
-    let mut ies = esp_open_ap_beacon_head_ies(ssid, channel)?;
-    ies.extend_from_slice(&esp_open_ap_beacon_tail(channel));
-    Ok(ies)
-}
-
-fn esp_open_ap_probe_ies_for_device(ssid: &str, mac: [u8; 6], channel: u8) -> Result<Vec<u8>> {
-    let mut ies = esp_open_ap_beacon_head_ies(ssid, channel)?;
-    ies.extend_from_slice(&esp_open_ap_beacon_tail_for_device(mac, channel));
-    Ok(ies)
-}
-
-fn open_ap_template_lengths(ssid: &str, channel: u8) -> Result<(usize, usize)> {
-    let mac = [0; 6];
-    Ok((
-        build_open_beacon_head(mac, ssid, channel)?.len(),
-        build_open_probe_resp(mac, ssid, channel)?.len(),
-    ))
-}
-
-fn default_open_ap_ssid(_iface: &str) -> String {
-    "DIRECT-dmesh".to_string()
-}
-
-fn build_dmesh_vendor_action_frame(
-    destination: [u8; 6],
-    source: [u8; 6],
-    payload: &[u8],
-) -> Result<Vec<u8>> {
-    build_dmesh_vendor_action_frame_with_bssid(destination, source, destination, payload)
-}
-
-fn build_dmesh_vendor_action_frame_with_bssid(
-    destination: [u8; 6],
-    source: [u8; 6],
-    bssid: [u8; 6],
-    payload: &[u8],
-) -> Result<Vec<u8>> {
-    dmesh_rawnan::build_espnow_action_frame(destination, source, bssid, payload)
-}
-
-fn build_dmesh_multicast_data_frame(
-    destination: [u8; 6],
-    source: [u8; 6],
-    payload: &[u8],
-) -> Vec<u8> {
-    let body_len = payload.len().min(1400);
-    let mut frame = Vec::with_capacity(IEEE80211_BODY + DMESH_VENDOR_ACTION_LEN + body_len);
-    frame.extend_from_slice(&[0x08, 0x00, 0x00, 0x00]);
-    frame.extend_from_slice(&destination);
-    frame.extend_from_slice(&source);
-    frame.extend_from_slice(&destination);
-    frame.extend_from_slice(&[0x00, 0x00]);
-    frame.extend_from_slice(&dmesh_vendor_action_header(destination));
-    frame.extend_from_slice(&payload[..body_len]);
-    frame
-}
-
-fn build_dmesh_sta_multicast_llc_frame(bssid: [u8; 6], source: [u8; 6], payload: &[u8]) -> Vec<u8> {
-    let body_len = payload.len().min(1400);
-    let mut frame = Vec::with_capacity(
-        IEEE80211_BODY + IEEE80211_LLC_SNAP_LEN + DMESH_VENDOR_ACTION_LEN + body_len,
-    );
-    frame.extend_from_slice(&[0x08, 0x01, 0x00, 0x00]);
-    frame.extend_from_slice(&bssid);
-    frame.extend_from_slice(&source);
-    frame.extend_from_slice(&RAW_WIFI_MULTICAST);
-    frame.extend_from_slice(&[0x00, 0x00]);
-    frame.extend_from_slice(&IEEE80211_LLC_SNAP_DMESH);
-    frame.extend_from_slice(&dmesh_vendor_action_header(RAW_WIFI_MULTICAST));
-    frame.extend_from_slice(&payload[..body_len]);
-    frame
-}
-
-fn build_dmesh_sta_direct_llc_frame(
-    destination: [u8; 6],
-    source: [u8; 6],
-    payload: &[u8],
-) -> Vec<u8> {
-    let body_len = payload.len().min(1400);
-    let mut frame = Vec::with_capacity(
-        IEEE80211_BODY + IEEE80211_LLC_SNAP_LEN + DMESH_VENDOR_ACTION_LEN + body_len,
-    );
-    frame.extend_from_slice(&[0x08, 0x00, 0x00, 0x00]);
-    frame.extend_from_slice(&destination);
-    frame.extend_from_slice(&source);
-    frame.extend_from_slice(&destination);
-    frame.extend_from_slice(&[0x00, 0x00]);
-    frame.extend_from_slice(&IEEE80211_LLC_SNAP_DMESH);
-    frame.extend_from_slice(&dmesh_vendor_action_header(destination));
-    frame.extend_from_slice(&payload[..body_len]);
-    frame
-}
-
-/// Build an unassociated NAN-cluster data frame. Address3 is the selected
-/// cluster BSSID; no IP/UDP/AP association is involved. The LLC/SNAP marker is
-/// intentionally the same one used by the existing raw data parser so this
-/// can be compared with the action-frame path.
-fn build_dmesh_nan_data_frame(
-    bssid: [u8; 6],
-    destination: [u8; 6],
-    source: [u8; 6],
-    payload: &[u8],
-) -> Vec<u8> {
-    dmesh_rawnan::build_nan_ipv6_udp_frame(bssid, destination, source, payload)
-}
-
-fn build_dmesh_nan_raw_data_frame(
-    bssid: [u8; 6],
-    destination: [u8; 6],
-    source: [u8; 6],
-    llc: &[u8; IEEE80211_LLC_SNAP_LEN],
-    payload: &[u8],
-) -> Vec<u8> {
-    dmesh_rawnan::build_nan_raw_data_frame(bssid, destination, source, *llc, payload)
-}
-
-fn parse_experimental_llc(value: Option<&str>) -> Option<[u8; IEEE80211_LLC_SNAP_LEN]> {
-    let value = value?;
-    let value = value.strip_prefix("hex:").unwrap_or(value);
-    let compact = value.replace([':', '-', ' ', '_'], "");
-    if compact.len() != IEEE80211_LLC_SNAP_LEN * 2 {
-        return None;
-    }
-    let mut out = [0u8; IEEE80211_LLC_SNAP_LEN];
-    for (index, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&compact[index * 2..index * 2 + 2], 16).ok()?;
-    }
-    Some(out)
-}
-
-fn build_dmesh_ethernet_frame(destination: [u8; 6], source: [u8; 6], payload: &[u8]) -> Vec<u8> {
-    let body_len = payload.len().min(1400);
-    let mut frame = Vec::with_capacity(ETHERNET_HEADER_LEN + DMESH_VENDOR_ACTION_LEN + body_len);
-    frame.extend_from_slice(&destination);
-    frame.extend_from_slice(&source);
-    frame.extend_from_slice(&ETH_P_DMESH.to_be_bytes());
-    frame.extend_from_slice(&dmesh_vendor_action_header(destination));
-    frame.extend_from_slice(&payload[..body_len]);
-    frame
-}
-
-fn dmesh_vendor_action_header(destination: [u8; 6]) -> [u8; DMESH_VENDOR_ACTION_LEN] {
-    let _ = destination;
-    dmesh_rawnan::espnow_action_header()
-}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 fn mesh_message_from_raw_wifi(value: &Value, iface: &str) -> MeshMessage {
     let mut message = MeshMessage::new(mesh::message::KIND_EVENT, MeshMessageCodec::Text)
@@ -11931,25 +4619,22 @@ fn push_radio_event(history: &Arc<Mutex<VecDeque<RadioEvent>>>, event: RadioEven
     if event.key == "wifi.rawnan.discovery" && !retain_discovery_event(&event) {
         return;
     }
-    // Keep radio, discovery, beacon, data, and trace records on the shared
-    // mesh pub/sub stream. The trace subscriber adds the common `event_type`
-    // envelope field and can filter it per connection.
+    // Every event that reaches this point is one the history retains (packet
+    // rate observations returned above), so it is also the node's `log.watch`
+    // record: `event_type` becomes the record's `kind` and `data` carries the
+    // event's value. `trace_prechecked` marks it as retained regardless of the
+    // per-type watch selection, which still governs other producers.
     let event_type = event.key.clone();
-    // Count first, then construct the tracing event only for an explicit
-    // watch. This generic mesh API keeps packet-rate adapters out of the
-    // tracing hot path when no operator is observing this event type.
-    if mesh::local_trace::is_event_enabled(&event_type) {
-        let source = &event.source;
-        let data = event.value.to_string();
-        tracing::info!(
-            target: "dmesh.event",
-            event_type = %event_type,
-            trace_prechecked = true,
-            source = %source,
-            data = %data,
-            message = "event"
-        );
-    }
+    let source = &event.source;
+    let data = event.value.to_string();
+    tracing::info!(
+        target: "dmesh.event",
+        event_type = %event_type,
+        trace_prechecked = true,
+        source = %source,
+        data = %data,
+        message = "event"
+    );
     let mut history = history
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -11959,1001 +4644,49 @@ fn push_radio_event(history: &Arc<Mutex<VecDeque<RadioEvent>>>, event: RadioEven
     }
 }
 
-fn mac_at(frame: &[u8], offset: usize) -> Option<[u8; 6]> {
-    let mut out = [0_u8; 6];
-    out.copy_from_slice(frame.get(offset..offset + 6)?);
-    Some(out)
-}
 
-fn ifindex(iface: &str) -> Result<u32> {
-    let iface_c = std::ffi::CString::new(iface.as_bytes())
-        .map_err(|_| anyhow::anyhow!("interface name contains NUL byte: {iface:?}"))?;
-    let ifindex = unsafe { libc::if_nametoindex(iface_c.as_ptr()) };
-    if ifindex == 0 {
-        bail!(
-            "if_nametoindex({iface}) failed: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-    Ok(ifindex)
-}
 
-fn ifname_from_ifindex(ifindex: u32) -> Option<String> {
-    let mut buf = [0 as libc::c_char; libc::IF_NAMESIZE];
-    let ptr = unsafe { libc::if_indextoname(ifindex, buf.as_mut_ptr()) };
-    if ptr.is_null() {
-        return None;
-    }
-    let cstr = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
-    cstr.to_str().ok().map(ToString::to_string)
-}
 
-fn channel_to_freq(channel: u8) -> u32 {
-    if channel == 14 {
-        2484
-    } else {
-        2407 + (channel as u32 * 5)
-    }
-}
 
-fn iface_mac(iface: &str) -> Result<[u8; 6]> {
-    let iface_c = std::ffi::CString::new(iface.as_bytes())
-        .map_err(|_| anyhow::anyhow!("interface name contains NUL byte: {iface:?}"))?;
-    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error()).context("failed to open ioctl socket");
-    }
-    let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
-    let name_bytes = iface_c.as_bytes_with_nul();
-    if name_bytes.len() > request.ifr_name.len() {
-        unsafe {
-            libc::close(fd);
-        }
-        bail!("interface name too long: {iface}");
-    }
-    for (idx, byte) in name_bytes.iter().enumerate() {
-        request.ifr_name[idx] = *byte as libc::c_char;
-    }
-    let rc = unsafe { libc::ioctl(fd, libc::SIOCGIFHWADDR as libc::Ioctl, &mut request) };
-    let error = std::io::Error::last_os_error();
-    unsafe {
-        libc::close(fd);
-    }
-    if rc < 0 {
-        return Err(error).with_context(|| format!("failed to read hardware address for {iface}"));
-    }
-    let mut out = [0_u8; 6];
-    unsafe {
-        let data = request.ifr_ifru.ifru_hwaddr.sa_data;
-        for (idx, slot) in out.iter_mut().enumerate() {
-            *slot = data[idx] as u8;
-        }
-    }
-    Ok(out)
-}
 
-fn parse_mac(value: Option<&str>) -> Option<[u8; 6]> {
-    let value = value?;
-    let compact = value.replace([':', '-'], "");
-    if compact.len() != 12 {
-        return None;
-    }
-    let mut out = [0_u8; 6];
-    for (idx, slot) in out.iter_mut().enumerate() {
-        *slot = u8::from_str_radix(&compact[idx * 2..idx * 2 + 2], 16).ok()?;
-    }
-    Some(out)
-}
 
-fn raw_wifi_destination(value: Option<&str>, variant: &str) -> [u8; 6] {
-    if let Some(value) = value {
-        if let Some(mac) = value
-            .strip_prefix("rx:")
-            .or_else(|| value.strip_prefix("raw:"))
-            .and_then(|mac| parse_mac(Some(mac)))
-        {
-            // NAN data frames use ordinary 802.11 address semantics. The
-            // raw-receive-MAC XOR convention is only for the ESP-NOW/action
-            // probe path.
-            if variant != "nan_data" && variant != "nan_data_active" {
-                return raw_receive_mac(mac);
-            }
-            return mac;
-        }
-        if let Some(mac) = parse_mac(Some(value)) {
-            return mac;
-        }
-    }
-    if variant == "multicast_data" || variant == "multicast_data_active" {
-        RAW_WIFI_MULTICAST
-    } else {
-        RAW_WIFI_BROADCAST
-    }
-}
 
-fn raw_wifi_destination_mode(value: Option<&str>, variant: &str) -> &'static str {
-    if let Some(value) = value {
-        if (value.starts_with("rx:") || value.starts_with("raw:"))
-            && variant != "nan_data"
-            && variant != "nan_data_active"
-        {
-            return "peer_raw_receive_mac";
-        }
-        if parse_mac(Some(value)).is_some() {
-            return "explicit_mac";
-        }
-    }
-    if variant == "multicast_data" || variant == "multicast_data_active" {
-        "ipv6_multicast_ff02_5227"
-    } else {
-        "broadcast"
-    }
-}
 
-fn raw_wifi_source(value: Option<&str>, iface: &str) -> Result<[u8; 6]> {
-    if let Some(value) = value {
-        if let Some(mac) = parse_mac(Some(value)) {
-            return Ok(mac);
-        }
-        bail!("invalid source MAC {value:?}");
-    }
-    iface_mac(iface)
-}
 
-fn raw_wifi_source_mode(value: Option<&str>) -> &'static str {
-    if value.is_some() {
-        "explicit_mac"
-    } else {
-        "interface_mac"
-    }
-}
 
-fn raw_receive_mac(mut mac: [u8; 6]) -> [u8; 6] {
-    mac[0] ^= 0x01;
-    mac
-}
 
-/// Directed NOW QUIC traffic uses the selected peer address unchanged in
-/// 802.11 address 1.  `raw_receive_mac` is retained only for legacy monitor
-/// filtering and discovery experiments; applying it to a directed sender
-/// turns a unicast address into a group address.
-fn directed_now_destination(peer: [u8; 6]) -> [u8; 6] {
-    peer
-}
 
-fn frame_type(frame: &[u8]) -> u8 {
-    (frame.first().copied().unwrap_or(0) & 0x0c) >> 2
-}
 
-fn frame_subtype(frame: &[u8]) -> u8 {
-    frame.first().copied().unwrap_or(0) >> 4
-}
 
-fn json_scalar_string(value: &Value) -> String {
-    value
-        .as_str()
-        .map(str::to_string)
-        .unwrap_or_else(|| value.to_string())
-}
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct NlMsgHdr {
-    nlmsg_len: u32,
-    nlmsg_type: u16,
-    nlmsg_flags: u16,
-    nlmsg_seq: u32,
-    nlmsg_pid: u32,
-}
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct NlMsgErr {
-    error: i32,
-    msg: NlMsgHdr,
-}
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct IfInfoMsg {
-    ifi_family: u8,
-    ifi_pad: u8,
-    ifi_type: u16,
-    ifi_index: i32,
-    ifi_flags: u32,
-    ifi_change: u32,
-}
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct IfAddrMsg {
-    ifa_family: u8,
-    ifa_prefixlen: u8,
-    ifa_flags: u8,
-    ifa_scope: u8,
-    ifa_index: u32,
-}
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct RtAttrHdr {
-    rta_len: u16,
-    rta_type: u16,
-}
 
-const NLM_F_CREATE: u16 = 0x400;
-const NLM_F_REPLACE: u16 = 0x100;
-const IFA_ADDRESS: u16 = 1;
-const IFA_LOCAL: u16 = 2;
-const IFA_BROADCAST: u16 = 4;
 
-/// Linux uses this flag in `/proc/net/if_inet6` while duplicate-address
-/// detection is still running.  Do not bind the scoped UDP6 bearer until it
-/// has cleared.
-const IPV6_ADDR_TENTATIVE: u32 = 0x40;
 
-fn link_local_from_mac(mac: [u8; 6]) -> std::net::Ipv6Addr {
-    let mut bytes = [0_u8; 16];
-    bytes[0] = 0xfe;
-    bytes[1] = 0x80;
-    bytes[8] = mac[0] ^ 0x02;
-    bytes[9] = mac[1];
-    bytes[10] = mac[2];
-    bytes[11] = 0xff;
-    bytes[12] = 0xfe;
-    bytes[13] = mac[3];
-    bytes[14] = mac[4];
-    bytes[15] = mac[5];
-    std::net::Ipv6Addr::from(bytes)
-}
 
-fn ready_link_local_address(iface: &str) -> Option<std::net::Ipv6Addr> {
-    let contents = std::fs::read_to_string("/proc/net/if_inet6").ok()?;
-    contents.lines().find_map(|line| {
-        let fields = line.split_whitespace().collect::<Vec<_>>();
-        if fields.len() != 6 || fields[5] != iface || !fields[0].starts_with("fe80") {
-            return None;
-        }
-        let flags = u32::from_str_radix(fields[4], 16).ok()?;
-        if flags & IPV6_ADDR_TENTATIVE != 0 {
-            return None;
-        }
-        let mut bytes = [0_u8; 16];
-        for (index, byte) in bytes.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(&fields[0][index * 2..index * 2 + 2], 16).ok()?;
-        }
-        Some(std::net::Ipv6Addr::from(bytes))
-    })
-}
 
-fn wait_for_link_local_address(iface: &str, attempts: usize) -> Option<std::net::Ipv6Addr> {
-    for attempt in 0..attempts.max(1) {
-        if let Some(address) = ready_link_local_address(iface) {
-            return Some(address);
-        }
-        if attempt + 1 != attempts.max(1) {
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
-    None
-}
 
-/// Keep scoped UDP6 usable after USB/driver resets that leave an administratively
-/// up Wi-Fi STA without the normally automatic IPv6 link-local address.
-fn ensure_link_local_address(iface: &str) -> Result<String> {
-    if let Some(address) = wait_for_link_local_address(iface, 10) {
-        return Ok(address.to_string());
-    }
-    let address = link_local_from_mac(iface_mac(iface)?);
-    set_ipv6_link_local_address(iface, address).map_err(anyhow::Error::msg)?;
-    wait_for_link_local_address(iface, 30)
-        .map(|address| address.to_string())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "IPv6 link-local address {address}%{iface} did not become non-tentative"
-            )
-        })
-}
 
-fn interface_link_status(iface: &str) -> Value {
-    match ifindex(iface) {
-        Ok(ifindex) => match get_link_flags(ifindex as i32) {
-            Ok(flags) => {
-                let mut names = Vec::new();
-                if flags & IFF_UP != 0 {
-                    names.push("UP");
-                }
-                if flags & libc::IFF_RUNNING as u32 != 0 {
-                    names.push("RUNNING");
-                }
-                if flags & libc::IFF_LOOPBACK as u32 != 0 {
-                    names.push("LOOPBACK");
-                }
-                json!({
-                    "ok": true,
-                    "backend": "rtnetlink",
-                    "iface": iface,
-                    "ifindex": ifindex,
-                    // Preserve the established operator/test presentation
-                    // while sourcing it directly from RTM_GETLINK.
-                    "stdout": format!("{ifindex}: {iface}: <{}>", names.join(",")),
-                    "flags": flags,
-                })
-            }
-            Err(error) => {
-                json!({"ok": false, "backend": "rtnetlink", "iface": iface, "ifindex": ifindex, "error": error})
-            }
-        },
-        Err(error) => json!({
-            "ok": false,
-            "backend": "rtnetlink",
-            "iface": iface,
-            "error": format!("{error:#}"),
-        }),
-    }
-}
 
-fn get_link_flags(ifindex: i32) -> std::result::Result<u32, String> {
-    let fd = unsafe {
-        libc::socket(
-            libc::AF_NETLINK,
-            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-            libc::NETLINK_ROUTE,
-        )
-    };
-    if fd < 0 {
-        return Err(format!(
-            "open rtnetlink socket: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    let header_len = std::mem::size_of::<NlMsgHdr>();
-    let info_len = std::mem::size_of::<IfInfoMsg>();
-    let header = NlMsgHdr {
-        nlmsg_len: (header_len + info_len) as u32,
-        nlmsg_type: libc::RTM_GETLINK,
-        nlmsg_flags: NLM_F_REQUEST,
-        nlmsg_seq: 2,
-        nlmsg_pid: 0,
-    };
-    let mut info: IfInfoMsg = unsafe { std::mem::zeroed() };
-    info.ifi_family = libc::AF_UNSPEC as u8;
-    info.ifi_index = ifindex;
-    let mut request = Vec::with_capacity(header_len + info_len);
-    append_struct(&mut request, &header);
-    append_struct(&mut request, &info);
-    let sent = unsafe {
-        libc::send(
-            fd,
-            request.as_ptr() as *const libc::c_void,
-            request.len(),
-            0,
-        )
-    };
-    if sent != request.len() as isize {
-        let error = if sent < 0 {
-            std::io::Error::last_os_error().to_string()
-        } else {
-            "short RTM_GETLINK write".to_owned()
-        };
-        unsafe {
-            libc::close(fd);
-        }
-        return Err(error);
-    }
-    let mut response = [0_u8; 4096];
-    let read = unsafe {
-        libc::recv(
-            fd,
-            response.as_mut_ptr() as *mut libc::c_void,
-            response.len(),
-            0,
-        )
-    };
-    unsafe {
-        libc::close(fd);
-    }
-    if read < 0 {
-        return Err(format!(
-            "read RTM_GETLINK: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    let response = &response[..read as usize];
-    if response.len() < header_len + info_len {
-        return Err("short RTM_GETLINK response".to_owned());
-    }
-    let header = unsafe { std::ptr::read_unaligned(response.as_ptr() as *const NlMsgHdr) };
-    if header.nlmsg_type == NLMSG_ERROR {
-        return Err("RTM_GETLINK returned netlink error".to_owned());
-    }
-    if header.nlmsg_type != libc::RTM_NEWLINK {
-        return Err(format!(
-            "unexpected RTM_GETLINK response type {}",
-            header.nlmsg_type
-        ));
-    }
-    let info =
-        unsafe { std::ptr::read_unaligned(response[header_len..].as_ptr() as *const IfInfoMsg) };
-    Ok(info.ifi_flags)
-}
 
-fn list_rtnetlink_interfaces() -> std::result::Result<Vec<Value>, String> {
-    let fd = unsafe {
-        libc::socket(
-            libc::AF_NETLINK,
-            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-            libc::NETLINK_ROUTE,
-        )
-    };
-    if fd < 0 {
-        return Err(format!(
-            "open rtnetlink socket: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    let header_len = std::mem::size_of::<NlMsgHdr>();
-    let info_len = std::mem::size_of::<IfInfoMsg>();
-    let header = NlMsgHdr {
-        nlmsg_len: (header_len + info_len) as u32,
-        nlmsg_type: libc::RTM_GETLINK,
-        nlmsg_flags: NLM_F_REQUEST | NLM_F_DUMP,
-        nlmsg_seq: 3,
-        nlmsg_pid: 0,
-    };
-    let mut info: IfInfoMsg = unsafe { std::mem::zeroed() };
-    info.ifi_family = libc::AF_UNSPEC as u8;
-    let mut request = Vec::with_capacity(header_len + info_len);
-    append_struct(&mut request, &header);
-    append_struct(&mut request, &info);
-    let sent = unsafe { libc::send(fd, request.as_ptr().cast(), request.len(), 0) };
-    if sent != request.len() as isize {
-        let error = if sent < 0 {
-            std::io::Error::last_os_error().to_string()
-        } else {
-            "short RTM_GETLINK dump write".to_owned()
-        };
-        unsafe {
-            libc::close(fd);
-        }
-        return Err(error);
-    }
 
-    let mut interfaces = Vec::new();
-    let mut buffer = [0_u8; 8192];
-    loop {
-        let read = unsafe { libc::recv(fd, buffer.as_mut_ptr().cast(), buffer.len(), 0) };
-        if read < 0 {
-            let error = std::io::Error::last_os_error().to_string();
-            unsafe {
-                libc::close(fd);
-            }
-            return Err(format!("read RTM_GETLINK dump: {error}"));
-        }
-        let mut bytes = &buffer[..read as usize];
-        while bytes.len() >= header_len {
-            let message = unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const NlMsgHdr) };
-            let length = message.nlmsg_len as usize;
-            if length < header_len || length > bytes.len() {
-                unsafe {
-                    libc::close(fd);
-                }
-                return Err("malformed RTM_GETLINK dump message".to_owned());
-            }
-            match message.nlmsg_type {
-                NLMSG_DONE => {
-                    unsafe {
-                        libc::close(fd);
-                    }
-                    return Ok(interfaces);
-                }
-                NLMSG_ERROR => {
-                    unsafe {
-                        libc::close(fd);
-                    }
-                    return Err("RTM_GETLINK dump returned netlink error".to_owned());
-                }
-                kind if kind == libc::RTM_NEWLINK => {
-                    if length >= header_len + info_len {
-                        let info = unsafe {
-                            std::ptr::read_unaligned(
-                                bytes[header_len..].as_ptr() as *const IfInfoMsg
-                            )
-                        };
-                        let mut name = None;
-                        let mut mac = None;
-                        let mut attrs = &bytes[header_len + info_len..length];
-                        while attrs.len() >= std::mem::size_of::<RtAttrHdr>() {
-                            let attr = unsafe {
-                                std::ptr::read_unaligned(attrs.as_ptr() as *const RtAttrHdr)
-                            };
-                            let attr_len = attr.rta_len as usize;
-                            if attr_len < std::mem::size_of::<RtAttrHdr>() || attr_len > attrs.len()
-                            {
-                                break;
-                            }
-                            let payload = &attrs[std::mem::size_of::<RtAttrHdr>()..attr_len];
-                            match attr.rta_type & NLA_TYPE_MASK {
-                                1 if payload.len() == 6 => {
-                                    mac = Some(
-                                        payload
-                                            .iter()
-                                            .map(|byte| format!("{byte:02x}"))
-                                            .collect::<Vec<_>>()
-                                            .join(":"),
-                                    )
-                                }
-                                3 => {
-                                    name = std::ffi::CStr::from_bytes_until_nul(payload)
-                                        .ok()
-                                        .and_then(|name| name.to_str().ok())
-                                        .map(str::to_owned)
-                                }
-                                _ => {}
-                            }
-                            let aligned = (attr_len + 3) & !3;
-                            if aligned > attrs.len() {
-                                break;
-                            }
-                            attrs = &attrs[aligned..];
-                        }
-                        interfaces.push(json!({"ifindex": info.ifi_index, "iface": name, "mac": mac, "flags": info.ifi_flags}));
-                    }
-                }
-                _ => {}
-            }
-            let aligned = (length + 3) & !3;
-            if aligned > bytes.len() {
-                break;
-            }
-            bytes = &bytes[aligned..];
-        }
-    }
-}
 
-fn link_state_result(iface: &str, up: bool) -> Value {
-    match set_link_state(iface, up) {
-        Ok(output) => json!({
-            "ok": true,
-            "backend": "rtnetlink",
-            "iface": iface,
-            "state": if up { "up" } else { "down" },
-            "stdout": output.stdout,
-        }),
-        Err(error) => json!({
-            "ok": false,
-            "backend": "rtnetlink",
-            "iface": iface,
-            "state": if up { "up" } else { "down" },
-            "error": error,
-        }),
-    }
-}
 
-/// Request an administrative link-up and confirm it through a fresh
-/// RTM_GETLINK read. USB Wi-Fi drivers can deliver a delayed or dropped ACK
-/// while applying the state transition, so neither an ACK nor a timeout alone
-/// is authoritative. Keep recovery bounded and retain every attempt for
-/// operator diagnosis.
-fn link_up_confirmed(iface: &str, attempts: usize) -> Value {
-    let attempts = attempts.clamp(1, 3);
-    let mut history = Vec::with_capacity(attempts);
-    for attempt in 1..=attempts {
-        let request = link_state_result(iface, true);
-        let observed = ifindex(iface)
-            .and_then(|index| get_link_flags(index as i32).map_err(anyhow::Error::msg));
-        let up = observed.as_ref().is_ok_and(|flags| flags & IFF_UP != 0);
-        history.push(json!({
-            "attempt": attempt,
-            "request": request,
-            "flags": observed.as_ref().ok().copied(),
-            "up": up,
-            "read_error": observed.as_ref().err().map(|error| error.to_string()),
-        }));
-        if up {
-            return json!({"ok": true, "backend": "rtnetlink", "iface": iface, "state": "up", "attempts": history});
-        }
-        if attempt != attempts {
-            std::thread::sleep(Duration::from_millis(250));
-        }
-    }
-    json!({"ok": false, "backend": "rtnetlink", "iface": iface, "state": "up", "attempts": history})
-}
 
-fn set_link_up(iface: &str) -> std::result::Result<CommandOutput, String> {
-    set_link_state(iface, true)
-}
 
-fn set_link_state(iface: &str, up: bool) -> std::result::Result<CommandOutput, String> {
-    let iface_c = std::ffi::CString::new(iface.as_bytes())
-        .map_err(|_| format!("interface name contains NUL byte: {iface:?}"))?;
-    let ifindex = unsafe { libc::if_nametoindex(iface_c.as_ptr()) };
-    if ifindex == 0 {
-        return Err(format!(
-            "if_nametoindex({iface}) failed: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
 
-    let fd = unsafe {
-        libc::socket(
-            libc::AF_NETLINK,
-            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-            libc::NETLINK_ROUTE,
-        )
-    };
-    if fd < 0 {
-        return Err(format!(
-            "failed to open rtnetlink socket: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
 
-    let result = unsafe { send_setlink_state(fd, ifindex as i32, up) };
-    unsafe {
-        libc::close(fd);
-    }
-    result.map(|()| CommandOutput {
-        status: Some(0),
-        stdout: format!(
-            "set {iface} {} via rtnetlink",
-            if up { "up" } else { "down" }
-        ),
-        stderr: String::new(),
-    })
-}
 
-fn set_ipv4_address(
-    iface: &str,
-    address: std::net::Ipv4Addr,
-    prefix: u8,
-) -> std::result::Result<CommandOutput, String> {
-    let ifindex = ifindex(iface).map_err(|error| error.to_string())?;
-    let fd = unsafe {
-        libc::socket(
-            libc::AF_NETLINK,
-            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-            libc::NETLINK_ROUTE,
-        )
-    };
-    if fd < 0 {
-        return Err(format!(
-            "failed to open rtnetlink socket: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
 
-    let result = unsafe { send_setaddr(fd, ifindex, address, prefix) };
-    unsafe {
-        libc::close(fd);
-    }
-    result.map(|()| CommandOutput {
-        status: Some(0),
-        stdout: format!("set {iface} IPv4 address {address}/{prefix} via rtnetlink"),
-        stderr: String::new(),
-    })
-}
 
-fn set_ipv6_link_local_address(
-    iface: &str,
-    address: std::net::Ipv6Addr,
-) -> std::result::Result<CommandOutput, String> {
-    let ifindex = ifindex(iface).map_err(|error| error.to_string())?;
-    let fd = unsafe {
-        libc::socket(
-            libc::AF_NETLINK,
-            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-            libc::NETLINK_ROUTE,
-        )
-    };
-    if fd < 0 {
-        return Err(format!(
-            "failed to open rtnetlink socket: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    let result = unsafe { send_setaddr6(fd, ifindex, address) };
-    unsafe {
-        libc::close(fd);
-    }
-    result.map(|()| CommandOutput {
-        status: Some(0),
-        stdout: format!("set {iface} IPv6 link-local {address}/64 via rtnetlink"),
-        stderr: String::new(),
-    })
-}
 
-unsafe fn send_setaddr6(
-    fd: RawFd,
-    ifindex: u32,
-    address: std::net::Ipv6Addr,
-) -> std::result::Result<(), String> {
-    let header_len = std::mem::size_of::<NlMsgHdr>();
-    let info_len = std::mem::size_of::<IfAddrMsg>();
-    let mut request = Vec::with_capacity(header_len + info_len + 48);
-    append_struct(
-        &mut request,
-        &NlMsgHdr {
-            nlmsg_len: 0,
-            nlmsg_type: libc::RTM_NEWADDR,
-            nlmsg_flags: NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
-            nlmsg_seq: 3,
-            nlmsg_pid: 0,
-        },
-    );
-    append_struct(
-        &mut request,
-        &IfAddrMsg {
-            ifa_family: libc::AF_INET6 as u8,
-            ifa_prefixlen: 64,
-            // This path runs only after the kernel has failed to generate any
-            // link-local address and its normal DAD window has elapsed.  The
-            // address is the interface's EUI-64 link-local identity, so retain a
-            // deterministic usable scoped address instead of an indefinitely
-            // tentative one on USB drivers that never emit the DAD completion.
-            ifa_flags: libc::IFA_F_NODAD as u8,
-            ifa_scope: libc::RT_SCOPE_LINK as u8,
-            ifa_index: ifindex,
-        },
-    );
-    let bytes = address.octets();
-    append_rt_attr(&mut request, IFA_ADDRESS, &bytes);
-    append_rt_attr(&mut request, IFA_LOCAL, &bytes);
-    let header_ptr = request.as_mut_ptr() as *mut NlMsgHdr;
-    unsafe {
-        (*header_ptr).nlmsg_len = request.len() as u32;
-    }
-    let written = unsafe { libc::send(fd, request.as_ptr().cast(), request.len(), 0) };
-    if written != request.len() as isize {
-        return Err(if written < 0 {
-            format!(
-                "failed to send IPv6 RTM_NEWADDR: {}",
-                std::io::Error::last_os_error()
-            )
-        } else {
-            "short IPv6 RTM_NEWADDR write".to_owned()
-        });
-    }
-    let mut response = [0_u8; 4096];
-    let read = unsafe { libc::recv(fd, response.as_mut_ptr().cast(), response.len(), 0) };
-    if read < 0 {
-        return Err(format!(
-            "read IPv6 RTM_NEWADDR: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    if (read as usize) < std::mem::size_of::<NlMsgHdr>() {
-        return Err("short IPv6 RTM_NEWADDR response".to_owned());
-    }
-    let header = unsafe { std::ptr::read_unaligned(response.as_ptr() as *const NlMsgHdr) };
-    if header.nlmsg_type == NLMSG_ERROR {
-        if read as usize >= std::mem::size_of::<NlMsgHdr>() + std::mem::size_of::<NlMsgErr>() {
-            let error = unsafe {
-                std::ptr::read_unaligned(
-                    response[std::mem::size_of::<NlMsgHdr>()..].as_ptr() as *const NlMsgErr
-                )
-            };
-            if error.error != 0 {
-                return Err(format!(
-                    "IPv6 RTM_NEWADDR failed: {}",
-                    std::io::Error::from_raw_os_error(-error.error)
-                ));
-            }
-        }
-    }
-    Ok(())
-}
 
-unsafe fn send_setaddr(
-    fd: RawFd,
-    ifindex: u32,
-    address: std::net::Ipv4Addr,
-    prefix: u8,
-) -> std::result::Result<(), String> {
-    let header_len = std::mem::size_of::<NlMsgHdr>();
-    let info_len = std::mem::size_of::<IfAddrMsg>();
-    let mut request = Vec::with_capacity(header_len + info_len + 16);
-    let header = NlMsgHdr {
-        nlmsg_len: 0,
-        nlmsg_type: libc::RTM_NEWADDR,
-        nlmsg_flags: NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
-        nlmsg_seq: 2,
-        nlmsg_pid: 0,
-    };
-    let info = IfAddrMsg {
-        ifa_family: libc::AF_INET as u8,
-        ifa_prefixlen: prefix,
-        ifa_flags: 0,
-        ifa_scope: 0,
-        ifa_index: ifindex,
-    };
-    append_struct(&mut request, &header);
-    append_struct(&mut request, &info);
-    let bytes = address.octets();
-    append_rt_attr(&mut request, IFA_ADDRESS, &bytes);
-    append_rt_attr(&mut request, IFA_LOCAL, &bytes);
-    let ip = u32::from_be_bytes(bytes);
-    let mask = if prefix == 0 {
-        0
-    } else {
-        u32::MAX << (32 - u32::from(prefix))
-    };
-    append_rt_attr(
-        &mut request,
-        IFA_BROADCAST,
-        &((ip & mask) | !mask).to_be_bytes(),
-    );
-    let message_len = request.len() as u32;
-    let header_ptr = request.as_mut_ptr() as *mut NlMsgHdr;
-    unsafe {
-        (*header_ptr).nlmsg_len = message_len;
-    }
 
-    let written = unsafe {
-        libc::send(
-            fd,
-            request.as_ptr() as *const libc::c_void,
-            request.len(),
-            0,
-        )
-    };
-    if written < 0 {
-        return Err(format!(
-            "failed to send RTM_NEWADDR: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    if written as usize != request.len() {
-        return Err(format!(
-            "short RTM_NEWADDR write: wrote {written}, expected {}",
-            request.len()
-        ));
-    }
-    let mut response = [0u8; 4096];
-    let read = unsafe {
-        libc::recv(
-            fd,
-            response.as_mut_ptr() as *mut libc::c_void,
-            response.len(),
-            0,
-        )
-    };
-    if read < 0 {
-        return Err(format!(
-            "failed to read RTM_NEWADDR ACK: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    parse_netlink_ack(&response[..read as usize])
-}
 
-fn append_rt_attr(out: &mut Vec<u8>, attr_type: u16, payload: &[u8]) {
-    let raw_len = std::mem::size_of::<RtAttrHdr>() + payload.len();
-    let aligned_len = (raw_len + 3) & !3;
-    let header = RtAttrHdr {
-        rta_len: raw_len as u16,
-        rta_type: attr_type,
-    };
-    append_struct(out, &header);
-    out.extend_from_slice(payload);
-    out.resize(out.len() + aligned_len - raw_len, 0);
-}
 
-unsafe fn send_setlink_state(fd: RawFd, ifindex: i32, up: bool) -> std::result::Result<(), String> {
-    let header_len = std::mem::size_of::<NlMsgHdr>();
-    let info_len = std::mem::size_of::<IfInfoMsg>();
-    let msg_len = header_len + info_len;
-    let header = NlMsgHdr {
-        nlmsg_len: msg_len as u32,
-        nlmsg_type: libc::RTM_NEWLINK,
-        nlmsg_flags: NLM_F_REQUEST | NLM_F_ACK,
-        nlmsg_seq: 1,
-        nlmsg_pid: 0,
-    };
-    let mut info: IfInfoMsg = unsafe { std::mem::zeroed() };
-    info.ifi_family = libc::AF_UNSPEC as u8;
-    info.ifi_index = ifindex;
-    info.ifi_flags = if up { IFF_UP } else { 0 };
-    info.ifi_change = IFF_UP;
-    let mut request = Vec::with_capacity(msg_len);
-    append_struct(&mut request, &header);
-    append_struct(&mut request, &info);
-
-    let written = unsafe {
-        libc::send(
-            fd,
-            request.as_ptr() as *const libc::c_void,
-            request.len(),
-            0,
-        )
-    };
-    if written < 0 {
-        return Err(format!(
-            "failed to send RTM_NEWLINK: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    if written as usize != request.len() {
-        return Err(format!(
-            "short RTM_NEWLINK write: wrote {written}, expected {}",
-            request.len()
-        ));
-    }
-
-    let mut response = [0u8; 4096];
-    let read = unsafe {
-        libc::recv(
-            fd,
-            response.as_mut_ptr() as *mut libc::c_void,
-            response.len(),
-            0,
-        )
-    };
-    if read < 0 {
-        return Err(format!(
-            "failed to read RTM_NEWLINK ACK: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    parse_netlink_ack(&response[..read as usize])
-}
-
-fn append_struct<T>(out: &mut Vec<u8>, value: &T) {
-    let bytes = unsafe {
-        std::slice::from_raw_parts(value as *const T as *const u8, std::mem::size_of::<T>())
-    };
-    out.extend_from_slice(bytes);
-}
-
-fn parse_netlink_ack(response: &[u8]) -> std::result::Result<(), String> {
-    if response.len() < std::mem::size_of::<NlMsgHdr>() {
-        return Err("short netlink ACK".to_string());
-    }
-    let header = unsafe { std::ptr::read_unaligned(response.as_ptr() as *const NlMsgHdr) };
-    if header.nlmsg_type != NLMSG_ERROR {
-        return Ok(());
-    }
-    if response.len() < std::mem::size_of::<NlMsgHdr>() + std::mem::size_of::<NlMsgErr>() {
-        return Err("short netlink error ACK".to_string());
-    }
-    let err_offset = std::mem::size_of::<NlMsgHdr>();
-    let error = unsafe { std::ptr::read_unaligned(response[err_offset..].as_ptr() as *const i32) };
-    if error == 0 {
-        Ok(())
-    } else {
-        let errno = -error;
-        Err(format!(
-            "RTM_NEWLINK failed: {}",
-            std::io::Error::from_raw_os_error(errno)
-        ))
-    }
-}
-
-#[derive(Debug)]
-struct CommandOutput {
-    status: Option<i32>,
-    stdout: String,
-    stderr: String,
-}
-
-fn command_result_json(output: std::result::Result<CommandOutput, String>) -> Value {
-    match output {
-        Ok(output) => json!({
-            "ok": output.status == Some(0),
-            "status": output.status,
-            "stdout": output.stdout,
-            "stderr": output.stderr,
-        }),
-        Err(error) => json!({ "ok": false, "error": error }),
-    }
-}
-
-fn result_json<T>(output: Result<T>) -> Value {
-    match output {
-        Ok(_) => json!({ "ok": true }),
-        Err(error) => json!({ "ok": false, "error": format!("{error:#}") }),
-    }
-}
 
 fn wifi_iface(value: Option<String>) -> String {
     value
@@ -12977,26 +4710,6 @@ fn raw_wifi_channel(value: Option<u8>) -> u8 {
     value.unwrap_or(DEFAULT_RAW_WIFI_CHANNEL).clamp(1, 13)
 }
 
-fn process_caps() -> Value {
-    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-    let caps = status
-        .lines()
-        .filter(|line| {
-            line.starts_with("CapInh:")
-                || line.starts_with("CapPrm:")
-                || line.starts_with("CapEff:")
-                || line.starts_with("CapBnd:")
-                || line.starts_with("CapAmb:")
-        })
-        .map(|line| {
-            let mut parts = line.split_whitespace();
-            let name = parts.next().unwrap_or("").trim_end_matches(':').to_string();
-            let value = parts.next().unwrap_or("").to_string();
-            (name, Value::String(value))
-        })
-        .collect::<serde_json::Map<_, _>>();
-    Value::Object(caps)
-}
 
 fn local_device_id() -> Result<[u8; 6]> {
     if let Some(value) = std::env::var("LMESH_DEVICE_ID").ok() {
@@ -13049,9 +4762,6 @@ fn now_wire_destination(destination: &str) -> String {
     }
 }
 
-fn hex_bytes(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
 
 /// Android's pre-identity NAN callback historically emitted this ASCII
 /// placeholder. It is not a stable device identity and must not hide a later
@@ -13060,43 +4770,15 @@ fn is_placeholder_announce_id(device_id: &[u8]) -> bool {
     device_id == b"000000" || device_id.iter().all(|byte| *byte == 0)
 }
 
-fn colon_mac(bytes: &[u8; 6]) -> String {
-    bytes
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<Vec<_>>()
-        .join(":")
-}
 
-fn peer_availability_name(availability: dmesh_rawnan::PeerAvailability) -> &'static str {
-    match availability {
-        dmesh_rawnan::PeerAvailability::Infra => "infra",
-        dmesh_rawnan::PeerAvailability::Dw0Dw8 => "dw0_dw8",
-    }
-}
 
-fn now_millis() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-}
 
-fn now_millis_u64() -> u64 {
-    now_millis().min(u64::MAX as u128) as u64
-}
 
-fn now_micros_u64() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros()
-        .min(u128::from(u64::MAX)) as u64
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dmesh_server::raw_wifi::WIFI_LINK_METRICS_SCHEMA_VERSION;
     use p256::SecretKey;
     use p256::ecdsa::SigningKey;
     use p256::ecdsa::signature::Signer;
@@ -13139,8 +4821,9 @@ mod tests {
             });
         }
 
-        let metrics = service.now_metrics(Some("wlan1".to_string()));
-        assert_eq!(metrics["action_seen"], 1);
+        // Only the action frame counts; its reflection is a different key.
+        let counts = service.now_counts(Some("wlan1".to_string()));
+        assert_eq!(counts.action_seen, 1);
     }
 
     #[test]
@@ -13175,13 +4858,27 @@ mod tests {
         assert_eq!(alias[0] & 1, 1, "the receive alias is a group address");
     }
 
+
     #[test]
-    fn action_ingress_reserves_now_sync_and_tagged_discovery_before_quic() {
-        let discovery = [0xa3, 1, 6, 2, 1, 3, 1];
-        assert!(action_payload_is_discovery(&discovery));
-        let quic = [0xc0, 1, 2];
-        assert!(!action_payload_is_discovery(&quic));
-        assert!(dmesh_rawnan::parse_now_sync_body(&quic).is_none());
+    fn admitted_announces_reach_the_shared_discovery_sink() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = RadioService::from_environment_with_discovery_log(
+            directory.path().join("discovery.jsonl"),
+        );
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink_seen = seen.clone();
+        service.set_announce_sink(Arc::new(move |source, peer, announce| {
+            sink_seen
+                .lock()
+                .unwrap()
+                .push((source.to_owned(), peer.to_owned(), announce.uptime_secs));
+        }));
+        let announce = dmesh_server::announce::Announce::discovery([0x61; 16], 16, 9);
+        assert!(service.observe_discovered_announce("nan_sd", "aa:bb:cc:dd:ee:61".to_owned(), None, announce));
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &[("nan_sd".to_owned(), "aa:bb:cc:dd:ee:61".to_owned(), 9)]
+        );
     }
 
     #[test]
@@ -13537,44 +5234,6 @@ mod tests {
         assert_eq!(open_ap_basic_rates(), &[0x8c]);
     }
 
-    #[test]
-    fn hostapd_ht20_probe_response_matches_beacon_and_association_capabilities() {
-        let channel = 6;
-        let probe = build_open_probe_resp_with_ies(
-            [1; 6],
-            "Direct-test",
-            channel,
-            0x0401,
-            &hostapd_open_ap_probe_ies("Direct-test", channel, false).unwrap(),
-        )
-        .unwrap();
-        let probe_ies = &probe[IEEE80211_BODY + 12..];
-        let beacon_ies = hostapd_open_ap_probe_ies("Direct-test", channel, false).unwrap();
-        let assoc = build_open_assoc_response([1; 6], [2; 6], 1, true, channel, false);
-        let assoc_ies = &assoc[IEEE80211_BODY + 6..];
-
-        assert_eq!(read_u16_at(&probe, IEEE80211_BODY + 10), Some(0x0401));
-        assert_eq!(probe_ies, beacon_ies);
-        assert_eq!(management_ie_bytes(probe_ies, 1), Some(&[0x8c][..]));
-        assert_eq!(
-            management_ie_bytes(probe_ies, 50),
-            Some(OPEN_AP_OFDM_EXTENDED_RATES.as_slice())
-        );
-        assert_eq!(
-            management_ie_bytes(probe_ies, 45),
-            management_ie_bytes(assoc_ies, 45)
-        );
-        assert_eq!(
-            management_ie_bytes(probe_ies, 61),
-            management_ie_bytes(assoc_ies, 61)
-        );
-        assert!(management_ie_bytes(probe_ies, 221).is_some());
-        assert!(
-            dmesh_rawnan::p2p::parse_advertisement(probe_ies)
-                .unwrap()
-                .is_some()
-        );
-    }
 
     #[test]
     fn station_rate_status_distinguishes_ht_from_legacy() {
@@ -13615,32 +5274,6 @@ mod tests {
         assert_eq!(attrs[0].1, &[12, 18, 24, 36, 48, 72, 96, 108]);
     }
 
-    #[test]
-    fn raw_wifi_vendor_action_round_trips() {
-        let dst = [0xff; 6];
-        let src = [0x02, 0x00, 0x00, 0xaa, 0xbb, 0xcc];
-        let frame = build_dmesh_vendor_action_frame(dst, src, b"stats").unwrap();
-
-        assert_eq!(&frame[..4], &[0xd0, 0x00, 0x00, 0x00]);
-        assert_eq!(
-            &frame[IEEE80211_BODY..IEEE80211_BODY + DMESH_VENDOR_ACTION_LEN],
-            &dmesh_vendor_action_header(dst)
-        );
-        assert_eq!(
-            &frame[IEEE80211_BODY..IEEE80211_BODY + 4],
-            &[0x7f, 0x18, 0xfe, 0x34]
-        );
-        assert_eq!(&frame[IEEE80211_BODY + 4..IEEE80211_BODY + 8], &[0xff; 4]);
-        assert_eq!(frame[IEEE80211_BODY + DMESH_VENDOR_ACTION_LEN], 0xdd);
-
-        let parsed = parse_dmesh_vendor_action(&frame, "wlan-test").unwrap();
-        assert_eq!(parsed["protocol"], "dmesh_wifi_raw");
-        assert_eq!(parsed["vendor_marker"], "espnow_dmesh");
-        assert_eq!(parsed["mesh_dst4"], "ffffffff");
-        assert_eq!(parsed["source"], "02:00:00:aa:bb:cc");
-        assert_eq!(parsed["destination"], "ff:ff:ff:ff:ff:ff");
-        assert_eq!(parsed["payload_text"], "stats");
-    }
 
     #[test]
     fn raw_nan_transport_action_uses_unicast_a1_a2_and_cluster_a3() {
@@ -13657,19 +5290,6 @@ mod tests {
         assert_ne!(&frame[16..22], &[0xff; 6]);
     }
 
-    #[test]
-    fn monitor_fcs_is_removed_only_when_crc_matches() {
-        let frame =
-            build_dmesh_vendor_action_frame([0xff; 6], [1, 2, 3, 4, 5, 6], b"ping").unwrap();
-        let crc = crc32_ieee(&frame);
-        let mut captured = frame.clone();
-        captured.extend_from_slice(&crc.to_le_bytes());
-        assert_eq!(strip_valid_fcs(&captured), frame.as_slice());
-
-        let mut arbitrary_tail = frame;
-        arbitrary_tail.extend_from_slice(&[0, 0, 0, 0]);
-        assert_eq!(strip_valid_fcs(&arbitrary_tail), arbitrary_tail.as_slice());
-    }
 
     #[test]
     fn raw_wifi_legacy_vendor_action_still_parses() {
@@ -13689,27 +5309,7 @@ mod tests {
         assert_eq!(parsed["payload_text"], "stats");
     }
 
-    #[test]
-    fn raw_wifi_accepts_radiotap_prefix() {
-        let frame =
-            build_dmesh_vendor_action_frame([0xff; 6], [1, 2, 3, 4, 5, 6], b"ping").unwrap();
-        let mut packet = vec![0, 0, 8, 0, 0, 0, 0, 0];
-        packet.extend_from_slice(&frame);
 
-        assert_eq!(ieee80211_frame(&packet).unwrap(), frame.as_slice());
-    }
-
-    #[test]
-    fn monitor_tx_radiotap_keeps_legacy_rate_and_no_ack() {
-        let packet = build_radiotap_packet(&[0xd0, 0x00, 0x00, 0x00]);
-        assert_eq!(
-            &packet[..12],
-            &[
-                0x00, 0x00, 0x0c, 0x00, 0x04, 0x80, 0x00, 0x00, 0x02, 0x00, 0x08, 0x00
-            ]
-        );
-        assert_eq!(&packet[12..], &[0xd0, 0x00, 0x00, 0x00]);
-    }
 
     #[test]
     fn dmesh_now_unicast_radiotap_keeps_no_mac_ack() {
@@ -13721,22 +5321,6 @@ mod tests {
         assert_eq!(&packet[10..12], &[0x08, 0x00]);
     }
 
-    #[test]
-    fn nan_control_frames_are_identified_for_six_mbps_policy() {
-        let action = build_dmesh_vendor_action_frame_with_bssid(
-            [0xff; 6],
-            [2, 0, 0, 0xaa, 0xbb, 0xcc],
-            [0x50, 0x6f, 0x9a, 1, 2, 3],
-            b"probe",
-        )
-        .unwrap();
-        assert!(is_nan_control_frame(&action));
-
-        let ordinary =
-            build_dmesh_vendor_action_frame([0xff; 6], [2, 0, 0, 0xaa, 0xbb, 0xcc], b"probe")
-                .unwrap();
-        assert!(!is_nan_control_frame(&ordinary));
-    }
 
     #[test]
     fn nan_radiotap_rate_is_six_mbps() {
@@ -13860,70 +5444,8 @@ mod tests {
         assert_eq!(parsed["bssid"], colon_mac(&bssid));
     }
 
-    #[test]
-    fn data_path_ethernet_frame_round_trips() {
-        let src = [0x44, 0x94, 0xfc, 0xe4, 0x84, 0x15];
-        let frame = build_dmesh_ethernet_frame(RAW_WIFI_MULTICAST, src, b"stats");
-        let parsed =
-            parse_dmesh_ethernet_frame(&frame, "wlan-test", &[RAW_WIFI_MULTICAST]).unwrap();
 
-        assert_eq!(&frame[..6], &RAW_WIFI_MULTICAST);
-        assert_eq!(&frame[6..12], &src);
-        assert_eq!(&frame[12..14], &ETH_P_DMESH.to_be_bytes());
-        assert_eq!(parsed["layout"], "ethernet");
-        assert_eq!(parsed["payload_text"], "stats");
-    }
 
-    #[test]
-    fn parses_iw_scan_bss_entries() {
-        let scan = r#"
-BSS a4:2b:b0:bd:00:e3(on wlan1)
-	freq: 2437
-	signal: -31.00 dBm
-	capability: ESS ShortSlotTime (0x0401)
-	SSID: Direct-E3-Dmesh-local
-BSS 44:94:fc:e4:84:15(on wlan1)
-	freq: 2437
-	signal: -34.00 dBm
-	SSID: Direct-15-Dmesh-local
-	RSN:
-	BSS Load:
-		* station count: 1
-"#;
-        let entries = parse_iw_scan(scan);
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0]["bssid"], "a4:2b:b0:bd:00:e3");
-        assert_eq!(entries[0]["ssid"], "Direct-E3-Dmesh-local");
-        assert_eq!(entries[0]["channel"], 6);
-        assert_eq!(entries[0]["auth"], "open");
-        assert_eq!(entries[1]["auth"], "wpa2");
-    }
-
-    #[test]
-    fn rsn_scan_auth_distinguishes_psk_sae_and_transition() {
-        // IE 48: RSN version 1, CCMP group/pairwise cipher, and the selected
-        // AKM suites. The scan API retains only this bounded semantic result.
-        let prefix = [0, 4, b't', b'e', b's', b't'];
-        let psk = [
-            48, 18, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2,
-        ];
-        let sae = [
-            48, 18, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 8,
-        ];
-        let transition = [
-            48, 22, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 2, 0, 0, 0x0f, 0xac, 2, 0,
-            0x0f, 0xac, 8,
-        ];
-        for (rsn, expected) in [
-            (&psk[..], "wpa2-psk"),
-            (&sae[..], "wpa3-sae"),
-            (&transition[..], "wpa2-wpa3-psk"),
-        ] {
-            let mut ies = prefix.to_vec();
-            ies.extend_from_slice(rsn);
-            assert_eq!(rsn_auth_from_information_elements(&ies), Some(expected));
-        }
-    }
 
     #[test]
     fn radio_inventory_unifies_active_and_passive_bss_by_channel() {
@@ -14012,35 +5534,55 @@ BSS 44:94:fc:e4:84:15(on wlan1)
         assert_eq!(wpa_owner_iface_names("wlan1", "wlan1"), vec!["wlan1"]);
     }
 
-    #[test]
-    fn ssid_information_element_is_bounded_and_decoded() {
-        assert_eq!(
-            ssid_from_information_elements(&[
-                1, 1, 0x82, 0, 14, b'D', b'I', b'R', b'E', b'C', b'T', b'-', b'x', b'-', b'd',
-                b'm', b'e', b's', b'h'
-            ]),
-            Some("DIRECT-x-dmesh".to_owned())
-        );
-        assert_eq!(ssid_from_information_elements(&[0, 8, b'b']), None);
-    }
 
-    #[test]
-    fn discovery_result_keeps_only_open_dmesh_candidates() {
-        let result = discovery_result(
-            "wlan1".to_owned(),
-            "linux_nl80211",
-            None,
-            Some(6),
-            false,
-            true,
-            vec![
-                json!({"ssid": "DIRECT-e6-dmesh", "bssid": "02:00:00:00:00:06", "channel": 6, "auth": "open"}),
-                json!({"ssid": "other", "bssid": "02:00:00:00:00:07", "channel": 6, "auth": "open"}),
-                json!({"ssid": "DIRECT-e7-dmesh", "bssid": "02:00:00:00:00:08", "channel": 1, "auth": "open"}),
-            ],
-            Some("ssid_scan"),
-        );
-        assert_eq!(result["dmesh"].as_array().unwrap().len(), 1);
-        assert_eq!(result["dmesh"][0]["bssid"], "02:00:00:00:00:06");
-    }
+}
+
+/// Station links of the AP interface `iface`, from an nl80211 station dump, as the common
+/// `telemetry.wifi_link` rows.
+pub fn station_links(iface: &str) -> Result<Vec<dmesh_server::platform_api::WifiLink>> {
+    let interface_index = ifindex(iface)?;
+    let socket = Nl80211Socket::open()?;
+    Ok(socket
+        .station_dump(interface_index)?
+        .iter()
+        .map(|station| station_link_metrics(station, interface_index))
+        .map(|metrics| dmesh_server::platform_api::WifiLink::from(&metrics))
+        .collect())
+}
+
+/// Convert a raw nl80211 station record into the shared optional link-metrics
+/// vocabulary.  The original station JSON remains available for compatibility,
+/// but exporters should consume this record so ESP-side observations and host
+/// MAC telemetry do not grow separate metric names.
+fn station_link_metrics(station: &Value, interface_index: u32) -> WifiLinkMetrics {
+    let unsigned = |key| station.get(key).and_then(Value::as_u64);
+    let signed = |key| {
+        station
+            .get(key)
+            .and_then(Value::as_i64)
+            .and_then(|value| i8::try_from(value).ok())
+    };
+    let mut metrics = WifiLinkMetrics::new();
+    metrics.interface_index = Some(interface_index);
+    metrics.peer_mac = station
+        .get("mac")
+        .and_then(Value::as_str)
+        .and_then(|mac| parse_mac(Some(mac)));
+    metrics.rx_bytes = unsigned("rx_bytes");
+    metrics.tx_bytes = unsigned("tx_bytes");
+    metrics.rx_packets = unsigned("rx_packets");
+    metrics.tx_packets = unsigned("tx_packets");
+    metrics.mac_tx_retries = unsigned("tx_retries");
+    metrics.mac_tx_failed = unsigned("tx_failed");
+    metrics.rx_dropped = unsigned("rx_drop_misc");
+    metrics.rx_airtime_us = unsigned("rx_airtime_us");
+    metrics.tx_airtime_us = unsigned("tx_airtime_us");
+    metrics.signal_dbm = signed("signal_dbm");
+    metrics.signal_avg_dbm = signed("signal_avg_dbm");
+    metrics.ack_signal_dbm = signed("ack_signal_dbm");
+    metrics.ack_signal_avg_dbm = signed("ack_signal_avg_dbm");
+    metrics.rx_bitrate_kbit_s = unsigned("rx_bitrate_kbit_s");
+    metrics.tx_bitrate_kbit_s = unsigned("tx_bitrate_kbit_s");
+    metrics.expected_throughput_kbit_s = unsigned("expected_throughput_kbit_s");
+    metrics
 }

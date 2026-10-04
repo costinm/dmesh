@@ -596,41 +596,43 @@ fn receive_action_frame_unlocked(frame: &[u8]) {
 /// Apply the common post-framing admission policy.  Every callback variant
 /// has supplied one complete bounded QUIC datagram and its immutable source
 /// path fact by this point.
-fn admit_now_payload(source: [u8; 6], payload: &[u8]) -> bool {
+fn admit_now_payload(source: [u8; 6], payload: &[u8]) -> crate::quic_node_esp::NowPayloadAdmission {
+    use crate::quic_node_esp::NowPayloadAdmission::{Consumed, Control, Quic};
     // ESP-IDF exposes a locally transmitted action to private receive paths.
     // It is not ingress and must not consume a device-wide packet slot.
     if crate::wifi_radio_control_esp::is_local_action_source(source) {
         RX_SELF_ECHOES.fetch_add(1, Ordering::Relaxed);
-        return false;
+        return Consumed;
     }
     if recently_seen_action(source, payload) {
         RX_DUPLICATE_ACTIONS.fetch_add(1, Ordering::Relaxed);
-        return false;
+        return Consumed;
     }
     match dmesh_server::raw_wifi::classify_espnow_payload(payload) {
         dmesh_server::raw_wifi::EspNowPayloadClass::NowSync => {
             let Some(sync) = dmesh_rawnan::parse_now_sync_body(payload) else {
-                return false;
+                return Consumed;
             };
+            // Beacon-equivalent: it selects/refreshes the cluster the NAN DW follows.
+            crate::wifi_nan_dw_capture_esp::observe_now_sync(source, &sync);
             if crate::wifi_nan_dw_capture_esp::defer_service_info(source, sync.service_info) {
                 RX_ACTIONS.fetch_add(1, Ordering::Relaxed);
             } else {
                 RX_SHARED_INGRESS_DROPS.fetch_add(1, Ordering::Relaxed);
                 RX_DROPS.fetch_add(1, Ordering::Relaxed);
             }
-            false
+            Consumed
         }
         dmesh_server::raw_wifi::EspNowPayloadClass::TaggedControl => {
-            let _ = crate::main_runtime::receive_connectionless_request(payload, |response| {
-                let _ = transmit(EspNowPeer { mac: source }, response);
-            });
-            false
+            // Transfer the parser's existing pool lease to the owner; no
+            // second payload buffer/copy is needed for non-QUIC controls.
+            Control
         }
-        dmesh_server::raw_wifi::EspNowPayloadClass::QuicDatagram => true,
+        dmesh_server::raw_wifi::EspNowPayloadClass::QuicDatagram => Quic,
         dmesh_server::raw_wifi::EspNowPayloadClass::Unrecognized => {
             RX_INVALID_DROPS.fetch_add(1, Ordering::Relaxed);
             RX_DROPS.fetch_add(1, Ordering::Relaxed);
-            false
+            Consumed
         }
     }
 }
@@ -910,6 +912,24 @@ pub fn broadcast_discovery(record: &[u8]) -> bool {
     // through the NOW action lane. The borrowed record is never returned as
     // a pool lease; only a transient busy result copies it into the shared
     // pool so the owner can retry it later.
+    let peer = EspNowPeer { mac: [0xff; 6] };
+    match try_transmit_from_worker(peer, record) {
+        NowTransmitResult::Accepted => true,
+        NowTransmitResult::Busy => crate::quic_node_esp::queue_now_control_response(peer, record),
+        NowTransmitResult::Failed => false,
+    }
+}
+
+/// Broadcast one DMesh record on NOW outside QUIC: a tagged control request (the NOW twin
+/// of a NAN request) or a NOW sync record. Anything else is not sent.
+pub fn broadcast_raw(record: &[u8]) -> bool {
+    if matches!(
+        dmesh_server::raw_wifi::classify_espnow_payload(record),
+        dmesh_server::raw_wifi::EspNowPayloadClass::QuicDatagram
+            | dmesh_server::raw_wifi::EspNowPayloadClass::Unrecognized
+    ) {
+        return false;
+    }
     let peer = EspNowPeer { mac: [0xff; 6] };
     match try_transmit_from_worker(peer, record) {
         NowTransmitResult::Accepted => true,

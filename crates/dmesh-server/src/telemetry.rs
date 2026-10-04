@@ -24,8 +24,10 @@ pub const BEARERS_METHOD: u64 = 9;
 pub const MEMORY_METHOD: u64 = 10;
 pub const POWER_METHOD: u64 = 11;
 pub const RUNTIME_METHOD: u64 = 12;
+pub const DEVICE_METHOD: u64 = 13;
+include!("generated_device_telemetry.rs");
 /// Every telemetry method: each takes an empty request.
-pub const METHODS: [u64; 12] = [
+pub const METHODS: [u64; 13] = [
     NAN_STATUS_METHOD,
     NOW_METRICS_METHOD,
     NAN_METRICS_METHOD,
@@ -38,7 +40,37 @@ pub const METHODS: [u64; 12] = [
     MEMORY_METHOD,
     POWER_METHOD,
     RUNTIME_METHOD,
+    DEVICE_METHOD,
 ];
+
+/// Encode static platform information inside the ordinary response envelope.
+pub fn device_response(record: crate::tagged::Record<'_>, info: TelemetryDeviceResponse<'_>) -> Option<alloc::vec::Vec<u8>> {
+    if record.component != Some(Name::Tag(TELEMETRY_COMPONENT))
+        || record.method != Some(Name::Tag(DEVICE_METHOD))
+        || record.to.is_some() || record.params.is_some() || record.fields.is_some()
+        || record.data.is_some() || record.result.is_some() || record.error.is_some() {
+        return None;
+    }
+    let mut data = [0u8; 256];
+    let len = info.encode_cbor(&mut data)?;
+    let mut out = alloc::vec![0u8; len + 64];
+    let used = crate::tagged::encode_numeric_response(TELEMETRY_COMPONENT, DEVICE_METHOD, record.id?, &data[..len], &mut out)?;
+    out.truncate(used);
+    Some(out)
+}
+
+/// Linux and Android expose physical RAM through the kernel, not process RSS.
+#[cfg(feature = "std")]
+pub fn host_total_ram_bytes() -> Option<u64> {
+    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+    info.lines().find_map(|line| {
+        let mut words = line.split_whitespace();
+        (words.next()? == "MemTotal:").then_some(())?;
+        let kib = words.next()?.parse::<u64>().ok()?;
+        (words.next()? == "kB").then_some(())?;
+        kib.checked_mul(1024)
+    })
+}
 pub const TELEMETRY_RESPONSE_MAX_BYTES: usize = 512;
 include!("generated_quic_telemetry.rs");
 /// A complete NAN snapshot currently has 35 scalar counters.  Leave bounded
@@ -407,12 +439,196 @@ pub fn encode_wifi_link_metrics(metrics: WifiLinkMetrics, out: &mut [u8]) -> Opt
     Some(e.len())
 }
 
+/// The resident set size of this process in bytes, from `VmRSS` in
+/// `/proc/self/status` (Linux and Android), for `telemetry.memory`.
+#[cfg(feature = "std")]
+pub fn process_rss_bytes() -> Result<u64, String> {
+    let status = std::fs::read_to_string("/proc/self/status").map_err(|error| error.to_string())?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .and_then(|rest| rest.trim().strip_suffix("kB"))
+        .and_then(|kilobytes| kilobytes.trim().parse::<u64>().ok())
+        .map(|kilobytes| kilobytes.saturating_mul(1024))
+        .ok_or_else(|| "no VmRSS in /proc/self/status".to_owned())
+}
+
+/// The host-typed `telemetry.quic` response (the generated `platform_api` type;
+/// firmware uses the no_std type above) from the node's counters.
+#[cfg(feature = "std")]
+impl From<quic_lite::NodeTelemetry> for crate::platform_api::TelemetryQuicResponse {
+    fn from(telemetry: quic_lite::NodeTelemetry) -> Self {
+        Self {
+            live_associations: telemetry.live_associations,
+            received_packets: telemetry.received_packets,
+            sent_packets: telemetry.sent_packets,
+            received_stream_packets: telemetry.received_stream_packets,
+            received_control_packets: telemetry.received_control_packets,
+            sent_stream_packets: telemetry.sent_stream_packets,
+            sent_control_packets: telemetry.sent_control_packets,
+            duplicate_packets: telemetry.duplicate_packets,
+            out_of_order_packets: telemetry.out_of_order_packets,
+            inferred_missing_packets: telemetry.inferred_missing_packets,
+            retransmitted_packets: telemetry.retransmitted_packets,
+            loss_events: telemetry.loss_events,
+            submission_failures: telemetry.submission_failures,
+        }
+    }
+}
+
+/// `telemetry.quic_associations` from the node's per-association rows. A
+/// bearer's name comes from the bearer rows; the peer is the bearer-local
+/// handle, as `discovery.nodes` would report it.
+#[cfg(feature = "std")]
+pub fn quic_associations_response(
+    associations: &[quic_lite::AssociationRow],
+    bearers: &[quic_lite::BearerRow],
+) -> crate::platform_api::TelemetryQuicAssociationsResponse {
+    let rows = associations
+        .iter()
+        .map(|row| {
+            let transport = row.telemetry.transport;
+            crate::platform_api::QuicAssociation {
+                association: Some(row.id),
+                bearer: row.bearer.and_then(|id| {
+                    bearers
+                        .iter()
+                        .find(|bearer| bearer.id == id)
+                        .map(|bearer| bearer.name.as_str().to_owned())
+                }),
+                peer: row.peer.map(|peer| peer.value().to_string()),
+                received_packets: Some(transport.received_packets),
+                sent_packets: Some(transport.sent_packets),
+                retransmitted_packets: Some(transport.retransmitted_packets),
+                loss_events: Some(transport.loss_events),
+                submission_failures: Some(transport.submission_failures),
+                bytes_in_flight: Some(row.telemetry.bytes_in_flight),
+                peer_max_data: Some(row.telemetry.peer_max_data),
+                peer_sent_data: Some(row.telemetry.peer_sent_data),
+                largest_acked_by_peer: row.telemetry.largest_acked_by_peer,
+                ..Default::default()
+            }
+        })
+        .collect();
+    crate::platform_api::TelemetryQuicAssociationsResponse {
+        associations: Some(rows),
+    }
+}
+
+/// `telemetry.bearers` from the node's per-bearer rows.
+#[cfg(feature = "std")]
+pub fn bearers_response(
+    bearers: &[quic_lite::BearerRow],
+) -> crate::platform_api::TelemetryBearersResponse {
+    let rows = bearers
+        .iter()
+        .map(|bearer| crate::platform_api::BearerCounters {
+            name: Some(bearer.name.as_str().to_owned()),
+            state: Some(u8::from(bearer.enabled)),
+            tx_submitted: Some(bearer.submitted_packets),
+            tx_accepted: Some(bearer.completed_packets),
+            tx_failed: Some(bearer.send_failures),
+            tx_busy: Some(bearer.send_would_block),
+            rx_packets: Some(bearer.received_packets),
+            rx_dropped: Some(bearer.ingress_drops),
+            queue_depth: u32::try_from(bearer.in_flight_packets).ok(),
+            ..Default::default()
+        })
+        .collect();
+    crate::platform_api::TelemetryBearersResponse {
+        bearers: Some(rows),
+    }
+}
+
+/// One `links` row of `telemetry.wifi_link` from a station's metrics.
+#[cfg(feature = "std")]
+impl From<&crate::raw_wifi::WifiLinkMetrics> for crate::platform_api::WifiLink {
+    fn from(link: &crate::raw_wifi::WifiLinkMetrics) -> Self {
+        Self {
+            schema_version: Some(link.schema_version),
+            peer_mac: link.peer_mac.map(|mac| mac.to_vec()),
+            interface_index: link.interface_index,
+            rx_bytes: link.rx_bytes,
+            tx_bytes: link.tx_bytes,
+            rx_packets: link.rx_packets,
+            tx_packets: link.tx_packets,
+            mac_tx_retries: link.mac_tx_retries,
+            mac_tx_failed: link.mac_tx_failed,
+            rx_dropped: link.rx_dropped,
+            rx_airtime_us: link.rx_airtime_us,
+            tx_airtime_us: link.tx_airtime_us,
+            signal_dbm: link.signal_dbm,
+            signal_avg_dbm: link.signal_avg_dbm,
+            ack_signal_dbm: link.ack_signal_dbm,
+            ack_signal_avg_dbm: link.ack_signal_avg_dbm,
+            rx_bitrate_kbit_s: link.rx_bitrate_kbit_s,
+            tx_bitrate_kbit_s: link.tx_bitrate_kbit_s,
+            expected_throughput_kbit_s: link.expected_throughput_kbit_s,
+            bearer_rx_frames: link.bearer_rx_frames,
+            bearer_rx_drops: link.bearer_rx_drops,
+            bearer_rx_invalid: link.bearer_rx_invalid,
+            bearer_udp_delivered: link.bearer_udp_delivered,
+            bearer_ndp_advertisements: link.bearer_ndp_advertisements,
+            bearer_tx_failures: link.bearer_tx_failures,
+            raw_tx_completion_failures: link.raw_tx_completion_failures,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// `API.md` is the one definition of each telemetry response. These tests
     /// hold the encoders and the metric-id constants to the typed structs
     /// generated from it, so the documentation cannot drift from the wire.
     mod spec {
+        #[test]
+        fn generated_marshalling_round_trips_every_scalar_kind() {
+            // Required and optional integers, text, bytes, and an array that
+            // goes through the JSON-value fallback.
+            let quic = api::TelemetryQuicResponse {
+                live_associations: 2,
+                received_packets: 9,
+                ..Default::default()
+            };
+            let wire = quic.encode_cbor();
+            let back = api::TelemetryQuicResponse::decode_cbor(&wire).unwrap();
+            assert_eq!((back.live_associations, back.received_packets), (2, 9));
+            // A required field that is absent is an error, not a zero.
+            assert!(api::TelemetryQuicResponse::decode_cbor(&[0xa0]).is_err());
+
+            let link = api::TelemetryWifiLinkResponse {
+                schema_version: Some(1),
+                signal_dbm: Some(-61),
+                peer_mac: Some(vec![0xaa; 6]),
+                links: Some(vec![api::WifiLink {
+                    rx_bytes: Some(7),
+                    peer_mac: Some(vec![1, 2, 3, 4, 5, 6]),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            };
+            let back = api::TelemetryWifiLinkResponse::decode_cbor(&link.encode_cbor()).unwrap();
+            assert_eq!(back.signal_dbm, Some(-61));
+            assert_eq!(back.peer_mac, Some(vec![0xaa; 6]));
+            let rows = back.links.unwrap();
+            assert_eq!(rows[0].rx_bytes, Some(7));
+            // The row's byte string stays bytes.
+            assert_eq!(rows[0].peer_mac, Some(vec![1, 2, 3, 4, 5, 6]));
+            // Unknown tags from a newer peer are skipped.
+            assert!(api::TelemetryNowResponse::decode_cbor(&[0xa1, 0x18, 0x63, 0x01]).is_ok());
+            // A value out of range for its type is rejected.
+            assert!(api::TelemetryNowResponse::decode_cbor(&[0xa1, 0x01, 0x01]).is_ok());
+            let mut log = api::LogWatchRequest::default();
+            log.level = Some(9);
+            assert_eq!(api::LogWatchRequest::decode_cbor(&log.encode_cbor()).unwrap().level, Some(9));
+            assert!(api::LogWatchRequest::decode_cbor(&[0xa1, 0x03, 0x19, 0x01, 0x00]).is_err());
+        }
+
+        #[test]
+        fn process_rss_is_read_in_bytes() {
+            assert!(process_rss_bytes().unwrap() > 100 * 1024);
+        }
+
         use super::super::*;
         use crate::platform_api as api;
         use mesh::tagged::TaggedFields;
@@ -441,9 +657,11 @@ mod tests {
             assert_eq!(seen, T::FIELDS.len(), "{module}: API.md has fields with no constant");
         }
 
-        fn decode<T: TaggedFields>(wire: &[u8]) -> T {
-            let value = mesh::cbor::decode_value_bytes(wire).unwrap();
-            mesh::tagged::from_tagged_value(&value).unwrap()
+        use crate::registry_bridge::TaggedCbor;
+
+        /// The generated marshalling reads what the device encoders write.
+        fn decode<T: TaggedCbor>(wire: &[u8]) -> T {
+            T::decode_cbor(wire).unwrap()
         }
 
         #[test]
@@ -474,8 +692,7 @@ mod tests {
         #[test]
         fn wifi_link_and_battery_encoders_match_their_tables() {
             let mut link = WifiLinkMetrics::new();
-            // `peer_mac` (tag 3) is a byte string; the JSON projection used by
-            // `decode` renders those as `base64:` text, so it is left out here.
+            link.peer_mac = Some([1, 2, 3, 4, 5, 6]);
             link.rx_bytes = Some(10);
             link.tx_bytes = Some(20);
             link.signal_dbm = Some(-40);
@@ -484,6 +701,8 @@ mod tests {
             let mut wire = [0u8; 128];
             let used = encode_wifi_link_metrics(link, &mut wire).unwrap();
             let response: api::TelemetryWifiLinkResponse = decode(&wire[..used]);
+            // A byte string stays a byte string.
+            assert_eq!(response.peer_mac.as_deref(), Some(&[1u8, 2, 3, 4, 5, 6][..]));
             assert_eq!(response.rx_bytes, Some(10));
             assert_eq!(response.tx_bytes, Some(20));
             assert_eq!(response.signal_dbm, Some(-40));

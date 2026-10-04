@@ -7,6 +7,66 @@
 //! socket-, FreeRTOS-, and ESP-independent gives host tests the same rules as
 //! firmware without exposing credentials in a diagnostic response.
 
+/// A targeted NAN wake holds the CPU active through STA startup. Automatic
+/// handler-idle return to NAN is a separate owner policy, not this lease.
+pub const NAN_WAKE_ACTIVE_MS: u32 = 10_000;
+
+/// Wrapping monotonic-clock lease; zero explicitly cancels the hold.
+pub fn nan_wake_hold_remaining(now_ms: u32, until_ms: u32) -> u32 {
+    let remaining = until_ms.wrapping_sub(now_ms);
+    if until_ms != 0 && remaining <= NAN_WAKE_ACTIVE_MS { remaining } else { 0 }
+}
+
+/// Enable idle PM only after the command grace and admitted wake lease, with
+/// the complete NAN-only radio epoch ready. This does not stop a driver.
+pub fn nan_idle_pm_ready(now_ms: u64, grace_until_ms: u64, wake_until_ms: u32, radio_ready: bool) -> bool {
+    radio_ready && now_ms >= grace_until_ms
+        && nan_wake_hold_remaining(now_ms as u32, wake_until_ms) == 0
+}
+
+#[cfg(test)]
+mod wake_lease_tests {
+    use super::*;
+
+    #[test]
+    fn wake_stays_active_for_ten_seconds_and_explicit_sleep_cancels() {
+        let until = 100 + NAN_WAKE_ACTIVE_MS;
+        assert_eq!(nan_wake_hold_remaining(100, until), 10_000);
+        assert_eq!(nan_wake_hold_remaining(9_999, until), 101);
+        assert_eq!(nan_wake_hold_remaining(until, until), 0);
+        assert_eq!(nan_wake_hold_remaining(until + 1, until), 0);
+        assert_eq!(nan_wake_hold_remaining(200, 0), 0);
+    }
+
+    #[test]
+    fn repeated_wake_renews_hold_and_clock_wrap_is_safe() {
+        let now = u32::MAX - 100;
+        let until = now.wrapping_add(NAN_WAKE_ACTIVE_MS);
+        assert_eq!(nan_wake_hold_remaining(now, until), 10_000);
+        assert_eq!(nan_wake_hold_remaining(50, until), 9_849);
+        let renewed = 50 + NAN_WAKE_ACTIVE_MS;
+        assert_eq!(nan_wake_hold_remaining(50, renewed), 10_000);
+        assert_eq!(nan_wake_hold_remaining(renewed + 1, renewed), 0);
+    }
+
+    #[test]
+    fn idle_pm_waits_for_command_grace_and_live_radio() {
+        assert!(!nan_idle_pm_ready(59_999, 60_000, 0, true));
+        assert!(!nan_idle_pm_ready(60_000, 60_000, 0, false));
+        assert!(nan_idle_pm_ready(60_000, 60_000, 0, true));
+        assert!(nan_idle_pm_ready(60_001, 0, 0, true));
+    }
+
+    #[test]
+    fn idle_pm_does_not_shorten_received_wake_or_renewal() {
+        assert!(!nan_idle_pm_ready(60_000, 0, 70_000, true));
+        assert!(!nan_idle_pm_ready(69_999, 0, 70_000, true));
+        assert!(nan_idle_pm_ready(70_000, 0, 70_000, true));
+        assert!(!nan_idle_pm_ready(70_000, 0, 79_000, true));
+        assert!(nan_idle_pm_ready(70_000, 0, 0, true));
+    }
+}
+
 /// Requested physical radio personality after a complete `transport.start`.
 ///
 /// This is intentionally a compact projection rather than `TransportProfile`:

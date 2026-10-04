@@ -1,9 +1,6 @@
 use alloc::vec::Vec;
 
-use dmesh_fw_transport::{
-    TRANSPORT_MTU, core_runtime,
-    shared_ingress_esp::{self, IngressKind, IngressPacket},
-};
+use dmesh_fw_transport::{TRANSPORT_MTU, core_runtime};
 use dmesh_server::firmware_profile::TransportProfile;
 use dmesh_server::main_runtime_state::RadioLifecycle;
 use dmesh_server::transport_state::TransportStateObserver;
@@ -11,7 +8,6 @@ use dmesh_server::{
     cbor::{Decoder, Encoder},
     tagged::{self, Name, Record},
 };
-use quic_lite::PeerL2Address;
 
 pub const BLE_COMPONENT: u64 = 104;
 
@@ -73,7 +69,6 @@ const BLE_COC_SEND: u64 = 86;
 const DEFAULT_SCAN_MS: u32 = 10_000;
 const MAX_SCAN_MS: u32 = 30_000;
 
-static mut BLE_COC_RESPONSE: [u8; TRANSPORT_MTU] = [0; TRANSPORT_MTU];
 static BLE_INGRESS_ENQUEUED: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 static BLE_INGRESS_ACCEPTED: core::sync::atomic::AtomicUsize =
@@ -110,15 +105,12 @@ pub fn register() {
 }
 
 pub fn install() {
-    let _ = shared_ingress_esp::start(IngressKind::BleCoc, receive_ble_coc_ingress);
+    // The L2CAP channel is a bearer of the node, like the UART: received SDUs enter it, and
+    // it sends through `send_ble_coc_sdu`.
+    core_runtime::install_ble_coc_io(dmesh_ble::coc_connected, send_ble_coc_sdu);
     dmesh_ble::set_coc_rx_hook(Some(receive_ble_coc_bytes));
-    dmesh_ble::set_coc_egress_ready_hook(Some(schedule_ble_coc_egress_ready));
+    dmesh_ble::set_coc_egress_ready_hook(Some(ble_coc_egress_ready));
     dmesh_ble::set_coc_state_hook(Some(on_ble_coc_state));
-    core_runtime::install_ble_coc_egress_pump(Some(pump_ble_coc_egress));
-}
-
-fn ble_coc_path() -> PeerL2Address {
-    core_runtime::connection_path_id(dmesh_server::transport_path::TransportId::BLE.0, [0; 6])
 }
 
 fn on_ble_coc_state(_connected: bool) {}
@@ -132,62 +124,35 @@ fn receive_ble_coc_bytes(packet: &[u8]) {
         return;
     }
     BLE_INGRESS_ENQUEUED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let _ = shared_ingress_esp::enqueue(IngressKind::BleCoc, [0; 6], packet);
-}
-
-fn receive_ble_coc_ingress(_item: IngressPacket, packet: &[u8]) {
-    unsafe {
-        let response = &mut *core::ptr::addr_of_mut!(BLE_COC_RESPONSE);
-        let path = ble_coc_path();
-        let ingress = core_runtime::receive_connection_frame_ingress(path, packet, response);
-        if ingress.accepted {
-            BLE_INGRESS_ACCEPTED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        } else {
-            BLE_INGRESS_REJECTED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        }
-        pump_ble_coc_egress(path, response, ingress.response);
+    if core_runtime::receive_ble_coc(packet) {
+        BLE_INGRESS_ACCEPTED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    } else {
+        BLE_INGRESS_REJECTED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
 }
 
-fn pump_ble_coc_egress(
-    path: PeerL2Address,
-    response: &mut [u8; TRANSPORT_MTU],
-    immediate: Option<usize>,
-) {
-    if !dmesh_ble::coc_connected() {
-        BLE_EGRESS_BLOCKED_DISCONNECTED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        return;
-    }
+/// Submit one packet as one SDU: 0 accepted, 1 the channel is still sending (retry on the
+/// ready edge), otherwise failure.
+fn send_ble_coc_sdu(packet: &[u8]) -> u8 {
     if dmesh_ble::coc_tx_pending() {
         BLE_EGRESS_BLOCKED_PENDING.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        return;
-    }
-    let used = immediate
-        .filter(|used| *used > 0 && *used <= TRANSPORT_MTU)
-        .unwrap_or_else(|| core_runtime::poll_connection(path, response).unwrap_or(0));
-    if used == 0 {
-        return;
+        return 1;
     }
     BLE_EGRESS_ATTEMPTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    match dmesh_ble::send_coc_bytes(&response[..used]) {
+    match dmesh_ble::send_coc_bytes(packet) {
         Ok(()) => {
             BLE_EGRESS_SENT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            0
         }
         Err(_) => {
             BLE_EGRESS_SEND_ERRORS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            2
         }
     }
 }
 
-fn schedule_ble_coc_egress_ready() {
-    let _ = shared_ingress_esp::schedule_ble_coc_egress_ready(ble_coc_egress_ready_event);
-}
-
-fn ble_coc_egress_ready_event() {
-    unsafe {
-        let response = &mut *core::ptr::addr_of_mut!(BLE_COC_RESPONSE);
-        pump_ble_coc_egress(ble_coc_path(), response, None);
-    }
+fn ble_coc_egress_ready() {
+    core_runtime::ble_coc_send_ready();
 }
 
 fn scan_duration(fields: Option<&[u8]>) -> u32 {

@@ -8,12 +8,18 @@ publish = false
 name = "uart_codec"
 
 [features]
-host = ["dep:libc", "dep:tokio", "quic-lite/tokio"]
+host = ["dep:libc", "dep:tokio", "dep:mesh-api", "quic-lite/tokio"]
+# Linux companion pairing over a physical UART (`companion.pair kind=uart`).
+pair = ["host", "dep:dmesh-server", "tokio/rt", "tokio/time", "tokio/io-util"]
 
 [dependencies]
+mesh-api = { git = "https://github.com/costinm/ssh-mesh", default-features = false, optional = true }
 libc = { version = "0.2", optional = true }
 quic-lite = { path = "../quic-lite" }
+dmesh-server = { path = "../dmesh-server", optional = true }
 tokio = { version = "1", default-features = false, features = ["net", "sync"], optional = true }
 
 [dev-dependencies]
+dmesh-discovery = { path = "../dmesh-discovery" }
+tempfile = "3"
 tokio = { version = "1", default-features = false, features = ["macros", "net", "rt"] }

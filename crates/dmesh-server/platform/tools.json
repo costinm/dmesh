@@ -19,10 +19,20 @@
           "x-protobuf-index": 9,
           "x-protobuf-type": "u32"
         },
+        "authenticated": {
+          "type": "boolean",
+          "x-protobuf-index": 22,
+          "x-protobuf-type": "bool"
+        },
         "available_fields": {
           "type": "integer",
           "x-protobuf-index": 4,
           "x-protobuf-type": "u32"
+        },
+        "bearer": {
+          "type": "string",
+          "x-protobuf-index": 16,
+          "x-protobuf-type": "string"
         },
         "bssid": {
           "type": "string",
@@ -32,6 +42,11 @@
         "channel": {
           "type": "integer",
           "x-protobuf-index": 15,
+          "x-protobuf-type": "u8"
+        },
+        "device_class": {
+          "type": "integer",
+          "x-protobuf-index": 20,
           "x-protobuf-type": "u8"
         },
         "device_id": {
@@ -69,6 +84,16 @@
           "x-protobuf-index": 6,
           "x-protobuf-type": "u32"
         },
+        "name": {
+          "type": "string",
+          "x-protobuf-index": 18,
+          "x-protobuf-type": "string"
+        },
+        "network_name": {
+          "type": "string",
+          "x-protobuf-index": 25,
+          "x-protobuf-type": "string"
+        },
         "packets": {
           "type": "integer",
           "x-protobuf-index": 7,
@@ -79,10 +104,35 @@
           "x-protobuf-index": 2,
           "x-protobuf-type": "bytes[6]"
         },
+        "probe_capabilities": {
+          "type": "integer",
+          "x-protobuf-index": 21,
+          "x-protobuf-type": "u16"
+        },
+        "rssi_dbm": {
+          "type": "integer",
+          "x-protobuf-index": 17,
+          "x-protobuf-type": "i16"
+        },
+        "udp_endpoint": {
+          "type": "string",
+          "x-protobuf-index": 24,
+          "x-protobuf-type": "string"
+        },
         "unavailable_fields": {
           "type": "integer",
           "x-protobuf-index": 14,
           "x-protobuf-type": "u32"
+        },
+        "uptime_secs": {
+          "type": "integer",
+          "x-protobuf-index": 23,
+          "x-protobuf-type": "u32"
+        },
+        "vip6": {
+          "type": "string",
+          "x-protobuf-index": 19,
+          "x-protobuf-type": "bytes"
         }
       },
       "required": [],
@@ -150,7 +200,33 @@
     },
     "name": "telemetry.nan_status",
     "outputSchema": {
-      "properties": {},
+      "properties": {
+        "active": {
+          "type": "boolean",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "bool"
+        },
+        "cluster_id": {
+          "type": "string",
+          "x-protobuf-index": 2,
+          "x-protobuf-type": "bytes"
+        },
+        "publish_pending": {
+          "type": "boolean",
+          "x-protobuf-index": 5,
+          "x-protobuf-type": "bool"
+        },
+        "publishing": {
+          "type": "boolean",
+          "x-protobuf-index": 4,
+          "x-protobuf-type": "bool"
+        },
+        "sync_id": {
+          "type": "string",
+          "x-protobuf-index": 3,
+          "x-protobuf-type": "bytes"
+        }
+      },
       "required": [],
       "type": "object"
     },
@@ -327,6 +403,217 @@
     },
     "x-component-index": 7,
     "x-method-index": 7,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
+  },
+  {
+    "description": "Return QUIC transport state for each live association",
+    "inputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "name": "telemetry.quic_associations",
+    "outputSchema": {
+      "properties": {
+        "associations": {
+          "type": "array",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "QuicAssociation[]"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 7,
+    "x-method-index": 8,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
+  },
+  {
+    "description": "Return common counters for each bearer",
+    "inputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "name": "telemetry.bearers",
+    "outputSchema": {
+      "properties": {
+        "bearers": {
+          "type": "array",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "BearerCounters[]"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 7,
+    "x-method-index": 9,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
+  },
+  {
+    "description": "Return packet pool, worker stack, and memory metrics",
+    "inputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "name": "telemetry.memory",
+    "outputSchema": {
+      "properties": {
+        "free_internal_bytes": {
+          "type": "integer",
+          "x-protobuf-index": 9,
+          "x-protobuf-type": "u32"
+        },
+        "largest_internal_block_bytes": {
+          "type": "integer",
+          "x-protobuf-index": 11,
+          "x-protobuf-type": "u32"
+        },
+        "min_free_internal_bytes": {
+          "type": "integer",
+          "x-protobuf-index": 10,
+          "x-protobuf-type": "u32"
+        },
+        "packet_drops": {
+          "type": "integer",
+          "x-protobuf-index": 3,
+          "x-protobuf-type": "u32"
+        },
+        "packet_slots": {
+          "type": "integer",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "u32"
+        },
+        "packet_slots_available": {
+          "type": "integer",
+          "x-protobuf-index": 2,
+          "x-protobuf-type": "u32"
+        },
+        "process_rss_bytes": {
+          "type": "integer",
+          "x-protobuf-index": 12,
+          "x-protobuf-type": "u64"
+        },
+        "worker_create_failures": {
+          "type": "integer",
+          "x-protobuf-index": 7,
+          "x-protobuf-type": "u32"
+        },
+        "worker_running": {
+          "type": "boolean",
+          "x-protobuf-index": 5,
+          "x-protobuf-type": "bool"
+        },
+        "worker_stack_bytes": {
+          "type": "integer",
+          "x-protobuf-index": 4,
+          "x-protobuf-type": "u32"
+        },
+        "worker_stack_min_free_words": {
+          "type": "integer",
+          "x-protobuf-index": 8,
+          "x-protobuf-type": "u32"
+        },
+        "worker_starts": {
+          "type": "integer",
+          "x-protobuf-index": 6,
+          "x-protobuf-type": "u32"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 7,
+    "x-method-index": 10,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
+  },
+  {
+    "description": "Return software version and hardware capacity",
+    "inputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "name": "telemetry.device",
+    "outputSchema": {
+      "properties": {
+        "cpu_type": {
+          "type": "string",
+          "x-protobuf-index": 2,
+          "x-protobuf-type": "string"
+        },
+        "flash_bytes": {
+          "type": "integer",
+          "x-protobuf-index": 4,
+          "x-protobuf-type": "u64"
+        },
+        "role": {
+          "type": "string",
+          "x-protobuf-index": 5,
+          "x-protobuf-type": "string"
+        },
+        "total_ram_bytes": {
+          "type": "integer",
+          "x-protobuf-index": 3,
+          "x-protobuf-type": "u64"
+        },
+        "version": {
+          "type": "string",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "cpu_type",
+        "role"
+      ],
+      "type": "object"
+    },
+    "x-component-index": 7,
+    "x-method-index": 13,
     "x-standard-errors": [
       "unauthenticated",
       "permission_denied",
@@ -561,6 +848,90 @@
       "type": "object"
     },
     "x-component-index": 209,
+    "x-method-index": 2,
+    "x-standard-errors": [
+      "unauthenticated",
+      "permission_denied",
+      "timeout",
+      "remote_exception",
+      "invalid_argument",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "internal"
+    ]
+  },
+  {
+    "description": "Read retained log and event records, optionally streaming them with periodic metric snapshots",
+    "inputSchema": {
+      "properties": {
+        "interval_ms": {
+          "type": "integer",
+          "x-protobuf-index": 8,
+          "x-protobuf-type": "u32"
+        },
+        "kind": {
+          "type": "string",
+          "x-protobuf-index": 5,
+          "x-protobuf-type": "string"
+        },
+        "level": {
+          "type": "integer",
+          "x-protobuf-index": 3,
+          "x-protobuf-type": "u8"
+        },
+        "limit": {
+          "type": "integer",
+          "x-protobuf-index": 2,
+          "x-protobuf-type": "u32"
+        },
+        "since_seq": {
+          "type": "integer",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "u64"
+        },
+        "snapshots": {
+          "type": "array",
+          "x-protobuf-index": 7,
+          "x-protobuf-type": "string[]"
+        },
+        "source": {
+          "type": "string",
+          "x-protobuf-index": 4,
+          "x-protobuf-type": "string"
+        },
+        "stream": {
+          "type": "boolean",
+          "x-protobuf-index": 6,
+          "x-protobuf-type": "bool"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "name": "log.watch",
+    "outputSchema": {
+      "properties": {
+        "cursor": {
+          "type": "integer",
+          "x-protobuf-index": 2,
+          "x-protobuf-type": "u64"
+        },
+        "dropped": {
+          "type": "integer",
+          "x-protobuf-index": 3,
+          "x-protobuf-type": "u64"
+        },
+        "records": {
+          "type": "array",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "LogRecord[]"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 208,
     "x-method-index": 2,
     "x-standard-errors": [
       "unauthenticated",
@@ -944,7 +1315,7 @@
         "ble_scan_results": {
           "type": "object",
           "x-protobuf-index": 3,
-          "x-protobuf-type": "object"
+          "x-protobuf-type": "cbor"
         },
         "count": {
           "type": "integer",
@@ -954,12 +1325,12 @@
         "events": {
           "type": "array",
           "x-protobuf-index": 1,
-          "x-protobuf-type": "array"
+          "x-protobuf-type": "cbor[]"
         },
         "followups": {
           "type": "array",
           "x-protobuf-index": 2,
-          "x-protobuf-type": "array"
+          "x-protobuf-type": "cbor[]"
         }
       },
       "required": [],

@@ -98,17 +98,7 @@ fn attach_uart(node: &mut Node, path: &str, baud: Option<u32>) -> Result<ClientP
             eprintln!("dmesh_uart_console {line:?}");
         }
         for bytes in received.log_records {
-            if let Ok(text) = std::str::from_utf8(&bytes) {
-                for line in text.lines().filter(|line| !line.is_empty()) {
-                    eprintln!("dmesh_uart_log {line:?}");
-                }
-            } else {
-                let hex = bytes
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>();
-                eprintln!("dmesh_uart_log_packet hex={hex}");
-            }
+            eprintln!("{}", uart_codec::host::render_sideband_record(&bytes));
         }
         if received.pool_drops != 0 {
             eprintln!("dmesh_uart_log_drop pool={}", received.pool_drops);
@@ -128,9 +118,18 @@ async fn attach_udp(
     bind: SocketAddr,
     peer: SocketAddr,
 ) -> Result<ClientPath, String> {
-    let bearer_impl = quic_lite::bearer_udp::TokioUdpBearer::<8>::bind(bind)
-        .await
-        .map_err(|error| error.to_string())?;
+    // The fixed client port can be busy (a second CLI running): then any free port will do.
+    let bearer_impl = match quic_lite::bearer_udp::TokioUdpBearer::<8>::bind(bind).await {
+        Ok(bearer) => bearer,
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse && bind.port() != 0 => {
+            let mut any = bind;
+            any.set_port(0);
+            quic_lite::bearer_udp::TokioUdpBearer::<8>::bind(any)
+                .await
+                .map_err(|error| error.to_string())?
+        }
+        Err(error) => return Err(error.to_string()),
+    };
     let peer_l2_address = bearer_impl
         .register_peer(peer)
         .map_err(|error| format!("register UDP peer: {error:?}"))?;

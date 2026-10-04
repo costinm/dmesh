@@ -398,19 +398,11 @@ fn ensure_power_locks() -> bool {
     if !UART_PM_LOCKS_ENABLED {
         return true;
     }
-    // RISC-V UART/USB-Serial-JTAG clocks do not need the classic ESP32 APB
-    // lock, and neither interface should veto NAN-only light sleep. Keep the
-    // driver installed; reception resumes when the CPU wakes. Classic UART0
-    // still needs its APB and no-light-sleep locks during an active window to
-    // preserve its configured baud.
-    #[cfg(target_arch = "riscv32")]
-    {
-        ensure_apb_lock()
-    }
-    #[cfg(not(target_arch = "riscv32"))]
-    {
-        ensure_apb_lock() && ensure_no_light_sleep_lock()
-    }
+    // UART remains installed, but does not veto NAN-only CPU idle sleep.
+    // Classic UART0 still needs the APB frequency constraint to preserve baud;
+    // that is not a NO_LIGHT_SLEEP constraint. Active personalities disable
+    // automatic light sleep in Main's power policy instead.
+    ensure_apb_lock()
 }
 
 fn active_window_open() -> bool {
@@ -534,40 +526,43 @@ fn time_after_or_equal(now: u32, deadline: u32) -> bool {
 #[repr(C)]
 struct QueuedUartPayload {
     /// `UART_EGRESS_PPP` is an opaque QUIC packet; `UART_EGRESS_TEXT` is raw
-    /// ASCII diagnostic text (the writer appends CRLF). Both have one writer.
+    /// ASCII diagnostic text (the writer appends CRLF); `UART_EGRESS_LOG`
+    /// is unmarked, PPP-framed CBOR sideband. All use the same writer.
     kind: u8,
     len: u16,
     bytes: [u8; UART_MAX_PACKET],
 }
 
-// Classic retains static task backing, but egress records are allocated only
-// while UART is enabled and can be sized from measured headroom. Keep the
-// classic UART receive and transmit tasks separate, as in the proven original
+// Physical Xtensa UARTs retain static task backing; egress records are sized
+// from measured headroom. Keep the receive and transmit tasks separate, as in
+// the proven original
 // Main/Recovery implementation: RX waits indefinitely for the driver's event
 // queue at priority 6 while TX waits independently for framed egress at
 // priority 5.  That avoids polling the console event queue while a large PPP
-// write is pending.
-#[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
+// write is pending. S3 must use the same blocking path: polling every tick
+// prevents the minimum three-tick idle opportunity needed for light sleep.
+#[cfg(not(target_arch = "riscv32"))]
 const UART_CLASSIC_TASK_STACK_WORDS: usize = (UART_L2_STACK_BYTES as usize) / 2;
-#[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
+#[cfg(not(target_arch = "riscv32"))]
 static mut UART_RX_TASK_CONTROL: core::mem::MaybeUninit<esp_idf_sys::StaticTask_t> =
     core::mem::MaybeUninit::uninit();
-#[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
+#[cfg(not(target_arch = "riscv32"))]
 static mut UART_RX_TASK_STACK: [esp_idf_sys::StackType_t; UART_CLASSIC_TASK_STACK_WORDS] =
     [0; UART_CLASSIC_TASK_STACK_WORDS];
-#[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
+#[cfg(not(target_arch = "riscv32"))]
 static UART_RX_TASK_HANDLE: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
-#[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
+#[cfg(not(target_arch = "riscv32"))]
 static mut UART_TX_TASK_CONTROL: core::mem::MaybeUninit<esp_idf_sys::StaticTask_t> =
     core::mem::MaybeUninit::uninit();
-#[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
+#[cfg(not(target_arch = "riscv32"))]
 static mut UART_TX_TASK_STACK: [esp_idf_sys::StackType_t; UART_CLASSIC_TASK_STACK_WORDS] =
     [0; UART_CLASSIC_TASK_STACK_WORDS];
-#[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
+#[cfg(not(target_arch = "riscv32"))]
 static UART_TX_TASK_HANDLE: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
 
 const UART_EGRESS_PPP: u8 = 1;
 const UART_EGRESS_TEXT: u8 = 2;
+const UART_EGRESS_LOG: u8 = 3;
 /// ESP UART adapter for the common bearer API. It retains exactly one pool
 /// lease while the dedicated physical writer performs PPP framing and returns
 /// that lease only after the final framed byte has been accepted.
@@ -603,13 +598,13 @@ impl PacketEgress<crate::shared_ingress_esp::SharedPacketLease> for EspUartBeare
         // only after the ownership-bearing value is complete, so the writer
         // can never observe an uninitialized submission.
         UART_POOL_SUBMISSION_STATE.store(2, Ordering::Release);
-        #[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
+        #[cfg(not(target_arch = "riscv32"))]
         notify_classic_tx_task();
         Ok(())
     }
 }
 
-#[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
+#[cfg(not(target_arch = "riscv32"))]
 fn notify_classic_tx_task() {
     let task = UART_TX_TASK_HANDLE.load(Ordering::Acquire);
     if !task.is_null() {
@@ -696,7 +691,7 @@ fn enqueue_uart_payload(kind: u8, payload: &[u8]) -> bool {
     if payload.is_empty() || payload.len() > UART_MAX_PACKET {
         return false;
     }
-    if !matches!(kind, UART_EGRESS_PPP | UART_EGRESS_TEXT) {
+    if !matches!(kind, UART_EGRESS_PPP | UART_EGRESS_TEXT | UART_EGRESS_LOG) {
         return false;
     }
     let queue = UART_EGRESS_QUEUE.load(Ordering::Acquire);
@@ -724,7 +719,7 @@ fn enqueue_uart_payload(kind: u8, payload: &[u8]) -> bool {
     if !accepted {
         UART_EGRESS_QUEUED.fetch_sub(1, Ordering::AcqRel);
     } else {
-        #[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
+        #[cfg(not(target_arch = "riscv32"))]
         notify_classic_tx_task();
     }
     accepted
@@ -749,7 +744,7 @@ fn dequeue_uart_payload_wait(out: &mut QueuedUartPayload, ticks_to_wait: u32) ->
     }
     UART_EGRESS_QUEUED.fetch_sub(1, Ordering::AcqRel);
     let len = usize::from(out.len);
-    matches!(out.kind, UART_EGRESS_PPP | UART_EGRESS_TEXT) && len != 0 && len <= UART_MAX_PACKET
+    matches!(out.kind, UART_EGRESS_PPP | UART_EGRESS_TEXT | UART_EGRESS_LOG) && len != 0 && len <= UART_MAX_PACKET
 }
 
 fn dequeue_uart_current(ticks_to_wait: u32) -> bool {
@@ -825,11 +820,47 @@ pub fn send_debug_text(text: &[u8]) -> bool {
     if text.is_empty()
         || text.len().saturating_add(2) > UART_MAX_PACKET
         || !text.is_ascii()
-        || text.iter().any(|byte| matches!(*byte, 0x7d | 0x7e))
     {
         return false;
     }
+    // Recovery intentionally has an output-only console, not Main's framed
+    // UART writer. Preserve the shared QUIC/flash diagnostics there too.
+    if crate::recovery_runtime::active() {
+        // ROM printf does not implement precision/width string formats.
+        let mut line = [0u8; UART_MAX_PACKET];
+        line[..text.len()].copy_from_slice(text);
+        unsafe {
+            esp_idf_sys::esp_rom_printf(
+                b"%s\n\0".as_ptr().cast(), line.as_ptr().cast::<i8>(),
+            );
+        }
+        return true;
+    }
+    if text.iter().any(|byte| matches!(*byte, 0x7d | 0x7e)) {
+        return false;
+    }
     enqueue_uart_payload(UART_EGRESS_TEXT, text)
+}
+
+/// Emit an ordinary CBOR LogRecord as UART sideband, never as a QUIC packet.
+pub(crate) fn send_log_record(record: &[u8]) -> bool {
+    if !crate::recovery_runtime::active() {
+        return enqueue_uart_payload(UART_EGRESS_LOG, record);
+    }
+    // Recovery has an output-only console. Reuse uart-codec framing and the
+    // configured ESP console FD; no UART input or private packet queue.
+    let Ok(mut encoder) = uart_codec::codec::Encoder::new(record, UART_MAX_PACKET) else { return false; };
+    let mut bytes = [0u8; 128];
+    while !encoder.is_finished() {
+        let count = encoder.write(&mut bytes);
+        let mut sent = 0;
+        while sent < count {
+            let written = unsafe { esp_idf_sys::write(1, bytes[sent..count].as_ptr().cast(), count - sent) };
+            if written <= 0 { return false; }
+            sent += written as usize;
+        }
+    }
+    true
 }
 
 /// C/ESP-IDF log bridge. It only queues an already-formatted diagnostic line;
@@ -870,6 +901,15 @@ fn write_queued_payload(queued: &QueuedUartPayload) {
         return;
     }
     match queued.kind {
+        UART_EGRESS_LOG => {
+            let Ok(mut encoder) = uart_codec::codec::Encoder::new(&queued.bytes[..len], UART_MAX_PACKET) else {
+                return;
+            };
+            while !encoder.is_finished() {
+                let produced = unsafe { encoder.write(&mut UART_TX_SCRATCH) };
+                write_all(&unsafe { &UART_TX_SCRATCH[..produced] });
+            }
+        }
         UART_EGRESS_PPP => {
             let Ok(mut encoder) = encode_packet(&queued.bytes[..len]) else {
                 return;
@@ -984,12 +1024,12 @@ pub unsafe extern "C" fn task_entry(_argument: *mut c_void) {
     command_task();
 }
 
-#[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
+#[cfg(not(target_arch = "riscv32"))]
 unsafe extern "C" fn classic_rx_task_entry(argument: *mut c_void) {
     classic_rx_task(argument.cast());
 }
 
-#[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
+#[cfg(not(target_arch = "riscv32"))]
 unsafe extern "C" fn classic_tx_task_entry(_argument: *mut c_void) {
     classic_tx_task();
 }
@@ -999,7 +1039,7 @@ unsafe extern "C" fn classic_tx_task_entry(_argument: *mut c_void) {
 /// task is the only reader and writer of that driver; callers interact only
 /// through opaque direct-record or QUIC-lite packet queues.
 pub unsafe fn start_task(stack_bytes: u32, priority: u32, core: i32) -> bool {
-    #[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
+    #[cfg(not(target_arch = "riscv32"))]
     {
         if !UART_RX_TASK_HANDLE.load(Ordering::Acquire).is_null()
             && !UART_TX_TASK_HANDLE.load(Ordering::Acquire).is_null()
@@ -1071,7 +1111,7 @@ pub unsafe fn start_task(stack_bytes: u32, priority: u32, core: i32) -> bool {
         return true;
     }
 
-    #[cfg(any(target_arch = "riscv32", target_feature = "esp32s3ops"))]
+    #[cfg(target_arch = "riscv32")]
     {
         let mut task = core::ptr::null_mut();
         esp_idf_sys::xTaskCreatePinnedToCore(
@@ -1087,10 +1127,10 @@ pub unsafe fn start_task(stack_bytes: u32, priority: u32, core: i32) -> bool {
     }
 }
 
-/// Restore the original classic ESP32 event-driven receive ownership.  The
+/// Physical Xtensa UART event-driven receive ownership. The
 /// UART driver is the source of truth for RX readiness: this task does not
 /// poll its ring after an empty event or share the queue with transmit.
-#[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
+#[cfg(not(target_arch = "riscv32"))]
 fn classic_rx_task(event_queue: *mut esp_idf_sys::QueueDefinition) {
     let mut decoder = PooledDecoder::new(crate::quic_node_esp::uart_pool());
     let mut bytes = [0u8; 256];
@@ -1125,9 +1165,9 @@ fn classic_rx_task(event_queue: *mut esp_idf_sys::QueueDefinition) {
     }
 }
 
-/// The matching classic ESP32 writer. Pool-backed QUIC submissions wake it
+/// The matching physical UART writer. Pool-backed QUIC submissions wake it
 /// directly; local diagnostic text remains in the auxiliary queue.
-#[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
+#[cfg(not(target_arch = "riscv32"))]
 fn classic_tx_task() {
     loop {
         let _ = write_pool_submission_if_ready();
@@ -1159,7 +1199,7 @@ fn command_task() {
     let _ = send_debug_text(b"DMESH uart: writer ready");
     crate::commands::send_response(b"DMESH uart: quic ready");
     loop {
-        // C6/S3 own a cooperative UART task, so a published pool lease is its
+        // C6 owns a cooperative UART task, so a published pool lease is its
         // own wake condition. Do not copy a packet-sized dummy record through
         // the legacy queue merely to signal this task.
         let wrote_pool_submission = write_pool_submission_if_ready();

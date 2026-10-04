@@ -320,6 +320,12 @@ bool dmesh_nimble_coc_encrypted(void) {
 #endif
 }
 
+int dmesh_nimble_clear_bonds(void) {
+    /* Forget every stored peer key: a peer bonded before this call has to pair
+     * again, and cannot reconnect with an old long-term key. */
+    return ble_store_clear();
+}
+
 static int dmesh_coc_event(struct ble_l2cap_event *event, void *arg) {
     (void)arg;
     switch (event->type) {

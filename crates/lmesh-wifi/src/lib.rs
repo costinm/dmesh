@@ -14,7 +14,7 @@ use std::{
     },
 };
 
-pub mod espnow_bearer;
+pub use dmesh_rawnan::linux::espnow_bearer;
 mod infra_credentials;
 mod radio;
 /// Host-side JSON/compatibility conversion for raw NAN and legacy BLE commands.
@@ -32,7 +32,7 @@ pub use infra_credentials::{
     INFRA_STA_CREDENTIALS_PATH, InfrastructureCredentials, load_default_infrastructure_credentials,
     load_infrastructure_credentials,
 };
-pub use radio::RadioService;
+pub use radio::{RadioService, station_links};
 
 /// Reusable Wi-Fi service instance.
 ///

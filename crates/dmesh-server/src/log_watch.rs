@@ -32,6 +32,59 @@ pub const LEVEL_INFO: u8 = 3;
 pub const LEVEL_DEBUG: u8 = 4;
 pub const LEVEL_TRACE: u8 = 5;
 
+/// Encode a structured event into caller-owned storage without allocating.
+/// The field map uses the same numeric-key CBOR contract as retained records.
+pub fn encode_event_into(
+    out: &mut [u8], seq: u64, time_ms: u64, level: u8,
+    source: &str, kind: &str, fields: &[(u64, crate::cbor::FieldValue<'_>)],
+) -> Option<usize> {
+    let mut e = Encoder::new(out);
+    e.map(7)?;
+    e.uint(1)?; e.uint(seq)?;
+    e.uint(2)?; e.uint(time_ms)?;
+    e.uint(3)?; e.uint(u64::from(level))?;
+    e.uint(4)?; e.text_value(source.as_bytes())?;
+    e.uint(5)?; e.text_value(kind.as_bytes())?;
+    e.uint(6)?; e.text_value(b"")?;
+    e.uint(7)?; crate::cbor::encode_fields_into(&mut e, fields)?;
+    Some(e.len())
+}
+
+#[cfg(test)]
+#[test]
+fn stack_event_matches_retained_record_and_rejects_short_storage() {
+    use crate::cbor::FieldValue::{Unsigned, Bool, Signed};
+    let fields = [(1, Unsigned(36)), (2, Bool(true)), (3, Signed(-67))];
+    let mut out = [0; 512];
+    let used = encode_event_into(&mut out, 7, 123, LEVEL_INFO, "wifi", "wifi.sta_disconnected", &fields).unwrap();
+    let (record, consumed) = LogRecord::decode(&out[..used]).unwrap();
+    assert_eq!(consumed, used);
+    assert_eq!(record.seq, 7);
+    assert_eq!(record.time_ms, 123);
+    assert_eq!(record.kind.as_deref(), Some("wifi.sta_disconnected"));
+    assert_eq!(record.encode(), out[..used]);
+    let mut expected = [0; 32];
+    let n = crate::cbor::encode_fields(&mut expected, &fields).unwrap();
+    assert_eq!(record.fields.as_deref(), Some(&expected[..n]));
+    assert!(encode_event_into(&mut [0; 8], 7, 123, LEVEL_INFO, "wifi", "event", &fields).is_none());
+    assert!(encode_event_into(&mut out, 7, 123, LEVEL_INFO, "wifi", "event", &[(2, Bool(true)), (1, Bool(false))]).is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn sta_candidate_event_fits_small_callback_storage() {
+    use crate::cbor::FieldValue::Unsigned;
+    // The richest current STA event has fourteen numeric fields. Exercise
+    // maximum integer widths rather than only today's small counter values.
+    let fields = core::array::from_fn::<_, 14, _>(|i| (i as u64 + 1, Unsigned(u64::MAX)));
+    let mut out = [0; 256];
+    let used = encode_event_into(&mut out, u64::MAX, u64::MAX, LEVEL_INFO,
+        "wifi", "wifi.sta_candidate", &fields).unwrap();
+    let (record, consumed) = LogRecord::decode(&out[..used]).unwrap();
+    assert_eq!(consumed, used);
+    assert_eq!(record.encode(), out[..used]);
+}
+
 /// A retained record's text is cut to this many bytes.
 pub const MAX_TEXT_BYTES: usize = 240;
 /// A poll with no `limit` returns at most this many records.
@@ -50,6 +103,10 @@ const COMPONENT_LOG: u64 = 208;
 const METHOD_WATCH: u64 = 2;
 
 /// One log line, event or snapshot. `fields` is an encoded CBOR map.
+///
+/// This is the no-std type the firmware ring also uses, so it is written by
+/// hand; on hosts `platform_api::LogRecord` is the generated twin, and a test
+/// checks that the two codecs produce the same bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LogRecord {
     pub seq: u64,
@@ -277,6 +334,73 @@ impl LogSource for LogRing {
         });
         for record in &records {
             if !visit(record) {
+                break;
+            }
+        }
+        dropped
+    }
+}
+
+/// The retained history of a host process: `mesh::local_trace::LogBuffer`,
+/// which holds what the process's `tracing` layer retained (warnings, errors,
+/// and events whose `event_type` is watched or marked `trace_prechecked`).
+/// `target` becomes the dotted `source`, `event_type` becomes `kind`, and the
+/// other fields become the record's text-keyed `fields` map.
+#[cfg(feature = "std")]
+pub struct MeshLogSource(pub mesh::local_trace::LogBuffer);
+
+#[cfg(feature = "std")]
+impl MeshLogSource {
+    fn record(entry: &mesh::local_trace::LogEntry) -> LogRecord {
+        let level = match entry.level.as_str() {
+            "error" => LEVEL_ERROR,
+            "warn" => LEVEL_WARN,
+            "info" => LEVEL_INFO,
+            "debug" => LEVEL_DEBUG,
+            _ => LEVEL_TRACE,
+        };
+        let mut kind = None;
+        let mut fields = None;
+        if let Some(serde_json::Value::Object(map)) = &entry.fields {
+            kind = map
+                .get("event_type")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let rest: serde_json::Map<String, serde_json::Value> = map
+                .iter()
+                .filter(|(key, _)| !matches!(key.as_str(), "event_type" | "trace_prechecked"))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            if !rest.is_empty() {
+                // An event too large for the encoding buffer is sent without
+                // its fields rather than cut.
+                let mut buffer = vec![0u8; 4096];
+                fields = crate::cbor::encode_json_value(&serde_json::Value::Object(rest), &mut buffer)
+                    .map(|used| buffer[..used].to_vec());
+            }
+        }
+        LogRecord {
+            seq: entry.seq,
+            time_ms: entry.uptime_ms,
+            level,
+            source: entry.target.replace("::", "."),
+            kind,
+            text: entry.message.clone(),
+            fields,
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl LogSource for MeshLogSource {
+    fn now_ms(&self) -> u64 {
+        self.0.uptime_ms()
+    }
+
+    fn read(&self, since: u64, visit: &mut dyn FnMut(&LogRecord) -> bool) -> u64 {
+        let (entries, dropped) = self.0.read_since(since);
+        for entry in &entries {
+            if !visit(&Self::record(entry)) {
                 break;
             }
         }
@@ -659,6 +783,92 @@ mod tests {
             (LEVEL_INFO, "log", "DMESH main: uart-start failed")
         );
         assert_eq!(parse_esp_idf_line("E"), (LEVEL_INFO, "log", "E"));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_host_log_buffer_is_a_log_source() {
+        let buffer = mesh::local_trace::LogBuffer::new(8);
+        let entry = |level: &str, target: &str, message: &str, fields: Option<serde_json::Value>| {
+            mesh::local_trace::LogEntry {
+                timestamp: String::new(),
+                level: level.into(),
+                target: target.into(),
+                message: message.into(),
+                fields,
+                seq: 0,
+                uptime_ms: 0,
+            }
+        };
+        buffer.push(entry("warn", "lmesh_wifi::radio", "slow", None));
+        buffer.push(entry(
+            "info",
+            "dmesh.event",
+            "event",
+            Some(serde_json::json!({
+                "event_type": "wifi.rawnan.discovery",
+                "trace_prechecked": true,
+                "source": "wlan0",
+            })),
+        ));
+        let source = MeshLogSource(buffer);
+        let mut seen = Vec::new();
+        assert_eq!(
+            source.read(0, &mut |record| {
+                seen.push(record.clone());
+                true
+            }),
+            0
+        );
+        assert_eq!(seen[0].seq, 1);
+        assert_eq!(
+            (seen[0].level, seen[0].source.as_str(), seen[0].kind.as_deref()),
+            (LEVEL_WARN, "lmesh_wifi.radio", None)
+        );
+        assert_eq!(seen[1].kind.as_deref(), Some("wifi.rawnan.discovery"));
+        // The event's other fields are a text-keyed map; the envelope fields are not.
+        let mut d = Decoder::new(seen[1].fields.as_deref().unwrap());
+        assert_eq!(d.head(), Some((5, 1)));
+        let mut name = [0u8; 16];
+        let used = d.text(&mut name).unwrap();
+        assert_eq!(&name[..used], b"source");
+        // Reading from a cursor returns only newer records.
+        let mut newer = 0;
+        source.read(1, &mut |_| {
+            newer += 1;
+            true
+        });
+        assert_eq!(newer, 1);
+    }
+
+    /// The no-std record and its generated twin (`platform_api::LogRecord`, the
+    /// row type of `log.watch`) must be one wire format.
+    #[cfg(feature = "std")]
+    #[test]
+    fn the_hand_written_record_and_the_generated_row_encode_identically() {
+        for (kind, fields) in [(None, None), (Some("nan.event".to_owned()), Some(vec![0xa1, 0x01, 0x01]))] {
+            let record = LogRecord {
+                seq: 7,
+                time_ms: 1234,
+                level: LEVEL_WARN,
+                source: "nan".to_owned(),
+                kind: kind.clone(),
+                text: "hello".to_owned(),
+                fields: fields.clone(),
+            };
+            let generated = crate::platform_api::LogRecord {
+                seq: 7,
+                time_ms: 1234,
+                level: LEVEL_WARN,
+                source: "nan".to_owned(),
+                kind,
+                text: "hello".to_owned(),
+                fields,
+            };
+            assert_eq!(record.encode(), generated.encode_cbor());
+            let back = crate::platform_api::LogRecord::decode_cbor(&record.encode()).unwrap();
+            assert_eq!(back, generated);
+        }
     }
 
     #[test]

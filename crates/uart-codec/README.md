@@ -24,7 +24,22 @@ UART records use an HDLC/PPP-style delimiter and escaping:
 - escape: `0x7d`;
 - escaped byte: `byte ^ 0x20`;
 - maximum record: 4,000 payload bytes - larger than Quic MTU because text may also be received.
-- QUIC marker: `0xf7`- may be removed
+- protocol marker: QUIC `0xf7 
+
+PPP wastes 4 bytes with fixed 0xFF address, 0x03 'connection-less, unack', 2 bytes 'protocol' - with 
+IPv4, IPv6, LCP (auth, MTU, header compression - which shring the 4 bytes to 1, connection close),
+IPCP (old DHCP) protocols. It also has a 2 bytes FCS. Typically LCP removes 3 bytes - the 
+result is '0x21' for IPv4, 0x57 IPv6. PPP quirk: first byte is odd, sort of varint using last bit.
+
+PPP also used header compression (Van Jacobson - versus modern 6LoWPAN). 
+
+VJ (RFC1144) is interesting - it looks at TCP. Both side keep 256 connections, compressing
+20+20 bytes to ~3 - 1 byte connection ID, delta on Seq Number (packet number), ack and window.
+That's what Quic-Lite is also doing - DCID is varint, quic frame handing connection flow control,
+with the streams multiplexed and using their own flow control.
+ 
+In 6LoWPAN - IPV6 and UDP are the trget (40+8). The local MAC is used to strip one address (or both
+if the destination is local). NHC for UDP - result is 6 bytes in ideal case. 
 
 Unframed boot text is surfaced as a log record for the service layer to encode
 as the one-way `log.record` message in the [root API](../../API.md).

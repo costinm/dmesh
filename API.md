@@ -14,8 +14,6 @@ Examples use a catalogued device name and the managed Linux service:
 dmesh-cli DEVICE telemetry.nan_status
 dmesh-cli DEVICE transport.set --mode=6 --nan_dw_interval=1 --now=1
 dmesh-cli DEVICE transport.set --1=6 --14=1 --15=1
-mesh lmesh wifi.interface.list
-mesh lmesh wifi.mgmt.capture --iface=wlan0 --channel=6 --capture_ms=200
 ```
 
 `DEVICE` is a device-catalog target. Use `--field=value` or the numeric
@@ -77,6 +75,21 @@ optional bearer-local correlation address and is never a device identity.
 | 13 | `last_payload_hash` | `u32` | Non-secret payload fingerprint. |
 | 14 | `unavailable_fields` | `u32` | Explicit complement of `available_fields`. |
 | 15 | `channel` | `u8` | Optional receiver-side capture channel. |
+| 16 | `bearer` | `string` | Bearer of this row's observation: `udp_multicast`, `nan`, `now`, `ble`. A device seen on several bearers has one row per bearer, all with the same `device_id`. |
+| 17 | `rssi_dbm` | `i16` | Last signal strength of this observation, when the bearer reports one. |
+| 18 | `name` | `string` | Device name from its announce. |
+| 19 | `vip6` | `bytes` | The device's 16-byte virtual IPv6 address. |
+| 20 | `device_class` | `u8` | Announced device class (ESP=1, host=2, Android=3, ...). |
+| 21 | `probe_capabilities` | `u16` | Announced probe capability set. |
+| 22 | `authenticated` | `bool` | The announce carried a public key whose signature verified. |
+| 23 | `uptime_secs` | `u32` | Producer-relative uptime from its announce. |
+| 24 | `udp_endpoint` | `string` | Where the device accepts QUIC over UDP (advertised address and port, with this receiver's interface scope); absent when it has no UDP path, such as a device seen only over NAN or BLE. |
+| 25 | `network_name` | `string` | Shared network label from its announce. |
+
+Fields 1 to 15 are the compact form every platform sends. Fields 16 and up come from
+the announce, so a platform that has it (Android, Linux) includes them and a device
+that only has an identifier (firmware) omits them; an absent field is unknown, not
+empty.
 
 ### Controller-owned device record
 
@@ -106,6 +119,22 @@ QUIC and does not queue application traffic behind a busy bearer. Each adapter
 only reports observations it actually received; callers subsequently read the
 merged `discovery.nodes` inventory.
 
+Discovery is one principle on every medium: the same signed request (the
+`announce.discovery` record), answered by the same signed announce, whether it
+travels as a UDP datagram, a NAN service-discovery frame (service info) or a NOW
+action. The record is the payload; the medium only changes the envelope. A node
+that owns a WLAN (Linux with a configured interface, the firmware) answers a request
+that arrives on NOW. Android answers on NAN only.
+
+A request is sent immediately, as a multicast would be, and also in the next
+discovery windows, including DW0 and DW8 (a sleepy peer listens only then), on both
+NOW and NAN. `to` selects one peer: a `udp://` endpoint, or on Linux a MAC address
+(the request is addressed to that peer on NOW and on NAN, with the same repeats), whose
+reply is awaited. A `nan.wakeup` is a NAN service-discovery request too and is sent the
+same way, on NAN and on NOW, so a Linux host and firmware that sync on NOW fake-beacons
+(no Android device running NAN) can wake each other. A directed check of a path (does a QUIC association
+work over this bearer) is a different thing: it is `probe`.
+
 ### Request
 
 | Tag | Field | Type | Description |
@@ -122,6 +151,19 @@ merged `discovery.nodes` inventory.
 
 **UI:** default
 
+Every field is optional: an absent field means the platform cannot observe it, never
+`false` or zero. The same record on Android, Linux and the firmware.
+
+### Response
+
+| Tag | Field | Type | Description |
+|---:|---|---|---|
+| 1 | `active` | `bool` | The local NAN adapter or runtime is attached and operational. |
+| 2 | `cluster_id` | `bytes` | Current cluster identifier, normally the six-byte cluster BSSID. |
+| 3 | `sync_id` | `bytes` | Current synchronization-master identifier, when the stack exposes it. |
+| 4 | `publishing` | `bool` | The periodic DMesh announce publish is active. |
+| 5 | `publish_pending` | `bool` | A publish was requested but is not active yet. |
+
 ## 2. `now` — Return local ESP-NOW submission, receive, admission, dispatch, drop, and error counters
 
 **Platforms:** L E
@@ -129,6 +171,8 @@ merged `discovery.nodes` inventory.
 Counters are `u64`, monotonic since boot, and an unavailable value is omitted, never sent as zero. The tag of each field is also the metric id used on the wire by every platform.
 
 ### Response
+
+Linux reports the three it can derive from the monitor events it retains: `rx_dispatched` (frames dispatched), `rx_accepted` (action frames seen) and `rx_rejected` (dispatch errors). The counts cover only the retained history.
 
 | Tag | Field | Type | Description |
 |---:|---|---|---|
@@ -158,6 +202,8 @@ Counters are `u64`, monotonic since boot, and an unavailable value is omitted, n
 Counters are `u64`, monotonic since boot, and an unavailable value is omitted, never sent as zero. The tag of each field is also the metric id used on the wire by every platform. Fields with a `_us` suffix are gauges (a duration or time), not counters.
 
 ### Response
+
+Linux reports `beacons`, the raw-NAN monitor's beacon count, and no other field.
 
 | Tag | Field | Type | Description |
 |---:|---|---|---|
@@ -207,6 +253,8 @@ Counters are `u64`, monotonic since boot, and an unavailable value is omitted, n
 
 ### Response
 
+Linux reports `rx_invalid` only: discovery datagrams that failed validation.
+
 | Tag | Field | Type | Description |
 |---:|---|---|---|
 | 1 | `rx_frames` | `u64` | Rx frames. |
@@ -222,9 +270,43 @@ Counters are `u64`, monotonic since boot, and an unavailable value is omitted, n
 
 **Platforms:** L E
 
-Optional fields distinguish unavailable driver telemetry from a measured zero. One record describes one peer; a Linux AP answers with its stations as separate records.
+Optional fields distinguish unavailable driver telemetry from a measured zero. A device describes its one peer in the top-level fields; a host with several peers sends a `links` array of such rows and no top-level peer fields.
 
 ### Response
+
+| Tag | Field | Type | Description |
+|---:|---|---|---|
+| 1 | `schema_version` | `u8` | Record schema version. |
+| 2 | `interface_index` | `u32` | Interface index. |
+| 3 | `peer_mac` | `bytes` | Peer MAC address. |
+| 4 | `rx_bytes` | `u64` | Bytes received from the peer. |
+| 5 | `tx_bytes` | `u64` | Bytes sent to the peer. |
+| 6 | `rx_packets` | `u64` | Packets received. |
+| 7 | `tx_packets` | `u64` | Packets sent. |
+| 8 | `mac_tx_retries` | `u64` | Driver MAC transmit retries. |
+| 9 | `mac_tx_failed` | `u64` | Driver MAC transmit failures. |
+| 10 | `rx_dropped` | `u64` | Received frames dropped. |
+| 11 | `rx_airtime_us` | `u64` | Receive airtime. |
+| 12 | `tx_airtime_us` | `u64` | Transmit airtime. |
+| 13 | `signal_dbm` | `i8` | Last signal strength. |
+| 14 | `signal_avg_dbm` | `i8` | Average signal strength. |
+| 15 | `ack_signal_dbm` | `i8` | Last ACK signal strength. |
+| 16 | `ack_signal_avg_dbm` | `i8` | Average ACK signal strength. |
+| 17 | `rx_bitrate_kbit_s` | `u64` | Receive bitrate. |
+| 18 | `tx_bitrate_kbit_s` | `u64` | Transmit bitrate. |
+| 19 | `expected_throughput_kbit_s` | `u64` | Driver-expected throughput. |
+| 20 | `bearer_rx_frames` | `u64` | Raw bearer frames received. |
+| 21 | `bearer_rx_drops` | `u64` | Raw bearer receive drops. |
+| 22 | `bearer_rx_invalid` | `u64` | Raw bearer invalid frames. |
+| 23 | `bearer_udp_delivered` | `u64` | UDP datagrams delivered from this bearer. |
+| 24 | `bearer_ndp_advertisements` | `u64` | Neighbor advertisements sent. |
+| 25 | `bearer_tx_failures` | `u64` | Raw bearer transmit failures. |
+| 26 | `raw_tx_completion_failures` | `u64` | Raw injection MAC completion failures. |
+| 27 | `links` | `WifiLink[]` | One row per peer, each with the fields above, for a host that tracks several peers (a Linux AP's stations). A device reports its one peer in the top-level fields instead. |
+
+One `links` row has fields 1 to 26 above, with the same tags and meanings.
+
+`WifiLink` fields:
 
 | Tag | Field | Type | Description |
 |---:|---|---|---|
@@ -313,9 +395,12 @@ dump.
 
 ## 8. `quic_associations` — Return QUIC transport state for each live association
 
-**Platforms:** none
+**Platforms:** A L
 
-Target platforms: A L E (the marker changes as each platform registers it).
+Target platforms: A L E; registered on A and L from the node's per-association
+state (a client association counts once it is established). The first-path bearer
+and peer come from the node; `streams_local_active` and `streams_peer_active` are
+not filled yet.
 
 One row per live association; the same counters as `quic`, per association,
 plus send-credit state. Round-trip time and congestion window are not listed
@@ -325,9 +410,9 @@ because `quic-lite` does not expose them yet.
 
 | Tag | Field | Type | Description |
 |---:|---|---|---|
-| 1 | `associations` | `array` | Rows, described below. |
+| 1 | `associations` | `QuicAssociation[]` | One row per live association. |
 
-Row fields:
+`QuicAssociation` fields:
 
 | Tag | Field | Type | Description |
 |---:|---|---|---|
@@ -348,11 +433,12 @@ Row fields:
 
 ## 9. `bearers` — Return common counters for each bearer
 
-**Platforms:** E
+**Platforms:** A L E
 
-Target platforms: A L E; registered on E today, which reports a row for `now` and
-`udp6` (the bearers that keep these counters) and omits fields a bearer does not
-count.
+Target platforms: A L E. E reports a row for `now` and `udp6` (the bearers that keep
+these counters); A and L report a row for every bearer registered on the QUIC node,
+from the node's own per-bearer counters. Fields a bearer does not count are omitted
+(`rx_rejected` is not kept by the node).
 
 One row per bearer the node runs. These are the bearer's own submission and
 receive facts; QUIC's view of the same traffic is in `quic`. Bearer-specific
@@ -362,9 +448,9 @@ detail stays in that bearer's method (`ble.status`, `now`, `nan`, `udp6`).
 
 | Tag | Field | Type | Description |
 |---:|---|---|---|
-| 1 | `bearers` | `array` | Rows, described below. |
+| 1 | `bearers` | `BearerCounters[]` | One row per bearer. |
 
-Row fields:
+`BearerCounters` fields:
 
 | Tag | Field | Type | Description |
 |---:|---|---|---|
@@ -381,12 +467,12 @@ Row fields:
 
 ## 10. `memory` — Return packet pool, worker stack, and memory metrics
 
-**Platforms:** E
+**Platforms:** A L E
 
 Target platforms: A L E, with fields omitted where the platform has no such
 value (a host process has no worker stacks; a device has no process RSS).
-Registered on E; replaces `memory.snapshot` (103/1), which E no longer
-registers.
+Registered on A, L and E (Android and Linux report `process_rss_bytes` only); replaces
+`memory.snapshot` (103/1), which no platform registers any more.
 
 ### Response
 
@@ -412,7 +498,8 @@ Tags start at 1; the older snapshot method used 0-based tags.
 **Platforms:** E
 
 Target platforms: A E (L when it has an observer). Registered on E; replaces
-`power.snapshot` (102/1), which E no longer registers. Battery state stays in `battery`.
+`power.snapshot` (102/1), which no platform registers any more. Battery state
+stays in `battery`.
 
 ### Response
 
@@ -436,7 +523,8 @@ Tags start at 1; the older snapshot method used 0-based tags.
 **Platforms:** E
 
 Target platforms: A L E. Registered on E; replaces `runtime.snapshot` (101/1),
-which E no longer registers.
+which no platform registers any more (Android's and Linux's only reported the
+service name, version and uptime, which `status` and `firmware.identity` carry).
 
 ### Response
 
@@ -457,6 +545,30 @@ Tags start at 1; the older snapshot method used 0-based tags.
 | 11 | `queue_overflow_count` | `u32` | Lifecycle queue overflows. |
 | 12 | `wake_cause` | `u32` | Last wake cause. |
 | 13 | `last_stale_reason` | `u32` | Reason the last stale completion was rejected. |
+
+## 13. `device` — Return software version and hardware capacity
+
+**Platforms:** A L E
+
+**Rust CBOR:** generated
+
+Static platform information, independent of radio state. Main and Recovery
+register the same handler. Values unavailable on a platform are omitted, not
+reported as zero. `total_ram_bytes` is physical RAM, not currently free heap;
+`flash_bytes` is physical flash capacity on ESP and is omitted on hosts where
+there is no equivalent single flash device. Discovery supplies node identity,
+CPU class and Main/Recovery role for flashing; this telemetry is not a flash
+protocol prerequisite.
+
+### Response
+
+| Tag | Field | Type | Required | Description |
+|---:|---|---|---|---|
+| 1 | `version` | `string` | yes | Running application version. |
+| 2 | `cpu_type` | `string` | yes | CPU family or host architecture. |
+| 3 | `total_ram_bytes` | `u64` | no | Physical RAM capacity when known. |
+| 4 | `flash_bytes` | `u64` | no | Physical flash capacity when applicable. |
+| 5 | `role` | `string` | yes | main, recovery, linux, or android. |
 
 # `transport` API (1)
 
@@ -496,21 +608,29 @@ Tags start at 1; the older snapshot method used 0-based tags.
 
 Pairing makes an unpaired ESP32 a companion of one Linux or Android controller.
 Every pairing attempt first sends `nan.pair_wakeup` through a nearby observer,
-even when the provisioning exchange will use USB, BLE, or Wi-Fi. A sleepy
+even when the provisioning exchange will use USB or BLE. A sleepy
 unpaired device may then open a time-limited pairing window. A device that already
 has `sec:key` ignores this invitation.
-`kind` selects the bearer used for this operation. Initial provisioning is
-currently limited to direct UART/USB and encrypted BLE CoC. It does
-not bind ownership to that bearer or disable the other transports. `id` is
-its adapter-local identifier, such as a serial path, BLE address, or signed
-Wi-Fi discovery identity. The host verifies the signed device identity,
+`kind` selects the bearer used for this operation: `uart` (USB or serial) or
+`ble`. Companions use only these two. `id` is its adapter-local identifier, a
+serial path or a BLE address. The host verifies the signed device identity,
 generates a new shared secret, writes it to the device, and durably stores the
 secret with the device MAC and public key in its private owned-device file.
-The signed `device_id` is stable across bearers. A Bluetooth bond alone does
-not grant access to privileged handlers; the shared secret does. Once paired,
-the same ownership works over any available transport. A second pair attempt
-must reject the device until an authorized unpair resets it. Firmware never
-returns the raw secret over control.
+The signed `device_id` is stable across bearers.
+
+Bearers add no cryptography of their own. The shared secret is what QUIC-lite
+uses to authenticate and encrypt once it is on the device. Over the wired UART
+(trusted physical access) the host may set or replace the secret, even on a
+device that has one and with no pairing window: that host could reflash the
+device anyway, so a later pair simply overrides the secret (future eFuse policy
+may restrict this). Pairing leaves the UART attached to the node and in use; a
+port that is already attached, for example at startup, is reused. Over BLE the
+channel is a plain, unencrypted L2CAP CoC (no BLE pairing or bond, so no prompt on any
+platform), and the device refuses when it already has a secret or its pairing window is
+closed; only a wired unpair or pair resets it. The shared secret, installed once over that
+channel, is what authenticates and encrypts everything after. Once paired, the same ownership works over any available
+transport.
+Firmware never returns the raw secret over control.
 
 Linux stores one pairing result per signed device VIP6 in
 `DMESH_PAIRED_DEVICES_DIR` (default `/home/system/etc/lmesh/paired`). The
@@ -532,10 +652,16 @@ identity and shared-secret proof remain required.
 
 **Platforms:** A L
 
-For UART, `vip6` must match a signed discovery check; physical access is the
-trust boundary, as with esp-tool, so no link encryption is required. BLE uses
-an address from scan results and provisions the secret only after bonding and
-an encrypted CoC connection; `psm` defaults to 128. Wi-Fi pairing is deferred.
+`vip6` is optional. The device is identified by its bearer (the serial port or
+BLE address) and by its signed discovery reply, whose VIP6 the owned record is
+keyed on. When `vip6` is given it must match that reply, and the host refuses a
+device that proves a different identity. UART and BLE use the same exchange over an ordinary QUIC
+association on the host's running node (BLE over a plain CoC): discover, `provision.install`, then
+save the owned-device file. A device that refuses leaves no host record. A
+re-pair over the wire replaces the earlier record. `id` is the serial path or
+BLE address (from scan results); `psm` defaults to 128. A UART port stays attached
+afterwards; a port already attached (`LMESH_UART`) is reused.
+
 Pairing reads the device name from NVS through signed discovery. Optional
 `name` replaces it, or supplies an initial name, and must be written to NVS
 before the local pairing result is committed.
@@ -544,15 +670,13 @@ By default this is the controller's own public key. If a root CA is configured,
 the controller uses that CA's public key; `root_public_key_b64` can select an
 explicit compressed P-256 public key for this pairing. The selected root key
 is saved in the private pairing result and is not a shared secret.
-Android's native
-Bluetooth API owns permission and bonding. A successful pair response means
-the device accepted the new secret and the host saved the matching identity
-and secret durably; starting an asynchronous bond is not completion.
+A successful pair response means the device accepted the new secret and the
+host saved the matching identity and secret durably. Android's native
+Bluetooth API owns permission and connecting.
 
 ```sh
-mesh lmesh companion.pair --kind=uart --id=/dev/ttyUSB0 --vip6=fd00::1234
+mesh lmesh companion.pair --kind=uart --id=/dev/ttyUSB0
 mesh lmesh companion.pair --kind=ble --id=AA:BB:CC:DD:EE:FF --psm=128
-mesh lmesh companion.unpair --kind=wifi --id=fd00::1234
 mesh lmesh companion.unpair --kind=uart --id=/dev/ttyUSB0
 ```
 
@@ -562,7 +686,7 @@ mesh lmesh companion.unpair --kind=uart --id=/dev/ttyUSB0
 |---:|---|---|---|
 | 1 | `kind` | `string` | Provisioning bearer: `uart` or `ble`. |
 | 2 | `id` | `string` | Adapter-local identifier from discovery. |
-| 3 | `vip6` | `string` | Signed discovered VIP, required for UART. |
+| 3 | `vip6` | `string` | Optional signed VIP the device must prove; default: whatever it proves. |
 | 4 | `baud` | `u32` | Optional UART physical baud rate. |
 | 5 | `psm` | `u16` | Optional BLE CoC PSM; default 128. |
 | 6 | `name` | `string` | Optional new device name, persisted in NVS during pairing. |
@@ -573,15 +697,15 @@ mesh lmesh companion.unpair --kind=uart --id=/dev/ttyUSB0
 **Platforms:** A L
 
 `kind` names the bearer carrying this operation; it does not identify the
-bearer on which pairing happened. Unpair removes its shared secret and
-BLE pairing data on the ESP32, removes its owned-device entry and BLE bond on
-Linux or Android, and releases its bearer. Afterwards the ESP32 behaves like
-an unpaired device. Over Wi-Fi or BLE, unpair requires proof of the current
+bearer on which pairing happened. Unpair removes the shared secret, the
+control-plane root and every BLE bond (stored peer keys) on the ESP32 and removes
+its owned-device entry on Linux or Android. A UART stays attached. Afterwards the ESP32 behaves like
+an unpaired device. Over BLE, unpair requires proof of the current
 shared secret and must reject devices owned by another controller. UART alone
 may unlock a device without that proof, including one paired to someone else.
 Physical UART access already permits Linux to flash the ESP32; future eFuse
 policy may restrict that ability. The UART exception must never apply to a
-request that arrives over Wi-Fi or BLE, even if its `kind` field says `uart`.
+request that arrives over BLE, even if its `kind` field says `uart`.
 
 ### Request
 
@@ -593,8 +717,9 @@ request that arrives over Wi-Fi or BLE, even if its `kind` field says `uart`.
 # `provision` API (210)
 
 This device-side internal API is used after the targeted NAN pairing wake.
-It accepts direct UART/USB or an encrypted BLE CoC, and rejects Wi-Fi, NAN,
-unencrypted CoC, and relayed requests. The device commits name and root first,
+It accepts direct UART/USB, which may replace an existing secret, and an
+BLE CoC (plain, unencrypted), which is accepted only for a device with no secret and an
+open pairing window. It rejects Wi-Fi, NAN, and relayed requests. The device commits name and root first,
 then the secret last. The caller verifies the correlated result and durably
 saves the signed identity, name, root and secret before reporting completion.
 Credential bytes are never logged.
@@ -612,6 +737,18 @@ Credential bytes are never logged.
 | 1 | `name` | `string` | Name to persist in NVS. |
 | 2 | `root_public_key` | `bytes` | Compressed P-256 control-plane root, 33 bytes. |
 | 3 | `secret` | `bytes` | Newly generated shared secret, 32 bytes. |
+
+## 2. `unpair` — Forget the companion credentials and BLE bonds
+
+**Platforms:** E
+
+**Visibility:** private
+
+Wired UART/USB only; a radio bearer is refused whatever the request claims.
+The device erases the shared secret, the control-plane root and every BLE bond,
+so it behaves as unpaired again, and answers `true` only when all of that
+succeeded. No proof of the current secret is needed: physical access already
+permits reflashing the device. The request has no fields.
 
 # `log` API (208)
 
@@ -635,14 +772,17 @@ frames remain unchanged. `log.watch` is the interface that reads retained record
 
 ## 2. `watch` — Read retained log and event records, optionally streaming them with periodic metric snapshots
 
-**Platforms:** E
+**Platforms:** A L E
 
 Target platforms: A L E; registered on E, which keeps the last 32 ESP-IDF log
-lines (`E (1234) tag: text` becomes level, source `tag` and text). Replaces
-`log-watch` (9/5) and `events` (9/4), and the per-platform histories behind them
-(the radio history, `messages.history`); each platform's old method is removed
-when it migrates. An event is a record whose `kind` is
-set; a plain log line has none.
+lines (`E (1234) tag: text` becomes level, source `tag` and text), and on L,
+which serves its `tracing` history (`mesh::local_trace`): warnings, errors and
+events whose `event_type` is watched or retained, with `target` as `source`
+and `event_type` as `kind`, and on A, which serves the same history plus NAN
+follow-ups and events (`nan.followup`, `nan.event`) and BLE scan results
+(`ble.scan_result`). Replaces `log-watch` (9/5) and `events` (9/4), which no
+platform registers any more. An event is a record whose `kind` is set; a plain
+log line has none.
 
 Every node keeps one retained history of recent records. `watch` returns
 records with `seq` greater than `since_seq`, oldest first, and a `cursor` to
@@ -671,28 +811,28 @@ register is skipped, and a `log` record with `source` `log.watch` says so once.
 | 4 | `source` | `string` | Only records from this source or one below it (`bearer` matches `bearer.ble`). |
 | 5 | `kind` | `string` | Only events whose kind starts with this prefix. |
 | 6 | `stream` | `bool` | Keep the stream open and send new records as they arrive. |
-| 7 | `snapshots` | `array` | Telemetry method names to snapshot periodically. |
+| 7 | `snapshots` | `string[]` | Telemetry method names to snapshot periodically. |
 | 8 | `interval_ms` | `u32` | Snapshot period; default 1000 and at least 100. |
 
 ### Response
 
 | Tag | Field | Type | Description |
 |---:|---|---|---|
-| 1 | `records` | `array` | `LogRecord` rows (poll mode; empty when streaming). |
+| 1 | `records` | `LogRecord[]` | Records (poll mode; empty when streaming). |
 | 2 | `cursor` | `u64` | `seq` of the last record returned or sent so far. |
 | 3 | `dropped` | `u64` | Records lost from the history since `since_seq`. |
 
 `LogRecord` fields:
 
-| Tag | Field | Type | Description |
-|---:|---|---|---|
-| 1 | `seq` | `u64` | Sequence number, increasing by one per record on this node. |
-| 2 | `time_ms` | `u64` | Milliseconds since the node started; no wall clock is assumed. |
-| 3 | `level` | `u8` | error=1, warn=2, info=3, debug=4, trace=5. |
-| 4 | `source` | `string` | Producing module, dotted (`quic`, `nan`, `bearer.ble`). |
-| 5 | `kind` | `string` | Event type, or a telemetry method name for a snapshot; absent for a plain log line. |
-| 6 | `text` | `string` | Message; a device may shorten it to fit its slot. |
-| 7 | `fields` | `map` | Structured values of an event, or a snapshot's response. |
+| Tag | Field | Type | Required | Description |
+|---:|---|---|---|---|
+| 1 | `seq` | `u64` | yes | Sequence number, increasing by one per record on this node. |
+| 2 | `time_ms` | `u64` | yes | Milliseconds since the node started; no wall clock is assumed. |
+| 3 | `level` | `u8` | yes | error=1, warn=2, info=3, debug=4, trace=5. |
+| 4 | `source` | `string` | yes | Producing module, dotted (`quic`, `nan`, `bearer.ble`). |
+| 5 | `kind` | `string` | no | Event type, or a telemetry method name for a snapshot; absent for a plain log line. |
+| 6 | `text` | `string` | yes | Message; a device may shorten it to fit its slot. |
+| 7 | `fields` | `cbor` | no | One CBOR map of structured values of an event, or a snapshot's response. |
 
 # `probe` API (8)
 
@@ -885,251 +1025,9 @@ dmesh-cli OBSERVER nan.pair_wakeup --to=aa:bb:cc:dd:ee:ff
 
 <!-- dmesh-api:end -->
 
-<!-- dmesh-api:linux -->
-
-These methods run on the managed `lmesh` daemon and may change `wlan0` state.
-The request tables give the numeric field tags used on its CBOR socket.
-
-```sh
-mesh lmesh wifi.interface.list
-mesh lmesh telemetry.nan_status
-mesh lmesh wifi.scan --iface=wlan0 --last_results=true
-mesh lmesh wifi.mgmt.capture --iface=wlan0 --channel=6 --capture_ms=200
-```
-
-# `lmesh` API (4)
-
-## 8. `send` — Send a payload through the selected mesh radio
-
-**Platforms:** L
-
-**UI:** advanced
-
-### Request
-
-| Tag | Field | Type | Description |
-|---:|---|---|---|
-| 1 | `radio` | `string` | radio parameter. |
-| 2 | `destination` | `string` | destination parameter. |
-| 3 | `payload` | `string` | payload parameter. |
-
-## 10. `messages.history` — Read retained local message history
-
-**Platforms:** L
-
-**UI:** advanced
-
-### Request
-
-| Tag | Field | Type | Description |
-|---:|---|---|---|
-| 1 | `keys` | `string` | keys parameter. |
-| 2 | `limit` | `u64` | limit parameter. |
-
-
-# `link` API (221)
-
-## 30. `steer` — link.steer on the local Linux mesh daemon
-
-**Platforms:** L
-
-**UI:** advanced
-
-### Request
-
-| Tag | Field | Type | Description |
-|---:|---|---|---|
-| 1 | `node` | `string` | node parameter. |
-| 2 | `radio` | `string` | radio parameter. |
-| 3 | `reason` | `string` | reason parameter. |
-
-# `object` API (224)
-
-## 30. `nan.dry_run` — object.nan.dry_run on the local Linux mesh daemon
-
-**Platforms:** L
-
-**UI:** advanced
-
-### Request
-
-| Tag | Field | Type | Description |
-|---:|---|---|---|
-| 1 | `image_size` | `u64` | image size parameter. |
-| 2 | `mtu` | `u64` | mtu parameter. |
-
-# `wifi` API (5)
-
-## 30. `interface.list` — wifi.interface.list on the local Linux mesh daemon
-
-**Platforms:** L
-
-**UI:** advanced
-
-## 31. `interface.up` — wifi.interface.up on the local Linux mesh daemon
-
-**Platforms:** L
-
-**UI:** advanced
-
-### Request
-
-| Tag | Field | Type | Description |
-|---:|---|---|---|
-| 1 | `iface` | `string` | iface parameter. |
-
-## 32. `interface.channel` — wifi.interface.channel on the local Linux mesh daemon
-
-**Platforms:** L
-
-**UI:** advanced
-
-### Request
-
-| Tag | Field | Type | Description |
-|---:|---|---|---|
-| 1 | `iface` | `string` | iface parameter. |
-| 2 | `channel` | `u8` | channel parameter. |
-
-## 33. `ocb.start` — wifi.ocb.start on the local Linux mesh daemon
-
-**Platforms:** L
-
-**UI:** advanced
-
-### Request
-
-| Tag | Field | Type | Description |
-|---:|---|---|---|
-| 1 | `iface` | `string` | iface parameter. |
-| 2 | `freq` | `u32` | freq parameter. |
-| 3 | `bandwidth` | `string` | bandwidth parameter. |
-
-## 34. `rate.profile` — wifi.rate.profile on the local Linux mesh daemon
-
-**Platforms:** L
-
-**UI:** advanced
-
-### Request
-
-| Tag | Field | Type | Description |
-|---:|---|---|---|
-| 1 | `iface` | `string` | iface parameter. |
-| 2 | `profile` | `string` | profile parameter. |
-| 3 | `disable_80211b` | `bool` | disable 80211b parameter. |
-
-## 35. `data.listen` — wifi.data.listen on the local Linux mesh daemon
-
-**Platforms:** L
-
-**UI:** advanced
-
-### Request
-
-| Tag | Field | Type | Description |
-|---:|---|---|---|
-| 1 | `iface` | `string` | iface parameter. |
-| 2 | `listen_sec` | `u64` | listen sec parameter. |
-
-## 36. `data.send` — wifi.data.send on the local Linux mesh daemon
-
-**Platforms:** L
-
-**UI:** advanced
-
-### Request
-
-| Tag | Field | Type | Description |
-|---:|---|---|---|
-| 1 | `iface` | `string` | iface parameter. |
-| 2 | `destination` | `string` | destination parameter. |
-| 3 | `payload` | `string` | payload parameter. |
-
-## 37. `ap.start_open` — wifi.ap.start_open on the local Linux mesh daemon
-
-**Platforms:** L
-
-**UI:** advanced
-
-### Request
-
-| Tag | Field | Type | Description |
-|---:|---|---|---|
-| 1 | `iface` | `string` | iface parameter. |
-| 2 | `ssid` | `string` | ssid parameter. |
-| 3 | `channel` | `u8` | channel parameter. |
-| 4 | `ht40` | `bool` | ht40 parameter. |
-| 5 | `beacon_interval_tu` | `u16` | beacon interval tu parameter. |
-
-## 38. `ap.stop` — wifi.ap.stop on the local Linux mesh daemon
-
-**Platforms:** L
-
-**UI:** advanced
-
-### Request
-
-| Tag | Field | Type | Description |
-|---:|---|---|---|
-| 1 | `iface` | `string` | iface parameter. |
-
-## 39. `ap.station.add` — wifi.ap.station.add on the local Linux mesh daemon
-
-**Platforms:** L
-
-**UI:** advanced
-
-### Request
-
-| Tag | Field | Type | Description |
-|---:|---|---|---|
-| 1 | `iface` | `string` | iface parameter. |
-| 2 | `mac` | `string` | mac parameter. |
-| 3 | `aid` | `u16` | aid parameter. |
-
-## 40. `sta.join_open` — wifi.sta.join_open on the local Linux mesh daemon
-
-**Platforms:** L
-
-**UI:** advanced
-
-### Request
-
-| Tag | Field | Type | Description |
-|---:|---|---|---|
-| 1 | `iface` | `string` | iface parameter. |
-| 2 | `ssid` | `string` | ssid parameter. |
-
-## 41. `sta.configure_ipv4` — wifi.sta.configure_ipv4 on the local Linux mesh daemon
-
-**Platforms:** L
-
-**UI:** advanced
-
-### Request
-
-| Tag | Field | Type | Description |
-|---:|---|---|---|
-| 1 | `iface` | `string` | iface parameter. |
-| 2 | `address` | `string` | address parameter. |
-| 3 | `prefix` | `u8` | prefix parameter. |
-
-## 13. `mgmt.capture` — Capture Wi-Fi management frames on an owned monitor interface
-
-**Platforms:** L
-
-### Request
-
-| Tag | Field | Type | Description |
-|---:|---|---|---|
-| 1 | `iface` | `string` | iface parameter. |
-| 2 | `channel` | `u8` | channel parameter. |
-| 3 | `capture_ms` | `u64` | capture ms parameter. |
-| 4 | `max_frames` | `u64` | max frames parameter. |
-| 5 | `active` | `bool` | active parameter. |
-
-<!-- dmesh-api:end -->
+<!-- Linux-only methods (`lmesh.*`, `link.steer`, `object.nan.dry_run`, `wifi.interface.*`,
+`wifi.ap.*`, `wifi.sta.*`) are implemented only by the experimental `lmesh-wifi`
+crate and are documented in [`crates/lmesh-wifi/API.md`](crates/lmesh-wifi/API.md). -->
 
 <!-- dmesh-api:android -->
 
@@ -1215,9 +1113,9 @@ companion API so the same method applies to BLE, UART, and Wi-Fi.
 
 | Tag | Field | Type | Description |
 |---:|---|---|---|
-| 1 | `events` | `array` | Retained NAN receipt events, newest first. |
-| 2 | `followups` | `array` | Retained NAN follow-up receipts, newest first. |
-| 3 | `ble_scan_results` | `object` | Matching retained BLE scan results (`results`, `count`). |
+| 1 | `events` | `cbor[]` | Retained NAN receipt events, newest first; each one CBOR map. |
+| 2 | `followups` | `cbor[]` | Retained NAN follow-up receipts, newest first; each one CBOR map. |
+| 3 | `ble_scan_results` | `cbor` | Matching retained BLE scan results (`results`, `count`), one CBOR map. |
 | 4 | `count` | `u64` | Total rows across the three lists. |
 
 # `usb` API (204)
@@ -1306,14 +1204,12 @@ The component and method columns are the numeric CBOR tags.
 
 | Component | Method | Wire name | Purpose | Platforms |
 |---:|---:|---|---|---|
-| 101 | 1 | `runtime.snapshot` | Read desired and applied radio lifecycle generations, sleep state, and counters (superseded by `telemetry.runtime`). | A L |
 | 101 | 2 | `runtime.reset` | Reset the runtime diagnostics counters. | E |
-| 102 | 1 | `power.snapshot` | Read CPU frequency, power management, and sleep counters (superseded by `telemetry.power`). | A |
-| 103 | 1 | `memory.snapshot` | Read packet pool, worker stack, and internal memory metrics (superseded by `telemetry.memory`). | none |
 | 10 | 2 | `object.flash` | Transfer a verified firmware object into a selected durable slot. | E |
 | 1000 | 3 | `module.stop` | Request module shutdown with a deadline before flash work. | E |
+| 1000 | 1 | `module.status` | Refresh and read the installed module header and loader result. | E |
+| 1000 | 2 | `module.init` | Initialize the installed module loader. | E |
 | 11 | 1 | `boot.recovery` | Request a Main to Recovery handoff. | E |
-| 12 | 1 | `firmware.identity` | Read the booted firmware identity after a handoff or update. | A L E |
 | 104 | 80 | `ble.start` | Start the BLE companion radio. | E |
 | 104 | 81 | `ble.stop` | Stop the BLE companion radio. | E |
 | 104 | 82 | `ble.scan` | Start a time-limited BLE scan. | A E |
@@ -1323,13 +1219,10 @@ The component and method columns are the numeric CBOR tags.
 | 104 | 86 | `ble.coc.send` | Send one payload as one BLE L2CAP CoC SDU. | E |
 | 9 | 1 | `status` | Read compact device health and application state. | A L E |
 | 9 | 2 | `services` | List registered service handlers. | A L E |
-| 9 | 3 | `metrics` | Read general transport and service counters (superseded by `telemetry.now`, `nan`, `udp6`, `wifi_link`). | L |
-| 9 | 4 | `events` | Read retained event history (superseded by `log.watch`). | A L |
-| 9 | 5 | `log-watch` | Read retained structured log records (superseded by `log.watch`). | A L |
 | 4 | 71 | `radio.tx` | Submit one size-limited raw radio frame for diagnostics. | L E |
 | 4 | 72 | `radio.control` | Adjust volatile radio diagnostic controls. | L E |
 | 4 | 73 | `radio.snapshot` | Read radio state and counters. | L E |
-| 4 | 77 | `wifi.scan` | Scan or read retained Wi-Fi results. | L E |
+| 4 | 77 | `wifi.scan` | Scan or read retained Wi-Fi results. | E |
 | 4 | 74 | `radio.reset_counters` | Reset radio diagnostics counters. | L E |
 
 Platform registration notes:
@@ -1341,10 +1234,15 @@ Platform registration notes:
 - `object.flash` (10/2): registered by Main and Recovery firmware. Android
   and Linux do not register the device flash operation. The normal tagged
   request and its `data` byte-string body share one QUIC stream.
-- Stubs are not registered: Android's `*_metrics`, `metrics` and
-  `memory.snapshot`, and Linux's `battery`, `power.snapshot`,
-  `memory.snapshot` and BLE methods other than the startup CoC bearer have no
-  source, so they are absent. The firmware registers `status` and `services` from
+- Stubs are not registered. Android answers `status`, `services`,
+  `telemetry.nan_status`, `battery`, `quic`, `quic_associations`, `bearers`, `memory`
+  and `log.watch`; Linux
+  answers `status`, `services`, the typed `telemetry.*` methods it has counters
+  for, `bearers`, `quic_associations` and `log.watch`. Neither has a source for
+  `power` or `runtime`, and Linux has none for `battery` or the BLE methods
+  other than the startup CoC bearer, so those are absent. The old `metrics`,
+  `events`, `log-watch` and the three `*.snapshot` methods are registered
+  nowhere. The firmware registers `status` and `services` from
   component 9 only (its logs are `log.watch`, its snapshots are
   `telemetry.memory`, `power`, `runtime` and `bearers`), and has no
   `telemetry.battery` source.
@@ -1363,8 +1261,8 @@ Platform registration notes:
   handlers on every platform that can run them; see the `probe` API above. The
   firmware and Linux run `probe.start` as a client (ESP-NOW, UDP6/UDP); Android
   runs it over its UDP, USB and BLE bearers.
-- The firmware module components (1000-1003) are compiled only when the
-  `modules` feature is enabled.
+- The firmware module components (1000-1003) are compiled when the
+  `modules` feature is enabled (the Main default); Recovery omits them.
 - Android additionally registers a named `status.text` service on the HTTP
   gateway surface; it is not a numeric device method.
 - The ssh-mesh common methods `mesh` (2000) and `trace` (2001) have reserved
@@ -1395,64 +1293,6 @@ are described by the method purpose above.
 | `sta_bssid` | `string` | Associated AP BSSID, or `unavailable` when not associated. |
 | `sta_ipv4` | `string` | Current STA IPv4 address, or `unavailable` until DHCP assigns one. |
 
-### `runtime.snapshot` request fields
-
-| Tag | Field | Type | Values |
-|---:|---|---|---|
-| 0 | `desired_mode` | `u32` | — |
-| 1 | `desired_generation` | `u32` | — |
-| 2 | `request_id` | `u32` | — |
-| 3 | `sleepy` | `bool` | — |
-| 4 | `radio_lifecycle` | `u32` | — |
-| 5 | `applied_generation` | `u32` | — |
-| 6 | `power_lifecycle` | `u32` | — |
-| 7 | `sleep_blockers` | `u32` | — |
-| 8 | `last_error` | `u32` | — |
-| 9 | `stale_completion_count` | `u32` | — |
-| 10 | `queue_overflow_count` | `u32` | — |
-| 11 | `wake_cause` | `u32` | — |
-| 12 | `cpu_mhz` | `u32` | — |
-| 13 | `pm_min_mhz` | `u32` | — |
-| 14 | `pm_max_mhz` | `u32` | — |
-| 15 | `pm_automatic_light_sleep` | `bool` | — |
-| 16 | `pm_configured` | `bool` | — |
-| 17 | `light_sleep_attempts` | `u32` | — |
-| 18 | `light_sleep_entries` | `u32` | — |
-| 19 | `light_sleep_skipped` | `u32` | — |
-| 20 | `last_sleep_requested_us` | `u32` | — |
-| 21 | `last_sleep_duration_us` | `u32` | — |
-
-### `power.snapshot` request fields
-
-| Tag | Field | Type | Values |
-|---:|---|---|---|
-| 0 | `cpu_mhz` | `u32` | — |
-| 1 | `min_mhz` | `u32` | — |
-| 2 | `max_mhz` | `u32` | — |
-| 3 | `automatic_light_sleep` | `bool` | — |
-| 4 | `configured` | `bool` | — |
-| 5 | `light_sleep_attempts` | `u32` | — |
-| 6 | `light_sleep_entries` | `u32` | — |
-| 7 | `light_sleep_skipped` | `u32` | — |
-| 8 | `last_sleep_requested_us` | `u32` | — |
-| 9 | `last_sleep_duration_us` | `u32` | — |
-
-### `memory.snapshot` request fields
-
-| Tag | Field | Type | Values |
-|---:|---|---|---|
-| 0 | `packet_slots` | `u32` | — |
-| 1 | `packet_slots_available` | `u32` | — |
-| 2 | `packet_drops` | `u32` | — |
-| 3 | `worker_stack_bytes` | `u32` | — |
-| 4 | `worker_running` | `bool` | — |
-| 5 | `worker_starts` | `u32` | — |
-| 6 | `worker_create_failures` | `u32` | — |
-| 7 | `worker_stack_min_free_words` | `u32` | — |
-| 8 | `free_internal_bytes` | `u32` | — |
-| 9 | `min_free_internal_bytes` | `u32` | — |
-| 10 | `largest_internal_block_bytes` | `u32` | — |
-
 ### `object.flash` request fields
 
 | Tag | Field | Type | Values |
@@ -1479,7 +1319,7 @@ ends early, or runs on, is rejected by verification.
 
 **Response body:** none
 
-The request is the normal correlated tagged-CBOR header on one stream. There is
+The request is the normal JSON-RPC-style CBOR envelope on one stream. There is
 no separate flash handshake, marker, duplicated request ID, or second stream.
 The firmware dispatches the registered `object.flash` method as soon as the
 header is complete, so the handler is chosen, and may refuse (busy, unknown
@@ -1488,10 +1328,12 @@ into the verifier and sink. The association and stream that carried the request
 own the entire operation, and a stream with no progress for 15 seconds is
 abandoned and releases the writer.
 
-The correlated terminal result is returned on that same stream only after the
+The response envelope is returned on that same stream only after the
 body ends and verification plus sink completion succeed. Handler acceptance,
 stream ACKs, and byte counts are not proof of durable completion or successful
-reboot. Recovery performs its Stage2 handoff only after durable completion;
+reboot. The response has no body and ends with FIN, like every header-only
+handler response. Recovery schedules its Stage2 handoff only after durable
+completion and finishing this ordinary response direction;
 Main leaves the written slot for the normal boot/update path. `dry_run=true`
 validates through the sink's dry-run behavior and does not signal durable
 flash completion.
@@ -1548,19 +1390,6 @@ The payload is the complete CoC SDU. It has no bearer-local length prefix.
 | Tag | Field | Type | Values |
 |---:|---|---|---|
 | 2 | `data` | `hex` | — |
-
-### `events` request fields
-
-| Tag | Field | Type | Values |
-|---:|---|---|---|
-| 1 | `since` | `u64` | — |
-
-### `log-watch` request fields
-
-| Tag | Field | Type | Values |
-|---:|---|---|---|
-| 1 | `since` | `u64` | — |
-| 2 | `records` | `u8` | — |
 
 ### `radio.tx` request fields
 
@@ -1624,6 +1453,20 @@ The payload is the complete CoC SDU. It has no bearer-local length prefix.
 | 128 | `sta_enabled` | `bool` | Infrastructure STA requested by the active profile. |
 | 129 | `sta_bssid` | `mac` | Associated AP BSSID; absent when not associated or unavailable. |
 | 130 | `sta_ipv4` | `bytes` | Four IPv4 octets in network order; absent without a lease. |
+| 131 | `sta_connections` | `u32` | Cumulative SDK connected callbacks since boot; wraps at u32 maximum. |
+| 132 | `sta_disconnections` | `u32` | Cumulative SDK disconnected callbacks since boot, including intentional releases. |
+| 133 | `sta_last_event_disconnect_reason` | `u8` | Most recent SDK disconnect reason, including local STA_LEAVING (36); zero before any callback. |
+| 134 | `sta_diagnostic_log_drops` | `u32` | Structured STA records rejected by encoding/UART egress since boot. Missing logs do not imply missing events. |
+| 135 | `sta_scan_rssi_threshold_dbm` | `i8` | Live SDK fast-scan RSSI threshold; SDK documents nonnegative values as default -127 dBm. |
+| 136 | `sta_scan_authmode_threshold` | `u8` | Live SDK minimum auth-mode enum; not the AP's advertised auth mode. |
+| 137 | `sta_config_channel` | `u8` | SDK association channel hint; zero means no preference, not the current radio channel. |
+| 138 | `sta_config_bssid` | `mac` | SDK-configured BSSID; binding only when tag 139 is true, not proof of association. |
+| 139 | `sta_config_bssid_set` | `bool` | Whether the SDK pins the configured BSSID. |
+| 140 | `sta_scan_method` | `u8` | SDK scan-method enum. |
+| 141 | `sta_pmf_capable` | `bool` | SDK configured PMF capability. |
+| 142 | `sta_pmf_required` | `bool` | SDK requires PMF. |
+| 143 | `sta_sae_pwe_method` | `u8` | SDK SAE password-element method enum. |
+| 144 | `sta_config_ssid` | `bytes` | Raw 32-byte SDK SSID array, including trailing NULs; no credential material. |
 | 23 | `applied_promiscuous` | `bool` | — |
 | 24 | `dw_capturing` | `bool` | — |
 | 25 | `applied_comparator_bssid` | `mac` | — |

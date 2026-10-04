@@ -7,7 +7,7 @@ resolver = "2"
 [workspace]
 
 [features]
-default = []
+default = ["modules"]
 modules = ["dep:dmesh-fw-modules"]
 
 [dependencies]

@@ -127,9 +127,6 @@ pub fn schedule_ble_coc_egress_ready(handler: fn()) -> bool {
     handler();
     true
 }
-pub fn active_pairing_bearer() -> Option<IngressKind> {
-    None
-}
 pub fn set_packet_capacity_limit(_slots: usize) {}
 pub fn available() -> usize {
     0
@@ -154,8 +151,14 @@ pub struct IngressMemoryStats {
 }
 
 pub fn memory_stats() -> IngressMemoryStats {
+    // The retired ingress worker no longer supplies these values. Heap
+    // telemetry must still observe ESP-IDF rather than silently report zero.
+    let caps = esp_idf_sys::MALLOC_CAP_INTERNAL | esp_idf_sys::MALLOC_CAP_8BIT;
     IngressMemoryStats {
         packet_drops: drops(),
+        free_internal_bytes: unsafe { esp_idf_sys::heap_caps_get_free_size(caps) as u32 },
+        min_free_internal_bytes: unsafe { esp_idf_sys::heap_caps_get_minimum_free_size(caps) as u32 },
+        largest_internal_block_bytes: unsafe { esp_idf_sys::heap_caps_get_largest_free_block(caps) as u32 },
         ..IngressMemoryStats::default()
     }
 }

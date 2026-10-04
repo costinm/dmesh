@@ -18,6 +18,8 @@ pub(crate) struct DeviceCatalog {
 pub(crate) struct CatalogDevice {
     pub(crate) name: String,
     #[serde(default)]
+    pub(crate) sleepy: bool,
+    #[serde(default)]
     pub(crate) serial: Option<String>,
     #[serde(default)]
     pub(crate) serial_glob: Option<String>,
@@ -67,15 +69,17 @@ impl DeviceCatalog {
 }
 
 fn default_udp_port() -> u16 {
-    3337
+    3339
 }
 
 /// Optional override for the one shared inventory location.
 pub const DEVICE_CATALOG_ENV: &str = "DMESH_DEVICE_CATALOG";
-pub const DEFAULT_UDP_PORT: u16 = 3337;
+pub const DEFAULT_UDP_PORT: u16 = 3339;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeviceProfile {
+    /// Explicit caller policy; missing discovery is not proof of sleep.
+    pub sleepy: bool,
     /// Optional redundant guard against placing the wrong file in a directory.
     pub name: Option<String>,
     /// Static STA address, preferred for the current host UDP bearer.
@@ -230,6 +234,7 @@ fn profile_from_device(device: &CatalogDevice) -> Result<DeviceProfile, String> 
         .transpose()
         .map_err(|error| format!("catalog device {name:?} has invalid mac: {error}"))?;
     Ok(DeviceProfile {
+        sleepy: device.sleepy,
         name: Some(device.name.clone()),
         static_ipv4,
         vip6,
@@ -294,6 +299,7 @@ mod tests {
     #[test]
     fn profile_prefers_static_ip_and_expands_serial_id() {
         let profile = DeviceProfile {
+            sleepy: false,
             name: Some("e6".into()),
             static_ipv4: Some("192.0.2.6".parse::<Ipv4Addr>().unwrap()),
             vip6: Some("fc00::6".parse::<Ipv6Addr>().unwrap()),
@@ -305,7 +311,7 @@ mod tests {
             auth_secret_ref: Some("reserved".into()),
             udp_port: DEFAULT_UDP_PORT,
         };
-        assert_eq!(profile.udp_peer().unwrap().to_string(), "192.0.2.6:3337");
+        assert_eq!(profile.udp_peer().unwrap().to_string(), "192.0.2.6:3339");
         assert_eq!(
             profile.serial_path().unwrap().unwrap().to_string_lossy(),
             "/dev/serial/by-id/usb-e6"
@@ -316,7 +322,7 @@ mod tests {
     fn explicit_ipv4_is_a_default_port_udp_target() {
         assert_eq!(
             resolve_udp_peer("192.0.2.9").unwrap().unwrap().to_string(),
-            "192.0.2.9:3337"
+            "192.0.2.9:3339"
         );
         assert!(resolve_udp_peer("fe80::9").is_err());
     }
@@ -365,6 +371,7 @@ mod tests {
     #[test]
     fn mac_catalog_target_uses_identity_discovery_instead_of_static_ipv4() {
         let device = super::CatalogDevice {
+            sleepy: false,
             name: "node-under-test".into(),
             serial: None,
             serial_glob: None,

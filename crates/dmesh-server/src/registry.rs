@@ -65,6 +65,9 @@ pub struct CallContext {
     /// The request's `timeout` envelope field: milliseconds the caller allows,
     /// counted from receipt. `None` means the handler's own default.
     pub timeout_ms: Option<u64>,
+    /// The bearer the request's association runs over, as the node knows it (for example
+    /// `uart0`). Provenance for handlers that treat a wired link differently from a radio.
+    pub bearer: Option<quic_lite::BearerName>,
 }
 
 impl CallContext {
@@ -76,6 +79,7 @@ impl CallContext {
             stream_id: None,
             local: true,
             timeout_ms: None,
+            bearer: None,
         }
     }
 }
@@ -432,7 +436,8 @@ impl Registry {
 
 fn into_header_only(request: &Request<'_>, outcome: Option<Outcome>) -> Option<Vec<u8>> {
     match outcome? {
-        Outcome::Respond(Response { header, body: None }) => Some(header),
+        // After-response actions require a stream's write/finish lifecycle.
+        Outcome::Respond(Response { header, body: None, after_finish: None }) => Some(header),
         Outcome::Respond(_) | Outcome::Receive(_) | Outcome::Defer(_) => {
             let (Name::Tag(component), Name::Tag(method)) =
                 (request.record.component?, request.record.method?)
@@ -713,6 +718,9 @@ pub mod methods {
         "set",
     );
 
+    pub const COMPANION_PAIR: Method = Method::new(209, "companion", 1, "pair");
+    pub const COMPANION_UNPAIR: Method = Method::new(209, "companion", 2, "unpair");
+
     pub const RADIO_TX: Method = Method::new(
         raw_wifi::RAW_WIFI_COMPONENT,
         "radio",
@@ -796,20 +804,17 @@ pub mod methods {
     pub const TELEMETRY_MEMORY: Method = telemetry(telemetry::MEMORY_METHOD, "memory");
     pub const TELEMETRY_POWER: Method = telemetry(telemetry::POWER_METHOD, "power");
     pub const TELEMETRY_RUNTIME: Method = telemetry(telemetry::RUNTIME_METHOD, "runtime");
+    pub const TELEMETRY_DEVICE: Method = telemetry(telemetry::DEVICE_METHOD, "device");
     /// `log.watch`: retained log/event records, optionally streamed with
-    /// periodic telemetry snapshots. The older `log-watch` (9/5) is
-    /// `LOG_WATCH` until platforms migrate.
+    /// periodic telemetry snapshots.
     pub const LOG_WATCH_RECORDS: Method = Method::new(208, "log", 2, "watch");
 
-    /// The historical un-prefixed names: `status`, `services`, `log-watch`...
+    /// The historical un-prefixed names: `status` and `services`.
     const fn diagnostic(method: u64, name: &'static str) -> Method {
         Method::new(services::DIAGNOSTIC_COMPONENT, "", method, name)
     }
     pub const STATUS: Method = diagnostic(services::DIAGNOSTIC_STATUS_METHOD, "status");
     pub const SERVICES: Method = diagnostic(services::DIAGNOSTIC_SERVICES_METHOD, "services");
-    pub const METRICS: Method = diagnostic(services::DIAGNOSTIC_METRICS_METHOD, "metrics");
-    pub const EVENTS: Method = diagnostic(services::DIAGNOSTIC_EVENTS_METHOD, "events");
-    pub const LOG_WATCH: Method = diagnostic(services::DIAGNOSTIC_LOG_WATCH_METHOD, "log-watch");
 
     /// `probe.start`: ask a node to run a probe against `peer`. Header only,
     /// in both directions.
@@ -855,31 +860,12 @@ pub mod methods {
         "identity",
     );
 
-    pub const RUNTIME_SNAPSHOT: Method = Method::new(
-        services::RUNTIME_SNAPSHOT_COMPONENT,
-        "runtime",
-        services::RUNTIME_SNAPSHOT_METHOD,
-        "snapshot",
-    );
     pub const RUNTIME_RESET: Method = Method::new(
         services::RUNTIME_SNAPSHOT_COMPONENT,
         "runtime",
         services::RUNTIME_RESET_METHOD,
         "reset",
     );
-    pub const POWER_SNAPSHOT: Method = Method::new(
-        services::POWER_SNAPSHOT_COMPONENT,
-        "power",
-        services::RUNTIME_SNAPSHOT_METHOD,
-        "snapshot",
-    );
-    pub const MEMORY_SNAPSHOT: Method = Method::new(
-        services::MEMORY_SNAPSHOT_COMPONENT,
-        "memory",
-        services::RUNTIME_SNAPSHOT_METHOD,
-        "snapshot",
-    );
-
     const fn ble(method: u64, name: &'static str) -> Method {
         Method::new(services::BLE_COMPONENT, "ble", method, name)
     }
@@ -896,5 +882,11 @@ pub mod methods {
         "provision",
         provision::INSTALL,
         "install",
+    );
+    pub const PROVISION_UNPAIR: Method = Method::new(
+        provision::COMPONENT,
+        "provision",
+        provision::UNPAIR,
+        "unpair",
     );
 }
