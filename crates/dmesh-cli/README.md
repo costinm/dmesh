@@ -2,7 +2,7 @@
 
 dmesh-cli sends tagged CBOR service requests over Wi-Fi/UDP or a local serial
 port. Most remote communication should use the faster Wi-Fi path. In the
-examples, DEVICE is a name from the device catalog, OBSERVER is a reachable
+examples, DEVICE is the name of a device record, OBSERVER is a reachable
 device that can observe NAN, and SERIAL is a local /dev/serial/by-id/... path.
 Use your own names and addresses; the examples are syntax, not lab targets.
 
@@ -28,19 +28,23 @@ dmesh-cli http://127.0.0.1:18480 transport.set --mode=6
 
 ~~~sh
 . ./env.sh
-export DMESH_DEVICE_CATALOG=/path/to/device-catalog.toml # Deprecated test override only.
+export DMESH_NODES_DIR=/path/to/nodes   # node records, one TOML per node (':'-separated; first is written)
 dmesh-cli DEVICE status
 dmesh-cli udp://[fe80::1234%wlan0]:3339 status
 dmesh-cli SERIAL status
 ~~~
 
 An IPv6 link-local address needs its interface scope, such as %wlan0. A
-catalog name with a scoped Wi-Fi address tries it first and checks the signed
-identity. If that fails, the CLI uses discovery and NAN activation. A catalog
+node name with a scoped Wi-Fi address tries it first and checks the signed
+identity. If that fails, the CLI uses discovery and NAN activation. A node
 VIP6 selects an identity; it is not a directly routable UDP address. See the
-[example device catalog](examples/device-catalog.toml). Static host inventory
-is deprecated; normal device selection is moving to discovery plus paired-device
-leases. Hardware tests must restore and release acquired peers so later runs can
+[example node records](examples/nodes). A device record
+(`dmesh_server::device_record::DeviceRecord`, one TOML file per device, the same files lmesh and
+Android write) holds the long-lived facts about a device and, when there is one, its secret.
+The CLI reads `DMESH_NODES_DIR` / `DMESH_PAIRED_DEVICES_DIR`, or else `~/.config/dmesh/nodes`
+and then the tracked examples; `dmesh-cli devices sync` records the devices that answer
+discovery. Secrets and the control-plane root live only in the private first directory (0700,
+files 0600), never in the tracked examples. Hardware tests must restore and release acquired peers so later runs can
 select them reproducibly.
 
 ## Find and inspect devices

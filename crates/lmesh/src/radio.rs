@@ -156,7 +156,30 @@ pub fn register(
     if configured {
         maintain(radio.clone(), discovery.clone());
     }
+    persist_nodes(discovery.clone());
     register_methods(registry, radio, discovery.clone(), interface().0);
+}
+
+/// Keep the stable part of the inventory on disk: every minute, the authenticated devices are
+/// merged into the node directory (identity, name, domain, type, a stable ESP MAC). The inventory
+/// itself, live endpoints and sleep state stay in RAM and are rebuilt by discovery after a restart.
+fn persist_nodes(discovery: Arc<LocalDiscovery>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            let devices = discovery.engine().devices();
+            let store = crate::companion::device_store();
+            match tokio::task::spawn_blocking(move || {
+                dmesh_discovery::persist::persist_devices(&store, &devices)
+            })
+            .await
+            {
+                Ok(Ok(0)) | Err(_) => {}
+                Ok(Ok(written)) => tracing::info!(written, "lmesh_node_records_updated"),
+                Ok(Err(error)) => tracing::warn!(%error, "lmesh_node_records_failed"),
+            }
+        }
+    });
 }
 
 /// Bring the interface to the chain's target state, and keep it there. Starting is

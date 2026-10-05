@@ -168,6 +168,25 @@ mod tests {
     }
 
     #[test]
+    fn a_signed_announce_becomes_a_first_seen_record_and_an_unsigned_one_does_not() {
+        use dmesh_server::device_record::DeviceRecord;
+        let identity = P256Identity::generate();
+        let mut announce = Announce::discovery(identity.device_id(), 16, 5);
+        announce.set_device_name("light1");
+        identity.sign(&mut announce).unwrap();
+        let record = DeviceRecord::from_announce(&announce, Some([2, 0, 0, 0, 0, 1])).unwrap();
+        assert_eq!(record.name.as_deref(), Some("light1"));
+        assert_eq!(record.mac, Some([2, 0, 0, 0, 0, 1]));
+        assert_eq!(record.public_key.len(), 33);
+        assert_eq!(record.trust.as_deref(), Some("first-seen"));
+        assert!(record.secret.is_empty() && record.vip6.as_deref().unwrap().starts_with("fc00:"));
+        let unsigned = UnsignedIdentity::from_seed(b"ssh-ed25519 AAAA");
+        let mut plain = Announce::discovery(unsigned.device_id(), 16, 1);
+        unsigned.sign(&mut plain).unwrap();
+        assert!(DeviceRecord::from_announce(&plain, None).is_none());
+    }
+
+    #[test]
     fn the_key_file_is_created_private_and_reloaded() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("nested").join("key.pem");

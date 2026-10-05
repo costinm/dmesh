@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use dmesh_server::discovery::{
     DiscoveredDevice,
 };
-use dmesh_store::{FrameRecord, StoreCommand};
+use dmesh_server::radio_history::{RadioEvent, RadioHistory};
 use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JString};
 #[cfg(target_os = "android")]
 use jni::sys::JNI_VERSION_1_6;
@@ -55,7 +55,6 @@ const BRIDGE_HOST: &str = "dmesh-msg";
 const BRIDGE_PORT: u16 = 1;
 const MAX_BRIDGE_MESSAGE_BYTES: usize = 2 * 1024;
 static BRIDGE_SENDERS: OnceLock<Mutex<HashMap<u64, UnboundedSender<Vec<u8>>>>> = OnceLock::new();
-static STORE_SENDER: OnceLock<UnboundedSender<StoreCommand>> = OnceLock::new();
 /// Discovered devices live in the shared `dmesh-discovery` engine inventory:
 /// UDP multicast, NAN Service Info and follow-ups, and future control-plane
 /// observations all update that one inventory, and short-lived NAN
@@ -70,26 +69,21 @@ static LOCAL_NETWORKS: OnceLock<Mutex<dmesh_server::local_networks::LocalNetwork
 /// Latest Android platform power/memory telemetry. This is an input to Rust
 /// scheduling; Java reports facts and does not decide admission policy.
 static POWER_STATE: OnceLock<Mutex<dmesh_server::power::PowerState>> = OnceLock::new();
-/// Last received NAN follow-ups are retained independently of the optional
-/// persistent frame store so Android status and E2E use the same bounded
-/// receipt view as host/ESP adapters.
-static NAN_FOLLOWUPS: OnceLock<Mutex<VecDeque<FrameRecord>>> = OnceLock::new();
-/// Android framework lifecycle/configuration events are forwarded to Rust as
-/// well, but they are not directed NAN follow-ups. Keep their diagnostic
-/// history distinct so `radio.nan.followups` has the same receipt semantics
-/// as the host and ESP handlers.
-static NAN_EVENTS: OnceLock<Mutex<VecDeque<FrameRecord>>> = OnceLock::new();
-const NAN_FOLLOWUP_HISTORY_LEN: usize = 32;
-const NAN_EVENT_HISTORY_LEN: usize = 64;
+/// Last received NAN follow-ups, so Android status and E2E use the same receipt view as the host
+/// and ESP adapters.
+static NAN_FOLLOWUPS: Mutex<RadioHistory> = Mutex::new(RadioHistory::new(32));
+/// Android framework lifecycle/configuration events: forwarded to Rust as well, but they are not
+/// directed follow-ups, so they keep their own history.
+static NAN_EVENTS: Mutex<RadioHistory> = Mutex::new(RadioHistory::new(64));
 const BLE_SCAN_RESULT_MAX: usize = 32;
 static BLE_SCAN_RESULTS: OnceLock<Mutex<BTreeMap<String, Value>>> = OnceLock::new();
 
-fn nan_followups() -> &'static Mutex<VecDeque<FrameRecord>> {
-    NAN_FOLLOWUPS.get_or_init(|| Mutex::new(VecDeque::with_capacity(NAN_FOLLOWUP_HISTORY_LEN)))
+fn nan_followups() -> &'static Mutex<RadioHistory> {
+    &NAN_FOLLOWUPS
 }
 
-fn nan_events() -> &'static Mutex<VecDeque<FrameRecord>> {
-    NAN_EVENTS.get_or_init(|| Mutex::new(VecDeque::with_capacity(NAN_EVENT_HISTORY_LEN)))
+fn nan_events() -> &'static Mutex<RadioHistory> {
+    &NAN_EVENTS
 }
 
 fn ble_scan_results_store() -> &'static Mutex<BTreeMap<String, Value>> {
@@ -186,77 +180,36 @@ pub(crate) fn ble_scan_clear() -> Value {
 
 /// Retain one NAN observation as a `log.watch` record: `kind` is the event
 /// type and the other fields describe the frame.
-fn trace_nan_frame(event_type: &str, frame: &FrameRecord) {
-    let msg_type = frame.msg_type.as_deref().unwrap_or("");
-    let target = frame.target_device.as_deref().unwrap_or("");
+fn trace_nan_frame(event_type: &str, frame: &RadioEvent) {
+    let msg_type = frame.event.as_deref().unwrap_or("");
+    let target = frame.target.as_deref().unwrap_or("");
     tracing::info!(
         target: "dmesh.event",
         event_type = %event_type,
         trace_prechecked = true,
         protocol = %frame.protocol,
         event = %msg_type,
-        peer = %frame.src_device,
+        peer = %frame.source,
         target_device = %target,
         payload_hash = %frame.payload_hash,
         message = "event"
     );
 }
 
-fn record_nan_followup(frame: FrameRecord) {
+fn record_nan_followup(frame: RadioEvent) {
     trace_nan_frame("nan.followup", &frame);
     if let Ok(mut history) = nan_followups().lock() {
-        if history.len() == NAN_FOLLOWUP_HISTORY_LEN {
-            history.pop_front();
-        }
-        history.push_back(frame);
+        history.push(frame);
     }
 }
 
-fn record_nan_event(frame: FrameRecord) {
+fn record_nan_event(frame: RadioEvent) {
     trace_nan_frame("nan.event", &frame);
     if let Ok(mut history) = nan_events().lock() {
-        // Lifecycle callbacks describe the state used by `telemetry.nan_status`.
-        // Routine discovery callbacks can be arbitrarily frequent, so they must
-        // not evict the last attach/publish/subscribe transition and make a live
-        // Android Aware session look inactive.
-        if history.len() == NAN_EVENT_HISTORY_LEN {
-            if let Some(index) = history
-                .iter()
-                .position(|entry| !nan_event_is_lifecycle(entry.msg_type.as_deref()))
-            {
-                history.remove(index);
-            } else if nan_event_is_lifecycle(frame.msg_type.as_deref()) {
-                // A lifecycle-only history is exceptionally small; retain the
-                // latest transition rather than rejecting it.
-                history.pop_front();
-            } else {
-                // Keep the lifecycle state intact. The raw persistent frame
-                // store still receives this diagnostic callback below.
-                return;
-            }
-        }
-        history.push_back(frame);
+        history.push_keeping_lifecycle(frame);
     }
 }
 
-fn nan_event_is_lifecycle(event: Option<&str>) -> bool {
-    matches!(
-        event,
-        Some(
-            "attached"
-                | "aware.on_attached"
-                | "aware.on_session_terminated"
-                | "aware.on_attach_failed"
-                | "aware.session_close"
-                | "aware.on_publish_started"
-                | "aware.on_publish_terminated"
-                | "aware.publish_close"
-                | "aware.on_subscribe_started"
-                | "aware.on_subscribe_terminated"
-                | "aware.subscribe_close"
-        )
-    )
-}
 #[cfg(target_os = "android")]
 static ANDROID_LOGGER: AndroidLog = AndroidLog;
 #[cfg(target_os = "android")]
@@ -292,14 +245,6 @@ fn android_vpn_handles() -> &'static Mutex<HashMap<i64, AndroidVpnHandle>> {
 
 fn bridge_senders() -> &'static Mutex<HashMap<u64, UnboundedSender<Vec<u8>>>> {
     BRIDGE_SENDERS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-pub fn init_store_sender(sender: UnboundedSender<StoreCommand>) {
-    STORE_SENDER.set(sender).ok();
-}
-
-fn store_sender() -> Option<&'static UnboundedSender<StoreCommand>> {
-    STORE_SENDER.get()
 }
 
 /// The discovered devices in the shape the JSON-reading consumers (status
@@ -999,13 +944,14 @@ pub(crate) fn register_ble_service(services: &ssh_mesh::mesh_rest::MeshServiceRe
     }
 }
 
+/// The BLE companion link: Android's Bluetooth stack reaches the device.
 #[cfg(target_os = "android")]
-struct AndroidCompanionBackend;
+struct AndroidBleLink;
 
-/// Directory holding one private paired-device JSON file per VIP6. Set on
-/// Android by `configure_android_mesh_paths`; host tests may set it to a
-/// temporary directory to exercise companion-aware surfaces.
-static ANDROID_OWNED_DEVICES_PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
+/// Directory of the device records (one TOML file per device). Set on Android by
+/// `configure_android_mesh_paths`; host tests may set it to a temporary directory to exercise
+/// companion-aware surfaces.
+static ANDROID_DEVICE_RECORDS_PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
 
 #[cfg(target_os = "android")]
 fn accepted_android_companion(value: Value) -> anyhow::Result<Value> {
@@ -1018,7 +964,7 @@ fn accepted_android_companion(value: Value) -> anyhow::Result<Value> {
 }
 
 #[cfg(target_os = "android")]
-fn android_require_owned_companion(
+fn android_require_paired_companion(
     id: &str,
     expected_vip6: Option<&str>,
 ) -> anyhow::Result<(String, String)> {
@@ -1052,17 +998,18 @@ fn android_require_owned_companion(
         .context("signed companion has no public key")?
         .to_owned();
     let device_id = device_id.clone();
-    let path = ANDROID_OWNED_DEVICES_PATH
+    let path = ANDROID_DEVICE_RECORDS_PATH
         .get()
-        .context("Android owned-device inventory path unavailable")?;
-    let owned = dmesh_server::discovery::PairedDevices::load(path, &vip6)
+        .context("Android device record path unavailable")?;
+    let owned = dmesh_server::device_record::DeviceStore::new(path)
+        .load(&vip6)
         .map_err(anyhow::Error::msg)?
         .context("companion has no private pairing result")?;
     if owned.device_id != device_id {
         anyhow::bail!("paired device ID differs from signed discovery");
     }
     if owned.secret.len() < 16 {
-        anyhow::bail!("owned companion has no provisioned control secret");
+        anyhow::bail!("companion has no provisioned control secret");
     }
     if !owned.public_key.is_empty()
         && owned
@@ -1072,53 +1019,45 @@ fn android_require_owned_companion(
             .collect::<String>()
             != public_key
     {
-        anyhow::bail!("owned companion public key differs from signed discovery");
+        anyhow::bail!("companion public key differs from signed discovery");
     }
     if owned.vip6.as_deref().is_some_and(|stored| stored != vip6) {
-        anyhow::bail!("owned Wi-Fi companion VIP differs from signed discovery");
+        anyhow::bail!("companion VIP differs from signed discovery");
     }
     Ok((device_id, vip6))
 }
 
 #[cfg(target_os = "android")]
 #[async_trait]
-impl dmesh_server::companion_service::CompanionBackend for AndroidCompanionBackend {
-    async fn pair(
-        &self,
-        kind: String,
-        id: String,
-        _vip6: Option<String>,
-        _baud: Option<u32>,
-        psm: Option<u16>,
-    ) -> anyhow::Result<Value> {
-        // TODO(pairing): BLE currently acknowledges starting a native bond;
-        // Wi-Fi only checks an existing secret. Neither provisions and
-        // durably commits a new secret to an unpaired device and inventory.
-        match kind.as_str() {
-            "ble" => accepted_android_companion(
-                android_ble_command(
-                    "companion.pair",
-                    &json!({"kind": kind, "id": id, "psm": psm.unwrap_or(128)}),
-                )
-                .context("Android BLE callback is unavailable")?,
-            ),
-            _ => anyhow::bail!("unsupported Android companion kind: {kind}"),
+impl dmesh_server::companion::CompanionLink for AndroidBleLink {
+    async fn pair(&self, request: dmesh_server::companion::PairRequest<'_>) -> Result<(), String> {
+        // TODO(pairing): BLE currently acknowledges starting a native bond; it does not provision
+        // and durably commit a new secret to an unpaired device and its record.
+        if request.name.is_some() || request.root_public_key.is_some() {
+            return Err("pairing name and root-key provisioning are not implemented".to_owned());
         }
+        let command = json!({"kind": "ble", "id": request.id, "psm": request.psm.unwrap_or(128)});
+        let result = android_ble_command("companion.pair", &command)
+            .context("Android BLE callback is unavailable")
+            .and_then(accepted_android_companion);
+        result.map(|_| ()).map_err(|error| format!("{error:#}"))
     }
 
-    async fn unpair(&self, kind: String, id: String) -> anyhow::Result<Value> {
-        // TODO(pairing): Clear device NVS and both sides' BLE bonds, then
-        // remove the inventory entry. This currently releases local state.
-        match kind.as_str() {
-            "ble" => {
-                android_require_owned_companion(&id, None)?;
-                accepted_android_companion(
-                    android_ble_command("companion.unpair", &json!({"kind": kind, "id": id}))
-                        .context("Android BLE callback is unavailable")?,
-                )
-            }
-            _ => anyhow::bail!("unsupported Android companion kind: {kind}"),
-        }
+    async fn unpair(
+        &self,
+        id: &str,
+        _store: &dmesh_server::device_record::DeviceStore,
+    ) -> Result<(), String> {
+        // TODO(pairing): Clear device NVS and both sides' BLE bonds, then remove the record. This
+        // currently releases local state.
+        let result = (|| {
+            android_require_paired_companion(id, None)?;
+            accepted_android_companion(
+                android_ble_command("companion.unpair", &json!({"kind": "ble", "id": id}))
+                    .context("Android BLE callback is unavailable")?,
+            )
+        })();
+        result.map(|_| ()).map_err(|error| format!("{error:#}"))
     }
 }
 
@@ -1126,19 +1065,18 @@ impl dmesh_server::companion_service::CompanionBackend for AndroidCompanionBacke
 pub(crate) fn register_companion_service(
     services: &ssh_mesh::mesh_rest::MeshServiceRegistry,
 ) -> bool {
-    match dmesh_server::companion_service::CompanionService::new(Arc::new(AndroidCompanionBackend))
-    {
-        Ok(handler) => register_local_service(
-            services,
-            dmesh_server::companion_service::SERVICE_NAME,
-            dmesh_server::companion_service::methods(),
-            handler,
-        ),
-        Err(error) => {
-            log::error!("Failed to register companion service: {error}");
-            false
-        }
-    }
+    // The shared handlers (dmesh_server::companion) do the request handling; Android contributes
+    // the BLE link. It holds no control-plane root key yet, so a pairing installs none.
+    let store = dmesh_server::device_record::DeviceStore::new(
+        ANDROID_DEVICE_RECORDS_PATH.get().cloned().unwrap_or_default(),
+    );
+    std::sync::Arc::new(
+        dmesh_server::companion::Companions::new(&[], store)
+            .with_link("ble", Arc::new(AndroidBleLink)),
+    )
+    .register_local_only(&dmesh_server::registry::REGISTRY);
+    register_gateway_route(services, dmesh_server::companion::SERVICE_NAME);
+    true
 }
 
 #[cfg(target_os = "android")]
@@ -1448,22 +1386,22 @@ fn android_radio_history(limit: Option<u64>, since_ms: Option<u64>, keys: Option
         history
             .iter()
             .rev()
-            .filter(|entry| entry.timestamp >= cutoff)
+            .filter(|entry| entry.timestamp_ms >= cutoff)
             .filter(|entry| {
                 matches(&[
                     entry.protocol.as_str(),
-                    entry.msg_type.as_deref().unwrap_or(""),
-                    entry.src_device.as_str(),
+                    entry.event.as_deref().unwrap_or(""),
+                    entry.source.as_str(),
                 ])
             })
             .take(take)
             .map(|entry| {
                 json!({
                     "kind": "event",
-                    "last_seen_ms": entry.timestamp,
+                    "last_seen_ms": entry.timestamp_ms,
                     "protocol": entry.protocol,
-                    "event": entry.msg_type,
-                    "peer": entry.src_device,
+                    "event": entry.event,
+                    "peer": entry.source,
                     "payload_hash": entry.payload_hash,
                 })
             })
@@ -1476,24 +1414,24 @@ fn android_radio_history(limit: Option<u64>, since_ms: Option<u64>, keys: Option
         history
             .iter()
             .rev()
-            .filter(|entry| entry.timestamp >= cutoff)
+            .filter(|entry| entry.timestamp_ms >= cutoff)
             .filter(|entry| {
                 matches(&[
                     entry.protocol.as_str(),
-                    entry.msg_type.as_deref().unwrap_or(""),
-                    entry.src_device.as_str(),
-                    entry.target_device.as_deref().unwrap_or(""),
+                    entry.event.as_deref().unwrap_or(""),
+                    entry.source.as_str(),
+                    entry.target.as_deref().unwrap_or(""),
                 ])
             })
             .take(take)
             .map(|entry| {
                 json!({
                     "kind": "followup",
-                    "last_seen_ms": entry.timestamp,
+                    "last_seen_ms": entry.timestamp_ms,
                     "protocol": entry.protocol,
-                    "event": entry.msg_type,
-                    "source": entry.src_device,
-                    "target": entry.target_device,
+                    "event": entry.event,
+                    "source": entry.source,
+                    "target": entry.target,
                     "seq": entry.seq,
                     "payload_hash": entry.payload_hash,
                 })
@@ -1590,20 +1528,16 @@ fn compact_age(age_ms: i64) -> String {
 /// Pairing state is private controller data, never carried by discovery.
 fn companion_names() -> BTreeMap<String, String> {
     let mut names = BTreeMap::new();
-    let Some(directory) = ANDROID_OWNED_DEVICES_PATH.get() else {
+    let Some(directory) = ANDROID_DEVICE_RECORDS_PATH.get() else {
         return names;
     };
-    let Ok(entries) = std::fs::read_dir(directory) else {
+    let Ok(devices) = dmesh_server::device_record::DeviceStore::new(directory).list() else {
         return names;
     };
-    for entry in entries.flatten() {
-        let Ok(bytes) = std::fs::read(entry.path()) else {
-            continue;
-        };
-        let Ok(device) = serde_json::from_slice::<dmesh_server::discovery::OwnedDevice>(&bytes)
-        else {
-            continue;
-        };
+    for device in devices
+        .iter()
+        .filter(|device| device.trust.as_deref() == Some(dmesh_server::device_record::trust::PAIRED))
+    {
         let Some(name) = device.name.as_deref().filter(|name| !name.is_empty()) else {
             continue;
         };
@@ -2079,21 +2013,17 @@ fn observe_nan_followup_packet(
         .and_then(|v| v.as_u64())
         .map(|h| h as u32)
         .unwrap_or_else(|| dmesh_server::discovery::payload_hash(payload));
-    let frame = FrameRecord {
+    let frame = RadioEvent {
         protocol: "dmesh_nan_followup".to_string(),
         payload_hash: packet_hash,
-        src_device: src_device.to_string(),
-        target_device: (!target_device.is_empty()).then(|| target_device.to_string()),
+        source: src_device.to_string(),
+        target: (!target_device.is_empty()).then(|| target_device.to_string()),
         seq,
-        msg_type: (!msg_type.is_empty()).then(|| msg_type.to_string()),
+        event: (!msg_type.is_empty()).then(|| msg_type.to_string()),
         payload: payload.to_vec(),
-        rssi: rssi_dbm,
-        timestamp: chrono::Utc::now().timestamp_millis(),
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
     };
     record_nan_followup(frame.clone());
-    if let Some(sender) = store_sender() {
-        let _ = sender.send(StoreCommand::InsertFrame(frame));
-    }
     // A directed Follow-up carries the same tagged-CBOR announce bytes as
     // NAN Service Info and UDP discovery. Promote that semantic record through
     // the one inventory ingress before retaining a provisional radio address;
@@ -2154,7 +2084,7 @@ pub(crate) fn observe_announce(
 
 /// The Android settings file: app-private, next to the paired-device store.
 fn android_settings_store() -> Option<dmesh_server::settings::FileSettings> {
-    let base = ANDROID_OWNED_DEVICES_PATH.get()?.parent()?;
+    let base = ANDROID_DEVICE_RECORDS_PATH.get()?.parent()?;
     Some(dmesh_server::settings::FileSettings::new(
         base.join("settings.conf"),
         "android",
@@ -2243,7 +2173,7 @@ pub(crate) fn discovered_udp_endpoint(key: &str) -> Result<std::net::SocketAddr,
 #[cfg(target_os = "android")]
 fn configure_android_mesh_paths(base_dir: &str) {
     let base = std::path::Path::new(base_dir);
-    let _ = ANDROID_OWNED_DEVICES_PATH.set(base.join("paired"));
+    let _ = ANDROID_DEVICE_RECORDS_PATH.set(base.join("paired"));
     let run_base = base.join("run").join("mesh");
     let home_base = base.join("home");
     let opt_base = base.join("opt");
@@ -2263,7 +2193,7 @@ fn configure_android_mesh_paths(base_dir: &str) {
     // Keep these app-private files in sync with the Rust adapters while Java
     // remains the platform callback boundary.
     for (component, tools) in [
-        ("companion", dmesh_server::companion_service::tools_json()),
+        ("companion", dmesh_server::companion::tools_json()),
         ("ble", dmesh_server::ble_service::tools_json()),
         ("usb", dmesh_server::usb_service::tools_json()),
         ("wifi", dmesh_server::wifi_service::tools_json()),
@@ -2797,11 +2727,11 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                 .rev()
                 .map(|entry| {
                     json!({
-                        "last_seen_ms": entry.timestamp,
-                        "source": entry.src_device,
-                        "target": entry.target_device,
+                        "last_seen_ms": entry.timestamp_ms,
+                        "source": entry.source,
+                        "target": entry.target,
                         "seq": entry.seq,
-                        "msg_type": entry.msg_type,
+                        "msg_type": entry.event,
                         "payload_hash": entry.payload_hash,
                         "payload_hex": bytes_to_hex(&entry.payload),
                     })
@@ -2818,9 +2748,9 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                 .rev()
                 .map(|entry| {
                     json!({
-                        "last_seen_ms": entry.timestamp,
-                        "event": entry.msg_type,
-                        "peer": entry.src_device,
+                        "last_seen_ms": entry.timestamp_ms,
+                        "event": entry.event,
+                        "peer": entry.source,
                         "payload_hex": bytes_to_hex(&entry.payload),
                     })
                 })
@@ -2844,9 +2774,9 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
             let mut last_event = None;
             for entry in events
                 .iter()
-                .filter(|entry| now_ms.saturating_sub(entry.timestamp) <= 10 * 60 * 1_000)
+                .filter(|entry| now_ms.saturating_sub(entry.timestamp_ms) <= 10 * 60 * 1_000)
             {
-                let Some(event) = entry.msg_type.as_deref() else {
+                let Some(event) = entry.event.as_deref() else {
                     continue;
                 };
                 last_event = Some(event);
@@ -2904,21 +2834,17 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
         "radio.nan.event" => {
             let event = cmd.data.get("event").cloned().unwrap_or_default();
             let peer = cmd.data.get("peer").cloned().unwrap_or_default();
-            let frame = FrameRecord {
+            let frame = RadioEvent {
                 protocol: "android_nan_event".to_string(),
                 payload_hash: 0,
-                src_device: peer,
-                target_device: None,
+                source: peer,
+                target: None,
                 seq: None,
-                msg_type: (!event.is_empty()).then_some(event),
+                event: (!event.is_empty()).then_some(event),
                 payload: payload.to_vec(),
-                rssi: None,
-                timestamp: chrono::Utc::now().timestamp_millis(),
+                timestamp_ms: chrono::Utc::now().timestamp_millis(),
             };
             record_nan_event(frame.clone());
-            if let Some(sender) = store_sender() {
-                let _ = sender.send(StoreCommand::InsertFrame(frame));
-            }
             json!({"status": "ok"}).to_string().into_bytes()
         }
         "radio.transport.event" => {
@@ -2926,20 +2852,6 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
             let event = cmd.data.get("event").cloned().unwrap_or_default();
             if transport == "ble" && event.starts_with("scan_result:") {
                 record_ble_scan_result(&event, payload);
-            }
-            let frame = FrameRecord {
-                protocol: format!("android_{transport}_event"),
-                payload_hash: 0,
-                src_device: String::new(),
-                target_device: None,
-                seq: None,
-                msg_type: (!event.is_empty()).then_some(event),
-                payload: payload.to_vec(),
-                rssi: None,
-                timestamp: chrono::Utc::now().timestamp_millis(),
-            };
-            if let Some(sender) = store_sender() {
-                let _ = sender.send(StoreCommand::InsertFrame(frame));
             }
             json!({"status": "ok"}).to_string().into_bytes()
         }
@@ -3035,41 +2947,6 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
             let peer = cmd.data.get("peer").map(String::as_str).unwrap_or("");
             let rssi = parse_i32(&cmd, "rssi", -1)?;
             observe_nan_followup_packet(peer, payload, (rssi != -1).then_some(rssi))?
-                .to_string()
-                .into_bytes()
-        }
-        "radio.coc.store_frame" => {
-            let src_device = required_data(&cmd, "src_device")?;
-            let seq = parse_i32(&cmd, "seq", -1)?;
-            let hash = parse_u32(&cmd, "hash", 0)?;
-            if seq < 0 || seq > u16::MAX as i32 {
-                anyhow::bail!("radio.coc.store_frame requires seq=0..{}", u16::MAX);
-            }
-            if payload.is_empty() {
-                anyhow::bail!("radio.coc.store_frame requires a non-empty payload");
-            }
-            let frame = FrameRecord {
-                protocol: "dmesh_coc_lora".to_string(),
-                payload_hash: hash,
-                src_device: src_device.to_string(),
-                target_device: None,
-                seq: Some(seq as u16),
-                msg_type: Some("lora".to_string()),
-                payload: payload.to_vec(),
-                rssi: None,
-                timestamp: chrono::Utc::now().timestamp_millis(),
-            };
-            let sender =
-                store_sender().ok_or_else(|| anyhow::anyhow!("dmesh-store is not initialized"))?;
-            let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-            sender
-                .send(StoreCommand::InsertFrameWithReply(frame, reply_tx))
-                .map_err(|_| anyhow::anyhow!("dmesh-store service is unavailable"))?;
-            let id = reply_rx
-                .recv_timeout(std::time::Duration::from_secs(5))
-                .map_err(|_| anyhow::anyhow!("timed out waiting for dmesh-store"))?
-                .map_err(anyhow::Error::msg)?;
-            json!({"status": "stored", "id": id})
                 .to_string()
                 .into_bytes()
         }
@@ -4479,7 +4356,7 @@ mod tests {
                 .unwrap()
         };
         let paired_dir = tempfile::tempdir().unwrap();
-        let owned = dmesh_server::discovery::OwnedDevice {
+        let owned = dmesh_server::device_record::DeviceRecord {
             device_id: "paired-id".to_owned(),
             name: Some("kitchen".to_owned()),
             mac: None,
@@ -4488,13 +4365,12 @@ mod tests {
             vip6: Some(companion_vip6.clone()),
             endpoints: BTreeMap::new(),
             secret: vec![7; 16],
+            ..Default::default()
         };
-        std::fs::write(
-            paired_dir.path().join("kitchen.json"),
-            serde_json::to_vec(&owned).unwrap(),
-        )
-        .unwrap();
-        let _ = ANDROID_OWNED_DEVICES_PATH.set(paired_dir.path().to_path_buf());
+        dmesh_server::device_record::DeviceStore::new(paired_dir.path())
+            .save_paired(&owned)
+            .unwrap();
+        let _ = ANDROID_DEVICE_RECORDS_PATH.set(paired_dir.path().to_path_buf());
 
         // Companion over Aware with a recent RSSI.
         let mut id = [0_u8; 16];
@@ -4558,7 +4434,7 @@ mod tests {
         let ble_index = text.find(ble_line).unwrap();
         assert!(companion_index < sleepy_index && companion_index < ble_index);
         // Paired but never-discovered companions still surface.
-        let unseen = dmesh_server::discovery::OwnedDevice {
+        let unseen = dmesh_server::device_record::DeviceRecord {
             device_id: "lost".to_owned(),
             name: Some("lost-pair".to_owned()),
             mac: None,
@@ -4567,12 +4443,14 @@ mod tests {
             vip6: Some("fc00::5".to_owned()),
             endpoints: BTreeMap::new(),
             secret: vec![7; 16],
+            ..Default::default()
         };
-        std::fs::write(
-            paired_dir.path().join("lost.json"),
-            serde_json::to_vec(&unseen).unwrap(),
-        )
-        .unwrap();
+        dmesh_server::device_record::DeviceStore::new(paired_dir.path())
+            .put(&dmesh_server::device_record::DeviceRecord {
+                trust: Some(dmesh_server::device_record::trust::PAIRED.to_owned()),
+                ..unseen
+            })
+            .unwrap();
         let text = status_text();
         assert!(
             text.lines().any(|line| line.contains("lost-pair")),
@@ -4760,7 +4638,7 @@ mod tests {
             )
             .unwrap();
         }
-        for _ in 0..(NAN_EVENT_HISTORY_LEN * 2) {
+        for _ in 0..(64 * 2) {
             radio_message(
                 "radio.nan.event",
                 "event=aware.on_service_discovered peer=peer",

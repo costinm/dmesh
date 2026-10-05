@@ -2,14 +2,12 @@
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use dmesh_server::companion::{CompanionLink, PairRequest};
 use dmesh_server::companion_pair;
-use dmesh_server::platform_api::{
-    CompanionPairRequest, CompanionPairResponse, CompanionUnpairRequest, CompanionUnpairResponse,
-};
+use dmesh_server::device_record::DeviceStore;
 use quic_lite::packet_pool::PacketPool;
 use quic_lite::tokio::TokioNode;
 use quic_lite::{BearerId, PacketMeta, PeerL2Address};
@@ -43,24 +41,10 @@ impl<const SLOTS: usize, const MTU: usize> BleCompanion<SLOTS, MTU> {
         }
     }
 
-    /// `companion.pair`: connect a CoC, attach it to the node, and install
-    /// fresh credentials. The bearer stays attached after a successful pair;
-    /// a failed one is detached again.
-    pub async fn pair(
-        &self,
-        request: &CompanionPairRequest,
-        root_public_key: [u8; 33],
-        directory: &Path,
-    ) -> Result<CompanionPairResponse, String> {
-        let address = request
-            .id
-            .as_deref()
-            .ok_or("companion.pair kind=ble needs id (the BLE address)")?;
-        let vip6 = request
-            .vip6
-            .as_deref()
-            .map(|text| text.parse().map_err(|_| "vip6 is not an IPv6 address".to_owned()))
-            .transpose()?;
+    /// Connect a CoC, attach it to the node, and install fresh credentials. The bearer stays
+    /// attached after a successful pair; a failed one is detached again.
+    async fn pair_device(&self, request: PairRequest<'_>) -> Result<(), String> {
+        let address = request.id;
         let key = address.to_ascii_uppercase();
         if self.lock().contains_key(&key) {
             return Err(format!("{address} is already connected"));
@@ -96,10 +80,12 @@ impl<const SLOTS: usize, const MTU: usize> BleCompanion<SLOTS, MTU> {
             let paired = companion_pair::pair(
                 &association,
                 &companion_pair::Pairing {
-                    vip6,
-                    name: request.name.as_deref(),
-                    root_public_key,
-                    directory,
+                    vip6: request.vip6,
+                    name: request.name,
+                    root_public_key: request
+                        .root_public_key
+                        .ok_or("this controller has no control-plane root key; name one in root_public_key_b64")?,
+                    store: request.store,
                     endpoint: ("ble", address),
                 },
             )
@@ -112,7 +98,7 @@ impl<const SLOTS: usize, const MTU: usize> BleCompanion<SLOTS, MTU> {
         match outcome {
             Ok(_) => {
                 self.lock().insert(key, (id, channel));
-                Ok(CompanionPairResponse::default())
+                Ok(())
             }
             Err(error) => {
                 self.node.remove_bearer(id).await;
@@ -122,29 +108,32 @@ impl<const SLOTS: usize, const MTU: usize> BleCompanion<SLOTS, MTU> {
         }
     }
 
-    /// `companion.unpair`: release the CoC. Resetting the device and removing
-    /// the BlueZ bond are not implemented.
-    pub async fn unpair(
-        &self,
-        request: &CompanionUnpairRequest,
-    ) -> Result<CompanionUnpairResponse, String> {
-        let address = request
-            .id
-            .as_deref()
-            .ok_or("companion.unpair kind=ble needs id (the BLE address)")?;
+    /// Release the CoC. Resetting the device is a wired operation.
+    async fn release(&self, address: &str) -> Result<(), String> {
         let (id, channel) = self
             .lock()
             .remove(&address.to_ascii_uppercase())
             .ok_or_else(|| format!("{address} is not connected"))?;
         self.node.remove_bearer(id).await;
         channel.shutdown();
-        Ok(CompanionUnpairResponse::default())
+        Ok(())
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, (BearerId, Arc<CocChannel>)>> {
         self.connected
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl<const SLOTS: usize, const MTU: usize> CompanionLink for BleCompanion<SLOTS, MTU> {
+    async fn pair(&self, request: PairRequest<'_>) -> Result<(), String> {
+        self.pair_device(request).await
+    }
+
+    async fn unpair(&self, id: &str, _store: &DeviceStore) -> Result<(), String> {
+        self.release(id).await
     }
 }
 
@@ -177,29 +166,16 @@ mod tests {
             .block_on(tokio::task::LocalSet::new().run_until(future))
     }
 
-    #[test]
-    fn pair_needs_the_address() {
-        local(async {
-            let companion = companion();
-            let directory = Path::new("/nonexistent");
-            let error = |request: CompanionPairRequest| {
-                let companion = &companion;
-                async move { companion.pair(&request, [2; 33], directory).await.unwrap_err() }
-            };
-            assert!(error(CompanionPairRequest::default()).await.contains("id"));
-        });
+    fn pair_request<'a>(id: &'a str, psm: Option<u16>, store: &'a DeviceStore) -> PairRequest<'a> {
+        PairRequest { id, vip6: None, baud: None, psm, name: None, root_public_key: Some([2; 33]), store }
     }
 
     #[test]
     fn a_psm_outside_the_dynamic_range_is_rejected_before_any_radio_use() {
         local(async {
-            let request = CompanionPairRequest {
-                id: Some("AA:BB:CC:DD:EE:FF".to_owned()),
-                psm: Some(0x0001),
-                ..Default::default()
-            };
+            let store = DeviceStore::new("/nonexistent");
             let error = companion()
-                .pair(&request, [2; 33], Path::new("/nonexistent"))
+                .pair_device(pair_request("AA:BB:CC:DD:EE:FF", Some(0x0001), &store))
                 .await
                 .unwrap_err();
             assert!(error.contains("PSM"), "{error}");
@@ -209,11 +185,8 @@ mod tests {
     #[test]
     fn unpair_of_an_unknown_address_is_an_error() {
         local(async {
-            let request = CompanionUnpairRequest {
-                id: Some("AA:BB:CC:DD:EE:FF".to_owned()),
-                ..Default::default()
-            };
-            assert!(companion().unpair(&request).await.unwrap_err().contains("not connected"));
+            let error = companion().release("AA:BB:CC:DD:EE:FF").await.unwrap_err();
+            assert!(error.contains("not connected"));
         });
     }
 }

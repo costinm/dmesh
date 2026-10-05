@@ -100,7 +100,7 @@ pub(crate) fn secret_setting_exists(key: &[u8]) -> bool {
 /// Presence only: a NAN pairing invitation for an unpaired device must never read the
 /// shared secret or infer ownership from a public VIP prefix.
 pub fn shared_secret_exists() -> bool {
-    // An NVS failure must never make an owned device look unpaired. This
+    // An NVS failure must never make a paired device look unpaired. This
     // predicate also selects the BLE advertisement and NAN pairing wake.
     if unsafe { nvs_flash_init() } != 0 {
         return true;

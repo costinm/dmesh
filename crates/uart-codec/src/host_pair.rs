@@ -10,6 +10,7 @@
 //! startup, or by an earlier pairing) is reused. The exchange itself is the
 //! bearer-independent one in `dmesh_server::companion_pair`.
 
+use std::boxed::Box;
 use std::{
     collections::HashMap,
     format,
@@ -46,8 +47,8 @@ pub struct Pairing<'a> {
     pub name: Option<&'a str>,
     /// Compressed P-256 control-plane root to install (33 bytes).
     pub root_public_key: [u8; 33],
-    /// Private directory for the owned-device record.
-    pub directory: &'a Path,
+    /// Where the device's record is saved.
+    pub store: &'a dmesh_server::device_record::DeviceStore,
 }
 
 /// The serial ports attached to one QUIC node. `SLOTS` and `MTU` are the node's
@@ -83,7 +84,7 @@ impl<const SLOTS: usize, const MTU: usize> UartCompanion<SLOTS, MTU> {
                     vip6: request.vip6,
                     name: request.name,
                     root_public_key: request.root_public_key,
-                    directory: request.directory,
+                    store: request.store,
                     endpoint: ("uart", request.path),
                 },
             )
@@ -98,10 +99,10 @@ impl<const SLOTS: usize, const MTU: usize> UartCompanion<SLOTS, MTU> {
         &self,
         path: &str,
         baud: Option<u32>,
-        directory: &Path,
+        store: &dmesh_server::device_record::DeviceStore,
     ) -> Result<Ipv6Addr, String> {
         self.with_association(path, baud, |association| async move {
-            companion_pair::unpair(&association, directory).await
+            companion_pair::unpair(&association, store).await
         })
         .await
     }
@@ -181,11 +182,38 @@ impl<const SLOTS: usize, const MTU: usize> UartCompanion<SLOTS, MTU> {
     }
 }
 
+#[async_trait::async_trait]
+impl<const SLOTS: usize, const MTU: usize> dmesh_server::companion::CompanionLink
+    for UartCompanion<SLOTS, MTU>
+{
+    async fn pair(&self, request: dmesh_server::companion::PairRequest<'_>) -> Result<(), String> {
+        UartCompanion::pair(
+            self,
+            Pairing {
+                path: request.id,
+                baud: request.baud,
+                vip6: request.vip6,
+                name: request.name,
+                root_public_key: request
+                    .root_public_key
+                    .ok_or("this controller has no control-plane root key; name one in root_public_key_b64")?,
+                store: request.store,
+            },
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn unpair(&self, id: &str, store: &dmesh_server::device_record::DeviceStore) -> Result<(), String> {
+        UartCompanion::unpair(self, id, None, store).await.map(|_| ())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use dmesh_server::announce::{self, Announce};
-    use dmesh_server::discovery::{OwnedDevice, PairedDevices};
+    use dmesh_server::device_record::{DeviceRecord, DeviceStore};
     use dmesh_server::{provision, tagged};
     use quic_lite::{QuicNode, tokio::TokioNodeDriver};
     use std::{boxed::Box, vec, vec::Vec, string::ToString, borrow::ToOwned, format, future::Future};
@@ -377,14 +405,14 @@ mod tests {
         UartCompanion::new(host_node())
     }
 
-    fn request<'a>(cable: &'a Cable, vip6: Ipv6Addr, directory: &'a Path) -> Pairing<'a> {
+    fn request<'a>(cable: &'a Cable, vip6: Ipv6Addr, store: &'a DeviceStore) -> Pairing<'a> {
         Pairing {
             path: cable.host_path.to_str().unwrap(),
             baud: None,
             vip6: Some(vip6),
             name: Some("sensor1"),
             root_public_key: [2u8; 33],
-            directory,
+            store,
         }
     }
 
@@ -408,13 +436,14 @@ mod tests {
     fn a_missing_port_is_reported_and_leaves_no_record() {
         local(async {
             let directory = tempfile::tempdir().unwrap();
+            let store = DeviceStore::new(directory.path());
             let error = companion().pair(Pairing {
                     path: "/dev/does-not-exist-uart",
                     baud: None,
                     vip6: Some("fc00::1".parse().unwrap()),
                     name: Some("x"),
                     root_public_key: [2; 33],
-                    directory: directory.path(),
+                    store: &store,
                 },
             )
             .await
@@ -432,7 +461,8 @@ mod tests {
             let installed = Arc::new(Mutex::new(Vec::new()));
             start_device(&cable, FakeDevice { announce, installed: installed.clone(), accept: true });
             let directory = tempfile::tempdir().unwrap();
-            let paired = companion().pair(request(&cable, vip6, directory.path()))
+            let store = DeviceStore::new(directory.path());
+            let paired = companion().pair(request(&cable, vip6, &store))
                 .await
                 .unwrap();
             assert_eq!(paired.vip6, vip6);
@@ -441,7 +471,7 @@ mod tests {
             assert_eq!(device_side[0].0, "sensor1");
             assert_eq!(device_side[0].1, [2u8; 33]);
             // The host's record carries the same secret the device committed.
-            let owned = PairedDevices::load(directory.path(), &vip6.to_string()).unwrap().unwrap();
+            let owned = store.load(&vip6.to_string()).unwrap().unwrap();
             assert_eq!(owned.secret, device_side[0].2);
             assert_eq!(owned.secret.len(), 32);
             assert_eq!(owned.public_key, announce.public_key());
@@ -460,10 +490,10 @@ mod tests {
             let installed = Arc::new(Mutex::new(Vec::new()));
             start_device(&cable, FakeDevice { announce, installed: installed.clone(), accept: true });
             let directory = tempfile::tempdir().unwrap();
+            let store = DeviceStore::new(directory.path());
             // A record from an earlier pairing.
-            PairedDevices::save(
-                directory.path(),
-                &OwnedDevice {
+            store.save_paired(
+                &DeviceRecord {
                     device_id: "00".repeat(16),
                     name: Some("old".to_owned()),
                     mac: None,
@@ -472,20 +502,21 @@ mod tests {
                     vip6: Some(vip6.to_string()),
                     endpoints: Default::default(),
                     secret: vec![7; 32],
+                    ..Default::default()
                 },
             )
             .unwrap();
             let host = companion();
-            host.pair(request(&cable, vip6, directory.path())).await.unwrap();
-            let first = PairedDevices::load(directory.path(), &vip6.to_string()).unwrap().unwrap();
+            host.pair(request(&cable, vip6, &store)).await.unwrap();
+            let first = store.load(&vip6.to_string()).unwrap().unwrap();
             assert_ne!(first.secret, vec![7; 32]);
             assert_eq!(first.secret, installed.lock().unwrap()[0].2);
             assert_eq!(first.name.as_deref(), Some("sensor1"));
             // The port stayed attached, so a second pairing reuses that bearer
             // (a second open of the same port would be refused) and replaces
             // the secret again.
-            host.pair(request(&cable, vip6, directory.path())).await.unwrap();
-            let second = PairedDevices::load(directory.path(), &vip6.to_string()).unwrap().unwrap();
+            host.pair(request(&cable, vip6, &store)).await.unwrap();
+            let second = store.load(&vip6.to_string()).unwrap().unwrap();
             assert_ne!(second.secret, first.secret);
             assert_eq!(second.secret, installed.lock().unwrap()[1].2);
         });
@@ -499,11 +530,12 @@ mod tests {
             let installed = Arc::new(Mutex::new(Vec::new()));
             start_device(&cable, FakeDevice { announce, installed: installed.clone(), accept: true });
             let directory = tempfile::tempdir().unwrap();
-            let mut pairing = request(&cable, vip6, directory.path());
+            let store = DeviceStore::new(directory.path());
+            let mut pairing = request(&cable, vip6, &store);
             pairing.vip6 = None;
             let paired = companion().pair(pairing).await.unwrap();
             assert_eq!(paired.vip6, vip6);
-            assert!(PairedDevices::load(directory.path(), &vip6.to_string()).unwrap().is_some());
+            assert!(store.load(&vip6.to_string()).unwrap().is_some());
             assert_eq!(installed.lock().unwrap().len(), 1);
         });
     }
@@ -516,7 +548,8 @@ mod tests {
             let installed = Arc::new(Mutex::new(Vec::new()));
             start_device(&cable, FakeDevice { announce, installed: installed.clone(), accept: true });
             let directory = tempfile::tempdir().unwrap();
-            let error = companion().pair(request(&cable, "fc00::1234".parse().unwrap(), directory.path()),
+            let store = DeviceStore::new(directory.path());
+            let error = companion().pair(request(&cable, "fc00::1234".parse().unwrap(), &store),
             )
             .await
             .unwrap_err();
@@ -534,7 +567,8 @@ mod tests {
             let installed = Arc::new(Mutex::new(Vec::new()));
             start_device(&cable, FakeDevice { announce, installed, accept: false });
             let directory = tempfile::tempdir().unwrap();
-            let error = companion().pair(request(&cable, vip6, directory.path()))
+            let store = DeviceStore::new(directory.path());
+            let error = companion().pair(request(&cable, vip6, &store))
                 .await
                 .unwrap_err();
             assert!(error.contains("refused"), "{error}");
@@ -551,9 +585,9 @@ mod tests {
                 Arc::new(Mutex::new(vec![("sensor1".to_owned(), vec![2; 33], vec![9; 32])]));
             start_device(&cable, FakeDevice { announce, installed: installed.clone(), accept: true });
             let directory = tempfile::tempdir().unwrap();
-            PairedDevices::save(
-                directory.path(),
-                &OwnedDevice {
+            let store = DeviceStore::new(directory.path());
+            store.save_paired(
+                &DeviceRecord {
                     device_id: "00".repeat(16),
                     name: Some("sensor1".to_owned()),
                     mac: None,
@@ -562,16 +596,17 @@ mod tests {
                     vip6: Some(vip6.to_string()),
                     endpoints: Default::default(),
                     secret: vec![9; 32],
+                    ..Default::default()
                 },
             )
             .unwrap();
             let removed = companion()
-                .unpair(cable.host_path.to_str().unwrap(), None, directory.path())
+                .unpair(cable.host_path.to_str().unwrap(), None, &store)
                 .await
                 .unwrap();
             assert_eq!(removed, vip6);
             assert!(installed.lock().unwrap().is_empty());
-            assert!(PairedDevices::load(directory.path(), &vip6.to_string()).unwrap().is_none());
+            assert!(store.load(&vip6.to_string()).unwrap().is_none());
         });
     }
 }

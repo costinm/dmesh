@@ -557,7 +557,7 @@ port 3338 (an ephemeral port if that is busy; `DMESH_UDP_SOURCE_PORT` overrides)
 ## Companion pairing from the lab host
 
 `companion.pair`/`companion.unpair` are `mesh lmesh` methods: `--kind=uart --id=<serial path>
-[--baud=N]` or `--kind=ble --id=<BLE address>`. Owned-device files are written under
+[--baud=N]` or `--kind=ble --id=<BLE address>`. Device records (TOML) are written under
 `DMESH_PAIRED_DEVICES_DIR` (`/home/lmesh/etc/paired` in `lmesh.toml`). The lmesh service needs the
 `dialout` group for the serial port and `CAP_NET_ADMIN` for BLE (only to enable LE on the controller,
 which the kernel requires before any LE connection; `lmesh-ble-hci::mgmt`). The BLE channel is a

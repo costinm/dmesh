@@ -16,7 +16,7 @@ dmesh-cli DEVICE transport.set --mode=6 --nan_dw_interval=1 --now=1
 dmesh-cli DEVICE transport.set --1=6 --14=1 --15=1
 ```
 
-`DEVICE` is a device-catalog target. Use `--field=value` or the numeric
+`DEVICE` is a node name (or FQDN, or VIP6) found in the node records (`DMESH_NODES_DIR`; `dmesh-cli devices sync` records the nodes it can see). Use `--field=value` or the numeric
 `--tag=value` form for declared request fields. The corresponding HTTP JSON
 endpoint uses the method name and field names from this document; see
 [`crates/dmesh-cli/README.md`](crates/dmesh-cli/README.md) for transport,
@@ -91,15 +91,19 @@ the announce, so a platform that has it (Android, Linux) includes them and a dev
 that only has an identifier (firmware) omits them; an absent field is unknown, not
 empty.
 
-### Controller-owned device record
+### Device record
 
-Linux and Android persist one private `OwnedDevice` pairing result per signed
-`device_id`; each record contains optional `name`, radio `mac`,
-signed `public_key`, `vip6`, transport `endpoints`, and controller/device `secret`. The secret is
-stored only in the mode-0600 private device file, is redacted from debug
-output, and is never returned by `discovery.nodes` or an HTTP/UI handler.
-Android BLE pairing is one producer of this record; it is not an alternate
-device schema.
+Linux, Android and the CLI persist one device record (`dmesh_server::device_record::DeviceRecord`,
+one TOML file per device, keyed by the low 64 bits of its VIP6, or by its MAC while the identity is
+unknown) holding the long- and medium-lived facts about a device: optional `name`, `domain`,
+`device_type`, radio `mac`, signed `public_key`, `vip6`, static addresses, wake capability, `trust`
+(`first-seen`, `paired`, `verified`) and transport `endpoints`. A record may also hold a `secret`
+and the control-plane `root_public_key`, whether or not this controller paired the device; where
+secrets are stored may change with the security work. A record with a secret is a mode-0600 file in
+a mode-0700 directory, the secret is redacted from debug output, and it is never returned by
+`discovery.nodes` or an HTTP/UI handler. Live endpoints, last-seen, RTT and sleep state are not
+stored. Pairing and discovery observations are producers of this record, merged without replacing a
+secret or lowering trust; there is no alternate device schema.
 
 The advertised `vip6` is always the complete 16-byte ULA. RFC 4193 allocates
 `fc00::/7`: the following `L` bit selects centrally assigned (`0`) or locally
@@ -615,7 +619,7 @@ has `sec:key` ignores this invitation.
 `ble`. Companions use only these two. `id` is its adapter-local identifier, a
 serial path or a BLE address. The host verifies the signed device identity,
 generates a new shared secret, writes it to the device, and durably stores the
-secret with the device MAC and public key in its private owned-device file.
+secret with the device MAC and public key in the device's record (a private file).
 The signed `device_id` is stable across bearers.
 
 Bearers add no cryptography of their own. The shared secret is what QUIC-lite
@@ -657,7 +661,7 @@ BLE address) and by its signed discovery reply, whose VIP6 the owned record is
 keyed on. When `vip6` is given it must match that reply, and the host refuses a
 device that proves a different identity. UART and BLE use the same exchange over an ordinary QUIC
 association on the host's running node (BLE over a plain CoC): discover, `provision.install`, then
-save the owned-device file. A device that refuses leaves no host record. A
+save the device record. A device that refuses leaves no host record. A
 re-pair over the wire replaces the earlier record. `id` is the serial path or
 BLE address (from scan results); `psm` defaults to 128. A UART port stays attached
 afterwards; a port already attached (`LMESH_UART`) is reused.
@@ -699,7 +703,7 @@ mesh lmesh companion.unpair --kind=uart --id=/dev/ttyUSB0
 `kind` names the bearer carrying this operation; it does not identify the
 bearer on which pairing happened. Unpair removes the shared secret, the
 control-plane root and every BLE bond (stored peer keys) on the ESP32 and removes
-its owned-device entry on Linux or Android. A UART stays attached. Afterwards the ESP32 behaves like
+its device record on Linux or Android. A UART stays attached. Afterwards the ESP32 behaves like
 an unpaired device. Over BLE, unpair requires proof of the current
 shared secret and must reject devices owned by another controller. UART alone
 may unlock a device without that proof, including one paired to someone else.
@@ -1009,7 +1013,7 @@ dmesh-cli DEVICE telemetry.nan_status
 **Platforms:** L E
 
 An observer sends this targeted NAN request before pairing over any bearer.
-The device accepts it only while `sec:key` is empty; an owned device ignores
+The device accepts it only while `sec:key` is empty; a paired device ignores
 it. The observer response means the wake was queued, not that the device
 entered pairing mode or that pairing completed.
 

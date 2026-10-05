@@ -1562,7 +1562,6 @@ dependencies = [
  "dmesh-discovery",
  "dmesh-rawnan",
  "dmesh-server",
- "dmesh-store",
  "hyper-util",
  "jni 0.21.1",
  "libc",
@@ -1598,6 +1597,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tempfile",
  "tokio",
  "toml",
  "tracing",
@@ -1647,6 +1647,7 @@ dependencies = [
  "sha2 0.11.0",
  "tempfile",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]
@@ -3455,6 +3456,7 @@ name = "lmesh-ble-hci"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "dmesh-server",
  "libc",
  "quic-lite",
@@ -7100,6 +7102,7 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 name = "uart-codec"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "dmesh-discovery",
  "dmesh-server",
  "libc",

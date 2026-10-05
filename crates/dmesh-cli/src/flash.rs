@@ -609,7 +609,6 @@ mod tests {
                 mac: Some([0x02, 0x11, 0x22, 0x33, 0x44, 0x55]),
                 serial_id: None,
                 uart_baud: None,
-                auth_secret_ref: None,
                 udp_port: 3339,
             },
         )
@@ -628,7 +627,7 @@ mod tests {
                 sleepy, name: None, static_ipv4: None, vip6: None,
                 ipv6_link_local: None, udp6_iface: None,
                 mac: Some([2, 0, 0, 0, 0, 1]), serial_id: None,
-                uart_baud: None, auth_secret_ref: None, udp_port: 3339,
+                uart_baud: None, udp_port: 3339,
             }).unwrap();
             assert_eq!(target.restore_sleepy, sleepy);
         }

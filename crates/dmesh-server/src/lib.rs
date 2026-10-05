@@ -20,6 +20,12 @@ pub mod control;
 /// Shared receiver-side facts exposed by every platform's discovered-device
 /// list. Radio callbacks and retention remain adapter-owned.
 pub mod discovery;
+#[cfg(feature = "std")]
+pub mod device_record;
+#[cfg(feature = "std")]
+pub mod radio_history;
+#[cfg(feature = "std")]
+pub mod companion;
 /// Shared, bearer- and ESP-independent Recovery/Main bootstrap profile.
 pub mod firmware_profile;
 /// Common CBOR contract for platform-observed local interfaces and addresses.
@@ -94,8 +100,6 @@ pub mod wake;
 pub mod ble_service;
 #[cfg(feature = "std")]
 pub mod companion_pair;
-#[cfg(feature = "std")]
-pub mod companion_service;
 /// Typed request/response structs for every `portable` and `android` method,
 /// generated from `API.md` (serde plus `mesh::tagged::TaggedFields`).
 #[cfg(feature = "std")]

@@ -34,9 +34,10 @@ from pathlib import Path
 
 ROOT = Path(os.environ.get("DMESH_INSTALL_ROOT", Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(ROOT))
-DEFAULT_DEVICE_CATALOG = ROOT / "crates" / "dmesh-cli" / "examples" / "device-catalog.toml"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import dmesh_nodes  # noqa: E402
 
-# Direct USB/JTAG identities are resolved from the same TOML catalog as the
+# Direct USB/JTAG identities are resolved from the device records shared with the
 # CLI and hardware E2E. A literal /dev path remains an explicit override.
 # Recovery rescue values integrity over JTAG throughput. The builtin adapter
 # defaults to 24 MHz; a wedged board on a long/noisy hub path is more reliable
@@ -51,34 +52,21 @@ class DirectDevice:
         self.flash_size_mb = flash_size_mb
 
 
-def catalog_device(catalog: Path | None, role: str) -> dict:
-    if catalog is None:
-        raise RuntimeError(
-            f"{role}: device catalog not selected"
-        )
-    if not catalog.is_file():
-        raise RuntimeError(f"device catalog not found: {catalog}")
-    with catalog.open("rb") as stream:
-        document = tomllib.load(stream)
-    devices = document.get("devices")
-    if not isinstance(devices, list):
-        raise RuntimeError("device catalog has no [[devices]] entries")
-    matches = [device for device in devices if isinstance(device, dict) and device.get("name") == role]
-    if len(matches) != 1:
-        raise RuntimeError(f"device catalog must contain exactly one device named {role!r}")
-    return matches[0]
+def device_record(role: str) -> dict:
+    """The device record named `role` (see dmesh_nodes)."""
+    return dmesh_nodes.find(role)
 
 
-def direct_serial_port(role: str, catalog: Path | None) -> str:
+def direct_serial_port(role: str) -> str:
     if role.startswith("/dev/"):
         return role
     override = os.environ.get(f"DMESH_SERIAL_{role.upper().replace('-', '_')}")
     if override:
         return override
-    device = catalog_device(catalog, role)
+    device = device_record(role)
     pattern = device.get("serial_glob") or device.get("serial")
     if not isinstance(pattern, str) or not pattern:
-        raise RuntimeError(f"{role}: catalog has no serial or serial_glob; set DMESH_SERIAL_<ROLE>")
+        raise RuntimeError(f"{role}: device record has no uart endpoint; set DMESH_SERIAL_<ROLE>")
     if pattern.startswith("/dev/"):
         return pattern
     matches = sorted(glob.glob(f"/dev/serial/by-id/{pattern}"))
@@ -227,15 +215,15 @@ def probe_direct_until(port: str, baud: int, timeout_s: float) -> DirectDevice |
         time.sleep(0.25)
 
 
-def board_ip_from_catalog(catalog: Path | None, role: str) -> str:
-    """Return the static STA IPv4 configured for a catalog device."""
-    value = catalog_device(catalog, role).get("ipv4")
+def board_ip_from_record(role: str) -> str:
+    """Return the static STA IPv4 configured in a device record."""
+    value = device_record(role).get("ipv4")
     if not isinstance(value, str):
-        raise RuntimeError(f"{role}: catalog has no IPv4 address; pass --board-ip explicitly")
+        raise RuntimeError(f"{role}: device record has no IPv4 address; pass --board-ip explicitly")
     try:
         return str(ipaddress.IPv4Address(value))
     except ipaddress.AddressValueError as error:
-        raise RuntimeError(f"{role}: catalog IPv4 address is invalid: {value!r}") from error
+        raise RuntimeError(f"{role}: device record IPv4 address is invalid: {value!r}") from error
 
 
 def deployment_transport(target: str, requested: str) -> str:
@@ -264,7 +252,7 @@ def openocd_binary_and_scripts() -> tuple[Path, Path]:
     return binary, scripts
 
 
-def jtag_adapter_location(role: str, catalog: Path | None) -> str:
+def jtag_adapter_location(role: str) -> str:
     """Return the exact USB topology of this board's builtin JTAG adapter.
 
     OpenOCD's serial-string selection is unreliable immediately after a C6
@@ -277,7 +265,7 @@ def jtag_adapter_location(role: str, catalog: Path | None) -> str:
     fallback for a board whose serial interface is temporarily absent.
     """
     try:
-        port = Path(direct_serial_port(role, catalog)).resolve()
+        port = Path(direct_serial_port(role)).resolve()
         interface = (Path("/sys/class/tty") / port.name / "device").resolve()
         usb_device = interface.parent
         bus = (usb_device / "busnum").read_text().strip()
@@ -286,13 +274,13 @@ def jtag_adapter_location(role: str, catalog: Path | None) -> str:
             return f"{bus}-{devpath}"
     except (OSError, RuntimeError):
         pass
-    location = catalog_device(catalog, role).get("jtag_adapter_location")
+    location = device_record(role).get("jtag_adapter_location")
     if not isinstance(location, str) or not location:
-        raise RuntimeError(f"{role}: catalog has no jtag_adapter_location")
+        raise RuntimeError(f"{role}: device record has no jtag endpoint")
     return location
 
 
-def jtag_write_partition(role: str, image: Path, offset: str, catalog: Path | None) -> None:
+def jtag_write_partition(role: str, image: Path, offset: str) -> None:
     """Write one verified C6 application partition through USB-JTAG.
 
     This is deliberately narrower than the normal serial path: only the
@@ -304,7 +292,7 @@ def jtag_write_partition(role: str, image: Path, offset: str, catalog: Path | No
     if not image.is_file():
         raise RuntimeError(f"missing Recovery image: {image}")
     openocd, scripts = openocd_binary_and_scripts()
-    adapter_location = jtag_adapter_location(role, catalog)
+    adapter_location = jtag_adapter_location(role)
     # `program_esp ... reset exit` leaves this C6 builtin-JTAG target halted
     # at the reset vector. Keep the programming command separate so the final
     # reset has explicit `run` semantics before OpenOCD releases the adapter.
@@ -459,7 +447,7 @@ def nvs_boot_target_image(
     server: str, board_ip: str, server_port: int, flash_baud: int,
     source_override: Path | None = None, sta_profile: Path | None = None,
     sta_ssid: str | None = None, sta_server_ll: str | None = None,
-    sta_server_port: int = 3336, device_catalog: Path | None = None,
+    sta_server_port: int = 3336, provision_security: bool = False,
 ) -> Path:
     """Preserve NVS contents while setting or removing the lab boot target."""
     output = ROOT / "target" / "nvs" / role
@@ -477,7 +465,7 @@ def nvs_boot_target_image(
         sys.executable, str(ROOT / "scripts" / "prepare-nvs-image.py"),
         str(source), str(csv), str(image), "--size", "0x6000",
     ]
-    if device_catalog is not None:
+    if provision_security:
         command.extend(("--server", server, "--ip", board_ip,
                         "--gw", server, "--mask", "255.255.0.0", "--port", str(server_port)))
     if clear_boot_target:
@@ -497,8 +485,8 @@ def nvs_boot_target_image(
         if sta_server_ll is not None:
             command.extend(("--sta-server-ll", sta_server_ll))
         command.extend(("--sta-server-port", str(sta_server_port)))
-    if device_catalog is not None:
-        command.extend(("--device-catalog", str(device_catalog), "--device-role", role))
+    if provision_security:
+        command.extend(("--device-role", role))
     subprocess.run(
         command,
         cwd=ROOT,
@@ -655,24 +643,19 @@ def main() -> int:
                         help="with target=nvs: remove only persisted STA selector/credential keys")
     parser.add_argument("--clear-pairing", action="store_true",
                         help="with target=nvs: remove sec:key and ESP NimBLE bond data over physical USB")
-    parser.add_argument("--device-catalog", type=Path,
-                        default=os.environ.get("DMESH_DEVICE_CATALOG", DEFAULT_DEVICE_CATALOG),
-                        help="shared device/E2E catalog; defaults to the checked-in test catalog")
     parser.add_argument("--provision-security", action="store_true",
-                        help="with target=nvs: explicitly install the selected catalog secret and control key")
+                        help="with target=nvs: explicitly install the device record's secret and control-plane key")
     args = parser.parse_args()
     if args.artifact_root is not None and args.target not in ("all", "stage", "recovery", "main"):
         parser.error("--artifact-root supports all, stage, recovery, and main")
-    if args.device_catalog is not None:
-        args.device_catalog = Path(args.device_catalog)
     try:
         args.transport = deployment_transport(args.target, args.transport)
     except ValueError as error:
         parser.error(str(error))
     # A static board address is NVS input only. Resolve it from the same
-    # catalog that supplies the selected board's USB/JTAG identity.
+    # device record that supplies the selected board's USB/JTAG identity.
     if args.board_ip is None and args.target == "nvs":
-        args.board_ip = board_ip_from_catalog(args.device_catalog, args.role)
+        args.board_ip = board_ip_from_record(args.role)
 
     if args.transport == "action":
         action_flash(args.role)
@@ -687,7 +670,7 @@ def main() -> int:
         if len(pairs) != 1 or pairs[0][0] != expected_offset:
             raise RuntimeError(f"unexpected {args.role} {args.target} JTAG artifact: {pairs}")
         print(f"{args.role}: JTAG {args.target} write {pairs[0][1]}", flush=True)
-        jtag_write_partition(args.role, pairs[0][1], expected_offset, args.device_catalog)
+        jtag_write_partition(args.role, pairs[0][1], expected_offset)
         print(f"{args.role}: JTAG verified {args.target} and reset", flush=True)
         return 0
     if args.boot_target is not None and args.clear_boot_target:
@@ -707,7 +690,7 @@ def main() -> int:
         parser.error("--sta-ssid requires --sta-profile")
     if args.sta_server_ll is not None and args.sta_profile is None:
         parser.error("--sta-server-ll requires --sta-profile")
-    physical = direct_serial_port(args.role, args.device_catalog)
+    physical = direct_serial_port(args.role)
     if args.check:
         device = probe_direct_until(physical, args.flash_baud, args.probe_timeout)
         if device is None:
@@ -737,7 +720,7 @@ def main() -> int:
                 physical, chip, args.role, args.boot_target, args.clear_boot_target,
                 args.mode, args.clear_sta_profile, args.clear_pairing, args.server, args.board_ip, args.server_port, args.flash_baud,
                 args.nvs_source, args.sta_profile, args.sta_ssid, args.sta_server_ll,
-                args.sta_server_port, args.device_catalog if args.provision_security else None,
+                args.sta_server_port, args.provision_security,
             )
             pairs = [("0x9000", image)]
         else:

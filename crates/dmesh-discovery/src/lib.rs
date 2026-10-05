@@ -28,6 +28,7 @@ mod identity;
 pub mod interfaces;
 mod inventory;
 pub mod nodes;
+pub mod persist;
 #[cfg(feature = "tokio")]
 pub mod udp;
 

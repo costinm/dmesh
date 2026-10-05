@@ -228,7 +228,7 @@ mod tests {
             ["wifi.status", "wifi.scan"]
         );
         assert_eq!(
-            names(crate::companion_service::methods()),
+            names(crate::companion::methods()),
             ["companion.pair", "companion.unpair"]
         );
         assert_eq!(names(crate::transport_service::methods()), ["transport.set"]);

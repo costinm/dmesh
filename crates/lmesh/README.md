@@ -19,7 +19,7 @@ The legacy UART forwarding service is retired. `lmesh` lists USB serial ports
 without opening them, probes a port only on `uart.discover`, and retains it only
 after `companion.pair` names its kind, ID, and signed VIP. The same public
 method also selects an encrypted BLE CoC or an already discovered Wi-Fi route.
-Linux requires a matching secret in the private owned-device inventory before
+Linux requires a matching secret in the private device records before
 reporting a companion paired. `companion.unpair` releases only the selected
 local companion; it does not erase ESP NVS credentials.
 `dmesh-cli` can own an unpaired physical port for direct diagnostics. The

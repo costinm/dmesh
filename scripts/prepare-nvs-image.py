@@ -20,6 +20,9 @@ import sys
 import tomllib
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import dmesh_nodes  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[1]
 
 TYPE_MAP = {
@@ -66,43 +69,33 @@ def base64_key(value: object, field: str, lengths: tuple[int, ...]) -> str:
     return value
 
 
-def load_device_security(catalog: Path, role: str) -> dict[str, str]:
-    """Load one ESP security record from the shared test device catalog.
+def load_device_security(role: str) -> dict[str, str]:
+    """Load one ESP security record from the device record named `role` (see dmesh_nodes).
 
-    The catalog's device name is the single provisioning authority.  Its
-    shared secret deliberately remains host-side in this first milestone;
-    checking it here prevents a half-populated device record from being used.
+    The record's name is the single provisioning authority. Its secret and the control-plane root
+    live in the private record file; checking them here prevents a half-populated record from being
+    used.
     """
-    if not catalog.is_file():
-        raise ValueError(f"device catalog not found: {catalog}")
-    with catalog.open("rb") as stream:
-        document = tomllib.load(stream)
-    security = document.get("security")
-    if not isinstance(security, dict):
-        raise ValueError("device catalog is missing [security]")
-    control_plane = base64_key(
-        security.get("control_plane_public_key_b64"),
-        "security.control_plane_public_key_b64", (33,),
-    )
-    devices = document.get("devices")
-    if not isinstance(devices, list):
-        raise ValueError("device catalog has no [[devices]] entries")
-    matches = [device for device in devices if isinstance(device, dict) and device.get("name") == role]
-    if len(matches) != 1:
-        raise ValueError(f"device catalog must contain exactly one device named {role!r}")
-    device = matches[0]
+    try:
+        device = dmesh_nodes.find(role)
+    except RuntimeError as error:
+        raise ValueError(str(error)) from error
     if device.get("kind") != "esp":
-        raise ValueError(f"catalog device {role!r} is not an ESP device")
+        raise ValueError(f"device record {role!r} is not an ESP device")
+    control_plane = base64_key(
+        device.get("control_plane_public_key_b64"),
+        f"{role}: control-plane root (root_public_key)", (33,),
+    )
     name = device.get("name")
     if not isinstance(name, str) or not 1 <= len(name.encode("ascii")) <= 8:
-        raise ValueError("catalog ESP name must be 1..8 ASCII bytes for announce")
-    domain = document.get("domain", "test.webinf.info")
+        raise ValueError("ESP name must be 1..8 ASCII bytes for announce")
+    domain = device.get("domain", "test.webinf.info")
     if not isinstance(domain, str) or not 1 <= len(domain.encode("ascii")) <= 16:
-        raise ValueError("catalog domain must be 1..16 ASCII bytes for announce")
-    # ESP private keys are generated on-device by the P-256 hardware-backed
-    # identity path. The catalog contains only public/control-plane material.
+        raise ValueError("domain must be 1..16 ASCII bytes for announce")
+    # ESP private keys are generated on-device by the P-256 hardware-backed identity path. The
+    # record holds only the shared secret and the control-plane public key.
     shared_secret = base64_key(
-        device.get("shared_secret_b64"), f"devices.{role}.shared_secret_b64", (32,),
+        device.get("shared_secret_b64"), f"{role}: secret", (32,),
     )
     return {
         DEVICE_NAME: name,
@@ -384,10 +377,8 @@ def main() -> int:
                         help="optional Recovery server IPv6 link-local address without an interface scope")
     parser.add_argument("--sta-server-port", type=int, default=3336,
                         help="Recovery server UDP port when --sta-server-ll is used")
-    parser.add_argument("--device-catalog", type=Path,
-                        help="shared test device catalog containing [security] and this ESP's key material")
     parser.add_argument("--device-role",
-                        help="catalog ESP name selected by flash-device.py")
+                        help="name of the ESP device record whose secret and control-plane root are installed")
     args = parser.parse_args()
     if args.boot_target is not None and args.clear_boot_target:
         parser.error("--boot-target and --clear-boot-target are mutually exclusive")
@@ -410,13 +401,11 @@ def main() -> int:
         except ValueError as error:
             parser.error(str(error))
         device_profile.update(sta_profile)
-    if (args.device_catalog is None) != (args.device_role is None):
-        parser.error("--device-catalog and --device-role must be used together")
-    if args.clear_pairing and args.device_catalog is not None:
-        parser.error("--clear-pairing cannot be combined with catalog secret provisioning")
-    if args.device_catalog is not None:
+    if args.clear_pairing and args.device_role is not None:
+        parser.error("--clear-pairing cannot be combined with secret provisioning")
+    if args.device_role is not None:
         try:
-            device_profile.update(load_device_security(args.device_catalog, args.device_role))
+            device_profile.update(load_device_security(args.device_role))
         except ValueError as error:
             parser.error(str(error))
     removed = write_csv(

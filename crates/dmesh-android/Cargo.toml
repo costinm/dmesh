@@ -12,7 +12,6 @@ jni-wrapper = ["dep:jni"]
 # live in this workspace so Android and Linux builds use the same source.
 ssh-mesh = { git = "https://github.com/costinm/ssh-mesh", package = "ssh-mesh" }
 mesh-tun = { path = "../tun", default-features = false }
-dmesh-store = { path = "../dmesh-store" }
 dmesh-server = { path = "../dmesh-server" }
 dmesh-discovery = { path = "../dmesh-discovery", features = ["tokio"] }
 dmesh-rawnan = { path = "../rawnan" }

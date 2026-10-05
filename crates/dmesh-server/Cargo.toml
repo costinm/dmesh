@@ -12,6 +12,7 @@ hex = { version = "0.4", optional = true }
 libc = { version = "0.2", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
+toml = { version = "0.8", optional = true }
 tokio = { version = "1", default-features = false, features = ["macros", "net", "rt", "rt-multi-thread", "io-util", "time", "sync", "fs"], optional = true }
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
@@ -27,6 +28,7 @@ std = [
     "dep:libc",
     "dep:serde",
     "dep:serde_json",
+    "dep:toml",
     "dep:tokio",
     "dep:tracing",
     "dep:tracing-subscriber",

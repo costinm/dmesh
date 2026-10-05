@@ -12,7 +12,7 @@ use crate::flash::{
 use crate::uart::{DeviceSession, DeviceSessionEvent};
 use crate::{
     device::{
-        DeviceProfile, device_catalog_path, load_device, resolve_catalog_target, resolve_udp_peer,
+        DeviceProfile, load_device, resolve_catalog_target, resolve_udp_peer,
     },
     schema::{
         encode_direct_command_with_id, encode_stream_argv_with_id, encode_stream_command_with_id,
@@ -21,12 +21,11 @@ use crate::{
 };
 use dmesh_server::announce;
 use std::{
-    collections::BTreeMap,
     env,
     io::{ErrorKind, Read},
     net::{Ipv6Addr, SocketAddr, SocketAddrV6},
     os::fd::AsRawFd,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -56,7 +55,7 @@ pub(crate) fn is_fatal_diagnostic(line: &str) -> bool {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: dmesh-cli SERIAL|DEVICE --reset\n       dmesh-cli SERIAL|DEVICE --wake [--baud PHYSICAL_UART_BAUD]\n       dmesh-cli SERIAL|DEVICE --watch [--reset] [--interactive] [--baud PHYSICAL_UART_BAUD] [--timeout-secs N]\n       dmesh-cli DEVICE METHOD [--field=value ...] [--bearer udp[,uart]]\n       dmesh-cli SERIAL METHOD [--baud PHYSICAL_UART_BAUD] [--timeout-secs N] [--linger-secs N] [--repeat-secs N] [--field=value ...]\n       dmesh-cli devices check|backfill [--dry-run]\n       dmesh-cli discover\n       dmesh-cli flash TARGET [--target main|recovery|stage2|MODULE] [--file IMAGE]\n       dmesh-cli SERIAL|DEVICE [--msg TEXT | --direct-hex HEX] [--timeout-secs N]\n       dmesh-cli lmesh METHOD [--field=value ...]\n       dmesh-cli NODE check\n       dmesh-cli udp://HOST:PORT --socket PATH\n       dmesh-cli http://HOST:PORT SERVICE.METHOD [--field=value ...]"
+        "usage: dmesh-cli SERIAL|DEVICE --reset\n       dmesh-cli SERIAL|DEVICE --wake [--baud PHYSICAL_UART_BAUD]\n       dmesh-cli SERIAL|DEVICE --watch [--reset] [--interactive] [--baud PHYSICAL_UART_BAUD] [--timeout-secs N]\n       dmesh-cli DEVICE METHOD [--field=value ...] [--bearer udp[,uart]]\n       dmesh-cli SERIAL METHOD [--baud PHYSICAL_UART_BAUD] [--timeout-secs N] [--linger-secs N] [--repeat-secs N] [--field=value ...]\n       dmesh-cli devices check|sync [--dry-run]|import-catalog FILE [DIR]\n       dmesh-cli discover\n       dmesh-cli flash TARGET [--target main|recovery|stage2|MODULE] [--file IMAGE]\n       dmesh-cli SERIAL|DEVICE [--msg TEXT | --direct-hex HEX] [--timeout-secs N]\n       dmesh-cli lmesh METHOD [--field=value ...]\n       dmesh-cli NODE check\n       dmesh-cli udp://HOST:PORT --socket PATH\n       dmesh-cli http://HOST:PORT SERVICE.METHOD [--field=value ...]"
     );
     std::process::exit(2)
 }
@@ -105,13 +104,13 @@ pub fn run_dmesh_cli_args(args: impl IntoIterator<Item = String>) -> Result<(), 
     if arguments.as_slice() == ["devices", "check"] {
         return run_devices_check();
     }
-    if matches!(arguments.as_slice(), [devices, backfill] if devices == "devices" && backfill == "backfill")
+    if matches!(arguments.as_slice(), [devices, sync] if devices == "devices" && (sync == "sync" || sync == "backfill"))
     {
-        return run_devices_backfill(false);
+        return run_devices_sync(false);
     }
-    if matches!(arguments.as_slice(), [devices, backfill, dry_run] if devices == "devices" && backfill == "backfill" && dry_run == "--dry-run")
+    if matches!(arguments.as_slice(), [devices, sync, dry_run] if devices == "devices" && (sync == "sync" || sync == "backfill") && dry_run == "--dry-run")
     {
-        return run_devices_backfill(true);
+        return run_devices_sync(true);
     }
     if arguments.as_slice() == ["discover"] {
         return run_hosts_discovery();
@@ -1408,7 +1407,7 @@ pub(crate) fn submit_nan_wake_to_all(
         .ok_or_else(|| format!("target_wake_rejected target={}", target.description))
 }
 
-/// A stable operator-facing device identity read from the shared catalog.
+/// A stable operator-facing node identity read from the node records.
 /// Its VIP6 low 64 bits are the signed announce identity hint. Names are only
 /// lookup aliases and never participate in radio or flash target matching.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1420,44 +1419,42 @@ pub(crate) struct CatalogVip6 {
 }
 
 pub(crate) fn catalog_vip6_inventory() -> Result<Vec<CatalogVip6>, String> {
-    let path = device_catalog_path();
-    let catalog = crate::device::DeviceCatalog::from_path(&path)?;
     let mut entries = Vec::new();
-    for device in catalog.devices {
-        let Some(value) = device.vip6 else {
+    for node in crate::device::store().list()? {
+        let name = node.name.clone().unwrap_or_else(|| node.device_id.clone());
+        let Some(value) = node.vip6.as_deref() else {
             continue;
         };
-        let vip6 = value.parse::<Ipv6Addr>().map_err(|error| {
-            format!(
-                "catalog device {:?} has invalid vip6 {value:?}: {error}",
-                device.name
-            )
-        })?;
+        let vip6 = value
+            .parse::<Ipv6Addr>()
+            .map_err(|error| format!("node {name:?} has invalid vip6 {value:?}: {error}"))?;
         if vip6.octets()[0] != 0xfc {
-            return Err(format!(
-                "catalog device {:?} has vip6 outside fc00::/8: {vip6}",
-                device.name
-            ));
+            return Err(format!("node {name:?} has vip6 outside fc00::/8: {vip6}"));
         }
         entries.push(CatalogVip6 {
-            name: device.name,
+            name,
             vip6,
             node: hex_encode(&vip6.octets()[8..]),
-            mac: device.mac.as_deref().and_then(parse_mac),
+            mac: node.mac,
         });
     }
     if entries.is_empty() {
         return Err(format!(
-            "device catalog {} has no vip6 entries (expected fc00::/8)",
-            path.display()
+            "no node records with a vip6 in {} (expected fc00::/8); run `dmesh-cli devices sync`",
+            crate::device::store()
+                .directories()
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(":")
         ));
     }
     Ok(entries)
 }
 
-/// Validate the checked-in node identity inventory against multicast
-/// presence.  A VIP6 is an overlay identity, not a LAN route, so this must
-/// not attempt a raw UDP packet to the VIP itself.
+/// Validate the node records against multicast presence. A VIP6 is an overlay
+/// identity, not a LAN route, so this must not attempt a raw UDP packet to the
+/// VIP itself.
 fn run_devices_check() -> Result<(), String> {
     let inventory = catalog_vip6_inventory()?;
     let peers = multicast_discover_peers()?;
@@ -1477,18 +1474,9 @@ fn run_devices_check() -> Result<(), String> {
         }
     }
     if visible == 0 {
-        return Err("no catalogued VIP6 identity answered multicast discovery".into());
+        return Err("no node record answered multicast discovery".into());
     }
     Ok(())
-}
-
-/// A signed identity correlated to a concrete Wi-Fi radio address.  The
-/// catalog maps that address to an operator-owned device entry; the
-/// announce display name is intentionally not used for this mapping.
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct DiscoveryBinding {
-    node: String,
-    mac: [u8; 6],
 }
 
 fn mac_from_eui64(address: Ipv6Addr) -> Option<[u8; 6]> {
@@ -1505,10 +1493,8 @@ fn mac_from_eui64(address: Ipv6Addr) -> Option<[u8; 6]> {
     })
 }
 
-fn binding_from_direct_peer(peer: &DiscoveredPeer) -> Option<DiscoveryBinding> {
-    if peer.node.len() != 16 {
-        return None;
-    }
+/// The radio MAC behind a direct peer's link-local address (EUI-64), when it has one.
+fn mac_of_direct_peer(peer: &DiscoveredPeer) -> Option<[u8; 6]> {
     let address = peer
         .announce
         .sta_link_local_v6()
@@ -1517,158 +1503,37 @@ fn binding_from_direct_peer(peer: &DiscoveredPeer) -> Option<DiscoveryBinding> {
             SocketAddr::V6(address) => Some(*address.ip()),
             SocketAddr::V4(_) => None,
         })?;
-    Some(DiscoveryBinding {
-        node: peer.node.clone(),
-        mac: mac_from_eui64(address)?,
-    })
+    mac_from_eui64(address)
 }
 
-fn insert_binding(
-    bindings: &mut BTreeMap<String, DiscoveryBinding>,
-    binding: DiscoveryBinding,
-) -> Result<(), String> {
-    let key = mac_encode(&binding.mac);
-    if let Some(existing) = bindings.get(&key) {
-        if existing.node != binding.node {
-            return Err(format!(
-                "conflicting signed discovery identities for radio MAC {key}: {} and {}",
-                existing.node, binding.node
-            ));
-        }
-        return Ok(());
-    }
-    bindings.insert(key, binding);
-    Ok(())
-}
-
-/// Update only one device's `vip6` field without reserializing the shared
-/// operator-maintained catalog or exposing its protected fields.
-fn upsert_catalog_vip6(path: &Path, name: &str, vip6: Ipv6Addr) -> Result<(), String> {
-    let rendered = format!("\"{vip6}\"");
-    let contents = std::fs::read_to_string(path)
-        .map_err(|error| format!("read device catalog {}: {error}", path.display()))?;
-    let mut lines = contents.lines().map(str::to_owned).collect::<Vec<_>>();
-    let mut section = None;
-    let mut end = lines.len();
-    for (index, line) in lines.iter().enumerate() {
-        if line.trim() == "[[devices]]" {
-            if section.is_some() {
-                end = index;
-                break;
-            }
-            continue;
-        }
-        if line.split_once('=').is_some_and(|(key, value)| {
-            key.trim() == "name" && value.trim() == format!("\"{name}\"")
-        }) {
-            section = (0..=index)
-                .rev()
-                .find(|&candidate| lines[candidate].trim() == "[[devices]]");
-        }
-    }
-    let section = section.ok_or_else(|| {
-        format!(
-            "device catalog {} has no device named {name:?}",
-            path.display()
-        )
-    })?;
-    if end == lines.len() {
-        end = lines[section + 1..]
-            .iter()
-            .position(|line| line.trim() == "[[devices]]")
-            .map(|offset| section + 1 + offset)
-            .unwrap_or(lines.len());
-    }
-    if let Some(index) = (section + 1..end).find(|&index| {
-        lines[index]
-            .split_once('=')
-            .is_some_and(|(key, _)| key.trim() == "vip6")
-    }) {
-        lines[index] = format!("vip6 = {rendered}");
-    } else {
-        lines.insert(end, format!("vip6 = {rendered}"));
-    }
-    let updated = format!("{}\n", lines.join("\n"));
-    let temporary = path.with_extension("toml.tmp");
-    std::fs::write(&temporary, updated)
-        .map_err(|error| format!("write {}: {error}", temporary.display()))?;
-    std::fs::rename(&temporary, path)
-        .map_err(|error| format!("replace {}: {error}", path.display()))
-}
-
-/// Back-fill catalogued VIP6 identities from live signed discovery. A write needs
-/// both an announce identity and a radio MAC.  The common catalog is the only
-/// MAC-to-name mapping, so a peer cannot create an arbitrary local node name.
-fn run_devices_backfill(dry_run: bool) -> Result<(), String> {
+/// Record every node that answers multicast discovery with a valid signed identity: the persisted
+/// part of its announce (identity, name, domain, type, port) and its radio MAC, merged into the node
+/// directory without touching a paired node's secret. Dynamic facts are not written.
+fn run_devices_sync(dry_run: bool) -> Result<(), String> {
+    let store = crate::device::store();
     let reachable = multicast_discover_peers()?;
-    let mut bindings = BTreeMap::<String, DiscoveryBinding>::new();
-    for peer in &reachable {
-        if let Some(binding) = binding_from_direct_peer(peer) {
-            insert_binding(&mut bindings, binding)?;
-        }
-    }
-    for peer in &reachable {
-        if peer.passive_ready {
-            let request = encode_stream_command_with_id("discovery.active", fresh_request_id())
-                .map_err(|error| format!("encode discovery.active: {error}"))?;
-            let _ = exchange_udp_stream_record(peer.peer, &request);
-        }
-    }
-    std::thread::sleep(Duration::from_secs(5));
-    for observer in &reachable {
-        let request = encode_stream_command_with_id("discovery.nodes", fresh_request_id())
-            .map_err(|error| format!("encode discovery.nodes: {error}"))?;
-        let Ok(response) = exchange_udp_stream_record(observer.peer, &request) else {
-            continue;
-        };
-        let Some(nodes) = observed_nodes(&response) else {
-            continue;
-        };
-        for observed in nodes {
-            if observed.node.len() == 16 {
-                if let Some(mac) = observed.peer_mac {
-                    insert_binding(
-                        &mut bindings,
-                        DiscoveryBinding {
-                            node: observed.node,
-                            mac,
-                        },
-                    )?;
-                }
-            }
-        }
-    }
-
-    let catalog_path = device_catalog_path();
-    let catalog = crate::device::DeviceCatalog::from_path(&catalog_path)?;
     let mut changed = 0usize;
-    for device in catalog.devices {
-        let Some(mac) = device.mac.as_deref().and_then(parse_mac) else {
+    for peer in &reachable {
+        let Some(record) = dmesh_server::device_record::DeviceRecord::from_announce(
+            &peer.announce,
+            mac_of_direct_peer(peer),
+        ) else {
             continue;
         };
-        let key = mac_encode(&mac);
-        let Some(binding) = bindings.get(&key) else {
-            continue;
-        };
-        let vip6 = announce::virtual_ip6_from_identity_hint(
-            &hex(&binding.node)
-                .map_err(|error| format!("decode node {}: {error}", binding.node))?,
-        )
-        .map(Ipv6Addr::from)
-        .ok_or_else(|| format!("invalid identity hint {}", binding.node))?;
         println!(
-            "dmesh_devices_backfill name={} mac={} vip6={} node={} write={}",
-            device.name, key, vip6, binding.node, !dry_run
+            "dmesh_devices_sync name={} vip6={} node={} write={}",
+            record.name.as_deref().unwrap_or("-"),
+            record.vip6.as_deref().unwrap_or("-"),
+            peer.node,
+            !dry_run
         );
         if !dry_run {
-            upsert_catalog_vip6(&catalog_path, &device.name, vip6)?;
+            store.observe(&record)?;
         }
         changed += 1;
     }
     if changed == 0 {
-        return Err(
-            "no catalogued radio MAC had a signed discovery identity; catalog unchanged".into(),
-        );
+        return Err("no node answered with a signed discovery identity; nothing recorded".into());
     }
     Ok(())
 }

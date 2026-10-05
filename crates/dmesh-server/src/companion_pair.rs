@@ -1,19 +1,18 @@
 //! The host side of `companion.pair` / `companion.unpair`, independent of the
 //! bearer: given an established association with a device, verify its signed
 //! identity, install fresh credentials with `provision.install`, and save the
-//! private owned-device record.
+//! device record.
 //!
 //! Bearers carry no credentials and make no security claim; the device decides
 //! whether a request is accepted (a wired UART/USB host may replace a secret, a
 //! radio bearer may not). The secret is never logged or returned.
 
 use std::net::Ipv6Addr;
-use std::path::Path;
 
 use quic_lite::tokio::TokioAssociation;
 
 use crate::announce::{self, Announce};
-use crate::discovery::{OwnedDevice, PairedDevices};
+use crate::device_record::{DeviceRecord, DeviceStore};
 use crate::{provision, tagged};
 
 /// What to pair.
@@ -25,8 +24,8 @@ pub struct Pairing<'a> {
     pub name: Option<&'a str>,
     /// Compressed P-256 control-plane root to install (33 bytes).
     pub root_public_key: [u8; 33],
-    /// Private directory for the owned-device record.
-    pub directory: &'a Path,
+    /// Where the device's record is saved.
+    pub store: &'a DeviceStore,
     /// Bearer kind and adapter-local id, kept as an endpoint of the record.
     pub endpoint: (&'a str, &'a str),
 }
@@ -87,7 +86,7 @@ pub async fn pair(
         );
     }
     let vip6 = identity.vip6.to_string();
-    let device = OwnedDevice {
+    let device = DeviceRecord {
         device_id: hex(announce.device_id()),
         name: Some(name.clone()),
         mac: None,
@@ -96,15 +95,15 @@ pub async fn pair(
         vip6: Some(vip6.clone()),
         endpoints: [(request.endpoint.0.to_owned(), request.endpoint.1.to_owned())].into(),
         secret: secret.to_vec(),
+        ..Default::default()
     };
     // The device has committed. A failed save leaves it paired with no host
     // record; say so, because only a wired pair or unpair recovers it.
-    if PairedDevices::load(request.directory, &vip6)?.is_some() {
-        PairedDevices::remove(request.directory, &vip6)?;
-    }
-    PairedDevices::save(request.directory, &device).map_err(|error| {
+    // A re-pair replaces the record in the write directory (none there is fine).
+    let _ = request.store.remove(&vip6);
+    request.store.save_paired(&device).map_err(|error| {
         format!(
-            "device accepted the credentials but the owned record was not saved ({error}); pair it again over a wired link"
+            "device accepted the credentials but the device record was not saved ({error}); pair it again over a wired link"
         )
     })?;
     Ok(Paired {
@@ -116,7 +115,7 @@ pub async fn pair(
 /// Reset the device to unpaired (it forgets the secret, the control-plane root
 /// and its BLE bonds; the device only allows this over a wired link) and remove
 /// the owned record when one exists.
-pub async fn unpair(association: &TokioAssociation, directory: &Path) -> Result<Ipv6Addr, String> {
+pub async fn unpair(association: &TokioAssociation, store: &DeviceStore) -> Result<Ipv6Addr, String> {
     let announce = discover(association).await?;
     let identity = signed_identity(&announce)?;
     let id = fresh_id();
@@ -130,9 +129,7 @@ pub async fn unpair(association: &TokioAssociation, directory: &Path) -> Result<
         );
     }
     let vip6 = identity.vip6.to_string();
-    if PairedDevices::load(directory, &vip6)?.is_some() {
-        PairedDevices::remove(directory, &vip6)?;
-    }
+    let _ = store.remove(&vip6);
     Ok(identity.vip6)
 }
 
