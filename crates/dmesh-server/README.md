@@ -281,31 +281,31 @@ response ID before advancing. It creates forward and return labels over the
 same relay sequence; the transports may differ by direction because each
 next-hop description is resolved locally.
 
-## Signed objects and flash
+## Object transfer and flash
 
-`signed_object` identifies an immutable image with
-`{0:name?,1:cpu,2:target}`. The host-side `ObjectServer` resolves that identity
-to one object body. On the wire the host opens one bidirectional flash stream
-and sends a four-byte big-endian manifest length, exactly that many bytes of
-canonical CBOR manifest, then `image_size` raw binary bytes and QUIC FIN. There
-is no second data stream, per-block CBOR, or private manifest/blob/done framing.
-The device returns the terminal result on that stream, or resets it when the
-manifest or body is rejected.
+`object.flash` is the CLI name of `POST /flash`: the generic REST request of the tagged-CBOR
+envelope (`http`, component 2002, method 2 `post`, path `/flash`, see `http.rs` and ssh-mesh
+`mesh-api/PROTOCOLS.md`). The host opens one bidirectional stream and sends the request header (the
+headers are `name`, `cpu`, `target`, `address`, `transport`, `dry_run` and `content-length`), then
+exactly `content-length` raw image bytes and QUIC FIN. There is no manifest, per-block CBOR or
+private framing. The device returns the terminal result header on that stream (status 200, or 400,
+413, 501 or 503), or resets it when the body is rejected.
 
-`flash` is the device streaming-handler contract, not an ESP transport
-feature. The signed manifest carries the CPU and image target; local device
-policy maps an admitted target to its writable partition or address. The
-device feeds ordinary ordered stream bytes to `SignedObjectReceiver`. The
-length prefix fixes the manifest boundary; the receiver validates the signed
-manifest before admitting body data, derives block indexes and lengths from it,
-verifies the body incrementally, and calls an injected sink. Firmware injects
-the CPU/target admission and erase/write partition sink; host tests inject
-`FileImageSink`. Invalid manifest, length, proof, digest, platform match, or
-sink state rejects the stream before unsafe writes continue.
+`flash` is the device streaming-handler contract, not an ESP transport feature: `FlashHandler` is
+registered in the one registry at the key `[http, post, 10]` (`register_stream_at`; the longest
+registered prefix of `[component, method, path...]` wins). The request names the CPU and image target; local
+device policy maps an admitted target to its writable partition or address and checks
+`content-length` against it before erasing. The device feeds ordinary ordered stream bytes to an
+`ImageWriter`, which offers whole blocks of the sink's own block size to an injected sink and checks
+the total against `content-length`. Firmware injects the CPU/target admission and erase/write
+partition sink; host tests inject `FileImageSink`. There is no digest or signature: the transport
+carries integrity (see `notes/design/object-transfer-integrity.md`). Invalid headers, a length that
+does not fit, a platform mismatch, or a body that is shorter or longer than declared rejects the
+stream before unsafe writes continue.
 
 The host may first use identity or status streams on the same association to
 select an artifact. The flash stream remains self-contained, and the device
-validates the signed manifest CPU and target against local platform policy
+validates the request's CPU and target against local platform policy
 before erasing or accepting body bytes. The device sends the correlated result
 only after the sink is complete and durable; the handler does not block a
 bearer task.

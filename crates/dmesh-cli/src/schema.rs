@@ -641,7 +641,7 @@ mod tests {
             45,
         )
         .expect("stream flash request");
-        let (id, request) = dmesh_server::verified_object::decode_flash_handler_request(&command)
+        let (id, request) = dmesh_server::object_transfer::decode_flash_command(&command)
             .expect("canonical flash request");
         assert_eq!(id, 45);
         assert_eq!(request.object.cpu, 13);
@@ -651,7 +651,7 @@ mod tests {
 
         let command = encode_stream_command_with_id("object.flash cpu=13 target=3", 46)
             .expect("flash request with defaults");
-        let (id, request) = dmesh_server::verified_object::decode_flash_handler_request(&command)
+        let (id, request) = dmesh_server::object_transfer::decode_flash_command(&command)
             .expect("canonical flash request with defaults");
         assert_eq!(id, 46);
         assert_eq!(request.object.cpu, 13);
@@ -662,7 +662,7 @@ mod tests {
         let command =
             encode_stream_command_with_id("object.flash name=lora cpu=0 target=7 address=0", 47)
                 .expect("named module flash request");
-        let (_, request) = dmesh_server::verified_object::decode_flash_handler_request(&command)
+        let (_, request) = dmesh_server::object_transfer::decode_flash_command(&command)
             .expect("canonical named flash request");
         assert_eq!(request.object.name, Some(&b"lora"[..]));
         assert_eq!(request.address, Some(0));

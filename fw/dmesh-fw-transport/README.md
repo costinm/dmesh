@@ -7,7 +7,7 @@ shared by the firmware binaries.
 
 Code that can be host-tested without firmware ownership belongs in
 `quic-lite` (transport mechanics) or `dmesh-server` (CBOR schema, services,
-and the verified-object `CBOR manifest || raw body || FIN` consumer).
+and the object-transfer `CBOR manifest || raw body || FIN` consumer).
 
 ## Radio setup
 

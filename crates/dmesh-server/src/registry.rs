@@ -10,6 +10,13 @@
 //! Dispatch uses numbers only. Names exist for presentation: the `services`
 //! method reports `[component, method, name]` for exactly what is registered.
 //!
+//! The dispatch key is the list `[component, method, path...]` of numbers or text, like the prefix
+//! of a URL. `register_stream` registers the two-element key; `register_stream_at` appends path
+//! elements (the request's `params` array), and the longest registered prefix of a request's key
+//! wins. There is no second routing layer: `[http, post, FLASH]` and
+//! `[http, get, "host.example.com", "files"]` are both entries of this table, and a handler that
+//! owns a prefix reads the rest of the path from `params` itself.
+//!
 //! Every handler is a stream handler. A short request is the same thing as a
 //! large one: the first data chunk of an inbound stream carries its tagged
 //! envelope, with or without FIN. Large byte-string bodies may continue on the
@@ -25,6 +32,7 @@ use core::ptr;
 use core::sync::atomic::{AtomicPtr, Ordering};
 use core::task::{Context, Poll, Waker};
 
+use crate::http::{Seg, path_starts_with};
 use crate::stream::{OpenFuture, Outcome, Request, Response, StreamHandler};
 use crate::tagged::{self, Name, Record};
 
@@ -247,6 +255,8 @@ impl<H: Handler> StreamHandler for Unary<H> {
 
 struct Entry {
     method: Method,
+    /// Path elements after `[component, method]` that a request must start with.
+    path: &'static [Seg],
     handler: Box<dyn StreamHandler>,
 }
 
@@ -266,20 +276,38 @@ impl Registry {
     /// Register one implemented method. Returns `false` for a zero
     /// component, a duplicate `(component, method)`, or a full table.
     pub fn register(&self, method: Method, handler: impl Handler) -> bool {
-        self.publish(method, Box::new(Unary(handler)))
+        self.publish(method, &[], Box::new(Unary(handler)))
     }
 
     /// Register a method whose handler decides what happens to the request
     /// body. A method with no body uses [`Registry::register`].
     pub fn register_stream(&self, method: Method, handler: impl StreamHandler) -> bool {
-        self.publish(method, Box::new(handler))
+        self.publish(method, &[], Box::new(handler))
     }
 
-    fn publish(&self, method: Method, handler: Box<dyn StreamHandler>) -> bool {
-        if method.component == 0 || self.lookup(method.component, method.method).is_some() {
+    /// Register a stream handler for the key `[component, method, path...]`: it serves every
+    /// request whose key starts with it and has no longer registered prefix. Returns `false` for a
+    /// duplicate key or a full table.
+    pub fn register_stream_at(
+        &self,
+        method: Method,
+        path: &'static [Seg],
+        handler: impl StreamHandler,
+    ) -> bool {
+        self.publish(method, path, Box::new(handler))
+    }
+
+    fn publish(&self, method: Method, path: &'static [Seg], handler: Box<dyn StreamHandler>) -> bool {
+        if method.component == 0
+            || (0..CAPACITY).filter_map(|index| self.entry(index)).any(|entry| {
+                entry.method.component == method.component
+                    && entry.method.method == method.method
+                    && entry.path == path
+            })
+        {
             return false;
         }
-        let entry = Box::into_raw(Box::new(Entry { method, handler }));
+        let entry = Box::into_raw(Box::new(Entry { method, path, handler }));
         for slot in &self.table {
             if slot
                 .compare_exchange(ptr::null_mut(), entry, Ordering::AcqRel, Ordering::Acquire)
@@ -309,10 +337,17 @@ impl Registry {
         (!entry.is_null()).then(|| unsafe { &*entry })
     }
 
-    fn lookup(&self, component: u64, method: u64) -> Option<&Entry> {
+    /// The entry with the longest registered key that is a prefix of the request's
+    /// `[component, method, params...]`.
+    fn lookup(&self, component: u64, method: u64, params: Option<&[u8]>) -> Option<&Entry> {
         (0..CAPACITY)
             .filter_map(|index| self.entry(index))
-            .find(|entry| entry.method.component == component && entry.method.method == method)
+            .filter(|entry| {
+                entry.method.component == component
+                    && entry.method.method == method
+                    && path_starts_with(params, entry.path)
+            })
+            .max_by_key(|entry| entry.path.len())
     }
 
     /// Every registered method, ordered by component then method number.
@@ -322,6 +357,8 @@ impl Registry {
             .map(|entry| entry.method)
             .collect();
         methods.sort_by_key(|method| (method.component, method.method));
+        // Several routes under one `[component, method]` are one method here.
+        methods.dedup_by_key(|method| (method.component, method.method));
         methods
     }
 
@@ -371,7 +408,7 @@ impl Registry {
         else {
             return None;
         };
-        if let Some(entry) = self.lookup(component, method) {
+        if let Some(entry) = self.lookup(component, method, request.record.params) {
             if let Some(outcome) = entry.handler.open(request).await {
                 return Some(outcome);
             }
@@ -389,7 +426,7 @@ impl Registry {
         else {
             return None;
         };
-        if let Some(entry) = self.lookup(component, method) {
+        if let Some(entry) = self.lookup(component, method, request.record.params) {
             let mut future = entry.handler.open(request);
             let mut cx = Context::from_waker(Waker::noop());
             match future.as_mut().poll(&mut cx) {
@@ -509,6 +546,12 @@ pub fn register(method: Method, handler: impl Handler) -> bool {
 /// Register a method whose handler decides what happens to the request body.
 pub fn register_stream(method: Method, handler: impl StreamHandler) -> bool {
     REGISTRY.register_stream(method, handler)
+}
+
+/// Register a stream handler for `[component, method, path...]` (see
+/// [`Registry::register_stream_at`]).
+pub fn register_stream_at(method: Method, path: &'static [Seg], handler: impl StreamHandler) -> bool {
+    REGISTRY.register_stream_at(method, path, handler)
 }
 
 /// Register several methods served by one function.
@@ -685,13 +728,89 @@ mod tests {
             .unwrap();
         assert!(tagged::decode(&response).unwrap().result.is_some());
     }
+
+    fn reply_with(record: Record<'_>, value: u8) -> Option<Vec<u8>> {
+        let mut out = [0u8; 32];
+        let used = tagged::encode_numeric_response(0x7ffe, 1, record.id?, &[value], &mut out)?;
+        Some(Vec::from(&out[..used]))
+    }
+    fn root(record: Record<'_>) -> Option<Vec<u8>> {
+        reply_with(record, 1)
+    }
+    fn flash(record: Record<'_>) -> Option<Vec<u8>> {
+        reply_with(record, 2)
+    }
+    fn files(record: Record<'_>) -> Option<Vec<u8>> {
+        reply_with(record, 3)
+    }
+
+    /// `{1: 0x7ffe, 2: 1, 3: id, 4: path}` with the path elements given as numbers or text.
+    fn path_request(id: u64, path: &[Result<u64, &str>]) -> Vec<u8> {
+        let mut out = [0u8; 96];
+        let mut encoder = crate::cbor::Encoder::new(&mut out);
+        encoder.map(4).unwrap();
+        encoder.uint(1).unwrap();
+        encoder.uint(0x7ffe).unwrap();
+        encoder.uint(2).unwrap();
+        encoder.uint(1).unwrap();
+        encoder.uint(3).unwrap();
+        encoder.uint(id).unwrap();
+        encoder.uint(4).unwrap();
+        encoder.array(path.len() as u64).unwrap();
+        for segment in path {
+            match segment {
+                Ok(number) => encoder.uint(*number).unwrap(),
+                Err(text) => encoder.text_value(text.as_bytes()).unwrap(),
+            }
+        }
+        let used = encoder.len();
+        Vec::from(&out[..used])
+    }
+
+    #[test]
+    fn the_longest_registered_prefix_of_component_method_and_path_wins() {
+        static FLASH_PATH: &[Seg] = &[Seg::Num(10)];
+        static FILES_PATH: &[Seg] = &[Seg::Text("host.example.com"), Seg::Text("files")];
+        let registry = Registry::new();
+        // `[demo, get]` (the whole method), `[demo, get, 10]` and a hostname prefix.
+        assert!(registry.register(GET, SyncFn(root)));
+        assert!(registry.register_stream_at(GET, FLASH_PATH, Unary(SyncFn(flash))));
+        assert!(registry.register_stream_at(GET, FILES_PATH, Unary(SyncFn(files))));
+        // The same key twice is refused; the same method with another path is a different key.
+        assert!(!registry.register_stream_at(GET, FLASH_PATH, Unary(SyncFn(root))));
+        assert!(!registry.register(GET, SyncFn(root)));
+
+        let answered_by = |path: &[Result<u64, &str>]| {
+            let response = registry
+                .dispatch_now(&path_request(5, path), CallContext::default())
+                .unwrap();
+            tagged::decode(&response).unwrap().result.unwrap()[0]
+        };
+        assert_eq!(answered_by(&[Ok(10)]), 0x02);
+        // Longer than the prefix: the prefix owner still serves it (it reads the rest itself).
+        assert_eq!(answered_by(&[Ok(10), Ok(7)]), 0x02);
+        assert_eq!(answered_by(&[Err("host.example.com"), Err("files"), Err("a.txt")]), 0x03);
+        // Other paths fall back to the shortest key, `[demo, get]`.
+        assert_eq!(answered_by(&[Ok(11)]), 0x01);
+        assert_eq!(answered_by(&[Err("host.example.com")]), 0x01);
+        assert_eq!(answered_by(&[]), 0x01);
+        // A method with only path entries serves nothing outside them.
+        let narrow = Registry::new();
+        assert!(narrow.register_stream_at(GET, FLASH_PATH, Unary(SyncFn(flash))));
+        let response = narrow
+            .dispatch_now(&path_request(6, &[Ok(11)]), CallContext::default())
+            .unwrap();
+        assert!(tagged::decode(&response).unwrap().error.is_some());
+        // Routes of one method are one entry in the service catalog.
+        assert_eq!(registry.methods(), vec![GET]);
+    }
 }
 
 /// Identities of the common methods, built from the component constants each
 /// owning module defines. A platform registers the subset it implements.
 pub mod methods {
     use super::Method;
-    use crate::{announce, control, provision, raw_wifi, services, telemetry, verified_object};
+    use crate::{announce, control, provision, raw_wifi, services, telemetry};
 
     pub const SETTINGS_GET: Method = Method::new(
         control::CONTROL_COMPONENT,
@@ -834,18 +953,9 @@ pub mod methods {
         "handler",
     );
 
-    pub const OBJECT_GET: Method = Method::new(
-        verified_object::OBJECT_COMPONENT,
-        "object",
-        verified_object::OBJECT_GET_METHOD,
-        "get",
-    );
-    pub const OBJECT_FLASH: Method = Method::new(
-        verified_object::OBJECT_COMPONENT,
-        "object",
-        verified_object::OBJECT_FLASH_METHOD,
-        "flash",
-    );
+    /// `http.post`: REST-style POST; the path selects the resource (`/flash`).
+    pub const HTTP_POST: Method =
+        Method::new(crate::http::COMPONENT, "http", crate::http::verb::POST, "post");
 
     pub const BOOT_RECOVERY: Method = Method::new(
         services::BOOT_COMPONENT,

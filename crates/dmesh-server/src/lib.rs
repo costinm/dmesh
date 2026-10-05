@@ -1,11 +1,8 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
-//! Transport-neutral object store.
-//!
-//! The crate resolves a binary CBOR GET request and produces a manifest plus
-//! blob records on a caller-provided stream. It contains no sockets, UDP,
-//! QUIC packet handling, retransmission, or radio code. A host may put those
-//! records on a `quic-lite` stream; bearer adapters own socket or radio I/O.
+//! Transport-neutral device services: the tagged-CBOR registry, discovery records, and the
+//! `object.flash` image push. It contains no sockets, UDP, QUIC packet handling,
+//! retransmission, or radio code; bearer adapters own socket or radio I/O.
 
 extern crate alloc;
 
@@ -60,6 +57,8 @@ pub mod raw_wifi;
 /// The one registration and dispatch path for tagged-CBOR handlers, shared by
 /// Linux, Android, and firmware.
 pub mod registry;
+/// REST-style requests (component 2002): verb, path, headers, body, and the per-verb router.
+pub mod http;
 /// Handler streams: the header scanner, handler traits and server stream
 /// state machine shared by every ingress.
 pub mod stream;
@@ -116,23 +115,10 @@ pub mod wifi_service;
 
 #[cfg(feature = "std")]
 mod host {
-    use crate::{
-        cbor,
-        verified_object::{BLOCK_DIGEST_BYTES, VERIFIED_OBJECT_VERSION},
-    };
-    use anyhow::{Context, Result, bail};
-    use serde::{Deserialize, Serialize};
-    use sha2::{Digest, Sha256};
-    use std::collections::HashMap;
-    use std::io::Read;
+    use anyhow::{Result, bail};
     use std::path::{Path, PathBuf};
-    use std::sync::{Arc, Mutex};
 
-    pub use crate::verified_object::{
-        GetRequest, MAX_RECORD, RECORD_BLOB, RECORD_DONE, RECORD_MANIFEST, REQUEST_MAX,
-    };
-
-    pub const BLOCK_SIZE: usize = 4096;
+    pub use crate::object_transfer::{ObjectId, REQUEST_MAX};
 
     #[derive(Debug, Clone)]
     pub struct ServerConfig {
@@ -149,135 +135,7 @@ mod host {
         }
     }
 
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-    pub struct FileManifest {
-        pub source: String,
-        pub source_mtime_ns: u128,
-        pub source_size: u64,
-        pub block_size: u32,
-        pub image_size: u64,
-        pub image_sha256: String,
-        pub block_sha256: Vec<String>,
-    }
-
-    impl FileManifest {
-        pub fn sidecar_path(source: &Path) -> PathBuf {
-            let name = source
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("object");
-            source.with_file_name(format!("{name}.manifest.json"))
-        }
-
-        pub fn generate(source: &Path) -> Result<Self> {
-            let metadata = std::fs::metadata(source)
-                .with_context(|| format!("stat artifact {}", source.display()))?;
-            let mut file = std::fs::File::open(source)
-                .with_context(|| format!("open artifact {}", source.display()))?;
-            let mut full = Sha256::new();
-            let mut blocks = Vec::new();
-            let mut buf = vec![0u8; BLOCK_SIZE];
-            loop {
-                let n = file.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                full.update(&buf[..n]);
-                blocks.push(hex::encode(Sha256::digest(&buf[..n])));
-            }
-            Ok(Self {
-                source: source.to_string_lossy().into_owned(),
-                source_mtime_ns: mtime_ns(&metadata)?,
-                source_size: metadata.len(),
-                block_size: BLOCK_SIZE as u32,
-                image_size: metadata.len(),
-                image_sha256: hex::encode(full.finalize()),
-                block_sha256: blocks,
-            })
-        }
-
-        pub fn load_or_generate(source: &Path) -> Result<Self> {
-            let sidecar = Self::sidecar_path(source);
-            if sidecar.is_file() {
-                let bytes = std::fs::read(&sidecar)?;
-                if let Ok(manifest) = serde_json::from_slice::<Self>(&bytes) {
-                    if manifest.ensure_current(source).is_ok() {
-                        return Ok(manifest);
-                    }
-                }
-            }
-            let manifest = Self::generate(source)?;
-            let temporary = sidecar.with_extension("json.tmp");
-            match std::fs::write(&temporary, serde_json::to_vec_pretty(&manifest)?) {
-                Ok(()) => std::fs::rename(temporary, sidecar)?,
-                // Nix store firmware is immutable. The in-memory cache still
-                // serves the generated manifest for this process.
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::PermissionDenied
-                        || error.raw_os_error() == Some(30) => {}
-                Err(error) => return Err(error.into()),
-            }
-            Ok(manifest)
-        }
-
-        pub fn ensure_current(&self, source: &Path) -> Result<()> {
-            let metadata = std::fs::metadata(source)?;
-            if metadata.len() != self.source_size || mtime_ns(&metadata)? != self.source_mtime_ns {
-                bail!("stale manifest for {}", source.display());
-            }
-            Ok(())
-        }
-    }
-
-    fn mtime_ns(metadata: &std::fs::Metadata) -> Result<u128> {
-        Ok(metadata
-            .modified()?
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_nanos())
-    }
-
-    #[derive(Clone, Default)]
-    pub struct ManifestCache {
-        entries: Arc<Mutex<HashMap<PathBuf, FileManifest>>>,
-    }
-
-    impl ManifestCache {
-        pub fn get(&self, source: &Path) -> Result<FileManifest> {
-            if let Some(value) = self.entries.lock().unwrap().get(source).cloned() {
-                if value.ensure_current(source).is_ok() {
-                    return Ok(value);
-                }
-            }
-            let value = FileManifest::load_or_generate(source)?;
-            self.entries
-                .lock()
-                .unwrap()
-                .insert(source.to_path_buf(), value.clone());
-            Ok(value)
-        }
-
-        pub fn prepare_tree(&self, root: &Path) -> Result<usize> {
-            fn visit(cache: &ManifestCache, path: &Path, count: &mut usize) -> Result<()> {
-                for entry in std::fs::read_dir(path)? {
-                    let child = entry?.path();
-                    if child.is_dir() {
-                        visit(cache, &child, count)?;
-                    } else if child.is_file()
-                        && !child.to_string_lossy().ends_with(".manifest.json")
-                    {
-                        cache.get(&child)?;
-                        *count += 1;
-                    }
-                }
-                Ok(())
-            }
-            let mut count = 0;
-            visit(self, root, &mut count)?;
-            Ok(count)
-        }
-    }
-
-    fn target_file(root: &Path, request: GetRequest<'_>) -> Result<PathBuf> {
+    fn target_file(root: &Path, request: ObjectId<'_>) -> Result<PathBuf> {
         let chip = match request.cpu {
             9 => "esp32s3",
             13 => "esp32c6",
@@ -319,94 +177,49 @@ mod host {
         }
     }
 
-    fn manifest_bytes(manifest: &FileManifest, request: GetRequest<'_>) -> Result<Vec<u8>> {
-        if manifest.image_size > u32::MAX as u64 {
-            bail!("object too large");
-        }
-        let mut out = Vec::with_capacity(64 + manifest.block_sha256.len() * BLOCK_DIGEST_BYTES);
-        // CBOR map: target, CPU family, version, block size, block count,
-        // image size, full image digest, and a flat, fixed-width per-block
-        // digest table. The CPU belongs to the immutable object contract: a
-        // device must never successfully commit a valid image for another
-        // ESP family merely because the host selected the wrong catalog row.
-        // The receiver indexes the table by block number before accepting or
-        // committing an image.
-        cbor::encode::map(8, &mut out);
-        cbor::encode::uint(0, &mut out);
-        cbor::encode::uint(request.target as u64, &mut out);
-        cbor::encode::uint(8, &mut out);
-        cbor::encode::uint(request.cpu as u64, &mut out);
-        cbor::encode::uint(1, &mut out);
-        cbor::encode::uint(VERIFIED_OBJECT_VERSION as u64, &mut out);
-        cbor::encode::uint(2, &mut out);
-        cbor::encode::uint(manifest.block_size as u64, &mut out);
-        cbor::encode::uint(3, &mut out);
-        cbor::encode::uint(manifest.block_sha256.len() as u64, &mut out);
-        cbor::encode::uint(4, &mut out);
-        cbor::encode::uint(manifest.image_size, &mut out);
-        cbor::encode::uint(5, &mut out);
-        cbor::encode::bytes(&hex::decode(&manifest.image_sha256)?, &mut out);
-        let mut block_digests =
-            Vec::with_capacity(manifest.block_sha256.len() * BLOCK_DIGEST_BYTES);
-        for digest in &manifest.block_sha256 {
-            let bytes = hex::decode(digest)?;
-            if bytes.len() != 32 {
-                bail!("invalid block SHA-256 length")
-            }
-            block_digests.extend_from_slice(&bytes[..BLOCK_DIGEST_BYTES]);
-        }
-        cbor::encode::uint(6, &mut out);
-        cbor::encode::bytes(&block_digests, &mut out);
-        Ok(out)
-    }
-
     #[derive(Clone)]
     pub struct ObjectServer {
         pub config: ServerConfig,
-        pub manifests: ManifestCache,
     }
 
     impl ObjectServer {
         pub fn new(config: ServerConfig) -> Self {
-            Self {
-                config,
-                manifests: ManifestCache::default(),
-            }
+            Self { config }
         }
 
-        /// Resolve a GET as one ordered object: canonical CBOR manifest
-        /// followed immediately by the unencoded binary body.
-        pub fn response_object(&self, request: GetRequest<'_>) -> Result<(Vec<u8>, Vec<u8>)> {
-            let source = target_file(&self.config.artifact_root, request)?;
-            self.response_file(request, &source)
+        /// The catalog file for an object: the artifact of its CPU family and target.
+        pub fn object_path(&self, request: ObjectId<'_>) -> Result<PathBuf> {
+            target_file(&self.config.artifact_root, request)
         }
 
-        /// Serve an explicitly selected immutable object with the same
-        /// manifest/body representation as catalog-selected artifacts.  The
-        /// caller remains responsible for choosing a file appropriate for the
-        /// requested target; the receiver validates the signed manifest and
-        /// its permitted flash range.
-        pub fn response_file(
-            &self,
-            request: GetRequest<'_>,
-            source: &Path,
-        ) -> Result<(Vec<u8>, Vec<u8>)> {
+        /// Read an object's bytes: the request body of `POST /flash`. Its length is the `len`
+        /// header the sender declares.
+        pub fn read_object(&self, request: ObjectId<'_>) -> Result<(Vec<u8>, PathBuf)> {
+            let source = self.object_path(request)?;
+            let image = Self::read_file(&source)?;
+            Ok((image, source))
+        }
+
+        /// Read an explicitly selected file with the same checks as a catalog artifact.
+        pub fn read_file(source: &Path) -> Result<Vec<u8>> {
             if !source.is_file() {
                 bail!("artifact not found: {}", source.display());
             }
-            let manifest = self.manifests.get(&source)?;
-            Ok((manifest_bytes(&manifest, request)?, std::fs::read(source)?))
+            let image = std::fs::read(source)?;
+            if image.is_empty() || image.len() > u32::MAX as usize {
+                bail!("object size out of range: {}", source.display());
+            }
+            Ok(image)
         }
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::verified_object::ImageManifest;
         use tempfile::tempdir;
 
         #[test]
-        fn response_object_is_manifest_followed_by_exact_binary_body() {
+        fn a_catalog_object_is_the_exact_file_selected_by_cpu_and_target() {
             let directory = tempdir().unwrap();
             let artifact_root = directory.path().join("flash");
             let artifact = artifact_root.join("esp32c6/main-app.bin");
@@ -414,35 +227,13 @@ mod host {
             let bytes: Vec<u8> = (0..5000).map(|value| (value % 251) as u8).collect();
             std::fs::write(&artifact, &bytes).unwrap();
 
-            let server = ObjectServer::new(ServerConfig {
-                artifact_root,
-                ..ServerConfig::default()
-            });
-            let request = GetRequest {
-                name: None,
-                cpu: 13,
-                target: 6,
-            };
-            let (manifest_bytes, body) = server.response_object(request).unwrap();
+            let server = ObjectServer::new(ServerConfig { artifact_root, ..ServerConfig::default() });
+            let (body, path) = server
+                .read_object(ObjectId { name: None, cpu: 13, target: 6 })
+                .unwrap();
             assert_eq!(body, bytes);
-            let manifest = ImageManifest::decode(&manifest_bytes).unwrap();
-            assert_eq!(manifest.image_size, body.len() as u32);
-            assert_eq!(manifest.cpu, 13);
-            assert_eq!(manifest.block_count, 2);
-
-            let full_digest = Sha256::digest(&bytes).to_vec();
-            assert!(
-                manifest_bytes
-                    .windows(full_digest.len())
-                    .any(|window| window == &full_digest[..])
-            );
-            let first_digest = Sha256::digest(&bytes[..BLOCK_SIZE]).to_vec();
-            assert!(
-                manifest_bytes
-                    .windows(4)
-                    .any(|window| window == &first_digest[..4])
-            );
-            assert_eq!(manifest.block_size, BLOCK_SIZE as u32);
+            assert_eq!(path, artifact);
+            assert!(ObjectServer::read_file(&directory.path().join("missing")).is_err());
         }
 
         #[test]
@@ -459,7 +250,7 @@ mod host {
             assert_eq!(
                 target_file(
                     root,
-                    GetRequest {
+                    ObjectId {
                         name: None,
                         cpu: 13,
                         target: 2,
@@ -471,7 +262,7 @@ mod host {
             assert_eq!(
                 target_file(
                     root,
-                    GetRequest {
+                    ObjectId {
                         name: Some(b"lora"),
                         cpu: 13,
                         target: 7,
@@ -481,51 +272,18 @@ mod host {
                 module
             );
         }
-
-        #[test]
-        fn flat_block_digest_manifest_stays_small_for_four_mebibytes() {
-            let manifest = FileManifest {
-                source: "main-app.bin".into(),
-                source_mtime_ns: 0,
-                source_size: 4 * 1024 * 1024,
-                block_size: BLOCK_SIZE as u32,
-                image_size: 4 * 1024 * 1024,
-                image_sha256: "00".repeat(32),
-                block_sha256: vec!["00".repeat(32); 1024],
-            };
-            let bytes = manifest_bytes(
-                &manifest,
-                GetRequest {
-                    name: None,
-                    cpu: 13,
-                    target: 6,
-                },
-            )
-            .unwrap();
-            // 62 bytes of fixed fields plus key 6 and a 16,384-byte CBOR
-            // byte string: no per-block CBOR wrappers.
-            assert_eq!(bytes.len(), 8_258);
-            let decoded = ImageManifest::decode(&bytes).unwrap();
-            assert_eq!(decoded.block_digests.len(), 1024);
-            assert!(
-                decoded
-                    .block_digests
-                    .iter()
-                    .all(|digest| digest == &[0; BLOCK_DIGEST_BYTES])
-            );
-        }
     }
 }
 
 #[cfg(feature = "std")]
 pub use host::*;
 
-/// Bearer-neutral immutable object records, manifest validation, and stream
-/// consumers. Flash supplies only its durable partition sink; QUIC-lite and
-/// generic transport do not depend on this module.
-pub mod verified_object {
-    include!("verified_object.rs");
+/// `object.flash` (`POST /flash`): request headers, the image body, and the sink writer. Flash
+/// supplies only its durable partition sink; QUIC-lite and generic transport do not depend on this
+/// module.
+pub mod object_transfer {
+    include!("object_transfer.rs");
 }
 
 #[cfg(not(feature = "std"))]
-pub use verified_object::*;
+pub use object_transfer::*;

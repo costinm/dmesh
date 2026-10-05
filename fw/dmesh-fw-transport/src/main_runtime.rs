@@ -3692,9 +3692,10 @@ pub(crate) fn run_main_service(service: MainRuntimeService) {
         methods::TELEMETRY_DEVICE,
         SyncFn(crate::device_telemetry::receive),
     ));
-    assert!(registry::register_stream(
-        methods::OBJECT_FLASH,
-        dmesh_server::verified_object::FlashHandler(crate::flash::EspFlashPlatform),
+    assert!(registry::register_stream_at(
+        methods::HTTP_POST,
+        dmesh_server::object_transfer::FLASH_PATH,
+        dmesh_server::object_transfer::FlashHandler(crate::flash::EspFlashPlatform),
     ));
     crate::quic_node_esp::register_probe_handlers();
     for method in [methods::SETTINGS_GET, methods::SETTINGS_SET,

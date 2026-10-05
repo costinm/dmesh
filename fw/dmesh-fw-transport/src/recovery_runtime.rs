@@ -39,9 +39,10 @@ pub fn run() {
         methods::TELEMETRY_DEVICE,
         SyncFn(crate::device_telemetry::receive),
     );
-    let _ = registry::register_stream(
-        methods::OBJECT_FLASH,
-        dmesh_server::verified_object::FlashHandler(crate::flash::EspFlashPlatform),
+    let _ = registry::register_stream_at(
+        methods::HTTP_POST,
+        dmesh_server::object_transfer::FLASH_PATH,
+        dmesh_server::object_transfer::FlashHandler(crate::flash::EspFlashPlatform),
     );
     // Recovery answers a discovery check with its own announce, as a registered
     // handler like every other method, whichever delivery form carries it.

@@ -1612,38 +1612,38 @@
     },
     {
       "name": "object.flash",
-      "description": "Call the object.flash QUIC stream handler",
+      "description": "Flash an image: the CLI name of POST /flash (headers are these fields; the sender adds content-length)",
       "inputSchema": {
         "type": "object",
         "properties": {
           "name": {
             "type": "string",
-            "x-protobuf-index": 0,
+            "x-protobuf-index": 64,
             "x-dmesh-kind": "text"
           },
           "cpu": {
             "type": "integer",
-            "x-protobuf-index": 1,
+            "x-protobuf-index": 65,
             "x-dmesh-kind": "u8"
           },
           "target": {
             "type": "integer",
-            "x-protobuf-index": 2,
+            "x-protobuf-index": 66,
             "x-dmesh-kind": "u8"
           },
           "address": {
             "type": "integer",
-            "x-protobuf-index": 3,
+            "x-protobuf-index": 67,
             "x-dmesh-kind": "u32"
           },
           "transport": {
             "type": "integer",
-            "x-protobuf-index": 4,
+            "x-protobuf-index": 68,
             "x-dmesh-kind": "u8"
           },
           "dry_run": {
             "type": "boolean",
-            "x-protobuf-index": 5,
+            "x-protobuf-index": 69,
             "x-dmesh-kind": "bool"
           }
         }

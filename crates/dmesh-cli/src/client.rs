@@ -411,7 +411,7 @@ fn run_serial_stream_command(arguments: &[String]) -> Result<(), String> {
     let body = encode_stream_argv_with_id(&service_arguments, fresh_request_id())
         .map_err(|error| error.to_string())?;
     let path = arguments.first().ok_or("missing serial path")?;
-    if dmesh_server::verified_object::decode_flash_handler_request(&body).is_some() {
+    if dmesh_server::object_transfer::decode_flash_command(&body).is_some() {
         return Err(
             "object.flash is not supported over UART; use `dmesh-cli flash TARGET` for Wi-Fi flashing or scripts/flash-device.py for physical recovery"
                 .into(),
@@ -872,10 +872,9 @@ pub(crate) fn run_udp_service_client(arguments: &[String]) -> Result<(), String>
                 "object.flash selects UDP for bulk image transfer; omit --uart-bearer".into(),
             );
         }
-        let (_, flash) = dmesh_server::verified_object::decode_flash_handler_request(&request)
+        let (_, flash) = dmesh_server::object_transfer::decode_flash_command(&request)
             .ok_or("invalid object.flash request")?;
-        let (manifest, image, artifact) =
-            flash_upload_object(flash.object, object_file.as_deref())?;
+        let (image, artifact) = flash_upload_object(flash.object, object_file.as_deref())?;
         eprintln!(
             "dmesh_cli_object_upload bearer=udp association=single stream=single artifact={}",
             artifact.display()
@@ -885,7 +884,6 @@ pub(crate) fn run_udp_service_client(arguments: &[String]) -> Result<(), String>
                 udp_bind_for_peer(peer),
                 peer,
                 &request,
-                &manifest,
                 &image,
                 object_upload_timeout(),
             ))?
@@ -1022,7 +1020,7 @@ fn probe_request_timeout(bytes: u64) -> Duration {
 
 /// Remove the CLI-only object source selector before schema encoding.  A
 /// source path is host policy, not a firmware command field, so it must never
-/// be sent to the device or become part of the signed object manifest.
+/// be sent to the device or become part of the object manifest.
 fn split_object_file_argument(
     arguments: &[String],
 ) -> Result<(Vec<String>, Option<PathBuf>), String> {

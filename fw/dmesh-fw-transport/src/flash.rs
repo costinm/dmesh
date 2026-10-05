@@ -1,28 +1,22 @@
-//! Bearer-neutral signed-object flash handling for Main and Recovery.
+//! Bearer-neutral flash handling for Main and Recovery.
 //!
-//! `object.flash` is an ordinary registered stream handler: a request header,
-//! then the length-prefixed signed manifest and image as the raw request
-//! body, then FIN, answered with a terminal response header. The shared
-//! handler stream layer owns header parsing and body delivery; this module
-//! owns only request admission, image verification, and durable partition
-//! writes, as a body sink.
+//! `object.flash` is an ordinary registered stream handler (`POST /flash`): a request header
+//! carrying cpu, target, destination and the content length, then the image as the raw request
+//! body, then FIN, answered with a terminal response header. The shared handler stream layer owns
+//! header parsing and body delivery; this module owns only request admission and durable partition
+//! writes, as a body sink that knows its own block size.
 
 use alloc::{boxed::Box, vec, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use dmesh_server::cbor::FieldValue::{self, Unsigned as U, Text as T, Null};
-use dmesh_server::verified_object::{BLOCK_SIZE, ImageSink, StreamingImageSink};
+use dmesh_server::object_transfer::{FlashStartError, ImageSink, ImageWriter};
 
 const STAGE2_REGION_BYTES: usize = 0x7000;
-const MAX_MANIFEST_BYTES: usize = 10 * 1024;
-const MAX_BLOB_RECORD_BYTES: usize = 12 + BLOCK_SIZE;
+/// The write unit and erase granularity this sink offers to the shared writer.
+const BLOCK_SIZE: usize = 4096;
 const FLASH_PROGRESS_INTERVAL_MS: u64 = 5_000;
 
-type Receiver = dmesh_server::verified_object::SignedObjectReceiver<
-    EspPartitionSink,
-    dmesh_server::verified_object::NoSignatureVerifier,
-    MAX_MANIFEST_BYTES,
-    MAX_BLOB_RECORD_BYTES,
->;
+type Receiver = ImageWriter<EspPartitionSink>;
 
 /// Application progress of the one active transfer, for periodic reports.
 struct FlashProgress {
@@ -61,19 +55,18 @@ struct FlashSink {
     ended: bool,
 }
 
-impl dmesh_server::verified_object::FlashPlatform for EspFlashPlatform {
+impl dmesh_server::object_transfer::FlashPlatform for EspFlashPlatform {
     fn start(
         &self,
-        request: dmesh_server::verified_object::FlashRequest<'_>,
+        request: dmesh_server::object_transfer::FlashRequest<'_>,
         id: u64,
         context: dmesh_server::registry::CallContext,
-    ) -> Result<Box<dyn dmesh_server::stream::BodySink>, dmesh_server::verified_object::FlashStartError>
+    ) -> Result<Box<dyn dmesh_server::stream::BodySink>, dmesh_server::object_transfer::FlashStartError>
     {
         if TRANSFER_ACTIVE.load(Ordering::Acquire) {
-            return Err(dmesh_server::verified_object::FlashStartError::Busy);
+            return Err(FlashStartError::Busy);
         }
-        let receiver = new_receiver(request)
-            .map_err(|_| dmesh_server::verified_object::FlashStartError::InvalidTarget)?;
+        let receiver = new_receiver(request)?;
         DURABLE_COMPLETED.store(false, Ordering::Release);
         *progress() = Some(FlashProgress {
             request_id: id,
@@ -124,8 +117,9 @@ impl FlashSink {
 
 impl dmesh_server::stream::BodySink for FlashSink {
     fn write(&mut self, chunk: &[u8], _fin: bool) -> Result<usize, Vec<u8>> {
-        match self.receiver.0.push_ordered(chunk) {
-            Ok(consumed) => {
+        match self.receiver.0.write(chunk) {
+            Ok(()) => {
+                let consumed = chunk.len();
                 self.received = self.received.saturating_add(consumed as u64);
                 if let Some(progress) = progress().as_mut() {
                     progress.received = self.received;
@@ -152,7 +146,7 @@ impl dmesh_server::stream::BodySink for FlashSink {
 
     fn finish(mut self: Box<Self>) -> dmesh_server::stream::Response {
         let (association, stream_id) = self.context();
-        let result = self.receiver.0.finish_ordered();
+        let result = self.receiver.0.finish();
         let complete = result.is_ok() && self.receiver.0.is_complete();
         if let (Some(association), Some(stream_id)) = (association, stream_id) {
             log_flash_event(
@@ -196,6 +190,7 @@ impl dmesh_server::stream::BodySink for FlashSink {
                 "reason=no_application_progress",
             );
         }
+        self.receiver.0.abort();
         self.end();
     }
 }
@@ -220,7 +215,7 @@ pub fn take_durable_flash_completion() -> bool {
 
 fn set_transfer_active(active: bool) {
     if TRANSFER_ACTIVE.swap(active, Ordering::AcqRel) != active {
-        // Pause optional NAN sidecar work while the signed object receiver is
+        // Pause optional NAN sidecar work while the object receiver is
         // erasing/writing. This changes no bearer registration or selection.
         crate::wifi_nan_dw_capture_esp::set_nan_action_tx_suppressed(active);
         crate::wifi_nan_dw_capture_esp::set_nan_capture_suspended(active);
@@ -301,26 +296,17 @@ pub(crate) fn report_owner_progress(now: u64, deadline_ms: Option<u64>, pool_ava
     ]);
 }
 
+/// The terminal `POST /flash` response header: status 200 with the result text, or 400 with the
+/// error text.
 fn flash_result(request_id: u64, message: &[u8], error: bool) -> Vec<u8> {
     let mut response = vec![0; message.len().saturating_add(64)];
-    let used = if error {
-        dmesh_server::tagged::encode_numeric_error(
-            dmesh_server::verified_object::OBJECT_COMPONENT,
-            dmesh_server::verified_object::OBJECT_FLASH_METHOD,
-            request_id,
-            message,
-            &mut response,
-        )
-    } else {
-        dmesh_server::tagged::encode_numeric_data_response(
-            dmesh_server::verified_object::OBJECT_COMPONENT,
-            dmesh_server::verified_object::OBJECT_FLASH_METHOD,
-            request_id,
-            message,
-            true,
-            &mut response,
-        )
-    }
+    let used = dmesh_server::http::encode_response(
+        dmesh_server::http::verb::POST,
+        request_id,
+        if error { 400 } else { 200 },
+        message,
+        &mut response,
+    )
     .unwrap_or(0);
     response.truncate(used);
     response
@@ -350,13 +336,12 @@ fn log_receiver_error(
     _association: Option<quic_lite::QuicAssociation>,
     stream_id: Option<u64>,
     received: u64,
-    error: &dmesh_server::verified_object::ImageError,
+    error: &dmesh_server::object_transfer::ImageError,
 ) {
-    use dmesh_server::verified_object::ImageError;
+    use dmesh_server::object_transfer::ImageError;
     let reason = match error {
-        ImageError::Truncated => "truncated", ImageError::Allocation => "allocation",
-        ImageError::InvalidManifest => "invalid_manifest", ImageError::InvalidBlock => "invalid_block",
-        ImageError::InvalidSignature => "invalid_signature", ImageError::Sink => "sink",
+        ImageError::Allocation => "allocation", ImageError::Length => "length",
+        ImageError::Sink => "sink",
     };
     emit_event("object_flash.receiver_rejected", &[
         (1, U(request_id)), (2, stream_id.map(U).unwrap_or(Null)), (3, U(received)), (4, T(reason)),
@@ -380,14 +365,29 @@ fn emit_event(kind: &str, fields: &[(u64, FieldValue<'_>)]) {
     let _ = crate::uart_esp::send_log_record(&record.encode());
 }
 
+/// Admit a request: the image must be for this CPU, name a writable destination, and fit it.
 fn new_receiver(
-    request: dmesh_server::verified_object::FlashRequest<'_>,
-) -> Result<Box<Receiver>, ()> {
-    Receiver::try_new_boxed_with(|| sink_for_request(request).map_err(|_| ())).map_err(|_| ())
+    request: dmesh_server::object_transfer::FlashRequest<'_>,
+) -> Result<Box<Receiver>, FlashStartError> {
+    if request.object.cpu != local_cpu() {
+        return Err(FlashStartError::InvalidTarget);
+    }
+    let sink = sink_for_request(request).map_err(|_| FlashStartError::InvalidTarget)?;
+    let len = request.len as usize;
+    let erase_len = len.checked_add(BLOCK_SIZE - 1).map(|n| n / BLOCK_SIZE * BLOCK_SIZE);
+    if len == 0 || erase_len.is_none_or(|erase_len| erase_len > sink.capacity) {
+        return Err(FlashStartError::TooLarge);
+    }
+    ImageWriter::try_new(sink, request.len)
+        .map(Box::new)
+        .map_err(|error| match error {
+            dmesh_server::object_transfer::ImageError::Length => FlashStartError::TooLarge,
+            _ => FlashStartError::Unsupported,
+        })
 }
 
 fn sink_for_request(
-    request: dmesh_server::verified_object::FlashRequest<'_>,
+    request: dmesh_server::object_transfer::FlashRequest<'_>,
 ) -> Result<EspPartitionSink, ()> {
     let target = request.object.target;
     let (partition_type, label, base, capacity) = match target {
@@ -460,8 +460,8 @@ const fn local_cpu() -> u8 {
     }
 }
 
-/// Synchronous ESP-IDF partition sink. The verified-object receiver owns one
-/// block at a time, so writes complete before their stream bytes are released.
+/// Synchronous ESP-IDF partition sink. The shared writer offers one block at a time, so writes
+/// complete before their stream bytes are released.
 pub struct EspPartitionSink {
     partition: *const esp_idf_sys::esp_partition_t,
     address: usize,
@@ -596,14 +596,12 @@ impl EspPartitionSink {
 impl ImageSink for EspPartitionSink {
     type Error = ();
 
-    fn begin(&mut self, manifest: &dmesh_server::verified_object::ImageManifest) -> Result<(), ()> {
-        if manifest.target != self.target
-            || manifest.cpu != local_cpu()
-            || manifest.block_size as usize != BLOCK_SIZE
-        {
-            return Err(());
-        }
-        let image_len = manifest.image_size as usize;
+    fn block_size(&self) -> usize {
+        BLOCK_SIZE
+    }
+
+    fn begin(&mut self, len: u32) -> Result<(), ()> {
+        let image_len = len as usize;
         let erase_len = image_len.checked_add(BLOCK_SIZE - 1).ok_or(())? / BLOCK_SIZE * BLOCK_SIZE;
         if image_len == 0 || erase_len > self.capacity {
             return Err(());
@@ -627,7 +625,7 @@ impl ImageSink for EspPartitionSink {
         while self.erase.erased < end {
             let base = if self.partition.is_null() { 0 } else { unsafe { (*self.partition).address as usize } };
             let address = base.checked_add(self.address).and_then(|base| base.checked_add(self.erase.erased)).ok_or(())?;
-            let count = dmesh_server::verified_object::next_erase_chunk_len(
+            let count = dmesh_server::object_transfer::next_erase_chunk_len(
                 address, self.erase.planned - self.erase.erased, BLOCK_SIZE, ERASE_BLOCK_BYTES,
             ).ok_or(())?;
             self.erase_next(count)?;
@@ -658,7 +656,7 @@ impl ImageSink for EspPartitionSink {
         (result == esp_idf_sys::ESP_OK).then_some(()).ok_or(())
     }
 
-    fn finish(&mut self, _: &dmesh_server::verified_object::ImageManifest) -> Result<(), ()> {
+    fn finish(&mut self) -> Result<(), ()> {
         emit_event("object_flash.storage_timing", &[
             (1, U(progress().as_ref().map_or(0, |p| p.request_id))),
             (2, U(u64::from(self.target))), (3, U(self.erase.erased as u64)),
@@ -669,10 +667,4 @@ impl ImageSink for EspPartitionSink {
         Ok(())
     }
     fn abort(&mut self) {}
-}
-
-impl StreamingImageSink for EspPartitionSink {
-    fn poll_completed(&mut self) -> Result<dmesh_server::verified_object::StoragePoll, ()> {
-        Ok(dmesh_server::verified_object::StoragePoll::Ready)
-    }
 }

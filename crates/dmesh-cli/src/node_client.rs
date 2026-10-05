@@ -161,20 +161,19 @@ async fn exchange(association: TokioAssociation, payload: &[u8]) -> Result<Respo
     Ok(Response { bytes })
 }
 
-/// Send `object.flash`: the request header, then the object as the raw request
-/// body (manifest length, manifest, image), then FIN. The response is the
+/// Send `object.flash` (`POST /flash`): the request header with the content length, then the
+/// image as the raw request body, then FIN. The response is the
 /// terminal header.
 async fn flash_exchange(
     association: TokioAssociation,
     request: &[u8],
-    manifest: &[u8],
     image: &[u8],
 ) -> Result<Response, String> {
     let mut stream = association
         .open_stream()
         .await
         .map_err(node_error("open object.flash stream"))?;
-    let bytes = dmesh_server::stream_client::flash(&mut stream, request, manifest, image)
+    let bytes = dmesh_server::stream_client::flash(&mut stream, request, image)
         .await
         .map_err(|error| format!("object.flash stream exchange: {error}"))?;
     association
@@ -333,7 +332,6 @@ pub(crate) async fn flash_udp(
     bind: SocketAddr,
     peer: SocketAddr,
     request: &[u8],
-    manifest: &[u8],
     image: &[u8],
     timeout: Duration,
 ) -> Result<Response, String> {
@@ -342,7 +340,7 @@ pub(crate) async fn flash_udp(
         let primary = attach_udp(&mut node, bind, peer).await?;
         run_node(node, |client| async move {
             let association = associate_paths(&client, primary, &[]).await?;
-            flash_exchange(association, request, manifest, image).await
+            flash_exchange(association, request, image).await
         })
         .await
     };

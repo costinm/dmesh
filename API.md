@@ -1209,7 +1209,7 @@ The component and method columns are the numeric CBOR tags.
 | Component | Method | Wire name | Purpose | Platforms |
 |---:|---:|---|---|---|
 | 101 | 2 | `runtime.reset` | Reset the runtime diagnostics counters. | E |
-| 10 | 2 | `object.flash` | Transfer a verified firmware object into a selected durable slot. | E |
+| 10 | 2 | `object.flash` | CLI name of `POST /flash` (wire: `http.post`, path `/flash`): transfer a firmware image into a selected durable slot. | E |
 | 1000 | 3 | `module.stop` | Request module shutdown with a deadline before flash work. | E |
 | 1000 | 1 | `module.status` | Refresh and read the installed module header and loader result. | E |
 | 1000 | 2 | `module.init` | Initialize the installed module loader. | E |
@@ -1235,9 +1235,9 @@ Platform registration notes:
   `boot.recovery`, `module.*`, `runtime.reset`, `object.flash` or
   `ble.start/stop/coc.send`: they depend on the ESP Stage2/Recovery/module
   layout or its radio lifecycle, so a request receives the numeric error.
-- `object.flash` (10/2): registered by Main and Recovery firmware. Android
-  and Linux do not register the device flash operation. The normal tagged
-  request and its `data` byte-string body share one QUIC stream.
+- `object.flash` (`POST /flash`): registered by Main and Recovery firmware at the key
+  `[http (2002), post (2), 10]`. Android and Linux do not register the device flash
+  operation. The request header and the raw image body share one QUIC stream.
 - Stubs are not registered. Android answers `status`, `services`,
   `telemetry.nan_status`, `battery`, `quic`, `quic_associations`, `bearers`, `memory`
   and `log.watch`; Linux
@@ -1299,48 +1299,53 @@ are described by the method purpose above.
 
 ### `object.flash` request fields
 
+`object.flash` is the CLI name of `POST /flash`. On the wire it is the generic REST request of the
+tagged-CBOR envelope (component `2002` `http`, method `2` `post`, `params` the path `[10]` or
+`["flash"]`, `fields` the headers below, see ssh-mesh `mesh-api/PROTOCOLS.md`, "HTTP component"). A
+command built by the CLI carries the same headers as its fields; the sender adds `content-length`
+(header `1`) and posts it.
+
 | Tag | Field | Type | Values |
 |---:|---|---|---|
-| 0 | `name` | `text` | — |
-| 1 | `cpu` | `u8` | — |
-| 2 | `target` | `u8` | — |
-| 3 | `address` | `u32` | — |
-| 4 | `transport` | `u8` | — |
-| 5 | `dry_run` | `bool` | — |
+| 64 | `name` | `text` | — |
+| 65 | `cpu` | `u8` | — |
+| 66 | `target` | `u8` | — |
+| 67 | `address` | `u32` | — |
+| 68 | `transport` | `u8` | — |
+| 69 | `dry_run` | `bool` | — |
 
-`name` optionally selects the object; `cpu` and nonzero `target` identify its
-platform image. `address` is an optional platform-specific destination,
-`transport=0` means use the active connection's default path, and
-`dry_run=false` is the normal write mode. Omitted `transport` and `dry_run`
-have those same defaults. Unknown, duplicate, or malformed fields are rejected
-before the firmware sink can erase anything.
+Header keys may be spelled by number or by name; a name and its number together are a duplicate.
+`name` optionally selects the object; `cpu` and nonzero `target` identify its platform image.
+`address` is an optional platform-specific destination, `transport=0` means use the active
+connection's default path, and `dry_run=false` is the normal write mode. Omitted `transport` and
+`dry_run` have those same defaults. `content-length` is the number of image bytes that follow, and a
+request without it (or with a length larger than the destination) is refused. Unknown, duplicate, or
+malformed headers are rejected before the firmware sink can erase anything.
 
-**Request body:** the object: the 4-byte big-endian manifest length, the signed
-manifest, then the image records. They are raw bytes that follow the request
-header on the same stream; FIN follows the last image byte. No length is
-declared in the header: the manifest states the image size, and a body that
-ends early, or runs on, is rejected by verification.
+**Request body:** the image: raw bytes that follow the request header on the same stream; FIN follows
+the last image byte. There is no manifest, block table, digest or signature (the transport carries
+integrity; see `notes/design/object-transfer-integrity.md`), and the device chooses its own block
+size. A body shorter or longer than `content-length` is rejected.
 
-**Response body:** none
+**Response body:** none. The response header carries `fields {0: status}` and, for success, the
+result text `flash complete`; a refusal carries `error` with status `400` (invalid target), `413`
+(image larger than the destination or no length), `501` (unavailable) or `503` (a flash is already in
+progress).
 
-The request is the normal JSON-RPC-style CBOR envelope on one stream. There is
-no separate flash handshake, marker, duplicated request ID, or second stream.
-The firmware dispatches the registered `object.flash` method as soon as the
-header is complete, so the handler is chosen, and may refuse (busy, unknown
-target), before any body byte arrives; it then streams the body incrementally
-into the verifier and sink. The association and stream that carried the request
-own the entire operation, and a stream with no progress for 15 seconds is
-abandoned and releases the writer.
+The firmware registers the flash handler at the dispatch key `[http, post, 10]` (component, method,
+path: the longest registered prefix of a request's key wins, there is no second router). The handler
+is chosen as soon as the header is complete and may refuse before any body byte arrives; it then
+streams the body incrementally into the sink. The association and stream that carried the
+request own the entire operation, and a stream with no progress for 15 seconds is abandoned and
+releases the writer.
 
-The response envelope is returned on that same stream only after the
-body ends and verification plus sink completion succeed. Handler acceptance,
-stream ACKs, and byte counts are not proof of durable completion or successful
-reboot. The response has no body and ends with FIN, like every header-only
-handler response. Recovery schedules its Stage2 handoff only after durable
-completion and finishing this ordinary response direction;
-Main leaves the written slot for the normal boot/update path. `dry_run=true`
-validates through the sink's dry-run behavior and does not signal durable
-flash completion.
+The response is returned on that same stream only after the body ends and the sink has made the
+image durable. Handler acceptance, stream ACKs, and byte counts are not proof of durable completion or
+successful reboot. The response has no body and ends with FIN, like every header-only handler
+response. Recovery schedules its Stage2 handoff only after durable completion and finishing this
+ordinary response direction; Main leaves the written slot for the normal boot/update path.
+`dry_run=true` validates through the sink's dry-run behavior and does not signal durable flash
+completion.
 
 ### `ble.scan` request fields
 

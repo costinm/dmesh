@@ -24,10 +24,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// The image to POST: the explicit `--object-file`, else the catalog artifact for the object.
 pub(crate) fn flash_upload_object(
-    object: dmesh_server::verified_object::GetRequest<'_>,
+    object: dmesh_server::object_transfer::ObjectId<'_>,
     source: Option<&Path>,
-) -> Result<(Vec<u8>, Vec<u8>, PathBuf), String> {
+) -> Result<(Vec<u8>, PathBuf), String> {
     let artifact_root = env::var_os("DMESH_OBJECT_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("target/flash"));
@@ -36,16 +37,13 @@ pub(crate) fn flash_upload_object(
         ..dmesh_server::ServerConfig::default()
     });
     if let Some(source) = source {
-        let source = source.to_path_buf();
-        let (manifest, image) = server
-            .response_file(object, &source)
+        let image = dmesh_server::ObjectServer::read_file(source)
             .map_err(|error| format!("object.flash artifact: {error}"))?;
-        Ok((manifest, image, source))
+        Ok((image, source.to_path_buf()))
     } else {
-        let (manifest, image) = server
-            .response_object(object)
-            .map_err(|error| format!("object.flash artifact: {error}"))?;
-        Ok((manifest, image, server.config.artifact_root.clone()))
+        server
+            .read_object(object)
+            .map_err(|error| format!("object.flash artifact: {error}"))
     }
 }
 
@@ -163,7 +161,7 @@ fn flash_target_from_profile(
 }
 
 /// Flash one Main image without requiring an operator to stitch together the
-/// discovery, NAN wake, Recovery handoff, and verified-object steps.  The
+/// discovery, NAN wake, Recovery handoff, and object-transfer steps.  The
 /// target is its catalogued VIP6 identity, MAC identity, or a compatibility raw
 /// node ID. A NAN MAC is accepted as a temporary explicit wake selector. A
 /// legacy generic ESP announce is deliberately refused for writes: it cannot
