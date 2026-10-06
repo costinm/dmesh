@@ -195,6 +195,7 @@ impl<const PACKET: usize> ServerStreamConnection<PACKET> {
             open.max_stream_data,
             open.max_in_flight_packets,
         )?;
+        mux.endpoint.set_peer_datagram_limit(open.max_datagram_frame_size);
         mux.endpoint
             .continue_packet_numbers_from(bootstrap_packet_number.saturating_add(1))
     }
@@ -746,6 +747,7 @@ impl<const PACKET: usize> ClientConnection<PACKET> {
         endpoint.set_time(now_us);
         endpoint.install_connection_ids(self.local_cid, ack.server_receive_cid)?;
         endpoint.set_initial_peer_credit(ack.max_data, ack.max_stream_data)?;
+        endpoint.set_peer_datagram_limit(ack.max_datagram_frame_size);
         endpoint.continue_packet_numbers_from(self.open_packet_number.saturating_add(1))?;
         self.peer_cid = Some(ack.server_receive_cid);
         self.peer_reset_token = ack.stateless_reset_token;

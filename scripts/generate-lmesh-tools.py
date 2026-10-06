@@ -6,7 +6,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from dmesh_api import check_additional_device_methods, extract
+from dmesh_api import TIERS, check_additional_device_methods, extract, section_tiers
 
 root = Path(__file__).resolve().parent.parent
 path = root / 'crates/lmesh/resources/tools.json'
@@ -59,6 +59,15 @@ for tool in device:
     if request.get('properties') and not tool['inputSchema'].get('properties'):
         tool['inputSchema'] = request
 catalog['tools'] = device + [tool for tool in local if tool['name'] not in seen]
+# The tier of a section method is its `**Tier:**` line in the formal API document; a table-only
+# device method keeps the tier of its hand-written entry (check_additional_device_methods compares
+# it with the API.md table). Every tool must end up with one.
+tiers = section_tiers()
+for tool in catalog['tools']:
+    if tool['name'] in tiers:
+        tool['x-tier'] = tiers[tool['name']]
+    if tool.get('x-tier') not in TIERS:
+        raise SystemExit(f"{tool['name']} has no tier: add **Tier:** to its API.md section or a Tier column entry")
 generated = json.dumps(catalog, indent=2) + '\n'
 if '--check' in sys.argv:
     if path.read_text() != generated:

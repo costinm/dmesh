@@ -108,17 +108,6 @@ impl<const SLOTS: usize, const MTU: usize> BleCompanion<SLOTS, MTU> {
         }
     }
 
-    /// Release the CoC. Resetting the device is a wired operation.
-    async fn release(&self, address: &str) -> Result<(), String> {
-        let (id, channel) = self
-            .lock()
-            .remove(&address.to_ascii_uppercase())
-            .ok_or_else(|| format!("{address} is not connected"))?;
-        self.node.remove_bearer(id).await;
-        channel.shutdown();
-        Ok(())
-    }
-
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, (BearerId, Arc<CocChannel>)>> {
         self.connected
             .lock()
@@ -133,7 +122,9 @@ impl<const SLOTS: usize, const MTU: usize> CompanionLink for BleCompanion<SLOTS,
     }
 
     async fn unpair(&self, id: &str, _store: &DeviceStore) -> Result<(), String> {
-        self.release(id).await
+        // Firmware permits ownership reset only over a physical wired link.
+        // Do not disconnect or erase the record and claim device-side success.
+        Err(format!("cannot reset {id} over BLE; use USB/UART to unpair the device"))
     }
 }
 
@@ -183,10 +174,11 @@ mod tests {
     }
 
     #[test]
-    fn unpair_of_an_unknown_address_is_an_error() {
+    fn ble_unpair_does_not_claim_device_reset() {
         local(async {
-            let error = companion().release("AA:BB:CC:DD:EE:FF").await.unwrap_err();
-            assert!(error.contains("not connected"));
+            let error = companion().unpair("AA:BB:CC:DD:EE:FF", &DeviceStore::new("/nonexistent"))
+                .await.unwrap_err();
+            assert!(error.contains("use USB/UART"));
         });
     }
 }

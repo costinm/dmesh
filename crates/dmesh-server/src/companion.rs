@@ -55,7 +55,8 @@ pub struct PairRequest<'a> {
 #[async_trait]
 pub trait CompanionLink: Send + Sync {
     async fn pair(&self, request: PairRequest<'_>) -> Result<(), String>;
-    /// Reset the device to unpaired and drop its record, or release the link.
+    /// Confirm device reset and clear local credentials/ownership. Disconnecting
+    /// alone must return an error, not successful unpair.
     async fn unpair(&self, id: &str, store: &DeviceStore) -> Result<(), String>;
 }
 
@@ -66,11 +67,14 @@ pub struct Companions {
     /// unless a request names one.
     own_key: Vec<u8>,
     store: DeviceStore,
+    /// Provisioning is infrequent; serialize state-changing operations so pair
+    /// and unpair cannot race each other's device and filesystem commits.
+    operation: tokio::sync::Mutex<()>,
 }
 
 impl Companions {
     pub fn new(own_key: &[u8], store: DeviceStore) -> Self {
-        Self { links: BTreeMap::new(), own_key: own_key.to_vec(), store }
+        Self { links: BTreeMap::new(), own_key: own_key.to_vec(), store, operation: tokio::sync::Mutex::new(()) }
     }
 
     /// Add the link that serves `kind` (`uart`, `ble`).
@@ -87,6 +91,7 @@ impl Companions {
     }
 
     pub async fn pair(&self, request: &CompanionPairRequest) -> Result<CompanionPairResponse, String> {
+        let _operation = self.operation.lock().await;
         let link = self.link(request.kind.as_deref())?;
         let root_public_key = root_key(request, &self.own_key)?;
         let id = request.id.as_deref().ok_or("companion.pair needs id")?;
@@ -109,6 +114,7 @@ impl Companions {
     }
 
     pub async fn unpair(&self, request: &CompanionUnpairRequest) -> Result<CompanionUnpairResponse, String> {
+        let _operation = self.operation.lock().await;
         let link = self.link(request.kind.as_deref())?;
         let id = request.id.as_deref().ok_or("companion.unpair needs id")?;
         link.unpair(id, &self.store).await?;
@@ -279,5 +285,64 @@ mod tests {
         assert!(error(CompanionPairRequest { kind: Some("uart".into()), ..Default::default() }).contains("needs id"));
         assert!(error(CompanionPairRequest { kind: Some("uart".into()), id: Some("x".into()), vip6: Some("nope".into()), ..Default::default() }).contains("vip6"));
         assert!(link.pairs.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_pair_and_unpair_are_serialized_by_the_shared_handler() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Default)]
+        struct Simulator {
+            active: AtomicUsize,
+            peak: AtomicUsize,
+            calls: AtomicUsize,
+        }
+        impl Simulator {
+            async fn operation(&self) {
+                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(active, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.active.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        #[async_trait]
+        impl CompanionLink for Simulator {
+            async fn pair(&self, _: PairRequest<'_>) -> Result<(), String> {
+                self.operation().await;
+                Ok(())
+            }
+            async fn unpair(&self, _: &str, _: &DeviceStore) -> Result<(), String> {
+                self.operation().await;
+                Ok(())
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let simulator = Arc::new(Simulator::default());
+        let companions = Companions::new(&[2; 33], DeviceStore::new(directory.path()))
+            .with_link("sim", simulator.clone());
+        let pair = CompanionPairRequest { kind: Some("sim".into()), id: Some("attachment".into()), ..Default::default() };
+        let unpair = CompanionUnpairRequest { kind: Some("sim".into()), id: Some("attachment".into()) };
+        let (a, b, c) = tokio::join!(companions.pair(&pair), companions.unpair(&unpair), companions.pair(&pair));
+        a.unwrap(); b.unwrap(); c.unwrap();
+        assert_eq!(simulator.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(simulator.peak.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_link_reset_failure_is_not_reported_as_success() {
+        struct RefusingLink;
+        #[async_trait]
+        impl CompanionLink for RefusingLink {
+            async fn pair(&self, _: PairRequest<'_>) -> Result<(), String> { Ok(()) }
+            async fn unpair(&self, _: &str, _: &DeviceStore) -> Result<(), String> {
+                Err("device reset not confirmed".into())
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let companions = Companions::new(&[], DeviceStore::new(directory.path()))
+            .with_link("sim", Arc::new(RefusingLink));
+        let error = companions.unpair(&CompanionUnpairRequest { kind: Some("sim".into()), id: Some("attachment".into()) })
+            .await.unwrap_err();
+        assert_eq!(error, "device reset not confirmed");
     }
 }

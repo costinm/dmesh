@@ -9,6 +9,8 @@
 //! logical node. See [`bearer`] for the physical packet I/O contract.
 
 extern crate alloc;
+mod datagram;
+pub use datagram::{DatagramPriority, DatagramSendError, ReceivedDatagram};
 use alloc::vec::Vec;
 
 #[cfg(all(feature = "std", not(test)))]
@@ -232,6 +234,14 @@ pub(crate) const FIRST_SERVER_BIDI_STREAM_ID: u64 = 1;
 /// this fits the proven firmware action ingress without relying on L2
 /// fragmentation or per-bearer MTU negotiation.
 pub const DEFAULT_MAX_PACKET_SIZE: usize = 1100;
+/// Conservative DATAGRAM frame budget within the protected-packet MTU.
+/// Maximum short header = 1 flag + 8 CID + 4 packet-number bytes; the
+/// 16-byte AEAD tag counts toward the bearer QUIC-packet MTU. In storage it
+/// occupies the existing suffix reserve, not an additional pool trailer.
+/// RFC 9221's advertised frame limit includes the DATAGRAM frame header.
+pub const DEFAULT_MAX_DATAGRAM_FRAME_SIZE: usize = DEFAULT_MAX_PACKET_SIZE - (1 + 8 + 4) - 16;
+/// Opaque payload budget for our dedicated 0x30 DATAGRAM encoding.
+pub const DEFAULT_MAX_DATAGRAM_PAYLOAD: usize = DEFAULT_MAX_DATAGRAM_FRAME_SIZE - 1;
 /// Conservative one-packet application payload after short-header and
 /// stream-frame overhead. Commands using this bound never rely on L2
 /// fragmentation, even when CID/varint widths grow.
@@ -369,6 +379,10 @@ pub enum Error {
     PathLimit,
     /// A retained packet cannot be represented by the retransmission storage.
     RetransmissionTooLarge,
+    /// The peer did not advertise RFC 9221 DATAGRAM reception.
+    DatagramUnsupported,
+    /// A DATAGRAM exceeds the peer frame-size limit or the selected path MTU.
+    DatagramTooLarge,
 }
 
 /// Embedded callers use this enum directly. Host association managers can
@@ -553,6 +567,60 @@ pub(crate) fn rewrite_dcid(
         return Err(Error::Invalid);
     }
     rewrite_destination(input, Some(outbound_dcid), out)
+}
+
+/// Preflight a short-header rewrite without modifying the packet. Changing CID
+/// width consumes/releases prefix space, never moves packet-number/body bytes.
+fn dcid_rewrite_layout<B: AsRef<[u8]>>(
+    packet: &OwnedPacket<B>,
+    destination: ConnectionId,
+    prefix_required: usize,
+    max_packet: usize,
+) -> Result<(core::ops::Range<usize>, [u8; 9], usize), Error> {
+    if destination.value() == 0 || packet.bytes().first().is_some_and(|b| b & 0x80 != 0) {
+        return Err(Error::Invalid);
+    }
+    let prefix = ShortHeader::decode_prefix(packet.bytes())?;
+    let range = packet.packet_range();
+    let tail = range.start + 1 + prefix.dcid.encoded_len();
+    let header_len = 1 + destination.encoded_len();
+    let start = tail.checked_sub(header_len).ok_or(Error::BufferTooSmall)?;
+    if start < prefix_required || range.end - start > max_packet {
+        return Err(Error::BufferTooSmall);
+    }
+    let mut header = [0; 9];
+    header[0] = packet.bytes()[0];
+    destination.encode(&mut header[1..header_len])?;
+    Ok((start..range.end, header, header_len))
+}
+
+/// Rewrite an exclusively owned short-header lease. Refusal returns the exact
+/// unchanged packet. Only flags/CID bytes are written; opaque PN/body/tag bytes
+/// retain their backing addresses, including when CID varint widths differ.
+pub(crate) fn rewrite_dcid_in_place<B: PacketBuffer>(
+    packet: OwnedPacket<B>,
+    destination: ConnectionId,
+    prefix_required: usize,
+    max_packet: usize,
+) -> Result<OwnedPacket<B>, (Error, OwnedPacket<B>)> {
+    let (new_range, header, header_len) =
+        match dcid_rewrite_layout(&packet, destination, prefix_required, max_packet) {
+            Ok(layout) => layout,
+            Err(error) => return Err((error, packet)),
+        };
+    let (mut buffer, old_range) = packet.into_parts();
+    let Some(storage) = buffer.as_mut_unique() else {
+        return Err((
+            Error::Blocked,
+            OwnedPacket::new(buffer, old_range)
+                .ok()
+                .expect("unchanged range"),
+        ));
+    };
+    storage[new_range.start..new_range.start + header_len].copy_from_slice(&header[..header_len]);
+    Ok(OwnedPacket::new(buffer, new_range)
+        .ok()
+        .expect("preflighted range"))
 }
 
 /// Rewrite a routing destination without representing an empty long-header
@@ -822,6 +890,7 @@ pub(crate) struct BootstrapOpen {
     /// Receiver credit the peer must honour before the first MAX_* frame.
     pub max_data: u64,
     pub max_stream_data: u64,
+    pub max_datagram_frame_size: u64,
     /// Maximum outstanding STREAM packets this receiver can absorb. Zero
     /// means no packet-count bound for compatibility with older peers.
     pub max_in_flight_packets: u16,
@@ -852,6 +921,7 @@ pub(crate) struct BootstrapOpenAck {
     /// Receiver credit the peer must honour before the first MAX_* frame.
     pub max_data: u64,
     pub max_stream_data: u64,
+    pub max_datagram_frame_size: u64,
     /// See [`BootstrapOpen::max_in_flight_packets`].
     pub max_in_flight_packets: u16,
     /// Token that proves an opaque packet is the peer's stateless-reset
@@ -864,7 +934,8 @@ pub(crate) struct BootstrapOpenAck {
 impl BootstrapOpen {
     pub(crate) const VERSION: u64 = 0;
     pub(crate) fn encode(self, out: &mut [u8]) -> Result<usize, Error> {
-        if self.client_receive_cid.value() == 0 || self.stateless_reset_token.is_some() {
+        if self.client_receive_cid.value() == 0 || self.stateless_reset_token.is_some()
+            || self.max_datagram_frame_size != 0 {
             return Err(Error::BootstrapInvalid);
         }
         if out.len() < 3 {
@@ -925,6 +996,7 @@ impl BootstrapOpen {
             client_receive_cid: cid,
             max_data,
             max_stream_data,
+            max_datagram_frame_size: 0,
             max_in_flight_packets,
             stateless_reset_token: None,
             requested_peer_limits: None,
@@ -936,7 +1008,8 @@ impl BootstrapOpen {
 impl BootstrapOpenAck {
     pub(crate) const VERSION: u64 = 0;
     pub(crate) fn encode(self, out: &mut [u8]) -> Result<usize, Error> {
-        if self.server_receive_cid.value() == 0 || self.stateless_reset_token.is_some() {
+        if self.server_receive_cid.value() == 0 || self.stateless_reset_token.is_some()
+            || self.max_datagram_frame_size != 0 {
             return Err(Error::BootstrapInvalid);
         }
         if out.len() < 3 {
@@ -997,6 +1070,7 @@ impl BootstrapOpenAck {
             server_receive_cid: cid,
             max_data,
             max_stream_data,
+            max_datagram_frame_size: 0,
             max_in_flight_packets,
             stateless_reset_token: None,
         })
@@ -1024,7 +1098,7 @@ fn encode_bootstrap_profile(
         (true, false) => 1,
         (false, true) => 2,
         (true, true) => 3,
-    };
+    } | if limits.max_datagram_frame_size != 0 { 4 } else { 0 };
     at += put_varint(version, &mut out[at..])?;
     let mut parameters = [0u8; 64];
     let mut used = 0;
@@ -1041,6 +1115,16 @@ fn encode_bootstrap_profile(
         }
         used += put_varint(request.max_data, &mut parameters[used..])?;
         used += put_varint(request.max_stream_data, &mut parameters[used..])?;
+    }
+    if limits.max_datagram_frame_size != 0 {
+        // RFC 9221 parameter in the DMesh profile extension. Existing
+        // profiles 0..3 remain unchanged when DATAGRAM is disabled.
+        used += put_varint(0x20, &mut parameters[used..])?;
+        let mut value = [0; 8];
+        let len = put_varint(limits.max_datagram_frame_size, &mut value)?;
+        used += put_varint(len as u64, &mut parameters[used..])?;
+        parameters[used..used + len].copy_from_slice(&value[..len]);
+        used += len;
     }
     at += put_varint(used as u64, &mut out[at..])?;
     if out.len() < at + used {
@@ -1066,11 +1150,11 @@ fn decode_bootstrap_profile(
         return Err(Error::BootstrapInvalid);
     }
     let (version, version_len) = get_varint(&input[1..])?;
-    if version > 3 {
+    if version > 7 {
         return Err(Error::BootstrapInvalid);
     }
     let (length, length_len) = get_varint(&input[1 + version_len..])?;
-    let parameters = &input[1 + version_len + length_len..];
+    let mut parameters = &input[1 + version_len + length_len..];
     if parameters.len() != length as usize {
         return Err(Error::BootstrapInvalid);
     }
@@ -1078,7 +1162,38 @@ fn decode_bootstrap_profile(
     let (max_stream_data, stream_len) = get_varint(&parameters[data_len..])?;
     let (packets, packets_len) = get_varint(&parameters[data_len + stream_len..])?;
     let values_len = data_len + stream_len + packets_len;
-    let (reset_token, requested_peer_limits) = match version {
+    let mut max_datagram_frame_size = 0;
+    if version & 4 != 0 {
+        let mut extension_at = values_len;
+        if version & 1 != 0 { extension_at += STATELESS_RESET_TOKEN_LEN; }
+        if version & 2 != 0 {
+            if expected_kind != 0 { return Err(Error::BootstrapInvalid); }
+            let (_, n) = get_varint(parameters.get(extension_at..).ok_or(Error::Truncated)?)?;
+            extension_at += n;
+            let (_, n) = get_varint(&parameters[extension_at..])?;
+            extension_at += n;
+        }
+        let mut tail = parameters.get(extension_at..).ok_or(Error::Truncated)?;
+        let mut seen = false;
+        while !tail.is_empty() {
+            let (id, n) = get_varint(tail)?;
+            tail = &tail[n..];
+            let (length, n) = get_varint(tail)?;
+            tail = &tail[n..];
+            let len = usize::try_from(length).map_err(|_| Error::BootstrapInvalid)?;
+            let value = tail.get(..len).ok_or(Error::Truncated)?;
+            if id == 0x20 {
+                if seen { return Err(Error::BootstrapInvalid); }
+                let (size, used) = get_varint(value)?;
+                if used != len { return Err(Error::BootstrapInvalid); }
+                max_datagram_frame_size = size;
+                seen = true;
+            }
+            tail = &tail[len..];
+        }
+        parameters = &parameters[..extension_at];
+    }
+    let (reset_token, requested_peer_limits) = match version & 3 {
         0 if values_len == parameters.len() => (None, None),
         1 if values_len + STATELESS_RESET_TOKEN_LEN == parameters.len() => {
             let mut token = [0u8; STATELESS_RESET_TOKEN_LEN];
@@ -1086,7 +1201,7 @@ fn decode_bootstrap_profile(
             (Some(StatelessResetToken(token)), None)
         }
         2 | 3 if expected_kind == 0 => {
-            let (token, request) = if version == 3 {
+            let (token, request) = if version & 3 == 3 {
                 if parameters.len() < values_len + STATELESS_RESET_TOKEN_LEN {
                     return Err(Error::BootstrapInvalid);
                 }
@@ -1127,6 +1242,7 @@ fn decode_bootstrap_profile(
         ConnectionLimits {
             max_data,
             max_stream_data,
+            max_datagram_frame_size,
             ..ConnectionLimits::default()
         },
         packets as u16,
@@ -1219,7 +1335,7 @@ pub(crate) fn encode_bootstrap_open_packet_with_profile_reset_token_and_peer_rec
     if client_cid.value() == 0 {
         return Err(Error::BootstrapInvalid);
     }
-    let mut body = [0u8; 48];
+    let mut body = [0u8; 96];
     let body_len = encode_bootstrap_profile(
         0,
         limits,
@@ -1228,7 +1344,7 @@ pub(crate) fn encode_bootstrap_open_packet_with_profile_reset_token_and_peer_rec
         requested_peer_limits,
         &mut body,
     )?;
-    let mut frame = [0u8; 64];
+    let mut frame = [0u8; 96];
     let frame_len = Frame::Stream(StreamFrame {
         id: CONTROL_STREAM_ID,
         offset: 0,
@@ -1281,6 +1397,7 @@ pub(crate) fn decode_bootstrap_open_packet_with_limits(
         client_receive_cid: source_cid,
         max_data: limits.max_data,
         max_stream_data: limits.max_stream_data,
+        max_datagram_frame_size: limits.max_datagram_frame_size,
         max_in_flight_packets,
         stateless_reset_token: reset_token,
         requested_peer_limits,
@@ -1375,7 +1492,7 @@ pub(crate) fn encode_bootstrap_open_ack_packet_with_profile_and_reset_token(
     if client_cid.value() == 0 || server_cid.value() == 0 || client_cid == server_cid {
         return Err(Error::BootstrapInvalid);
     }
-    let mut body = [0u8; 64];
+    let mut body = [0u8; 96];
     let body_len = encode_bootstrap_profile(
         1,
         limits,
@@ -1384,7 +1501,7 @@ pub(crate) fn encode_bootstrap_open_ack_packet_with_profile_and_reset_token(
         None,
         &mut body,
     )?;
-    let mut frame = [0u8; 64];
+    let mut frame = [0u8; 96];
     let frame_len = Frame::Stream(StreamFrame {
         id: CONTROL_STREAM_ID,
         offset: 0,
@@ -1445,6 +1562,7 @@ pub(crate) fn decode_bootstrap_open_ack_packet_with_limits(
         server_receive_cid: server_cid,
         max_data: limits.max_data,
         max_stream_data: limits.max_stream_data,
+        max_datagram_frame_size: limits.max_datagram_frame_size,
         max_in_flight_packets,
         stateless_reset_token,
     };
@@ -1772,6 +1890,7 @@ pub(crate) enum Frame<'a> {
         reordering_threshold: u64,
     },
     Stream(StreamFrame<'a>),
+    Datagram { data: &'a [u8], length: bool },
     MaxData(u64),
     MaxStreamData {
         id: u64,
@@ -1895,6 +2014,17 @@ impl<'a> Frame<'a> {
                 put(FRAME_MAX_DATA, out, &mut p)?;
                 put(*v, out, &mut p)?;
                 Ok(p)
+            }
+            Frame::Datagram { data, length } => {
+                put(if *length { 0x31 } else { 0x30 }, out, &mut p)?;
+                if *length {
+                    put(data.len() as u64, out, &mut p)?;
+                }
+                if out.len() < p + data.len() {
+                    return Err(Error::BufferTooSmall);
+                }
+                out[p..p + data.len()].copy_from_slice(data);
+                Ok(p + data.len())
             }
             Frame::MaxStreamData { id, max } => {
                 put(FRAME_MAX_STREAM_DATA, out, &mut p)?;
@@ -2061,8 +2191,21 @@ pub(crate) fn decode_frame<'a>(input: &'a [u8]) -> Result<(Frame<'a>, usize), Er
             ))
         }
         FRAME_MAX_DATA => {
-            let (v, n) = get_varint(&input[p..])?;
-            Ok((Frame::MaxData(v), p + n))
+            let (max, n) = get_varint(&input[p..])?;
+            Ok((Frame::MaxData(max), p + n))
+        }
+        0x30 | 0x31 => {
+            let length = typ == 0x31;
+            let len = if length {
+                let (len, used) = get_varint(&input[p..])?;
+                p += used;
+                usize::try_from(len).map_err(|_| Error::Invalid)?
+            } else {
+                input.len() - p
+            };
+            let end = p.checked_add(len).ok_or(Error::Invalid)?;
+            let data = input.get(p..end).ok_or(Error::Truncated)?;
+            Ok((Frame::Datagram { data, length }, end))
         }
         FRAME_MAX_STREAM_DATA => {
             let (id, n) = get_varint(&input[p..])?;
@@ -2901,6 +3044,11 @@ pub(crate) enum PathStatusKind {
 /// initial limits. QUIC-lite clamps negotiated values to the storage configured
 /// in the node; bearers must not alter these limits.
 pub struct ConnectionLimits {
+    /// RFC 9221 receive frame-size limit, including frame header. Zero
+    /// disables DATAGRAM reception; reliable flow credit is unaffected.
+    /// Defaults to DEFAULT_MAX_DATAGRAM_FRAME_SIZE, accounting for maximum
+    /// short-header space and the AEAD tag within the protected-packet MTU.
+    pub max_datagram_frame_size: u64,
     /// Total bytes the peer may send across all streams before more credit.
     pub max_data: u64,
     /// Bytes the peer may send on one stream before more credit.
@@ -2950,6 +3098,7 @@ impl ConnectionLimits {
             max_stream_data,
             max_streams_bidi,
             max_streams_uni: 4,
+            max_datagram_frame_size: DEFAULT_MAX_DATAGRAM_FRAME_SIZE as u64,
         }
     }
 
@@ -2981,6 +3130,7 @@ impl Default for ConnectionLimits {
             max_stream_data: INITIAL_MAX_STREAM_DATA,
             max_streams_bidi: DEFAULT_MAX_BIDI_STREAMS,
             max_streams_uni: 4,
+            max_datagram_frame_size: DEFAULT_MAX_DATAGRAM_FRAME_SIZE as u64,
         }
     }
 }
@@ -3244,6 +3394,9 @@ impl ConnectionState {
 /// congestion control.
 #[derive(Clone)]
 pub(crate) struct EndpointState<const P: usize = DEFAULT_MAX_PACKET_SIZE> {
+    peer_max_datagram_frame_size: u64,
+    #[cfg(feature = "packet-protection")]
+    opened_packet_number: Option<u32>,
     pub send: SendFlowControl,
     pub receive: ConnectionState,
     pub(crate) paths: Vec<PathState>,
@@ -4267,6 +4420,9 @@ impl<const P: usize> EndpointState<P> {
                 .write(history_capacity.saturating_mul(2));
             core::ptr::addr_of_mut!((*out).local_cid).write(None);
             core::ptr::addr_of_mut!((*out).peer_cid).write(None);
+            core::ptr::addr_of_mut!((*out).peer_max_datagram_frame_size).write(0);
+            #[cfg(feature = "packet-protection")]
+            core::ptr::addr_of_mut!((*out).opened_packet_number).write(None);
             #[cfg(feature = "packet-protection")]
             core::ptr::addr_of_mut!((*out).protection).write(None);
             core::ptr::addr_of_mut!((*out).control_pending).write(false);
@@ -4353,6 +4509,9 @@ impl<const P: usize> EndpointState<P> {
             transmission_limit: history_capacity.saturating_mul(2),
             local_cid: None,
             peer_cid: None,
+            peer_max_datagram_frame_size: 0,
+            #[cfg(feature = "packet-protection")]
+            opened_packet_number: None,
             #[cfg(feature = "packet-protection")]
             protection: None,
             control_pending: false,
@@ -6023,6 +6182,8 @@ impl<const P: usize> EndpointState<P> {
         let (header, header_len) =
             ShortHeader::decode_with_expected(input, expected_packet_number)?;
         #[cfg(feature = "packet-protection")]
+        let protection_opened = protection_opened || self.opened_packet_number == Some(header.packet_number);
+        #[cfg(feature = "packet-protection")]
         if self.protection.is_some() != protection_opened
             || (header.flags & FLAG_PROTECTED != 0) != protection_opened
         {
@@ -6101,6 +6262,15 @@ impl<const P: usize> EndpointState<P> {
                     }
                     streams[stream_count] = Some(value);
                     stream_count += 1;
+                }
+                Frame::Datagram { .. } => {
+                    let limit = self.receive.limits.max_datagram_frame_size;
+                    if limit == 0 || used as u64 > limit {
+                        self.close_code = Some(0x0a); // PROTOCOL_VIOLATION
+                        self.control_pending = true;
+                        return Err(Error::Invalid);
+                    }
+                    ack_eliciting = true;
                 }
                 Frame::Close { code } => {
                     if close_code.is_some() {
@@ -8975,6 +9145,7 @@ mod tests {
     #[test]
     fn connection_and_stream_credit_are_bounded() {
         let limits = ConnectionLimits {
+            max_datagram_frame_size: 0,
             max_data: 8,
             max_stream_data: 8,
             max_streams_bidi: 1,
@@ -8990,6 +9161,7 @@ mod tests {
     fn consumed_stream_keeps_the_negotiated_receive_budget() {
         const RECEIVE_WINDOW: u64 = 32 * 1024;
         let limits = ConnectionLimits {
+            max_datagram_frame_size: 0,
             max_data: RECEIVE_WINDOW,
             max_stream_data: RECEIVE_WINDOW,
             max_streams_bidi: 1,
@@ -9084,6 +9256,7 @@ mod tests {
         let client_cid = ConnectionId::new(0x721).unwrap();
         let server_cid = ConnectionId::new(0x722).unwrap();
         let limits = ConnectionLimits {
+            max_datagram_frame_size: 0,
             max_data: 64,
             max_stream_data: 64,
             ..ConnectionLimits::default()
@@ -9139,11 +9312,13 @@ mod tests {
     fn bootstrap_credit_constrains_sender_before_first_window_update() {
         const RECEIVE_WINDOW: u64 = 32 * 1024;
         let recovery = ConnectionLimits {
+            max_datagram_frame_size: 0,
             max_data: RECEIVE_WINDOW,
             max_stream_data: RECEIVE_WINDOW,
             ..ConnectionLimits::default()
         };
         let open = BootstrapOpen {
+            max_datagram_frame_size: 0,
             client_receive_cid: ConnectionId::new(7).unwrap(),
             max_data: recovery.max_data,
             max_stream_data: recovery.max_stream_data,
@@ -9184,6 +9359,7 @@ mod tests {
         let client = ConnectionId::new(0x711).unwrap();
         let server = ConnectionId::new(0x712).unwrap();
         let limits = ConnectionLimits {
+            max_datagram_frame_size: 0,
             max_data: 64 * 1200,
             max_stream_data: 64 * 1200,
             ..ConnectionLimits::default()
@@ -9235,6 +9411,7 @@ mod tests {
     fn bootstrap_profile_preserves_explicit_packet_budget() {
         let client = ConnectionId::new(0x713).unwrap();
         let limits = ConnectionLimits {
+            max_datagram_frame_size: 0,
             max_data: 48_000,
             max_stream_data: 24_000,
             ..ConnectionLimits::default()
@@ -9308,6 +9485,7 @@ mod tests {
     #[test]
     fn rejected_first_fragment_does_not_consume_stream_slot() {
         let limits = ConnectionLimits {
+            max_datagram_frame_size: 0,
             max_data: 4,
             max_stream_data: 8,
             max_streams_bidi: 1,
@@ -9323,6 +9501,7 @@ mod tests {
     #[test]
     fn connection_and_stream_windows_are_independent_and_extendable() {
         let limits = ConnectionLimits {
+            max_datagram_frame_size: 0,
             max_data: 16,
             max_stream_data: 8,
             max_streams_bidi: 2,
@@ -9404,6 +9583,7 @@ mod tests {
     #[test]
     fn bootstrap_stream_records_round_trip_and_reject_extensions() {
         let client = BootstrapOpen {
+            max_datagram_frame_size: 0,
             client_receive_cid: ConnectionId::new(0x1234).unwrap(),
             max_data: 4096,
             max_stream_data: 2048,
@@ -9415,6 +9595,7 @@ mod tests {
         let used = client.encode(&mut encoded).unwrap();
         assert_eq!(BootstrapOpen::decode(&encoded[..used]).unwrap(), client);
         let server = BootstrapOpenAck {
+            max_datagram_frame_size: 0,
             server_receive_cid: ConnectionId::new(0x3fff).unwrap(),
             max_data: 4096,
             max_stream_data: 2048,
@@ -9436,6 +9617,7 @@ mod tests {
     #[test]
     fn bootstrap_stream_records_have_byte_exact_golden_vectors() {
         let smallest = BootstrapOpen {
+            max_datagram_frame_size: 0,
             client_receive_cid: ConnectionId::new(1).unwrap(),
             max_data: 64,
             max_stream_data: 64,
@@ -9451,6 +9633,7 @@ mod tests {
         );
 
         let largest = BootstrapOpen {
+            max_datagram_frame_size: 0,
             client_receive_cid: ConnectionId::new(ConnectionId::MAX_VALUE).unwrap(),
             max_data: 64,
             max_stream_data: 64,
@@ -9468,6 +9651,7 @@ mod tests {
         );
 
         let smallest_ack = BootstrapOpenAck {
+            max_datagram_frame_size: 0,
             server_receive_cid: ConnectionId::new(1).unwrap(),
             max_data: 64,
             max_stream_data: 64,
@@ -9481,6 +9665,7 @@ mod tests {
         );
 
         let largest_ack = BootstrapOpenAck {
+            max_datagram_frame_size: 0,
             server_receive_cid: ConnectionId::new(ConnectionId::MAX_VALUE).unwrap(),
             max_data: 64,
             max_stream_data: 64,
@@ -12507,6 +12692,7 @@ mod tests {
     #[test]
     fn concurrent_streams_share_connection_but_keep_credit_independent() {
         let limits = ConnectionLimits {
+            max_datagram_frame_size: 0,
             max_data: 16,
             max_stream_data: 8,
             max_streams_bidi: 1,
@@ -13509,6 +13695,7 @@ mod tests {
     #[test]
     fn one_control_packet_returns_credit_for_each_consumed_stream() {
         let limits = ConnectionLimits {
+            max_datagram_frame_size: 0,
             max_data: 32,
             max_stream_data: 16,
             max_streams_bidi: 2,
@@ -13545,6 +13732,7 @@ mod tests {
     #[test]
     fn deferred_consumption_batches_paired_connection_and_stream_credit() {
         let limits = ConnectionLimits {
+            max_datagram_frame_size: 0,
             max_data: 64,
             max_stream_data: 64,
             max_streams_bidi: 1,

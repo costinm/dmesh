@@ -368,14 +368,13 @@ impl PacketEgress<<FirmwarePool as quic_lite::PacketPool>::Buffer> for Udp6Beare
         peer: PeerL2Address,
         submission: EgressSubmission<<FirmwarePool as quic_lite::PacketPool>::Buffer>,
     ) -> Result<(), PacketSubmitError<<FirmwarePool as quic_lite::PacketPool>::Buffer>> {
-        let sent = crate::wifi_raw_udp6_esp::peer_for_path(peer).is_some_and(|endpoint| {
-            crate::wifi_raw_udp6_esp::transmit_udp6(
-                endpoint.link,
-                endpoint,
-                crate::wifi_raw_udp6_esp::RAW_UDP6_PORT,
-                submission.packet().bytes(),
-            )
-        });
+        let (packet, completion) = submission.into_parts();
+        let (packet, sent) = if let Some(endpoint) = crate::wifi_raw_udp6_esp::peer_for_path(peer) {
+            crate::wifi_raw_udp6_esp::transmit_udp6_owned(endpoint,
+                crate::wifi_raw_udp6_esp::RAW_UDP6_PORT, packet)
+        } else {
+            (packet, false)
+        };
         if UDP6_EGRESS_REPORTED.fetch_add(1, Ordering::AcqRel) < 4 {
             let _ = crate::uart_esp::send_debug_text(if sent {
                 b"DMESH udp6 QUIC egress sent=true"
@@ -383,7 +382,8 @@ impl PacketEgress<<FirmwarePool as quic_lite::PacketPool>::Buffer> for Udp6Beare
                 b"DMESH udp6 QUIC egress sent=false"
             });
         }
-        submission.complete(
+        completion.complete(
+            packet,
             if sent {
                 PacketSendOutcome::Sent
             } else {
@@ -403,7 +403,7 @@ impl PacketBearer<FirmwarePool> for Udp6Bearer {
         BearerInfo {
             name: BearerName::new("udp6").expect("static bearer name is valid"),
             max_packet_size: quic_lite::DEFAULT_MAX_PACKET_SIZE,
-            prefix_required: 0,
+            prefix_required: quic_lite::PACKET_PREFIX_RESERVE,
             suffix_required: 0,
             requires_packet_encryption: false,
             secure_link: false,
@@ -495,9 +495,17 @@ unsafe fn runtime() -> &'static mut FirmwareRuntime {
         value
             .add_bearer(UartBearer)
             .expect("static UART bearer registration succeeds");
-        value
+        let udp_bearer = value
             .add_bearer(Udp6Bearer)
             .expect("static UDP6 bearer registration succeeds");
+        value.set_path_open_resolver(move |kind, address| {
+            if kind != dmesh_server::transport_path::TransportId::UDP6.0 {
+                return None;
+            }
+            crate::wifi_raw_udp6_esp::path_for_udp_address(address).map(|peer_l2_address| {
+                quic_lite::CircuitNextHop { bearer: udp_bearer, peer_l2_address }
+            })
+        });
         value
             .add_bearer(BleBearer)
             .expect("static BLE bearer registration succeeds");
@@ -821,6 +829,8 @@ pub(crate) fn progress() {
                         QuicNodeEgressError::Transport(quic_lite::Error::Truncated) => b"truncated",
                         QuicNodeEgressError::Transport(quic_lite::Error::Invalid) => b"invalid",
                         QuicNodeEgressError::Transport(quic_lite::Error::Blocked) => b"blocked",
+                        QuicNodeEgressError::Transport(quic_lite::Error::DatagramUnsupported) => b"datagram-unsupported",
+                        QuicNodeEgressError::Transport(quic_lite::Error::DatagramTooLarge) => b"datagram-too-large",
                         QuicNodeEgressError::Transport(quic_lite::Error::InvalidVarint) => {
                             b"invalid-varint"
                         }

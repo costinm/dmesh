@@ -122,6 +122,42 @@ captures. Capture I/O errors are reported to stderr and do not stop packet
 delivery. These are host observations; use `dmesh-cli SERIAL --watch` or a
 tagged `log.watch` request to collect device-side logs separately.
 
+### USB companion to STA relay exercise
+
+`crates/dmesh-cli/examples/companion_relay.rs` is an opt-in byte-checked
+host → USB → ESP → STA → host echo test. It uses the normal Tokio node/stream
+driver and existing PATH_OPEN relay setup, not a companion-specific QUIC
+protocol. Physical endpoints belong only in the selected E2E matrix:
+`[[devices]]` host/ESP descriptors supply `udp` socket endpoints (including
+IPv6 interface scope), and the ESP supplies `serial`. An enabled `[[pairs]]`
+row selects `source`, `target`, `tests = ["usb-sta-relay"]`, `bytes` and
+`timeout_secs`. Resolve endpoints from the catalog/discovery and local
+interface state; never embed them in the executable.
+
+Build the example with the same local dependency selection as the host CLI.
+Run `companion_relay server PAIR` first and wait for `ready=true`, then run
+`companion_relay client PAIR`. Both processes need
+`DMESH_E2E_CONFIG=/path/to/e2e-matrix.toml`. Give each process a distinct
+`QUIC_LITE_PCAP`; set `UART_CODEC_LOG` on the USB client. The server first
+establishes a UDP association so firmware knows its exact return tuple.
+Firmware resolves only previously observed UDP IP/port bindings. Completion
+requires matching bytes and FIN at both endpoints, not just path admission.
+
+UDP QUIC TX now prepends Ethernet/IPv6/UDP headers into the owned packet's
+prefix (62 bytes), or the raw station prefix (80 bytes). It preserves the
+QUIC payload and completion range, without an intermediate application
+frame copy. ESP-IDF's normal Wi-Fi TX still copies into driver storage.
+Discovery/generated connectionless responses retain their existing path.
+
+The 2026-10-06 USB-JTAG/STA exercise completed a 64 KiB echo, but a 1 MiB
+exercise stalled with watchdog reports in `dmesh_uart_l2`. Symbolization
+pointed to `CompletionQueue::send_completed`'s spinlock. The USB task runs
+at priority 5, while the Main owner runs at priority 1: a completion callback
+can preempt the lock holder and spin forever on this single-core target.
+This shared completion-path issue is not a companion packet-format issue;
+current simulator/host tests do not model fixed-priority single-core
+preemption. Do not classify larger hardware transfers as validated yet.
+
 For a UDP firmware object upload, set `QUIC_LITE_PCAP` on the `object.flash`
 process; it records that process's flash association across the UDP bearer.
 Run a separate `dmesh-cli SERIAL status --linger-secs 300` process with
@@ -567,6 +603,53 @@ Send `nan.pair_wakeup --to=<radio MAC>` first. Over BLE the device must be adver
 
 `scripts/e2e/60-pairing.sh` covers the Linux side. Android's `companion.pair kind=ble` connects the
 channel; provisioning over it is not implemented on Android yet (TODO in `mesh_jni.rs`).
+
+Companion lifecycle regression tests run locally first, without radios, serial
+ports or devices:
+
+```sh
+. ./env.sh
+RUSTFLAGS='-Awarnings' cargo test -p dmesh-server --lib companion
+RUSTFLAGS='-Awarnings' cargo test -p dmesh-server --lib device_record
+```
+
+The simulated device uses the real signed-discovery and provisioning CBOR
+records. Tests cover re-pair credential reuse/configuration retention, reset,
+refused/lost replies, identity mismatch, concurrent operations, atomic record
+replacement and discovery isolation. `companion = true` is separate from
+`trust = "paired"`. Confirmed reset clears credentials/membership but keeps the
+TOML record. Linux refuses `unpair kind=ble`; Android keeps the local BLE unpair
+callback for lifecycle tests. Local detach is not proof of firmware ownership
+reset. Future authenticated BLE reset requires the companion secret; physical
+USB/UART can force-unpair. Hardware tests come
+after the simulator gates, not instead of them.
+
+### Host-only relay and DATAGRAM forwarding checks
+
+These tests need no daemon, serial port or radio. They exercise A → companion → B
+with opaque relay and an outer DATAGRAM association, including bidirectional
+inner streams, loss recovery and independently protected inner/outer packets.
+
+```sh
+. ./env.sh
+RUSTFLAGS='-Awarnings' cargo test -p quic-lite --features tokio,packet-protection,stateless-reset --offline
+RUSTFLAGS='-Awarnings' cargo test -p quic-lite --no-default-features --offline --lib
+RUSTFLAGS='-Awarnings' cargo test -p quic-lite --release --features tokio three_node_forwarding_performance_comparison --offline --lib -- --ignored --nocapture
+RUSTFLAGS='-Awarnings' cargo test -p quic-lite --no-default-features --offline --lib plaintext_relay
+DMESH_FORWARDING_PACKETS=100000 RUSTFLAGS='-Awarnings' cargo test -p quic-lite --release --no-default-features --offline --lib plaintext_relay_rewrite_vs_companion_performance -- --ignored --nocapture
+```
+
+The three-node benchmark includes simulated physical RX copies, setup, ACKs and
+test-oracle work; its MiB/s is CPU throughput, not Wi-Fi performance. Relay and
+DATAGRAM encapsulation/decapsulation preserve the payload's backing address.
+The production companion bearer proxy/completion chaining remains separate work.
+See `notes/ai/companion-quic-api-proposal.md` and the quic-lite README for runtime
+limits, pool ownership and admission-versus-delivery semantics.
+
+The plaintext-only relay comparison separately checks DCID growth versus
+companion forwarding without rewrite. Prefix tests cover all CID widths, exact
+headroom and one-byte-short refusal, preserving body storage and bearer prefix
+space. Both modes use real node forwarding; no crypto feature is enabled.
 
 ## app-dmesh control with dmesh-cli
 

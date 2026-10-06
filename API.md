@@ -49,6 +49,8 @@ where a method has one, what its body contains.
 
 **Platforms:** A L E
 
+**Tier:** core
+
 **UI:** default
 
 ### Response
@@ -117,6 +119,8 @@ device; receivers must not infer common ownership from the fixed ULA bits.
 
 **Platforms:** A L E
 
+**Tier:** core
+
 The handler fans out locally to all currently owned discovery adapters (for
 example UDP multicast, NAN, BLE, or UART). It is not a path-selection hint for
 QUIC and does not queue application traffic behind a busy bearer. Each adapter
@@ -153,6 +157,8 @@ work over this bearer) is a different thing: it is `probe`.
 
 **Platforms:** A L E
 
+**Tier:** internal
+
 **UI:** default
 
 Every field is optional: an absent field means the platform cannot observe it, never
@@ -171,6 +177,8 @@ Every field is optional: an absent field means the platform cannot observe it, n
 ## 2. `now` — Return local ESP-NOW submission, receive, admission, dispatch, drop, and error counters
 
 **Platforms:** L E
+
+**Tier:** internal
 
 Counters are `u64`, monotonic since boot, and an unavailable value is omitted, never sent as zero. The tag of each field is also the metric id used on the wire by every platform.
 
@@ -202,6 +210,8 @@ Linux reports the three it can derive from the monitor events it retains: `rx_di
 ## 3. `nan` — Return local NAN beacon, SDF, Service Info, Follow-up, dispatch, drop, and error counters
 
 **Platforms:** L E
+
+**Tier:** internal
 
 Counters are `u64`, monotonic since boot, and an unavailable value is omitted, never sent as zero. The tag of each field is also the metric id used on the wire by every platform. Fields with a `_us` suffix are gauges (a duration or time), not counters.
 
@@ -253,6 +263,8 @@ Linux reports `beacons`, the raw-NAN monitor's beacon count, and no other field.
 
 **Platforms:** L E
 
+**Tier:** internal
+
 Counters are `u64`, monotonic since boot, and an unavailable value is omitted, never sent as zero. The tag of each field is also the metric id used on the wire by every platform.
 
 ### Response
@@ -273,6 +285,8 @@ Linux reports `rx_invalid` only: discovery datagrams that failed validation.
 ## 5. `wifi_link` — Return common optional per-peer Wi-Fi link observations
 
 **Platforms:** L E
+
+**Tier:** internal
 
 Optional fields distinguish unavailable driver telemetry from a measured zero. A device describes its one peer in the top-level fields; a host with several peers sends a `links` array of such rows and no top-level peer fields.
 
@@ -345,6 +359,8 @@ One `links` row has fields 1 to 26 above, with the same tags and meanings.
 
 **Platforms:** A
 
+**Tier:** internal
+
 `BatteryState` is the shared optional state for Android, ESP32, and Linux.
 Android currently produces it; the other adapters may leave fields absent
 until they implement an observer. Unknown values are omitted, not replaced
@@ -367,6 +383,8 @@ adapter; `idle_ms` and `charging_ms` describe the current interval, while
 ## 7. `quic` — Return aggregate QUIC counters for live associations
 
 **Platforms:** A L E
+
+**Tier:** internal
 
 **Rust CBOR:** generated
 
@@ -400,6 +418,8 @@ dump.
 ## 8. `quic_associations` — Return QUIC transport state for each live association
 
 **Platforms:** A L
+
+**Tier:** internal
 
 Target platforms: A L E; registered on A and L from the node's per-association
 state (a client association counts once it is established). The first-path bearer
@@ -439,6 +459,8 @@ because `quic-lite` does not expose them yet.
 
 **Platforms:** A L E
 
+**Tier:** internal
+
 Target platforms: A L E. E reports a row for `now` and `udp6` (the bearers that keep
 these counters); A and L report a row for every bearer registered on the QUIC node,
 from the node's own per-bearer counters. Fields a bearer does not count are omitted
@@ -473,6 +495,8 @@ detail stays in that bearer's method (`ble.status`, `now`, `nan`, `udp6`).
 
 **Platforms:** A L E
 
+**Tier:** internal
+
 Target platforms: A L E, with fields omitted where the platform has no such
 value (a host process has no worker stacks; a device has no process RSS).
 Registered on A, L and E (Android and Linux report `process_rss_bytes` only); replaces
@@ -501,6 +525,8 @@ Tags start at 1; the older snapshot method used 0-based tags.
 
 **Platforms:** E
 
+**Tier:** internal
+
 Target platforms: A E (L when it has an observer). Registered on E; replaces
 `power.snapshot` (102/1), which no platform registers any more. Battery state
 stays in `battery`.
@@ -525,6 +551,8 @@ Tags start at 1; the older snapshot method used 0-based tags.
 ## 12. `runtime` — Return radio lifecycle generations and sleep state
 
 **Platforms:** E
+
+**Tier:** internal
 
 Target platforms: A L E. Registered on E; replaces `runtime.snapshot` (101/1),
 which no platform registers any more (Android's and Linux's only reported the
@@ -554,6 +582,8 @@ Tags start at 1; the older snapshot method used 0-based tags.
 
 **Platforms:** A L E
 
+**Tier:** internal
+
 **Rust CBOR:** generated
 
 Static platform information, independent of radio state. Main and Recovery
@@ -579,6 +609,8 @@ protocol prerequisite.
 ## 4. `set` — Replace a node's complete volatile physical transport profile
 
 **Platforms:** A L E
+
+**Tier:** internal
 
 **UI:** default
 
@@ -618,7 +650,8 @@ has `sec:key` ignores this invitation.
 `kind` selects the bearer used for this operation: `uart` (USB or serial) or
 `ble`. Companions use only these two. `id` is its adapter-local identifier, a
 serial path or a BLE address. The host verifies the signed device identity,
-generates a new shared secret, writes it to the device, and durably stores the
+generates a shared secret (or reuses the stored secret for the same root on
+re-pair), writes it to the device, and durably stores the
 secret with the device MAC and public key in the device's record (a private file).
 The signed `device_id` is stable across bearers.
 
@@ -638,11 +671,14 @@ Firmware never returns the raw secret over control.
 
 Linux stores one pairing result per signed device VIP6 in
 `DMESH_PAIRED_DEVICES_DIR` (default `/home/system/etc/lmesh/paired`). The
-directory is mode 0700 and each JSON result is mode 0600. Android uses the
+directory is mode 0700 and each TOML record is mode 0600. Android uses the
 same layout under its app-private `files/ssh-mesh/paired` directory. A result is
 created from signed discovery, the device's NVS name (or the name set during
-pairing), the installed control-plane root public key, and the newly generated secret. Its filename is the final eight
-VIP6 bytes as 16 lowercase hexadecimal digits plus `.json`;
+pairing), the installed control-plane root public key, and the shared secret.
+Its filename is the final eight VIP6 bytes as 16 lowercase hexadecimal digits
+plus `.toml`; legacy JSON is read and migrated on write. `companion = true`
+marks owned interfaces, separately from `trust = "paired"`. Discovery cannot
+grant or remove companion membership;
 the old catalog inventory is not pairing authority. The secret must not appear in normal
 discovery, logs, HTTP responses, or command history.
 
@@ -656,13 +692,17 @@ identity and shared-secret proof remain required.
 
 **Platforms:** A L
 
+**Tier:** core
+
 `vip6` is optional. The device is identified by its bearer (the serial port or
 BLE address) and by its signed discovery reply, whose VIP6 the owned record is
 keyed on. When `vip6` is given it must match that reply, and the host refuses a
 device that proves a different identity. UART and BLE use the same exchange over an ordinary QUIC
 association on the host's running node (BLE over a plain CoC): discover, `provision.install`, then
-save the device record. A device that refuses leaves no host record. A
-re-pair over the wire replaces the earlier record. `id` is the serial path or
+save the device record. Refusal or a lost response does not create a new host
+record or remove an existing one. A re-pair over the wire atomically replaces
+the earlier record, retaining operator settings and attachment hints; the same
+root reuses the secret, while an explicit root change rotates it. `id` is the serial path or
 BLE address (from scan results); `psm` defaults to 128. A UART port stays attached
 afterwards; a port already attached (`LMESH_UART`) is reused.
 
@@ -700,12 +740,19 @@ mesh lmesh companion.unpair --kind=uart --id=/dev/ttyUSB0
 
 **Platforms:** A L
 
+**Tier:** core
+
 `kind` names the bearer carrying this operation; it does not identify the
 bearer on which pairing happened. Unpair removes the shared secret, the
-control-plane root and every BLE bond (stored peer keys) on the ESP32 and removes
-its device record on Linux or Android. A UART stays attached. Afterwards the ESP32 behaves like
-an unpaired device. Over BLE, unpair requires proof of the current
-shared secret and must reject devices owned by another controller. UART alone
+control-plane root and every BLE bond (stored peer keys) on the ESP32. Only after
+the reset response is confirmed does the host clear credentials and companion
+membership in its TOML record, retaining discovery and operator configuration.
+A local save failure is reported, not ignored. A UART stays attached. Afterwards
+the ESP32 behaves like an unpaired device. BLE device reset is not currently
+implemented: Linux rejects `unpair kind=ble`; Android retains its local BLE
+unpair callback for lifecycle tests, but that callback is not evidence of
+firmware ownership reset. When security is enabled, BLE device unpair will
+require proof of the companion secret. Use USB/UART for physical recovery. UART alone
 may unlock a device without that proof, including one paired to someone else.
 Physical UART access already permits Linux to flash the ESP32; future eFuse
 policy may restrict that ability. The UART exception must never apply to a
@@ -732,6 +779,8 @@ Credential bytes are never logged.
 
 **Platforms:** E
 
+**Tier:** internal
+
 **Visibility:** private
 
 ### Request
@@ -746,6 +795,8 @@ Credential bytes are never logged.
 
 **Platforms:** E
 
+**Tier:** internal
+
 **Visibility:** private
 
 Wired UART/USB only; a radio bearer is refused whatever the request claims.
@@ -759,6 +810,8 @@ permits reflashing the device. The request has no fields.
 ## 1. `record` — One-way diagnostic message from a companion bearer
 
 **Platforms:** none
+
+**Tier:** internal
 
 **Visibility:** private
 
@@ -777,6 +830,8 @@ frames remain unchanged. `log.watch` is the interface that reads retained record
 ## 2. `watch` — Read retained log and event records, optionally streaming them with periodic metric snapshots
 
 **Platforms:** A L E
+
+**Tier:** debug
 
 Target platforms: A L E; registered on E, which keeps the last 32 ESP-IDF log
 lines (`E (1234) tag: text` becomes level, source `tag` and text), and on L,
@@ -862,6 +917,8 @@ directly.
 
 **Platforms:** A L E
 
+**Tier:** debug
+
 **UI:** advanced
 
 The envelope's destination `to` (a request field named `to`, tag 15 in this
@@ -910,6 +967,8 @@ decoder rejects them.
 ## 2. `handler` — Answer a probe with a header and then the probe payload
 
 **Platforms:** A L E
+
+**Tier:** debug
 
 **UI:** advanced
 
@@ -963,6 +1022,8 @@ dmesh-cli DEVICE settings.set --1=name --2=demo
 
 **Platforms:** A L E
 
+**Tier:** core
+
 ### Request
 
 | Tag | Field | Type | Description |
@@ -972,6 +1033,8 @@ dmesh-cli DEVICE settings.set --1=name --2=demo
 ## 2. `set` — Write one setting
 
 **Platforms:** A L E
+
+**Tier:** core
 
 ### Request
 
@@ -983,6 +1046,8 @@ dmesh-cli DEVICE settings.set --1=name --2=demo
 ## 3. `list` — List setting keys
 
 **Platforms:** A L E
+
+**Tier:** core
 
 <!-- dmesh-api:end -->
 
@@ -1002,6 +1067,8 @@ dmesh-cli DEVICE telemetry.nan_status
 
 **Platforms:** A L E
 
+**Tier:** internal
+
 ### Request
 
 | Tag | Field | Type | Description |
@@ -1011,6 +1078,8 @@ dmesh-cli DEVICE telemetry.nan_status
 ## 12. `pair_wakeup` — Invite only an unpaired device into a time-limited pairing window
 
 **Platforms:** L E
+
+**Tier:** internal
 
 An observer sends this targeted NAN request before pairing over any bearer.
 The device accepts it only while `sec:key` is empty; a paired device ignores
@@ -1043,11 +1112,15 @@ Android BLE adapter operations. The service uses tagged CBOR; the Android framew
 
 **Platforms:** A
 
+**Tier:** internal
+
 **UI:** default
 
 ## 2. `scan` — Start a time-limited BLE scan
 
 **Platforms:** A
+
+**Tier:** internal
 
 **UI:** default
 
@@ -1055,11 +1128,15 @@ Android BLE adapter operations. The service uses tagged CBOR; the Android framew
 
 **Platforms:** A
 
+**Tier:** internal
+
 **UI:** default
 
 ## 4. `scan_results` — List retained BLE scan results
 
 **Platforms:** A
+
+**Tier:** internal
 
 **UI:** default
 
@@ -1073,11 +1150,15 @@ Android BLE adapter operations. The service uses tagged CBOR; the Android framew
 
 **Platforms:** A
 
+**Tier:** internal
+
 **UI:** default
 
 ## 6. `connect` — Connect to a BLE device over L2CAP CoC
 
 **Platforms:** A
+
+**Tier:** internal
 
 **Visibility:** private
 
@@ -1095,6 +1176,8 @@ companion API so the same method applies to BLE, UART, and Wi-Fi.
 
 **Platforms:** A
 
+**Tier:** internal
+
 **Visibility:** private
 
 # `radio` API (202)
@@ -1102,6 +1185,8 @@ companion API so the same method applies to BLE, UART, and Wi-Fi.
 ## 1. `history` — Read retained local radio event history
 
 **Platforms:** A
+
+**Tier:** debug
 
 **UI:** default
 
@@ -1128,17 +1213,23 @@ companion API so the same method applies to BLE, UART, and Wi-Fi.
 
 **Platforms:** A
 
+**Tier:** internal
+
 **UI:** default
 
 ## 2. `devices` — List USB devices visible to the host
 
 **Platforms:** A
 
+**Tier:** internal
+
 **UI:** default
 
 ## 3. `open` — Open and attach a USB serial device
 
 **Platforms:** A
+
+**Tier:** internal
 
 **UI:** default
 
@@ -1154,11 +1245,15 @@ companion API so the same method applies to BLE, UART, and Wi-Fi.
 
 **Platforms:** A
 
+**Tier:** internal
+
 **UI:** default
 
 ## 5. `discover` — Read the attached device's signed identity
 
 **Platforms:** A
+
+**Tier:** internal
 
 Sends a tagged discovery request over the open USB QUIC bearer. The response
 must carry a valid device signature. This is a read-only identity check and
@@ -1172,11 +1267,15 @@ does not pair or claim the device.
 
 **Platforms:** A
 
+**Tier:** internal
+
 **UI:** default
 
 ## 2. `scan` — Request a time-limited platform Wi-Fi scan
 
 **Platforms:** A
+
+**Tier:** internal
 
 **UI:** default
 
@@ -1185,6 +1284,8 @@ does not pair or claim the device.
 ## 1. `text` — Return the Rust-generated local status table
 
 **Platforms:** A
+
+**Tier:** debug
 
 **UI:** default
 
@@ -1204,30 +1305,31 @@ network peer is declined.
 
 These are active tagged-CBOR methods whose implementations live in the device
 or shared service handlers. Their wire names are retained for existing clients.
-The component and method columns are the numeric CBOR tags.
+The component and method columns are the numeric CBOR tags. `Tier` is `core` (the public control-plane
+surface), `debug` or `internal`; every method in this document has one.
 
-| Component | Method | Wire name | Purpose | Platforms |
-|---:|---:|---|---|---|
-| 101 | 2 | `runtime.reset` | Reset the runtime diagnostics counters. | E |
-| 10 | 2 | `object.flash` | CLI name of `POST /flash` (wire: `http.post`, path `/flash`): transfer a firmware image into a selected durable slot. | E |
-| 1000 | 3 | `module.stop` | Request module shutdown with a deadline before flash work. | E |
-| 1000 | 1 | `module.status` | Refresh and read the installed module header and loader result. | E |
-| 1000 | 2 | `module.init` | Initialize the installed module loader. | E |
-| 11 | 1 | `boot.recovery` | Request a Main to Recovery handoff. | E |
-| 104 | 80 | `ble.start` | Start the BLE companion radio. | E |
-| 104 | 81 | `ble.stop` | Stop the BLE companion radio. | E |
-| 104 | 82 | `ble.scan` | Start a time-limited BLE scan. | A E |
-| 104 | 83 | `ble.status` | Read BLE adapter and link state. | A E |
-| 104 | 84 | `ble.scan_stop` | Stop an active BLE scan. | A E |
-| 104 | 85 | `ble.connect` | Connect to a selected BLE peer. | A E |
-| 104 | 86 | `ble.coc.send` | Send one payload as one BLE L2CAP CoC SDU. | E |
-| 9 | 1 | `status` | Read compact device health and application state. | A L E |
-| 9 | 2 | `services` | List registered service handlers. | A L E |
-| 4 | 71 | `radio.tx` | Submit one size-limited raw radio frame for diagnostics. | L E |
-| 4 | 72 | `radio.control` | Adjust volatile radio diagnostic controls. | L E |
-| 4 | 73 | `radio.snapshot` | Read radio state and counters. | L E |
-| 4 | 77 | `wifi.scan` | Scan or read retained Wi-Fi results. | E |
-| 4 | 74 | `radio.reset_counters` | Reset radio diagnostics counters. | L E |
+| Component | Method | Wire name | Purpose | Platforms | Tier |
+|---:|---:|---|---|---|---|
+| 101 | 2 | `runtime.reset` | Reset the runtime diagnostics counters. | E | debug |
+| 10 | 2 | `object.flash` | CLI name of `POST /flash` (wire: `http.post`, path `/flash`): transfer a firmware image into a selected durable slot. | E | internal |
+| 1000 | 3 | `module.stop` | Request module shutdown with a deadline before flash work. | E | internal |
+| 1000 | 1 | `module.status` | Refresh and read the installed module header and loader result. | E | internal |
+| 1000 | 2 | `module.init` | Initialize the installed module loader. | E | internal |
+| 11 | 1 | `boot.recovery` | Request a Main to Recovery handoff. | E | internal |
+| 104 | 80 | `ble.start` | Start the BLE companion radio. | E | internal |
+| 104 | 81 | `ble.stop` | Stop the BLE companion radio. | E | internal |
+| 104 | 82 | `ble.scan` | Start a time-limited BLE scan. | A E | internal |
+| 104 | 83 | `ble.status` | Read BLE adapter and link state. | A E | internal |
+| 104 | 84 | `ble.scan_stop` | Stop an active BLE scan. | A E | internal |
+| 104 | 85 | `ble.connect` | Connect to a selected BLE peer. | A E | internal |
+| 104 | 86 | `ble.coc.send` | Send one payload as one BLE L2CAP CoC SDU. | E | internal |
+| 9 | 1 | `status` | Read compact device health and application state. | A L E | debug |
+| 9 | 2 | `services` | List registered service handlers. | A L E | debug |
+| 4 | 71 | `radio.tx` | Submit one size-limited raw radio frame for diagnostics. | L E | debug |
+| 4 | 72 | `radio.control` | Adjust volatile radio diagnostic controls. | L E | debug |
+| 4 | 73 | `radio.snapshot` | Read radio state and counters. | L E | debug |
+| 4 | 77 | `wifi.scan` | Scan or read retained Wi-Fi results. | E | internal |
+| 4 | 74 | `radio.reset_counters` | Reset radio diagnostics counters. | L E | debug |
 
 Platform registration notes:
 

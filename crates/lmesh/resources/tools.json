@@ -26,7 +26,8 @@
         "esp32",
         "android"
       ],
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "core"
     },
     {
       "name": "settings.set",
@@ -54,7 +55,8 @@
       "x-ui-visibility": "advanced",
       "x-check-all": null,
       "x-check-all-platforms": null,
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "core"
     },
     {
       "name": "settings.list",
@@ -74,7 +76,8 @@
         "esp32",
         "android"
       ],
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "core"
     },
     {
       "name": "transport.set",
@@ -202,7 +205,8 @@
       "x-ui-visibility": "default",
       "x-check-all": null,
       "x-check-all-platforms": null,
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "internal"
     },
     {
       "name": "discovery.nodes",
@@ -351,7 +355,8 @@
         "host",
         "android"
       ],
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "core"
     },
     {
       "name": "discovery.active",
@@ -383,7 +388,8 @@
         "host",
         "android"
       ],
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "core"
     },
     {
       "name": "nan.wakeup",
@@ -410,7 +416,8 @@
         "host",
         "android"
       ],
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "internal"
     },
     {
       "name": "telemetry.nan_status",
@@ -458,7 +465,8 @@
         "esp32",
         "host"
       ],
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "internal"
     },
     {
       "name": "telemetry.now",
@@ -571,7 +579,8 @@
         "esp32",
         "host"
       ],
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "internal"
     },
     {
       "name": "telemetry.nan",
@@ -779,7 +788,8 @@
         "esp32",
         "host"
       ],
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "internal"
     },
     {
       "name": "telemetry.udp6",
@@ -842,7 +852,8 @@
         "esp32",
         "host"
       ],
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "internal"
     },
     {
       "name": "telemetry.wifi_link",
@@ -1000,7 +1011,8 @@
         "esp32",
         "host"
       ],
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "internal"
     },
     {
       "name": "telemetry.battery",
@@ -1055,7 +1067,8 @@
       "x-ui-visibility": "advanced",
       "x-check-all": null,
       "x-check-all-platforms": null,
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "internal"
     },
     {
       "name": "telemetry.bearers",
@@ -1082,7 +1095,8 @@
       "x-check-all-platforms": [
         "esp32"
       ],
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "internal"
     },
     {
       "name": "telemetry.memory",
@@ -1165,7 +1179,8 @@
         "esp32",
         "host"
       ],
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "internal"
     },
     {
       "name": "telemetry.power",
@@ -1237,7 +1252,8 @@
       "x-check-all-platforms": [
         "esp32"
       ],
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "internal"
     },
     {
       "name": "telemetry.runtime",
@@ -1324,7 +1340,8 @@
       "x-check-all-platforms": [
         "esp32"
       ],
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "internal"
     },
     {
       "name": "log.watch",
@@ -1406,7 +1423,8 @@
         "esp32",
         "host"
       ],
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "debug"
     },
     {
       "name": "runtime.reset",
@@ -1425,7 +1443,8 @@
       "x-check-all-platforms": [
         "esp32"
       ],
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "debug"
     },
     {
       "name": "probe.start",
@@ -1534,7 +1553,8 @@
         "host",
         "android"
       ],
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "debug"
     },
     {
       "name": "probe.handler",
@@ -1608,7 +1628,8 @@
       "x-component-index": 8,
       "x-method-index": 2,
       "x-ui-visibility": "advanced",
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "debug"
     },
     {
       "name": "object.flash",
@@ -1656,7 +1677,8 @@
       "x-ui-visibility": "advanced",
       "x-check-all": null,
       "x-check-all-platforms": null,
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "internal"
     },
     {
       "name": "module.status",
@@ -1673,7 +1695,8 @@
       "x-ui-visibility": "advanced",
       "x-check-all": null,
       "x-check-all-platforms": null,
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "internal"
     },
     {
       "name": "module.init",
@@ -1690,7 +1713,8 @@
       "x-ui-visibility": "advanced",
       "x-check-all": null,
       "x-check-all-platforms": null,
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "internal"
     },
     {
       "name": "module.stop",
@@ -1707,7 +1731,8 @@
       "x-ui-visibility": "advanced",
       "x-check-all": null,
       "x-check-all-platforms": null,
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "internal"
     },
     {
       "name": "boot.recovery",
@@ -1724,7 +1749,8 @@
       "x-ui-visibility": "advanced",
       "x-check-all": null,
       "x-check-all-platforms": null,
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "internal"
     },
     {
       "name": "ble.start",
@@ -1741,7 +1767,8 @@
       "x-ui-visibility": "advanced",
       "x-check-all": null,
       "x-check-all-platforms": null,
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "internal"
     },
     {
       "name": "ble.stop",
@@ -1758,7 +1785,8 @@
       "x-ui-visibility": "advanced",
       "x-check-all": null,
       "x-check-all-platforms": null,
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "internal"
     },
     {
       "name": "ble.scan",
@@ -1781,7 +1809,8 @@
       "x-ui-visibility": "advanced",
       "x-check-all": null,
       "x-check-all-platforms": null,
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "internal"
     },
     {
       "name": "ble.status",
@@ -1930,7 +1959,8 @@
       "x-ui-visibility": "advanced",
       "x-check-all": null,
       "x-check-all-platforms": null,
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "internal"
     },
     {
       "name": "ble.scan_stop",
@@ -1947,7 +1977,8 @@
       "x-ui-visibility": "advanced",
       "x-check-all": null,
       "x-check-all-platforms": null,
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "internal"
     },
     {
       "name": "ble.connect",
@@ -1981,7 +2012,8 @@
       "x-ui-visibility": "advanced",
       "x-check-all": null,
       "x-check-all-platforms": null,
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "internal"
     },
     {
       "name": "ble.coc.send",
@@ -2005,7 +2037,8 @@
       "x-ui-visibility": "advanced",
       "x-check-all": null,
       "x-check-all-platforms": null,
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "internal"
     },
     {
       "name": "status",
@@ -2025,7 +2058,8 @@
         "esp32",
         "android"
       ],
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "debug"
     },
     {
       "name": "services",
@@ -2044,7 +2078,8 @@
       "x-check-all-platforms": [
         "esp32"
       ],
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "debug"
     },
     {
       "name": "radio.tx",
@@ -2110,7 +2145,8 @@
       "x-ui-visibility": "advanced",
       "x-check-all": null,
       "x-check-all-platforms": null,
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "debug"
     },
     {
       "name": "radio.control",
@@ -2345,7 +2381,8 @@
       "x-ui-visibility": "advanced",
       "x-check-all": null,
       "x-check-all-platforms": null,
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "debug"
     },
     {
       "name": "radio.snapshot",
@@ -2510,7 +2547,8 @@
       "x-check-all-platforms": [
         "esp32"
       ],
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "debug"
     },
     {
       "name": "wifi.scan",
@@ -2572,7 +2610,8 @@
       "x-check-all-platforms": [
         "esp32"
       ],
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "internal"
     },
     {
       "name": "radio.reset_counters",
@@ -2700,7 +2739,8 @@
       "x-ui-visibility": "advanced",
       "x-check-all": null,
       "x-check-all-platforms": null,
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "debug"
     },
     {
       "description": "Invite only an unpaired device into a time-limited pairing window",
@@ -2734,7 +2774,8 @@
         "unavailable",
         "internal"
       ],
-      "x-dmesh-device": true
+      "x-dmesh-device": true,
+      "x-tier": "internal"
     },
     {
       "description": "Return aggregate QUIC counters for live associations",
@@ -2841,7 +2882,8 @@
         "conflict",
         "unavailable",
         "internal"
-      ]
+      ],
+      "x-tier": "internal"
     },
     {
       "description": "Return QUIC transport state for each live association",
@@ -2874,7 +2916,8 @@
         "conflict",
         "unavailable",
         "internal"
-      ]
+      ],
+      "x-tier": "internal"
     },
     {
       "description": "Return software version and hardware capacity",
@@ -2931,7 +2974,8 @@
         "conflict",
         "unavailable",
         "internal"
-      ]
+      ],
+      "x-tier": "internal"
     },
     {
       "description": "Provision an unpaired companion",
@@ -2994,7 +3038,8 @@
         "conflict",
         "unavailable",
         "internal"
-      ]
+      ],
+      "x-tier": "core"
     },
     {
       "description": "Reset a companion to unpaired state",
@@ -3032,7 +3077,8 @@
         "conflict",
         "unavailable",
         "internal"
-      ]
+      ],
+      "x-tier": "core"
     },
     {
       "description": "Send a payload through the selected mesh radio",
@@ -3076,6 +3122,7 @@
         "unavailable",
         "internal"
       ],
+      "x-tier": "debug",
       "x-ui-visibility": "advanced"
     },
     {
@@ -3115,6 +3162,7 @@
         "unavailable",
         "internal"
       ],
+      "x-tier": "debug",
       "x-ui-visibility": "advanced"
     },
     {
@@ -3159,6 +3207,7 @@
         "unavailable",
         "internal"
       ],
+      "x-tier": "internal",
       "x-ui-visibility": "advanced"
     },
     {
@@ -3198,6 +3247,7 @@
         "unavailable",
         "internal"
       ],
+      "x-tier": "debug",
       "x-ui-visibility": "advanced"
     },
     {
@@ -3226,6 +3276,7 @@
         "unavailable",
         "internal"
       ],
+      "x-tier": "internal",
       "x-ui-visibility": "advanced"
     },
     {
@@ -3260,6 +3311,7 @@
         "unavailable",
         "internal"
       ],
+      "x-tier": "internal",
       "x-ui-visibility": "advanced"
     },
     {
@@ -3299,6 +3351,7 @@
         "unavailable",
         "internal"
       ],
+      "x-tier": "internal",
       "x-ui-visibility": "advanced"
     },
     {
@@ -3353,6 +3406,7 @@
         "unavailable",
         "internal"
       ],
+      "x-tier": "internal",
       "x-ui-visibility": "advanced"
     },
     {
@@ -3387,6 +3441,7 @@
         "unavailable",
         "internal"
       ],
+      "x-tier": "internal",
       "x-ui-visibility": "advanced"
     },
     {
@@ -3426,6 +3481,7 @@
         "unavailable",
         "internal"
       ],
+      "x-tier": "internal",
       "x-ui-visibility": "advanced"
     },
     {
@@ -3470,6 +3526,7 @@
         "unavailable",
         "internal"
       ],
+      "x-tier": "internal",
       "x-ui-visibility": "advanced"
     }
   ]

@@ -129,6 +129,11 @@ impl<K: Copy + Eq, const N: usize> PathBindingTable<K, N> {
             .find_map(|(known, key)| (*known == path).then_some(*key))
     }
 
+    /// Resolve an already observed return address without allocating a binding.
+    pub fn find(&self, matches: impl Fn(&K) -> bool) -> Option<quic_lite::PeerL2Address> {
+        self.entries.iter().flatten().find_map(|(path, key)| matches(key).then_some(*path))
+    }
+
     pub fn remove(&mut self, path: quic_lite::PeerL2Address) -> bool {
         let Some(entry) = self
             .entries
@@ -247,8 +252,12 @@ mod tests {
         assert_eq!(bindings.bind(first), Some(first_path));
         assert_eq!(bindings.get(first_path), Some(first));
         assert_eq!(bindings.get(second_path), Some(second));
+        assert_eq!(bindings.find(|peer| peer.ip == second.ip && peer.port == second.port), Some(second_path));
+        assert_eq!(bindings.find(|peer| peer.ip == first.ip && peer.port == first.port), Some(first_path));
+        assert_eq!(bindings.find(|peer| peer.port == 12345), None);
         assert!(bindings.remove(first_path));
         assert_eq!(bindings.get(first_path), None);
+        assert_eq!(bindings.find(|peer| peer.port == first.port), None);
     }
 
     #[test]

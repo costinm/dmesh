@@ -94,7 +94,8 @@ impl<const SLOTS: usize, const MTU: usize> UartCompanion<SLOTS, MTU> {
     }
 
     /// Reset the device on `path` to unpaired (it forgets the secret and its BLE
-    /// bonds) and remove its owned record. The port stays attached.
+    /// bonds), clear credentials/ownership and keep its discovery/configuration
+    /// record. The port stays attached.
     pub async fn unpair(
         &self,
         path: &str,
@@ -483,7 +484,7 @@ mod tests {
     }
 
     #[test]
-    fn pairing_again_over_the_wire_replaces_the_secret_and_the_record() {
+    fn pairing_again_over_the_wire_rotates_only_when_the_root_changes() {
         local(async {
             let cable = Cable::new();
             let (announce, vip6) = signed_device_announce();
@@ -514,10 +515,10 @@ mod tests {
             assert_eq!(first.name.as_deref(), Some("sensor1"));
             // The port stayed attached, so a second pairing reuses that bearer
             // (a second open of the same port would be refused) and replaces
-            // the secret again.
+            // the record without rotating the secret for the same root.
             host.pair(request(&cable, vip6, &store)).await.unwrap();
             let second = store.load(&vip6.to_string()).unwrap().unwrap();
-            assert_ne!(second.secret, first.secret);
+            assert_eq!(second.secret, first.secret);
             assert_eq!(second.secret, installed.lock().unwrap()[1].2);
         });
     }
@@ -577,7 +578,7 @@ mod tests {
     }
 
     #[test]
-    fn unpair_resets_the_device_and_removes_the_record() {
+    fn unpair_resets_the_device_and_preserves_the_discovery_record() {
         local(async {
             let cable = Cable::new();
             let (announce, vip6) = signed_device_announce();
@@ -606,7 +607,9 @@ mod tests {
                 .unwrap();
             assert_eq!(removed, vip6);
             assert!(installed.lock().unwrap().is_empty());
-            assert!(store.load(&vip6.to_string()).unwrap().is_none());
+            let reset = store.load(&vip6.to_string()).unwrap().unwrap();
+            assert!(reset.secret.is_empty() && reset.root_public_key.is_empty());
+            assert!(!reset.companion);
         });
     }
 }

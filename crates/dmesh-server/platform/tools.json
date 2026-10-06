@@ -151,6 +151,7 @@
       "unavailable",
       "internal"
     ],
+    "x-tier": "core",
     "x-ui-visibility": "default"
   },
   {
@@ -189,7 +190,8 @@
       "conflict",
       "unavailable",
       "internal"
-    ]
+    ],
+    "x-tier": "core"
   },
   {
     "description": "Return local NAN attach, cluster, synchronization, and publish state",
@@ -243,6 +245,7 @@
       "unavailable",
       "internal"
     ],
+    "x-tier": "internal",
     "x-ui-visibility": "default"
   },
   {
@@ -306,7 +309,8 @@
       "conflict",
       "unavailable",
       "internal"
-    ]
+    ],
+    "x-tier": "internal"
   },
   {
     "description": "Return aggregate QUIC counters for live associations",
@@ -413,7 +417,8 @@
       "conflict",
       "unavailable",
       "internal"
-    ]
+    ],
+    "x-tier": "internal"
   },
   {
     "description": "Return QUIC transport state for each live association",
@@ -446,7 +451,8 @@
       "conflict",
       "unavailable",
       "internal"
-    ]
+    ],
+    "x-tier": "internal"
   },
   {
     "description": "Return common counters for each bearer",
@@ -479,7 +485,8 @@
       "conflict",
       "unavailable",
       "internal"
-    ]
+    ],
+    "x-tier": "internal"
   },
   {
     "description": "Return packet pool, worker stack, and memory metrics",
@@ -567,7 +574,8 @@
       "conflict",
       "unavailable",
       "internal"
-    ]
+    ],
+    "x-tier": "internal"
   },
   {
     "description": "Return software version and hardware capacity",
@@ -624,7 +632,8 @@
       "conflict",
       "unavailable",
       "internal"
-    ]
+    ],
+    "x-tier": "internal"
   },
   {
     "description": "Replace a node's complete volatile physical transport profile",
@@ -758,6 +767,7 @@
       "unavailable",
       "internal"
     ],
+    "x-tier": "internal",
     "x-ui-visibility": "default"
   },
   {
@@ -821,7 +831,8 @@
       "conflict",
       "unavailable",
       "internal"
-    ]
+    ],
+    "x-tier": "core"
   },
   {
     "description": "Reset a companion to unpaired state",
@@ -859,7 +870,8 @@
       "conflict",
       "unavailable",
       "internal"
-    ]
+    ],
+    "x-tier": "core"
   },
   {
     "description": "Read retained log and event records, optionally streaming them with periodic metric snapshots",
@@ -943,7 +955,8 @@
       "conflict",
       "unavailable",
       "internal"
-    ]
+    ],
+    "x-tier": "debug"
   },
   {
     "description": "Ask a node to run a probe against a peer",
@@ -1053,6 +1066,7 @@
       "unavailable",
       "internal"
     ],
+    "x-tier": "debug",
     "x-ui-visibility": "advanced"
   },
   {
@@ -1138,6 +1152,7 @@
       "unavailable",
       "internal"
     ],
+    "x-tier": "debug",
     "x-ui-visibility": "advanced"
   },
   {
@@ -1166,6 +1181,7 @@
       "unavailable",
       "internal"
     ],
+    "x-tier": "internal",
     "x-ui-visibility": "default"
   },
   {
@@ -1194,6 +1210,7 @@
       "unavailable",
       "internal"
     ],
+    "x-tier": "internal",
     "x-ui-visibility": "default"
   },
   {
@@ -1222,6 +1239,7 @@
       "unavailable",
       "internal"
     ],
+    "x-tier": "internal",
     "x-ui-visibility": "default"
   },
   {
@@ -1256,6 +1274,7 @@
       "unavailable",
       "internal"
     ],
+    "x-tier": "internal",
     "x-ui-visibility": "default"
   },
   {
@@ -1284,6 +1303,7 @@
       "unavailable",
       "internal"
     ],
+    "x-tier": "internal",
     "x-ui-visibility": "default"
   },
   {
@@ -1349,6 +1369,7 @@
       "unavailable",
       "internal"
     ],
+    "x-tier": "debug",
     "x-ui-visibility": "default"
   },
   {
@@ -1377,6 +1398,7 @@
       "unavailable",
       "internal"
     ],
+    "x-tier": "internal",
     "x-ui-visibility": "default"
   },
   {
@@ -1405,6 +1427,7 @@
       "unavailable",
       "internal"
     ],
+    "x-tier": "internal",
     "x-ui-visibility": "default"
   },
   {
@@ -1449,6 +1472,7 @@
       "unavailable",
       "internal"
     ],
+    "x-tier": "internal",
     "x-ui-visibility": "default"
   },
   {
@@ -1477,6 +1501,7 @@
       "unavailable",
       "internal"
     ],
+    "x-tier": "internal",
     "x-ui-visibility": "default"
   },
   {
@@ -1505,6 +1530,7 @@
       "unavailable",
       "internal"
     ],
+    "x-tier": "internal",
     "x-ui-visibility": "default"
   },
   {
@@ -1533,6 +1559,7 @@
       "unavailable",
       "internal"
     ],
+    "x-tier": "internal",
     "x-ui-visibility": "default"
   },
   {
@@ -1561,6 +1588,7 @@
       "unavailable",
       "internal"
     ],
+    "x-tier": "internal",
     "x-ui-visibility": "default"
   },
   {
@@ -1595,6 +1623,7 @@
       "unavailable",
       "internal"
     ],
+    "x-tier": "debug",
     "x-ui-visibility": "default"
   }
 ]

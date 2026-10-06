@@ -1048,8 +1048,10 @@ impl dmesh_server::companion::CompanionLink for AndroidBleLink {
         id: &str,
         _store: &dmesh_server::device_record::DeviceStore,
     ) -> Result<(), String> {
-        // TODO(pairing): Clear device NVS and both sides' BLE bonds, then remove the record. This
-        // currently releases local state.
+        // Keep the BLE path for local lifecycle tests. It currently releases
+        // local state, not a confirmed firmware ownership reset. Once security
+        // is enabled, BLE unpair must prove the companion secret; physical
+        // UART/USB remains the force-unpair recovery path.
         let result = (|| {
             android_require_paired_companion(id, None)?;
             accepted_android_companion(

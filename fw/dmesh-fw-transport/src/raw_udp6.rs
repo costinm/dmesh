@@ -11,6 +11,8 @@ pub const ETHERNET_HEADER_LEN: usize = 14;
 pub const IPV6_HEADER_LEN: usize = 40;
 /// UDP header length without payload.
 pub const UDP_HEADER_LEN: usize = 8;
+/// Prefix for the associated STA/AP Ethernet driver handoff.
+pub const ETHERNET_UDP6_HEADROOM: usize = ETHERNET_HEADER_LEN + IPV6_HEADER_LEN + UDP_HEADER_LEN;
 /// Ethernet protocol number for IPv6.
 pub const ETHERTYPE_IPV6: u16 = 0x86dd;
 /// IPv6 next-header number for UDP.
@@ -596,8 +598,33 @@ pub fn encode_udp6(
     source_port: u16,
     payload: &[u8],
 ) -> Result<usize, Error> {
+    let total = ETHERNET_UDP6_HEADROOM.checked_add(payload.len()).ok_or(Error::Length)?;
+    if payload.len() > u16::MAX as usize - UDP_HEADER_LEN {
+        return Err(Error::Length);
+    }
+    if out.len() < total {
+        return Err(Error::OutputTooSmall);
+    }
+    out[ETHERNET_UDP6_HEADROOM..total].copy_from_slice(payload);
+    encode_udp6_prefix(out, payload.len(), destination_mac, source_mac,
+        destination_ip, source_ip, destination_port, source_port)
+}
+
+/// Encode Ethernet/IPv6/UDP headers around an already positioned payload.
+/// Only the prefix is written; payload and any following authentication
+/// trailer retain their backing addresses and bytes.
+pub fn encode_udp6_prefix(
+    out: &mut [u8],
+    payload_len: usize,
+    destination_mac: [u8; 6],
+    source_mac: [u8; 6],
+    destination_ip: [u8; 16],
+    source_ip: [u8; 16],
+    destination_port: u16,
+    source_port: u16,
+) -> Result<usize, Error> {
     let udp_len = UDP_HEADER_LEN
-        .checked_add(payload.len())
+        .checked_add(payload_len)
         .ok_or(Error::Length)?;
     let ipv6_len = IPV6_HEADER_LEN.checked_add(udp_len).ok_or(Error::Length)?;
     let total = ETHERNET_HEADER_LEN
@@ -622,7 +649,6 @@ pub fn encode_udp6(
     udp[2..4].copy_from_slice(&destination_port.to_be_bytes());
     udp[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
     udp[6..8].fill(0);
-    udp[8..].copy_from_slice(payload);
     let checksum = udp_checksum(source_ip, destination_ip, udp);
     udp[6..8].copy_from_slice(&if checksum == 0 { 0xffff } else { checksum }.to_be_bytes());
     Ok(total)
@@ -708,6 +734,44 @@ mod tests {
 
     const LOCAL_MAC: [u8; 6] = [0x14, 0xc1, 0x9f, 0xe5, 0x98, 0];
     const PEER_MAC: [u8; 6] = [2, 0, 0, 0, 0, 1];
+
+    #[test]
+    fn ethernet_udp6_prefix_preserves_payload_address_and_suffix() {
+        let local = link_local_from_mac(LOCAL_MAC);
+        let peer = link_local_from_mac(PEER_MAC);
+        for payload_len in [0, 1, 511, 1100] {
+            let mut slot = [0xa5; 1204];
+            let payload_start = 80;
+            let payload_end = payload_start + payload_len;
+            for (index, byte) in slot[payload_start..payload_end].iter_mut().enumerate() {
+                *byte = index as u8;
+            }
+            let pointer = slot[payload_start..payload_end].as_ptr();
+            let mut expected = [0; 1204];
+            let expected_len = encode_udp6(&mut expected, PEER_MAC, LOCAL_MAC,
+                peer, local, 3339, 4444, &slot[payload_start..payload_end]).unwrap();
+            let frame_start = payload_start - ETHERNET_UDP6_HEADROOM;
+            let len = encode_udp6_prefix(&mut slot[frame_start..payload_end], payload_len,
+                PEER_MAC, LOCAL_MAC, peer, local, 3339, 4444).unwrap();
+            assert_eq!(len, expected_len);
+            assert_eq!(&slot[frame_start..payload_end], &expected[..expected_len]);
+            assert_eq!(slot[payload_start..payload_end].as_ptr(), pointer);
+            assert!(slot[..frame_start].iter().all(|byte| *byte == 0xa5));
+            assert!(slot[payload_end..].iter().all(|byte| *byte == 0xa5));
+            let parsed = parse_udp6(&slot[frame_start..payload_end], peer, 3339).unwrap();
+            assert_eq!(parsed.payload.as_ptr(), pointer);
+        }
+    }
+
+    #[test]
+    fn ethernet_udp6_prefix_refusal_does_not_mutate_storage() {
+        for payload_len in [1, usize::MAX, u16::MAX as usize] {
+            let mut frame = [0xa5; ETHERNET_UDP6_HEADROOM];
+            assert!(encode_udp6_prefix(&mut frame, payload_len, PEER_MAC, LOCAL_MAC,
+                link_local_from_mac(PEER_MAC), link_local_from_mac(LOCAL_MAC), 3339, 4444).is_err());
+            assert_eq!(frame, [0xa5; ETHERNET_UDP6_HEADROOM]);
+        }
+    }
 
     #[test]
     fn link_local_uses_modified_eui64() {

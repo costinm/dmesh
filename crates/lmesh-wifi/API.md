@@ -30,6 +30,8 @@ mesh lmesh wifi.interface.list
 
 **Platforms:** L
 
+**Tier:** debug
+
 **UI:** advanced
 
 ### Request
@@ -43,6 +45,8 @@ mesh lmesh wifi.interface.list
 ## 10. `messages.history` — Read retained local message history
 
 **Platforms:** L
+
+**Tier:** debug
 
 **UI:** advanced
 
@@ -60,6 +64,8 @@ mesh lmesh wifi.interface.list
 
 **Platforms:** L
 
+**Tier:** internal
+
 **UI:** advanced
 
 ### Request
@@ -76,6 +82,8 @@ mesh lmesh wifi.interface.list
 
 **Platforms:** L
 
+**Tier:** debug
+
 **UI:** advanced
 
 ### Request
@@ -91,11 +99,15 @@ mesh lmesh wifi.interface.list
 
 **Platforms:** L
 
+**Tier:** internal
+
 **UI:** advanced
 
 ## 31. `interface.up` — wifi.interface.up on the local Linux mesh daemon
 
 **Platforms:** L
+
+**Tier:** internal
 
 **UI:** advanced
 
@@ -109,6 +121,8 @@ mesh lmesh wifi.interface.list
 
 **Platforms:** L
 
+**Tier:** internal
+
 **UI:** advanced
 
 ### Request
@@ -121,6 +135,8 @@ mesh lmesh wifi.interface.list
 ## 37. `ap.start_open` — wifi.ap.start_open on the local Linux mesh daemon
 
 **Platforms:** L
+
+**Tier:** internal
 
 **UI:** advanced
 
@@ -138,6 +154,8 @@ mesh lmesh wifi.interface.list
 
 **Platforms:** L
 
+**Tier:** internal
+
 **UI:** advanced
 
 ### Request
@@ -149,6 +167,8 @@ mesh lmesh wifi.interface.list
 ## 40. `sta.join_open` — wifi.sta.join_open on the local Linux mesh daemon
 
 **Platforms:** L
+
+**Tier:** internal
 
 **UI:** advanced
 
@@ -162,6 +182,8 @@ mesh lmesh wifi.interface.list
 ## 41. `sta.configure_ipv4` — wifi.sta.configure_ipv4 on the local Linux mesh daemon
 
 **Platforms:** L
+
+**Tier:** internal
 
 **UI:** advanced
 

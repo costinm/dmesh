@@ -1294,16 +1294,8 @@ mod tests {
             |pool: &'static RelayPool,
              routes: Option<Arc<Mutex<Vec<(u8, u8, crate::CircuitNextHop)>>>>| {
                 let mut node = QuicNode::<RelayPool>::new(pool);
+                let layered_routes = routes.clone();
                 if let Some(routes) = routes {
-                    let layered_routes = routes.clone();
-                    node.set_path_open_resolver(move |kind, address| {
-                        let key = address.first().copied()?;
-                        layered_routes.lock().unwrap().iter().find_map(
-                            |(route_kind, route_key, next_hop)| {
-                                (*route_kind == kind && *route_key == key).then_some(*next_hop)
-                            },
-                        )
-                    });
                     node.set_vip_path_open_resolver(move |kind, address, vip| {
                         if vip != destination_vip {
                             return None;
@@ -1316,7 +1308,16 @@ mod tests {
                         )
                     });
                 }
-                Runtime::new(node, relay_limits)
+                let mut runtime = Runtime::new(node, relay_limits);
+                if let Some(routes) = layered_routes {
+                    runtime.set_path_open_resolver(move |kind, address| {
+                        let key = address.first().copied()?;
+                        routes.lock().unwrap().iter().find_map(|(route_kind, route_key, next_hop)| {
+                            (*route_kind == kind && *route_key == key).then_some(*next_hop)
+                        })
+                    });
+                }
+                runtime
             };
 
         let routes1 = Arc::new(Mutex::new(Vec::new()));
@@ -1327,7 +1328,8 @@ mod tests {
         let mut relay2 = make_runtime(&RELAY2_POOL, Some(routes2.clone()));
         let mut relay3 = make_runtime(&RELAY3_POOL, Some(routes3.clone()));
         let mut server = make_runtime(&SERVER_POOL, None);
-        server.node.set_local_vip(destination_vip).unwrap();
+        assert!(server.set_local_vip(0).is_err());
+        server.set_local_vip(destination_vip).unwrap();
 
         let mut networks = Vec::<Network>::new();
         let mut client_ends = Vec::new();
@@ -3048,6 +3050,19 @@ where
         self.node.set_limits(limits)
     }
 
+    /// Resolve opaque PATH_OPEN destinations through registered local bearers.
+    pub fn set_path_open_resolver(
+        &mut self,
+        resolver: impl Fn(u8, &[u8]) -> Option<crate::CircuitNextHop> + Send + Sync + 'static,
+    ) {
+        self.node.set_path_open_resolver(resolver);
+    }
+
+    /// Set the local VIP used to recognize a telescoping path's destination.
+    pub fn set_local_vip(&mut self, vip: u64) -> Result<(), crate::QuicNodeError> {
+        self.node.set_local_vip(vip)
+    }
+
     /// Select limits for associations admitted after this call.
     pub fn set_default_association_limits(
         &mut self,
@@ -3476,7 +3491,7 @@ where
         let streams = &mut self.streams;
         let ingress = self
             .node
-            .receive_packet(
+            .receive_owned_packet(
                 meta,
                 packet,
                 |_| {
@@ -3561,7 +3576,8 @@ where
             NodeIngress::PathControl { response, .. } => {
                 self.node.submit_node_packet(response)?;
             }
-            NodeIngress::Association { association, .. } => {
+            NodeIngress::Association { association, .. }
+            | NodeIngress::Datagram { association } => {
                 self.node
                     .submit_or_defer_control(association.association())?;
             }

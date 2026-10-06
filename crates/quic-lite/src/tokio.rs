@@ -13,6 +13,9 @@ use core::{
     task::{Context, Poll},
 };
 use std::string::{String, ToString};
+#[path = "tokio_datagram.rs"]
+mod datagram;
+pub use datagram::DatagramSubmission;
 use std::{
     collections::hash_map::RandomState,
     fs::File,
@@ -55,6 +58,11 @@ pub(crate) fn initial_local_cid_seed() -> u64 {
 }
 
 enum DriverCommand {
+    Datagram(Box<dyn std::any::Any + Send>),
+    DatagramHandler {
+        register: Box<dyn std::any::Any + Send>,
+        reply: oneshot::Sender<Result<(), QuicNodeEgressError>>,
+    },
     Wake,
     Telemetry {
         reply: oneshot::Sender<crate::NodeTelemetry>,
@@ -144,6 +152,7 @@ enum DriverCommand {
 /// Cloneable command handle for a Tokio-owned QUIC node driver.
 #[derive(Clone)]
 pub struct TokioNode {
+    datagram_slots: Arc<::tokio::sync::Semaphore>,
     commands: mpsc::UnboundedSender<DriverCommand>,
     incoming: Arc<::tokio::sync::Mutex<mpsc::Receiver<TokioStream>>>,
     events: Arc<::tokio::sync::Mutex<mpsc::UnboundedReceiver<crate::AssociationEvent>>>,
@@ -723,6 +732,8 @@ pub struct TokioNodeDriver<
     const PACKET: usize = { crate::DEFAULT_MAX_PACKET_SIZE },
 > {
     node: QuicNode<P, PACKET>,
+    high_datagrams: std::collections::VecDeque<datagram::DatagramCommand<P::Buffer>>,
+    low_datagrams: std::collections::VecDeque<datagram::DatagramCommand<P::Buffer>>,
     limits: crate::ConnectionLimits,
     commands: mpsc::UnboundedReceiver<DriverCommand>,
     command_sender: mpsc::UnboundedSender<DriverCommand>,
@@ -754,6 +765,7 @@ where
             mpsc::channel(node.default_association_limits().max_pending_streams.max(1));
         let (event_sender, events) = mpsc::unbounded_channel();
         let handle = TokioNode {
+            datagram_slots: Arc::new(::tokio::sync::Semaphore::new(node.packet_capacity())),
             commands: commands.clone(),
             incoming: Arc::new(::tokio::sync::Mutex::new(incoming)),
             events: Arc::new(::tokio::sync::Mutex::new(events)),
@@ -762,6 +774,8 @@ where
             handle,
             Self {
                 node,
+                high_datagrams: std::collections::VecDeque::new(),
+                low_datagrams: std::collections::VecDeque::new(),
                 limits,
                 commands: receiver,
                 command_sender: commands,
@@ -782,12 +796,15 @@ where
         let clock_started = ::tokio::time::Instant::now();
         let clock_base_us = self.node.clock_us();
         loop {
+            self.dispatch_datagrams(true);
             self.dispatch_stream_chunks();
             self.dispatch_association_events();
             self.resolve_establishment_waiters();
             self.retry_pending_opens();
             self.retry_pending_writes();
             self.retry_finishes();
+            // An already queued normal/high command precedes low output.
+            if self.commands.is_empty() { self.dispatch_datagrams(false); }
             // The driver owns every node timer (pacing, loss, ACK delay, PTO,
             // idle). Without one, a send that pacing defers after the initial
             // burst would never be retried while the driver waits for packets
@@ -951,6 +968,20 @@ where
         // new association in the past and make every setup attempt fall due at once.
         let clock = self.node.clock_us();
         match command {
+            DriverCommand::Datagram(request) => {
+                if let Ok(request) = request.downcast::<datagram::DatagramCommand<P::Buffer>>() {
+                    if request.priority == crate::DatagramPriority::High {
+                        self.high_datagrams.push_back(*request);
+                    } else { self.low_datagrams.push_back(*request); }
+                }
+            }
+            DriverCommand::DatagramHandler { register, reply } => {
+                let result = match register.downcast::<datagram::RegisterHandler<P, PACKET>>() {
+                    Ok(register) => register(&mut self.node),
+                    Err(_) => Err(QuicNodeEgressError::Transport(crate::Error::Invalid)),
+                };
+                let _ = reply.send(result);
+            }
             DriverCommand::Wake => {}
             DriverCommand::Telemetry { reply } => {
                 let _ = reply.send(self.node.telemetry());
@@ -1527,7 +1558,7 @@ where
             self.association_chunk_limits(),
         );
         let ingress = self
-            .receive_packet(
+            .receive_owned_packet(
                 received.meta,
                 received.packet,
                 |_| {
@@ -1558,7 +1589,8 @@ where
             crate::node::NodeIngress::PathControl { response, .. } => {
                 self.submit_node_packet(response)?;
             }
-            crate::node::NodeIngress::Association { association, .. } => {
+            crate::node::NodeIngress::Association { association, .. }
+            | crate::node::NodeIngress::Datagram { association } => {
                 self.submit_or_defer_control(association.association())?;
             }
             crate::node::NodeIngress::Forward { next_hop, packet } => {

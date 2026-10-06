@@ -10,12 +10,48 @@ ROOT = Path(__file__).resolve().parent.parent
 GROUP_FILES = {'linux': 'crates/lmesh-wifi/API.md'}
 
 
+TIERS = ('core', 'debug', 'internal')
+
+
+def section_tiers() -> dict[str, str]:
+    """`component.method` -> tier for every section method of the formal API documents."""
+    tiers: dict[str, str] = {}
+    for path in ('API.md', 'crates/lmesh-wifi/API.md'):
+        source = (ROOT / path).read_text()
+        component = None
+        method = None
+        for line in source.split('\n'):
+            heading = re.match(r'^# `(\w+)` API', line)
+            if heading:
+                component = heading.group(1)
+            method_heading = re.match(r'^## \d+\. `([\w.]+)`', line)
+            if method_heading:
+                method = f'{component}.{method_heading.group(1)}'
+            marker = re.match(r'^\*\*Tier:\*\*\s+(\S+)\s*$', line)
+            if marker and method:
+                tiers[method] = marker.group(1)
+                method = None
+    return tiers
+
+
+def check_tiers(group: str, body: str) -> None:
+    """Every method of an API section carries `**Tier:** core|debug|internal`."""
+    for block in re.split(r'(?=^#{1,2} )', body, flags=re.M):
+        heading = re.match(r'^## (\d+)\. `([\w.]+)`', block)
+        if heading is None:
+            continue
+        marker = re.search(r'^\*\*Tier:\*\*\s+(\S+)\s*$', block, re.M)
+        if marker is None or marker.group(1) not in TIERS:
+            raise ValueError(f'{group} method {heading.group(2)} needs **Tier:** {"|".join(TIERS)}')
+
+
 def extract(group: str, platform: str | None = None) -> str:
     source = (ROOT / GROUP_FILES.get(group, 'API.md')).read_text()
     start = f'<!-- dmesh-api:{group} -->\n'
     if source.count(start) != 1:
         raise ValueError(f'expected one {group} API section')
     body = source.split(start, 1)[1].split('<!-- dmesh-api:end -->', 1)[0]
+    check_tiers(group, body)
     if platform is not None:
         methods = re.split(r'(?=^#{1,2} )', body, flags=re.M)
         kept = []
@@ -38,15 +74,17 @@ def check_additional_device_methods(catalog: dict) -> None:
         '## Firmware module payload contracts', 1
     )[0]
     device = {tool['name']: tool for tool in catalog['tools'] if tool.get('x-dmesh-device')}
-    method_rows = re.findall(r'^\| (\d+) \| (\d+) \| `([^`]+)` \| (.+) \|$', section, re.M)
+    method_rows = re.findall(r'^\| (\d+) \| (\d+) \| `([^`]+)` \| (.+) \| ([a-z]+) \|$', section, re.M)
     if not method_rows:
         raise ValueError('root API has no additional device methods')
-    for component, method, name, _description in method_rows:
+    for component, method, name, _description, tier in method_rows:
         tool = device.get(name)
         if tool is None or (tool['x-component-index'], tool['x-method-index']) != (
             int(component), int(method)
         ):
             raise ValueError(f'root API tag mismatch for {name}')
+        if tier not in TIERS or tool.get('x-tier') != tier:
+            raise ValueError(f'root API tier of {name} is {tier}, catalog has {tool.get("x-tier")}')
     for name, block in re.findall(
         r'^### `([^`]+)` request fields\n(.*?)(?=^### |\Z)', section, re.M | re.S
     ):

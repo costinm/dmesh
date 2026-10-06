@@ -155,6 +155,10 @@ pub struct DeviceRecord {
     /// `first-seen`, `paired` or `verified` (see [`trust`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust: Option<String>,
+    /// Owned interfaces of this node, not merely a device with paired credentials.
+    /// Discovery must never infer or change this operator/provisioning property.
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub companion: bool,
     /// Bearer-local identifiers that reach the node: the serial path, the BLE address.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub endpoints: BTreeMap<String, String>,
@@ -175,6 +179,7 @@ impl core::fmt::Debug for DeviceRecord {
             .field("domain", &self.domain)
             .field("device_type", &self.device_type)
             .field("trust", &self.trust)
+            .field("companion", &self.companion)
             .field("endpoints", &self.endpoints)
             .field("secret", &"<redacted>")
             .finish()
@@ -448,8 +453,6 @@ impl DeviceStore {
 
     fn write(&self, device: &DeviceRecord, replace: bool) -> Result<(), String> {
         use std::io::Write;
-        #[cfg(unix)]
-        use std::os::unix::fs::OpenOptionsExt;
         let directory = self.write_directory();
         let stem = Self::stem_of(device)?;
         std::fs::create_dir_all(directory)
@@ -465,23 +468,27 @@ impl DeviceStore {
         if !replace && (path.exists() || legacy.exists()) {
             return Err("device already has a record".into());
         }
-        let temporary = path.with_extension("toml.tmp");
-        let _ = std::fs::remove_file(&temporary);
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut file = options
-            .open(&temporary)
+        // Unique, private temporary files prevent concurrent writers from unlinking
+        // each other's in-progress credentials. Drop also cleans failed writes.
+        let mut file = tempfile::NamedTempFile::new_in(directory)
             .map_err(|error| format!("create device record: {error}"))?;
         let text = toml::to_string_pretty(device)
             .map_err(|error| format!("encode device record: {error}"))?;
         file.write_all(text.as_bytes())
-            .and_then(|_| file.sync_all())
+            .and_then(|_| file.as_file().sync_all())
             .map_err(|error| format!("write device record: {error}"))?;
-        std::fs::rename(&temporary, &path)
-            .map_err(|error| format!("commit device record: {error}"))?;
+        if replace {
+            file.persist(&path)
+        } else {
+            file.persist_noclobber(&path)
+        }
+        .map_err(|error| format!("commit device record: {}", error.error))?;
         let _ = std::fs::remove_file(&legacy);
+        // A successful response must survive a restart, not just flush file data.
+        #[cfg(unix)]
+        std::fs::File::open(directory)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("sync device directory after commit: {error}"))?;
         Ok(())
     }
 
@@ -492,8 +499,8 @@ impl DeviceStore {
     }
 
     /// Commit a pairing result. It needs the secret, the signed identity and the control-plane root,
-    /// and it does not replace an existing record in the write directory (a re-pair removes the old
-    /// one first).
+    /// replacing the old file atomically. Callers preserve desired configuration
+    /// when constructing a replacement; never remove the old record first.
     pub fn save_paired(&self, device: &DeviceRecord) -> Result<(), String> {
         if device.secret.len() < 16
             || device.public_key.len() != 33
@@ -510,7 +517,23 @@ impl DeviceStore {
         }
         let mut device = device.clone();
         device.trust = Some(trust::PAIRED.to_owned());
-        self.write(&device, false)
+        self.write(&device, true)
+    }
+
+    /// After confirmed device-side reset, revoke credentials and ownership while
+    /// preserving the discovery/configuration record. Writing an override also
+    /// prevents a lower-priority directory from resurrecting old credentials.
+    pub fn clear_pairing(&self, vip6: &str) -> Result<(), String> {
+        let Some(mut device) = self.load(vip6)? else {
+            return Ok(());
+        };
+        device.secret.clear();
+        device.root_public_key.clear();
+        device.companion = false;
+        if device.trust.as_deref() != Some(trust::VERIFIED) {
+            device.trust = Some(trust::FIRST_SEEN.to_owned());
+        }
+        self.write(&device, true)
     }
 
     /// Merge a discovery observation into the device's record, creating a `first-seen` record when
@@ -544,6 +567,7 @@ impl DeviceStore {
         let mut created = observed.clone();
         created.secret.clear();
         created.root_public_key.clear();
+        created.companion = false;
         created.trust = Some(trust::FIRST_SEEN.to_owned());
         self.write(&created, false)?;
         Ok(true)
@@ -588,13 +612,16 @@ mod tests {
     }
 
     #[test]
-    fn a_pairing_result_is_private_and_does_not_replace_an_existing_record() {
+    fn a_pairing_result_is_private_and_atomically_replaces_an_existing_record() {
         let directory = tempfile::tempdir().unwrap();
         let store = DeviceStore::new(directory.path());
         let device = paired();
         store.save_paired(&device).unwrap();
         assert_eq!(store.load("fc00::1").unwrap().unwrap().secret, device.secret);
-        assert!(store.save_paired(&device).is_err());
+        let mut replacement = device.clone();
+        replacement.secret = vec![8; 32];
+        store.save_paired(&replacement).unwrap();
+        assert_eq!(store.load("fc00::1").unwrap().unwrap().secret, replacement.secret);
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
         #[cfg(unix)]
         {
@@ -604,6 +631,73 @@ mod tests {
         }
         store.remove("fc00::1").unwrap();
         assert!(store.load("fc00::1").unwrap().is_none());
+    }
+
+    #[test]
+    fn invalid_replacement_preserves_the_previous_credentials() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DeviceStore::new(directory.path());
+        store.save_paired(&paired()).unwrap();
+        let mut invalid = paired();
+        invalid.secret.clear();
+        assert!(store.save_paired(&invalid).is_err());
+        assert_eq!(store.load("fc00::1").unwrap().unwrap().secret, paired().secret);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn concurrent_replacements_use_unique_temporary_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DeviceStore::new(directory.path());
+        store.save_paired(&paired()).unwrap();
+        std::thread::scope(|scope| {
+            for value in 1..=16 {
+                let store = &store;
+                scope.spawn(move || {
+                    let mut record = paired();
+                    record.secret = vec![value; 32];
+                    store.save_paired(&record).unwrap();
+                });
+            }
+        });
+        let secret = store.load("fc00::1").unwrap().unwrap().secret;
+        assert!(secret.iter().all(|byte| *byte == secret[0]));
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn reset_overrides_lower_priority_credentials_without_deleting_configuration() {
+        let writable = tempfile::tempdir().unwrap();
+        let fallback = tempfile::tempdir().unwrap();
+        let lower = DeviceStore::new(fallback.path());
+        let mut record = paired();
+        record.companion = true;
+        record.domain = Some("operator.example".into());
+        lower.save_paired(&record).unwrap();
+        let store = DeviceStore::with_directories(vec![writable.path().into(), fallback.path().into()]);
+        store.clear_pairing("fc00::1").unwrap();
+        let reset = store.load("fc00::1").unwrap().unwrap();
+        assert!(!reset.companion);
+        assert!(reset.secret.is_empty() && reset.root_public_key.is_empty());
+        assert_eq!(reset.domain, record.domain);
+        assert_eq!(reset.public_key, record.public_key);
+        assert_eq!(lower.load("fc00::1").unwrap().unwrap().secret, record.secret);
+        store.clear_pairing("fc00::1").unwrap();
+    }
+
+    #[test]
+    fn discovery_cannot_claim_or_remove_companion_membership() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DeviceStore::new(directory.path());
+        let mut record = paired();
+        record.companion = true;
+        store.save_paired(&record).unwrap();
+        let observed = DeviceRecord { vip6: record.vip6.clone(), ..Default::default() };
+        store.observe(&observed).unwrap();
+        assert!(store.load("fc00::1").unwrap().unwrap().companion);
+        let observed = DeviceRecord { vip6: Some("fc00::2".into()), companion: true, ..Default::default() };
+        store.observe(&observed).unwrap();
+        assert!(!store.load("fc00::2").unwrap().unwrap().companion);
     }
 
     #[test]

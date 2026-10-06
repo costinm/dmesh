@@ -30,6 +30,8 @@ use crate::relay::{
     SetupResult, SetupTransactionLookup,
 };
 use crate::{ConnectionId, Error, Frame};
+#[path = "node_datagram.rs"]
+mod datagram;
 
 /// Initial packet-timeout estimate used until an association has an RTT
 /// sample. Runtime adapters share this protocol value; only timer arming is
@@ -48,8 +50,8 @@ pub struct NodeLimits {
     /// Maximum combined local and relay DCID routes.
     pub max_routes: usize,
     /// Packet-pool slots data forwarding must leave free for control traffic.
-    /// The reserve is enforced on ingress before the relay allocates an
-    /// egress packet. A value of zero disables the reserve.
+    /// The reserve is enforced on ingress, accounting for whether forwarding
+    /// reuses the receive lease or allocates another slot. Zero disables it.
     pub relay_control_packet_reserve: usize,
 }
 
@@ -798,6 +800,7 @@ pub(crate) enum ApplicationStreamSource {
 
 /// Complete outcome of submitting one opaque packet to [`QuicNode`].
 pub(crate) enum NodeIngress<B, EgressBuffer, NextHop> {
+    Datagram { association: AssociationIngress },
     Association {
         association: AssociationIngress,
         packet: OwnedPacket<B>,
@@ -1810,6 +1813,7 @@ pub struct QuicNode<
     dropped_association_events: u64,
     node_limits: NodeLimits,
     default_association_limits: AssociationLimits,
+    datagram_handlers: Vec<(QuicAssociation, datagram::DatagramHandler<P::Buffer>)>,
     local_vip: Option<u64>,
     path_open_resolver:
         Option<Arc<dyn Fn(u8, &[u8]) -> Option<CircuitNextHop> + Send + Sync + 'static>>,
@@ -1994,6 +1998,7 @@ impl<P: PacketPool, const PACKET: usize> QuicNode<P, PACKET> {
             dropped_association_events: 0,
             node_limits,
             default_association_limits: association_limits,
+            datagram_handlers: Vec::new(),
             local_vip: None,
             path_open_resolver: None,
             vip_path_open_resolver: None,
@@ -2087,6 +2092,7 @@ impl<P: PacketPool, const PACKET: usize> QuicNode<P, PACKET> {
             core::ptr::addr_of_mut!((*node).dropped_association_events).write(0);
             core::ptr::addr_of_mut!((*node).node_limits).write(node_limits);
             core::ptr::addr_of_mut!((*node).default_association_limits).write(association_limits);
+            core::ptr::addr_of_mut!((*node).datagram_handlers).write(Vec::new());
             core::ptr::addr_of_mut!((*node).local_vip).write(None);
             core::ptr::addr_of_mut!((*node).path_open_resolver).write(None);
             core::ptr::addr_of_mut!((*node).vip_path_open_resolver).write(None);
@@ -2913,6 +2919,7 @@ impl<P: PacketPool, const PACKET: usize> QuicNode<P, PACKET> {
         let entry = self.associations[slot]
             .take()
             .ok_or(QuicNodeError::MissingAssociation)?;
+        self.datagram_handlers.retain(|(association, _)| *association != id);
         let mut removed_all = true;
         for cid in entry.receive_cids.into_iter().flatten() {
             removed_all &= self.router.remove_endpoint(cid, &id);
@@ -5364,8 +5371,8 @@ where
 
     /// Classify and process one complete opaque packet from any bearer.
     ///
-    /// This is the only packet-ingress API. The bearer does not inspect QUIC
-    /// headers or select a follow-up method. `admit_initial` is node policy,
+    /// Runtime bearer ingress uses this entry point. The bearer does not inspect
+    /// QUIC headers or select a follow-up method. `admit_initial` is node policy,
     /// called only after QUIC-lite has validated an Initial; returning `None`
     /// declines admission without changing node state.
     /// `on_stream` receives application bytes in increasing offset order for
@@ -5373,6 +5380,99 @@ where
     /// calls the handler only when the missing prefix arrives. A future
     /// explicitly selected mode may permit out-of-order callbacks; it will not
     /// change this ordered default silently.
+    /// Runtime ingress preserves an owned short-header relay lease whenever its
+    /// layout and uniqueness permit it. Bootstrap/shared/unsupported layouts
+    /// keep the existing serializer path. No companion policy lives here.
+    pub(crate) fn receive_owned_packet<Admit, StreamEvent>(
+        &mut self,
+        meta: PacketMeta,
+        mut packet: OwnedPacket<P::Buffer>,
+        admit_initial: Admit,
+        on_stream: StreamEvent,
+    ) -> Result<NodeIngress<P::Buffer, P::Buffer, ForwardNextHop>, RejectedNodePacket<P::Buffer>>
+    where
+        Admit: FnMut(crate::BootstrapOpen) -> Option<InitialAdmission>,
+        StreamEvent: FnMut(ApplicationStreamSource, u64, u64, bool, &[u8]) -> Result<usize, crate::Error>,
+    {
+        self.advance_clock(meta.received_at_us);
+        let classified = classify_server_packet(packet.bytes());
+        let destination = match classified {
+            Ok(ServerPacket::Established { destination }) => destination,
+            _ => return self.receive_packet(meta, packet, admit_initial, on_stream),
+        };
+        let rule = match self.router.target(packet.bytes()) {
+            Ok(RouterTarget::Forward(rule)) => *rule,
+            Ok(RouterTarget::Endpoint(association)) => {
+                let association = *association;
+                if let Some(path_id) = self.slot(association)
+                    .and_then(|slot| Self::slot_path_id_for_cid(slot, destination)) {
+                    return self.receive_owned_endpoint(association, path_id, meta, packet, admit_initial, on_stream);
+                }
+                return self.receive_packet(meta, packet, admit_initial, on_stream);
+            }
+            _ => return self.receive_packet(meta, packet, admit_initial, on_stream),
+        };
+        let ForwardDestination::Connection(outbound) = rule.destination else {
+            return self.receive_packet(meta, packet, admit_initial, on_stream);
+        };
+        let info = self
+            .bearers
+            .get(rule.next_hop.bearer)
+            .map(|bearer| bearer.info());
+        let prefix_required = info.map_or(PACKET_PREFIX_RESERVE, |info| info.prefix_required);
+        let suffix_required = info.map_or(PACKET_SUFFIX_RESERVE, |info| info.suffix_required);
+        // Preflight before quota/lease state changes. A shared lease or insufficient
+        // framing space falls back without changing bytes, credit or counters.
+        if crate::dcid_rewrite_layout(&packet, outbound, prefix_required, PACKET).is_err()
+            || packet.suffix_capacity() < suffix_required
+            || packet.bytes_mut_unique().is_none()
+        {
+            return self.receive_packet(meta, packet, admit_initial, on_stream);
+        }
+        let active = match self.router.forward_lease_active(packet.bytes(), self.clock_us) {
+            Ok(active) => active,
+            Err(error) => {
+                return Err(RejectedNodePacket {
+                    reason: QuicNodePacketRejection::Egress(QuicNodeEgressError::Transport(error)),
+                    packet,
+                });
+            }
+        };
+        if !active {
+            return Ok(NodeIngress::Unknown { destination, packet });
+        }
+        let control = crate::is_control_only_packet(packet.bytes());
+        // No second slot is allocated: equality leaves the configured reserve
+        // intact. With reserve zero a full pool can still forward its RX lease.
+        if !control && self.pool.available() < self.node_limits.relay_control_packet_reserve {
+            return Ok(NodeIngress::Unknown { destination, packet });
+        }
+        if !self.router.consume_forward_quota(destination, control, self.clock_us) {
+            return Ok(NodeIngress::Unknown { destination, packet });
+        }
+        match self.router.refresh_forward_lease(packet.bytes(), self.clock_us) {
+            Ok(true) => {}
+            Ok(false) => return Ok(NodeIngress::Unknown { destination, packet }),
+            Err(error) => {
+                return Err(RejectedNodePacket {
+                    reason: QuicNodePacketRejection::Egress(QuicNodeEgressError::Transport(error)),
+                    packet,
+                });
+            }
+        }
+        let packet = crate::rewrite_dcid_in_place(packet, outbound, prefix_required, PACKET)
+            .map_err(|(error, packet)| RejectedNodePacket {
+                reason: QuicNodePacketRejection::Egress(QuicNodeEgressError::Transport(error)),
+                packet,
+            })?;
+        Ok(NodeIngress::Forward {
+            next_hop: rule.next_hop,
+            packet,
+        })
+    }
+
+    /// Generic ingress and serializer fallback for packets that cannot reuse a
+    /// node-pool lease. Runtime adapters use `receive_owned_packet` instead.
     pub(crate) fn receive_packet<B, Admit, StreamEvent>(
         &mut self,
         meta: PacketMeta,
@@ -7964,6 +8064,14 @@ where
             .min()
     }
 }
+
+#[cfg(test)]
+#[path = "forwarding_sim.rs"]
+mod forwarding_sim;
+
+#[cfg(test)]
+#[path = "datagram_sim.rs"]
+mod datagram_sim;
 
 #[cfg(test)]
 mod tests {

@@ -11,7 +11,8 @@ use core::{
 
 use crate::raw_udp6::{
     Error, encode_neighbor_advertisement, encode_station_ipv6_data_frame,
-    encode_station_udp6_data_frame, encode_udp6, link_local_from_mac, parse_neighbor_solicitation,
+    encode_station_udp6_data_frame, encode_station_udp6_prefix, encode_udp6, encode_udp6_prefix,
+    ETHERNET_UDP6_HEADROOM, STATION_UDP6_HEADROOM, link_local_from_mac, parse_neighbor_solicitation,
     parse_udp6, parse_udp6_for_destination,
 };
 
@@ -909,6 +910,17 @@ pub(crate) fn peer_for_path(path: quic_lite::PeerL2Address) -> Option<RawUdp6Pee
     unsafe { (*core::ptr::addr_of!(UDP_PATH_BINDINGS)).get(path) }
 }
 
+/// Resolve only tuples already observed on UDP. PATH_OPEN never invents an
+/// L2 neighbour or substitutes the last sender for the requested destination.
+pub(crate) fn path_for_udp_address(address: &[u8]) -> Option<quic_lite::PeerL2Address> {
+    let bytes: &[u8; 18] = address.try_into().ok()?;
+    let port = u16::from_be_bytes([bytes[16], bytes[17]]);
+    unsafe {
+        (*core::ptr::addr_of!(UDP_PATH_BINDINGS))
+            .find(|peer| peer.ip == bytes[..16] && peer.port == port)
+    }
+}
+
 pub(crate) fn transmit_udp6(
     link: crate::shared_ingress_esp::IngressLink,
     peer: RawUdp6Peer,
@@ -948,6 +960,43 @@ pub(crate) fn transmit_udp6(
         return false;
     };
     transmit_ipv6(link, peer.mac, local_mac, &ethernet[..frame_len])
+}
+
+/// Frame a node-owned packet in its existing prefix and return its original
+/// QUIC range for completion accounting. ESP-IDF still owns its TX copy;
+/// there is no intermediate application payload/frame copy on this path.
+pub(crate) fn transmit_udp6_owned(
+    peer: RawUdp6Peer,
+    source_port: u16,
+    packet: crate::quic_node_esp::FirmwarePacket,
+) -> (crate::quic_node_esp::FirmwarePacket, bool) {
+    use quic_lite::PacketBuffer;
+    let local_mac = local_mac_for(peer.link);
+    let local_ip = link_local_from_mac(local_mac);
+    let raw_station = peer.link == crate::shared_ingress_esp::IngressLink::WifiSta
+        && !sta_driver_tx_enabled();
+    let prefix_len = if raw_station { STATION_UDP6_HEADROOM } else { ETHERNET_UDP6_HEADROOM };
+    let (mut buffer, range) = packet.into_parts();
+    let sent = range.start.checked_sub(prefix_len).and_then(|start| {
+        let storage = buffer.as_mut_unique()?;
+        let frame = &mut storage[start..range.end];
+        if raw_station {
+            let len = encode_station_udp6_prefix(frame, range.len(), load_ap_bssid(),
+                local_mac, peer.mac, peer.ip, local_ip, peer.port, source_port).ok()?;
+            Some(transmit_station_frame(frame, len))
+        } else {
+            let len = encode_udp6_prefix(frame, range.len(), peer.mac, local_mac,
+                peer.ip, local_ip, peer.port, source_port).ok()?;
+            let interface = match peer.link {
+                crate::shared_ingress_esp::IngressLink::WifiAp => crate::wifi_esp::RadioInterface::Ap,
+                crate::shared_ingress_esp::IngressLink::WifiSta => crate::wifi_esp::RadioInterface::Sta,
+                crate::shared_ingress_esp::IngressLink::None => return None,
+            };
+            Some(transmit_ethernet(interface, &frame[..len]))
+        }
+    }).unwrap_or(false);
+    let packet = quic_lite::OwnedPacket::new(buffer, range).ok().expect("original QUIC range");
+    (packet, sent)
 }
 
 /// Send one bounded unsigned presence record over every live UDP6 Wi-Fi link.
