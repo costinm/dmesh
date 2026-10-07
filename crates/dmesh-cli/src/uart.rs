@@ -22,6 +22,37 @@ pub enum DeviceSessionEvent {
     Diagnostic(String),
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs::File, io::Write, os::fd::{AsRawFd, FromRawFd}};
+
+    #[test]
+    fn passive_capture_keeps_backtrace_and_reboot_after_fatal_marker() {
+        let (mut master, mut slave) = (0, 0);
+        assert_eq!(unsafe { libc::openpty(&mut master, &mut slave,
+            core::ptr::null_mut(), core::ptr::null(), core::ptr::null()) }, 0);
+        let mut master = unsafe { File::from_raw_fd(master) };
+        let slave = unsafe { File::from_raw_fd(slave) };
+        let path = std::fs::read_link(format!("/proc/self/fd/{}", slave.as_raw_fd())).unwrap();
+        let mut session = DeviceSession::open(path.to_str().unwrap(), None).unwrap();
+        master.write_all(b"Guru Meditation Error\n").unwrap();
+        session.poll_diagnostics(Duration::from_millis(20)).unwrap();
+        assert!(session.assert_healthy().is_err());
+        // A later poll must still read the post-fatal diagnostics and reboot.
+        master.write_all(b"Backtrace: example\nESP-ROM: restarting\nMain ready\n").unwrap();
+        session.poll_diagnostics(Duration::from_millis(20)).unwrap();
+        let lines: Vec<_> = session.drain_events().filter_map(|event| match event {
+            DeviceSessionEvent::Diagnostic(line) => Some(line), _ => None,
+        }).collect();
+        assert!(lines.iter().any(|line| line.contains("Backtrace")));
+        assert!(lines.iter().any(|line| line.contains("Main ready")));
+        // Request/reply polling still fails fast; capture has not cleared the
+        // device failure or converted a crash into success.
+        assert!(session.poll(Duration::ZERO).is_err());
+    }
+}
+
 /// One explicitly owned UART connection to a firmware device.
 ///
 /// A suite opens this once before its cases and closes it after all cases.
@@ -160,6 +191,13 @@ impl DeviceSession {
             .map(|(_, records)| records)
     }
 
+    /// Passive diagnostics must capture the backtrace and following reboot,
+    /// even after a fatal marker. Keep the health failure latched for the
+    /// caller to report after its capture deadline, not on each read.
+    pub(crate) fn poll_diagnostics(&mut self, timeout: Duration) -> Result<usize, String> {
+        self.poll_until_policy(timeout, |_| false, false).map(|(_, records)| records)
+    }
+
     /// Poll until a caller-selected decoded event arrives or the bounded
     /// interval expires.  This lets an E2E suite retain one UART owner while
     /// correlating a real response instead of sleeping for every command.
@@ -168,7 +206,19 @@ impl DeviceSession {
     pub fn poll_until<F>(
         &mut self,
         timeout: Duration,
+        matched: F,
+    ) -> Result<(bool, usize), String>
+    where
+        F: FnMut(&DeviceSessionEvent) -> bool,
+    {
+        self.poll_until_policy(timeout, matched, true)
+    }
+
+    fn poll_until_policy<F>(
+        &mut self,
+        timeout: Duration,
         mut matched: F,
+        require_healthy: bool,
     ) -> Result<(bool, usize), String>
     where
         F: FnMut(&DeviceSessionEvent) -> bool,
@@ -190,7 +240,7 @@ impl DeviceSession {
                         let is_match = matched(&event);
                         self.push_event(event);
                         if is_match {
-                            self.assert_healthy()?;
+                            if require_healthy { self.assert_healthy()?; }
                             return Ok((true, records));
                         }
                     }
@@ -200,14 +250,14 @@ impl DeviceSession {
                         let is_match = matched(&event);
                         self.push_event(event);
                         if is_match {
-                            self.assert_healthy()?;
+                            if require_healthy { self.assert_healthy()?; }
                             return Ok((true, records));
                         }
                     }
                 }
             }
         }
-        self.assert_healthy()?;
+        if require_healthy { self.assert_healthy()?; }
         Ok((false, records))
     }
 

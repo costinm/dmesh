@@ -334,62 +334,18 @@ impl BearerRuntime {
                 .wait_established()
                 .await
                 .map_err(|error| format!("establish association: {error:?}"))?;
-            let mut stream = association
-                .open_stream()
-                .await
-                .map_err(|error| format!("open probe stream: {error:?}"))?;
-            // The request is a header and no body: FIN follows the header.
             let mut header = [0u8; dmesh_server::probe::PROBE_REQUEST_MAX];
             let mut outbound = request;
             outbound.peer = None;
             let used = dmesh_server::probe::encode_probe_handler_request(outbound, 1, &mut header)
                 .ok_or("probe request does not fit a probe.handler header")?;
-            stream
-                .write_all(&header[..used])
-                .await
-                .map_err(|error| format!("write probe request: {error}"))?;
-            stream
-                .shutdown()
-                .await
-                .map_err(|error| format!("finish probe request: {error}"))?;
-            let expected = request.bytes.min(quic_lite::probe::MAX_BYTES);
-            let mut reader = dmesh_server::probe::ProbeResponseReader::new(expected);
-            let started = Instant::now();
-            let mut chunk = vec![0u8; 2048];
-            loop {
-                let count = stream
-                    .read(&mut chunk)
-                    .await
-                    .map_err(|error| format!("read probe response: {error}"))?;
-                if count == 0 {
-                    break;
-                }
-                reader.push(&chunk[..count]).map_err(|error| match error {
-                    dmesh_server::probe::ProbeClientError::Rejected => {
-                        "peer rejected the probe request".to_owned()
-                    }
-                    other => format!("invalid probe response: {other:?}"),
-                })?;
-            }
-            if !reader.is_complete() {
-                return Err(format!(
-                    "probe response ended after {} of {expected} bytes",
-                    reader.bytes()
-                ));
-            }
+            let result = dmesh_server::stream_client::probe_quic(&association, &header[..used], outbound)
+                .await.map_err(|error| format!("probe exchange: {error}"))?;
             association
                 .finish()
                 .await
                 .map_err(|error| format!("finish association: {error:?}"))?;
-            let elapsed_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-            Ok(quic_lite::probe::ProbeResult {
-                bytes: reader.bytes(),
-                normal_bytes: reader.bytes(),
-                high_bytes: 0,
-                low_bytes: 0,
-                elapsed_us,
-                callback_errors: [0; 6],
-            })
+            Ok(result)
         };
         tokio::time::timeout(timeout, operation)
             .await
@@ -828,7 +784,7 @@ impl dmesh_server::registry::Handler for ProbeStartHandler {
             let started = Instant::now();
             let timeout = Duration::from_millis(dmesh_server::probe::probe_timeout_ms(
                 call.context.timeout_ms,
-                request.bytes,
+                request.total_bytes(),
             ));
             let outcome = match runtime {
                 Some(runtime) => runtime.probe(&peer, request, timeout).await,

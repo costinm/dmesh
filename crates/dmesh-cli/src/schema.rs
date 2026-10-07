@@ -7,7 +7,6 @@ const CATALOG_SERVICE: &str = "lmesh";
 
 /// The catalog tag of a field named `to` that is the envelope's destination.
 /// Other methods use tag 15 for unrelated fields (`transport.set`'s `now`).
-const ENVELOPE_TO_TAG: u32 = 15;
 
 /// The installed service catalog is the source for named and tagged requests.
 pub fn load_tagged_schema() -> Arc<TaggedSchema> {
@@ -104,24 +103,16 @@ pub fn render_device_record(schema: &TaggedSchema, payload: &[u8]) -> String {
     }
 }
 
-/// Encode a schema-guided direct command as one canonical tagged-CBOR record.
-///
-/// Direct records require reviewed numeric component and method tags.
-pub fn encode_direct_command(command: &str) -> Result<Vec<u8>> {
-    encode_direct_command_with_id(command, 0)
-}
-
-/// Encode one correlated direct command. Callers that cross a bearer must
-/// supply a fresh nonzero ID so request and result use the common envelope.
-pub fn encode_direct_command_with_id(command: &str, id: u64) -> Result<Vec<u8>> {
-    encode_schema_command_with_id(command, id, true)
-}
-
-/// Encode a schema command for a normal tagged QUIC stream.  This is the
-/// operator-facing counterpart of the direct encoder: every schema method is
-/// available here, while the direct path remains restricted to transport.set.
+/// Encode a schema command for a normal tagged QUIC stream: every catalog method is a stream
+/// handler, there is no separate connectionless "direct" form.
 pub fn encode_stream_command_with_id(command: &str, id: u64) -> Result<Vec<u8>> {
-    encode_schema_command_with_id(command, id, false)
+    let schema = load_tagged_schema();
+    let record = schema.parse_text(command)?;
+    let method = schema
+        .method_name(&record)
+        .context("command method")?
+        .to_owned();
+    finish_record(&schema, &method, record, id)
 }
 
 /// Encode a shell-split service invocation without splitting quoted field values.
@@ -129,162 +120,40 @@ pub fn encode_stream_argv_with_id(arguments: &[String], id: u64) -> Result<Vec<u
     let schema = load_tagged_schema();
     let method = arguments.first().context("missing device method")?;
     let record = schema.parse_argv(method, &arguments[1..])?;
-    let fields = schema.to_jsonl(&record);
-    let fields = fields.as_object().context("command fields")?;
-    let fields = fields
-        .iter()
-        .filter(|(key, _)| *key != "method")
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect();
-    encode_schema_fields_with_id(&schema, method, &fields, id, false)
+    finish_record(&schema, method, record, id)
 }
 
-fn encode_schema_command_with_id(command: &str, id: u64, direct: bool) -> Result<Vec<u8>> {
-    let schema = load_tagged_schema();
-    let record = schema.parse_text(command)?;
-    let value = schema.to_jsonl(&record);
-    let method = value
-        .get("method")
-        .and_then(Value::as_str)
-        .context("command method")?;
-    let fields = value
+/// Turn a parsed request into its wire record. The field rules (kinds, `timeout`, `to`) are
+/// `mesh::tagged`'s and are the same for `key=value` and JSON input; what is left here is DMesh's:
+/// nothing else: every handler decodes the common encoding.
+fn finish_record(
+    schema: &TaggedSchema,
+    method: &str,
+    mut record: mesh::tagged::TaggedRecord,
+    id: u64,
+) -> Result<Vec<u8>> {
+    let entry = schema
+        .method(method)
+        .with_context(|| format!("unknown device method {method}"))?;
+    let named = schema.to_jsonl(&record);
+    let fields: Map<String, Value> = named
         .as_object()
         .context("command fields")?
         .iter()
-        .filter(|(key, _)| key.as_str() != "method")
+        .filter(|(key, _)| !matches!(key.as_str(), "method" | "to" | "timeout"))
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
-    encode_schema_fields_with_id(&schema, method, &fields, id, direct)
-}
-
-/// Encode a JSON request from the local session/HTTP-style surface with the
-/// same schema used by shell `field=value` commands.
-pub fn encode_stream_fields_with_id(
-    method: &str,
-    fields: &Map<String, Value>,
-    id: u64,
-) -> Result<Vec<u8>> {
-    encode_schema_fields_with_id(&load_tagged_schema(), method, fields, id, false)
-}
-
-fn encode_schema_fields_with_id(
-    schema: &TaggedSchema,
-    method: &str,
-    fields: &Map<String, Value>,
-    id: u64,
-    direct: bool,
-) -> Result<Vec<u8>> {
-    let mut request_fields = fields.clone();
-    // The catalog declares CBOR text fields. Numeric-looking settings (and
-    // SSIDs/names) must not become integer CBOR merely through CLI parsing.
-    if let Some(entry) = schema.method(method) {
-        for (name, value) in &mut request_fields {
-            let field = entry.fields.get(name).or_else(|| name.parse::<u32>().ok()
-                .and_then(|tag| entry.fields.values().find(|field| field.tag == tag)));
-            if field.is_some_and(|field| matches!(field.kind.as_deref(), Some("text" | "string")))
-                && (value.is_number() || value.is_boolean())
-            {
-                *value = Value::String(value.to_string());
-            }
-        }
+    schema.validate_fields(method, &fields)?;
+    // Devices dispatch by number: a method without numeric identities cannot be sent.
+    if !matches!(entry.component, NameOrTag::Tag(_)) || !matches!(entry.method, NameOrTag::Tag(_)) {
+        anyhow::bail!("device command {method} has no numeric component and method");
     }
-    // `timeout=MS` is the envelope's allowance for the request, unless the
-    // method declares a field of that name itself.
-    let envelope_timeout = request_fields.remove("timeout");
-    let entry = schema.validate_fields(method, &request_fields)?;
-    let envelope_timeout = match envelope_timeout {
-        Some(value) if entry.fields.contains_key("timeout") => {
-            request_fields.insert("timeout".to_owned(), value);
-            None
-        }
-        Some(value) => Some(
-            value
-                .as_u64()
-                .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
-                .ok_or_else(|| anyhow::anyhow!("`timeout` is a number of milliseconds"))?,
-        ),
-        None => None,
-    };
-    if direct && (method != "transport.set" || entry.component != NameOrTag::Tag(1)) {
-        anyhow::bail!("{method} is stream-only; only transport.set has a direct encoding");
-    }
-    // Firmware handlers with an explicit wire constructor still need the
-    // numeric identity here; ordinary requests use the shared mesh catalog.
-    let component = match entry.component {
-        NameOrTag::Tag(tag) => tag,
-        _ => anyhow::bail!("device command {method} has no numeric component"),
-    };
-    let method_tag = match entry.method {
-        NameOrTag::Tag(tag) => tag,
-        _ => anyhow::bail!("device command {method} has no numeric method"),
-    };
-    // The inventory uses the shared correlated *empty* request constructor.
-    // It must carry an id for a normal QUIC stream, unlike the older
-    // connectionless observation form.
-    if component == dmesh_server::announce::ANNOUNCE_COMPONENT as u32
-        && u64::from(method_tag) == dmesh_server::announce::ANNOUNCE_DEVICES_OBSERVED
-        && fields.is_empty()
-    {
-        let mut wire = [0u8; 32];
-        let used = dmesh_server::tagged::encode_numeric_empty_request(
-            dmesh_server::announce::ANNOUNCE_COMPONENT,
-            dmesh_server::announce::ANNOUNCE_DEVICES_OBSERVED,
-            id,
-            &mut wire,
-        )
-        .context("discovery.nodes request")?;
-        return Ok(wire[..used].to_vec());
-    }
-    // Raw-radio snapshot/reset use a registered empty *fields map*, not an
-    // omitted payload. `mesh::cbor::encode_record` correctly omits an empty
-    // generic environment, but that would make the embedded raw handler
-    // distinguish this request from its documented `{5:{}}` envelope. Keep
-    // CLI, direct UART, and E2E on the one shared constructor.
-    if component == dmesh_server::raw_wifi::RAW_WIFI_COMPONENT as u32
-        && fields.is_empty()
-        && (u64::from(method_tag) == dmesh_server::raw_wifi::RAW_WIFI_METHOD_SNAPSHOT
-            || u64::from(method_tag) == dmesh_server::raw_wifi::RAW_WIFI_METHOD_RESET_COUNTERS
-            || u64::from(method_tag) == dmesh_server::raw_wifi::RAW_WIFI_METHOD_SCAN)
-    {
-        let mut wire = [0u8; 24];
-        let used = dmesh_server::raw_wifi::encode_raw_wifi_snapshot_request_with_id(
-            u64::from(method_tag),
-            id,
-            &mut wire,
-        )
-        .context("raw radio snapshot request")?;
-        return Ok(wire[..used].to_vec());
-    }
-    if component == dmesh_server::raw_wifi::RAW_WIFI_COMPONENT as u32
-        && u64::from(method_tag) == dmesh_server::raw_wifi::RAW_WIFI_METHOD_TX
-    {
-        let mut wire = [0u8; dmesh_server::raw_wifi::RAW_WIFI_MAX_FRAME + 64];
-        let used = dmesh_server::raw_wifi::encode_raw_wifi_tx_json_request(fields, id, &mut wire)
-            .context("radio.tx request")?;
-        return Ok(wire[..used].to_vec());
-    }
-    let mut record = schema.record_from_value(method, &Value::Object(request_fields))?;
-    // A `to` field with tag 15 is the envelope's destination: the node that runs
-    // the method, not a field of its request. A catalogued method that declares it
-    // (such as `probe.start`) can therefore be started from any node.
-    let to_is_envelope = entry
-        .fields
-        .get("to")
-        .is_some_and(|field| field.tag == ENVELOPE_TO_TAG);
-    if to_is_envelope
-        && let Some(to) = record.env.remove(&NameOrTag::Tag(ENVELOPE_TO_TAG))
-    {
-        let raw = to
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("`to` must be a destination string"))?;
-        let normalized = dmesh_server::probe::ProbeDestination::parse(raw)
-            .map(|uri| uri.as_str().to_owned())
-            .unwrap_or_else(|| raw.to_owned());
-        record.to = Some(Value::String(normalized));
+    // A destination has one canonical spelling (`mesh://` for a bare node): `mesh::resolve`'s.
+    if let Some(Value::String(raw)) = record.to.clone() {
+        record.to = Some(Value::String(mesh::resolve::canonical_target(&raw).unwrap_or(raw)));
     }
     record.id = Some(Value::from(id));
-    record.timeout = envelope_timeout;
-    mesh::cbor::encode_record(&record)
+    schema.encode_request(&record)
 }
 
 /// Render diagnostic fields, hiding the routine successful status marker.
@@ -369,7 +238,7 @@ mod tests {
         assert!(rendered.contains("remote diagnostic line"), "{rendered}");
     }
     use super::{
-        encode_direct_command, encode_direct_command_with_id, encode_stream_argv_with_id,
+        encode_stream_argv_with_id,
         encode_stream_command_with_id, load_tagged_schema, render_device_record,
     };
     use mesh::tagged::NameOrTag;
@@ -412,17 +281,22 @@ mod tests {
     }
 
     #[test]
-    fn relay_apply_is_stream_only() {
-        assert!(encode_direct_command_with_id("relay.apply allocation=7", 19).is_err());
-    }
-
-    #[test]
     fn discovery_nodes_uses_the_correlated_empty_stream_request() {
         let wire = encode_stream_command_with_id("discovery.nodes", 22).unwrap();
         assert!(dmesh_server::announce::is_devices_observed_request(&wire));
         let record = dmesh_server::tagged::decode(&wire).unwrap();
         assert_eq!(record.id, Some(22));
         assert!(record.fields.is_none());
+        // The generic encoder produces exactly the bytes of the dedicated constructor it replaced.
+        let mut dedicated = [0u8; 32];
+        let used = dmesh_server::tagged::encode_numeric_empty_request(
+            dmesh_server::announce::ANNOUNCE_COMPONENT,
+            dmesh_server::announce::ANNOUNCE_DEVICES_OBSERVED,
+            22,
+            &mut dedicated,
+        )
+        .unwrap();
+        assert_eq!(wire, dedicated[..used]);
     }
 
     #[test]
@@ -444,11 +318,6 @@ mod tests {
             dmesh_server::announce::decode_nan_wakeup_request(record),
             Some([0x84, 0x0d, 0x8e, 0x07, 0x41, 0x70])
         );
-    }
-
-    #[test]
-    fn relay_pair_is_stream_only() {
-        assert!(encode_direct_command_with_id("relay.pair forward_allocation=7", 20).is_err());
     }
 
     #[test]
@@ -487,9 +356,9 @@ mod tests {
     }
 
     #[test]
-    fn direct_transport_set_uses_the_cli_catalog_and_common_envelope() {
-        let command = encode_direct_command("transport.set mode=nan now=1").unwrap();
-        let envelope = dmesh_server::tagged::decode(&command).expect("tagged direct envelope");
+    fn transport_set_uses_the_cli_catalog_and_common_envelope() {
+        let command = encode_stream_command_with_id("transport.set mode=nan now=1", 0).unwrap();
+        let envelope = dmesh_server::tagged::decode(&command).expect("tagged envelope");
         assert_eq!(envelope.component, Some(dmesh_server::tagged::Name::Tag(1)));
         assert_eq!(envelope.method, Some(dmesh_server::tagged::Name::Tag(4)));
         assert_eq!(envelope.id, Some(0));
@@ -529,7 +398,6 @@ mod tests {
 
     #[test]
     fn settings_set_is_stream_only() {
-        assert!(encode_direct_command("settings.set key=sta_ssid value=costin").is_err());
         let command = encode_stream_command_with_id("settings.set key=sta_ssid value=costin", 41)
             .expect("stream settings command");
         let record = dmesh_server::tagged::decode(&command).expect("tagged stream command");
@@ -573,7 +441,6 @@ mod tests {
             Some(&Value::String("two words".to_owned()))
         );
         assert!(encode_stream_command_with_id("settings.set 99=demo", 77).is_err());
-        assert!(encode_direct_command("probe.start bytes=4096 packet_size=512").is_err());
         let command = encode_stream_command_with_id("probe.start bytes=4096 packet_size=512", 44)
             .expect("stream probe command");
         let record = dmesh_server::tagged::decode(&command).expect("tagged probe request");
@@ -633,9 +500,6 @@ mod tests {
 
     #[test]
     fn object_flash_is_a_schema_driven_stream_request() {
-        assert!(
-            encode_direct_command("object.flash cpu=13 target=3 transport=0 dry_run=true").is_err()
-        );
         let command = encode_stream_command_with_id(
             "object.flash cpu=13 target=3 transport=0 dry_run=true",
             45,
@@ -695,7 +559,6 @@ mod tests {
 
     #[test]
     fn boot_recovery_is_an_empty_tagged_stream_request() {
-        assert!(encode_direct_command("boot.recovery").is_err());
         let command =
             encode_stream_command_with_id("boot.recovery", 46).expect("stream boot request");
         let record = dmesh_server::tagged::decode(&command).expect("tagged boot request");
@@ -722,7 +585,6 @@ mod tests {
 
     #[test]
     fn device_telemetry_is_a_read_only_tagged_stream_request() {
-        assert!(encode_direct_command("telemetry.device").is_err());
         let command = encode_stream_command_with_id("telemetry.device", 47)
             .expect("stream device telemetry request");
         let record = dmesh_server::tagged::decode(&command).expect("tagged identity request");
@@ -783,8 +645,8 @@ mod tests {
             match key {
                 2 => {
                     assert_eq!(
-                        decoder.bytes_or_text_ref(),
-                        Some(b"hex:88664b020b6d".as_slice())
+                        decoder.bytes_ref(),
+                        Some([0x88, 0x66, 0x4b, 0x02, 0x0b, 0x6d].as_slice())
                     );
                 }
                 3 => assert_eq!(decoder.uint(), Some(1)),
@@ -815,8 +677,8 @@ mod tests {
             match key {
                 2 => {
                     assert_eq!(
-                        decoder.bytes_or_text_ref(),
-                        Some(b"hex:88664b020b6d".as_slice())
+                        decoder.bytes_ref(),
+                        Some([0x88, 0x66, 0x4b, 0x02, 0x0b, 0x6d].as_slice())
                     );
                 }
                 3 => assert_eq!(decoder.uint(), Some(1)),
@@ -838,8 +700,8 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(decoder.uint(), Some(2));
         assert_eq!(
-            decoder.bytes_or_text_ref(),
-            Some(b"hex:deadbeef".as_slice())
+            decoder.bytes_ref(),
+            Some([0xde, 0xad, 0xbe, 0xef].as_slice())
         );
     }
 
@@ -890,7 +752,6 @@ mod tests {
 
     #[test]
     fn radio_control_is_stream_only() {
-        assert!(encode_direct_command("radio.control channel=6").is_err());
         let telemetry = encode_stream_command_with_id("telemetry.nan", 43)
             .expect("stream telemetry command");
         assert_eq!(
@@ -901,7 +762,6 @@ mod tests {
 
     #[test]
     fn radio_snapshot_has_a_stream_handler_but_no_direct_encoding() {
-        assert!(encode_direct_command("radio.snapshot").is_err());
         let stream =
             encode_stream_command_with_id("radio.snapshot", 42).expect("stream radio snapshot");
         assert!(dmesh_server::raw_wifi::decode_raw_wifi_handler(&stream).is_ok());
@@ -920,10 +780,6 @@ mod tests {
 
     #[test]
     fn radio_tx_hex_is_a_correlated_stream_byte_request() {
-        assert!(
-            encode_direct_command("radio.tx frame=d000000000000000000000000000000000000000000000")
-                .is_err()
-        );
         let stream = encode_stream_command_with_id(
             "radio.tx frame=d000ffffffff00112233445566778899aabbccddeeff00112233445566 channel=6 interface=sta rate=6",
             43,

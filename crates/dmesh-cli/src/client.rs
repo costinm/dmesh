@@ -15,7 +15,7 @@ use crate::{
         DeviceProfile, load_device, resolve_catalog_target, resolve_udp_peer,
     },
     schema::{
-        encode_direct_command_with_id, encode_stream_argv_with_id, encode_stream_command_with_id,
+        encode_stream_argv_with_id, encode_stream_command_with_id,
         is_stream_command_name, load_tagged_schema, render_device_record,
     },
 };
@@ -55,21 +55,9 @@ pub(crate) fn is_fatal_diagnostic(line: &str) -> bool {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: dmesh-cli SERIAL|DEVICE --reset\n       dmesh-cli SERIAL|DEVICE --wake [--baud PHYSICAL_UART_BAUD]\n       dmesh-cli SERIAL|DEVICE --watch [--reset] [--interactive] [--baud PHYSICAL_UART_BAUD] [--timeout-secs N]\n       dmesh-cli DEVICE METHOD [--field=value ...] [--bearer udp[,uart]]\n       dmesh-cli SERIAL METHOD [--baud PHYSICAL_UART_BAUD] [--timeout-secs N] [--linger-secs N] [--repeat-secs N] [--field=value ...]\n       dmesh-cli devices check|sync [--dry-run]|import-catalog FILE [DIR]\n       dmesh-cli discover\n       dmesh-cli flash TARGET [--target main|recovery|stage2|MODULE] [--file IMAGE]\n       dmesh-cli SERIAL|DEVICE [--msg TEXT | --direct-hex HEX] [--timeout-secs N]\n       dmesh-cli lmesh METHOD [--field=value ...]\n       dmesh-cli NODE check\n       dmesh-cli udp://HOST:PORT --socket PATH\n       dmesh-cli http://HOST:PORT SERVICE.METHOD [--field=value ...]"
+        "usage: dmesh-cli SERIAL|DEVICE --reset\n       dmesh-cli SERIAL|DEVICE --wake [--baud PHYSICAL_UART_BAUD]\n       dmesh-cli SERIAL|DEVICE --watch [--reset] [--interactive] [--baud PHYSICAL_UART_BAUD] [--timeout-secs N]\n       dmesh-cli DEVICE METHOD [--field=value ...] [--bearer udp[,uart]]\n       dmesh-cli SERIAL METHOD [--baud PHYSICAL_UART_BAUD] [--timeout-secs N] [--linger-secs N] [--repeat-secs N] [--field=value ...]\n       dmesh-cli devices check|sync [--dry-run]\n       dmesh-cli discover\n       dmesh-cli flash TARGET [--target main|recovery|stage2|MODULE] [--file IMAGE]\n       dmesh-cli lmesh METHOD [--field=value ...]\n       dmesh-cli NODE check\n       dmesh-cli udp://HOST:PORT --socket PATH\n       dmesh-cli http://HOST:PORT SERVICE.METHOD [--field=value ...]"
     );
     std::process::exit(2)
-}
-
-fn hex(value: &str) -> Result<Vec<u8>, String> {
-    if value.len() % 2 != 0 {
-        return Err("hex length must be even".into());
-    }
-    (0..value.len())
-        .step_by(2)
-        .map(|offset| {
-            u8::from_str_radix(&value[offset..offset + 2], 16).map_err(|error| error.to_string())
-        })
-        .collect()
 }
 
 pub(crate) fn hex_encode(value: &[u8]) -> String {
@@ -201,34 +189,6 @@ pub fn run_dmesh_cli_args(args: impl IntoIterator<Item = String>) -> Result<(), 
             append_catalog_uart_baud(&mut arguments, &profile);
         }
         return run_serial_watch(&arguments);
-    }
-    // Raw records are an intentional, bounded physical-bearer lane for
-    // schema-defined bootstrap/control and diagnostics.  An explicit UDP URI
-    // selects the companion's private direct-control lane; a named profile remains
-    // serial-first so a routine local command cannot silently use the radio.
-    if arguments
-        .get(1)
-        .is_some_and(|argument| matches!(argument.as_str(), "--direct-hex" | "--msg"))
-    {
-        let target = arguments.first().cloned().unwrap_or_else(|| usage());
-        if target.starts_with("udp://") {
-            return run_udp_direct_record(&arguments);
-        }
-        if !target.starts_with('/') {
-            if target.contains(':') {
-                return Err(
-                    "--msg requires an explicit udp:// target, serial path, or device profile"
-                        .into(),
-                );
-            }
-            let profile = load_device(&target)?;
-            let serial = profile
-                .serial_path()?
-                .ok_or_else(|| format!("device {target:?} has no serial_id for --msg"))?;
-            arguments[0] = serial.display().to_string();
-            append_catalog_uart_baud(&mut arguments, &profile);
-        }
-        return run_serial_direct_record(&arguments);
     }
     if let Some(target) = arguments
         .first()
@@ -423,7 +383,7 @@ fn run_serial_stream_command(arguments: &[String]) -> Result<(), String> {
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
     if let Some((id, probe_request)) = probe_request {
         if !timeout_explicit {
-            timeout = probe_request_timeout(probe_request.bytes);
+            timeout = probe_request_timeout(probe_request.total_bytes());
         }
         // Without a `peer` the CLI is the probe's client: it calls the probed
         // node's registered `probe.handler` handler and validates the payload.
@@ -438,10 +398,11 @@ fn run_serial_stream_command(arguments: &[String]) -> Result<(), String> {
             timeout,
         ))?;
         println!(
-            "dmesh_cli_probe bearer=uart target={path} bytes={} elapsed_us={} bits_per_second={} callback_errors={:?}",
+            "dmesh_cli_probe bearer=uart target={path} direction={} bytes={} elapsed_us={} mbps={:.3} callback_errors={:?}",
+            probe_request.direction.as_str(),
             result.bytes,
             result.elapsed_us,
-            result.bits_per_second(),
+            result.bits_per_second() as f64 / 1_000_000.0,
             result.callback_errors,
         );
         return Ok(());
@@ -599,80 +560,6 @@ fn run_serial_direct_discovery(path: &str, baud: Option<u32>) -> Result<(), Stri
     Ok(())
 }
 
-/// Send one pre-association message through quic-lite and render application
-/// replies delivered by its common message/stream callback.
-fn run_serial_direct_record(arguments: &[String]) -> Result<(), String> {
-    let path = arguments.first().ok_or("missing serial path")?;
-    let mut index = 1;
-    let mut timeout = Duration::from_secs(2);
-    let mut baud = None;
-    let record = match arguments.get(index).map(String::as_str) {
-        Some("--direct-hex") => {
-            index += 1;
-            hex(arguments.get(index).ok_or("missing --direct-hex value")?)?
-        }
-        Some("--msg") => {
-            index += 1;
-            let end = arguments[index..]
-                .iter()
-                .position(|argument| matches!(argument.as_str(), "--timeout-secs" | "--baud"))
-                .map(|offset| index + offset)
-                .unwrap_or(arguments.len());
-            let command = arguments[index..end].join(" ");
-            if command.is_empty() {
-                return Err("missing --msg value".into());
-            }
-            index = end.saturating_sub(1);
-            encode_direct_command_with_id(&command, fresh_request_id())
-                .map_err(|error| error.to_string())?
-        }
-        _ => usage(),
-    };
-    index += 1;
-    while index < arguments.len() {
-        match arguments[index].as_str() {
-            "--timeout-secs" => {
-                index += 1;
-                timeout = Duration::from_secs(
-                    arguments
-                        .get(index)
-                        .ok_or("missing --timeout-secs value")?
-                        .parse::<u64>()
-                        .map_err(|error| error.to_string())?,
-                );
-            }
-            "--baud" => {
-                index += 1;
-                baud = Some(
-                    arguments
-                        .get(index)
-                        .ok_or("missing --baud value")?
-                        .parse::<u32>()
-                        .map_err(|error| error.to_string())?,
-                );
-            }
-            argument => return Err(format!("raw record does not support {argument}")),
-        }
-        index += 1;
-    }
-    if record.is_empty() || record.len() > quic_lite::DEFAULT_MAX_PACKET_SIZE - 6 {
-        return Err("raw record is empty or exceeds the UART MTU".into());
-    }
-    println!("dmesh_cli_raw_sent target={path} bytes={}", record.len());
-    let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
-    let response = runtime
-        .block_on(crate::node_client::request_uart(
-            path, baud, &record, timeout,
-        ))?
-        .bytes;
-    println!(
-        "dmesh_cli_raw_reply bytes={} {}",
-        response.len(),
-        render_device_record(&load_tagged_schema(), &response)
-    );
-    Ok(())
-}
-
 /// Passively render direct UART records from boot/platform code. This does
 /// not open a service stream and never substitutes for tagged `log-watch`:
 /// firmware logs belong on that flow-controlled stream. Marked QUIC-lite
@@ -789,7 +676,7 @@ fn run_serial_watch(arguments: &[String]) -> Result<(), String> {
                 Err(error) => return Err(error.to_string()),
             }
         }
-        session.poll(Duration::from_millis(2))?;
+        session.poll_diagnostics(Duration::from_millis(2))?;
         for event in session.drain_events() {
             observations = observations.saturating_add(1);
             match event {
@@ -828,7 +715,7 @@ fn run_serial_watch(arguments: &[String]) -> Result<(), String> {
             baud.map_or("driver-default".to_owned(), |value| value.to_string())
         ));
     }
-    Ok(())
+    session.assert_healthy()
 }
 
 /// Line-oriented command vocabulary for a serial watch pane.  It intentionally
@@ -908,15 +795,16 @@ pub(crate) fn run_udp_service_client(arguments: &[String]) -> Result<(), String>
                 timeout,
             ))?;
             println!(
-                "dmesh_cli_probe bearer={} target={peer} bytes={} elapsed_us={} bits_per_second={} callback_errors={:?}",
+                "dmesh_cli_probe bearer={} target={peer} direction={} bytes={} elapsed_us={} mbps={:.3} callback_errors={:?}",
                 if uart_path.is_some() {
                     "udp+uart"
                 } else {
                     "udp"
                 },
+                probe_request.direction.as_str(),
                 result.bytes,
                 result.elapsed_us,
-                result.bits_per_second(),
+                result.bits_per_second() as f64 / 1_000_000.0,
                 result.callback_errors,
             );
             return Ok(());
@@ -1002,7 +890,7 @@ fn split_uart_bearer_arguments(
 fn stream_request_timeout(request: &[u8]) -> Result<Duration, String> {
     let record = dmesh_server::tagged::decode(request).ok_or("invalid tagged request")?;
     Ok(dmesh_server::probe::decode_probe_start_record(record)
-        .map(|(_, request)| probe_request_timeout(request.bytes))
+        .map(|(_, request)| probe_request_timeout(request.total_bytes()))
         .unwrap_or_else(|| Duration::from_secs(3)))
 }
 
@@ -1850,66 +1738,6 @@ fn observed_nodes(response: &[u8]) -> Option<Vec<ObservedNode>> {
     })
 }
 
-/// Send one schema-backed private direct control record to an explicit UDP
-/// companion.  This is deliberately separate from a QUIC-lite service stream:
-/// it is used to request radio actions such as active discovery before a
-/// relay/DCID route exists.
-fn run_udp_direct_record(arguments: &[String]) -> Result<(), String> {
-    let target = arguments.first().ok_or("missing UDP target")?;
-    let peer = target
-        .strip_prefix("udp://")
-        .ok_or("UDP target must use udp://HOST:PORT")?;
-    let peer = parse_udp_peer(peer)?;
-    let mut index = 1;
-    let record = match arguments.get(index).map(String::as_str) {
-        Some("--direct-hex") => {
-            index += 1;
-            hex(arguments.get(index).ok_or("missing --direct-hex value")?)?
-        }
-        Some("--msg") => {
-            index += 1;
-            let end = arguments[index..]
-                .iter()
-                .position(|argument| matches!(argument.as_str(), "--timeout-secs" | "--baud"))
-                .map(|offset| index + offset)
-                .unwrap_or(arguments.len());
-            let command = arguments[index..end].join(" ");
-            if command.is_empty() {
-                return Err("missing --msg value".into());
-            }
-            index = end.saturating_sub(1);
-            encode_direct_command_with_id(&command, fresh_request_id())
-                .map_err(|error| error.to_string())?
-        }
-        _ => usage(),
-    };
-    index += 1;
-    let mut timeout = Duration::from_secs(2);
-    while index < arguments.len() {
-        match arguments[index].as_str() {
-            "--timeout-secs" => {
-                index += 1;
-                timeout = Duration::from_secs(
-                    arguments
-                        .get(index)
-                        .ok_or("missing --timeout-secs value")?
-                        .parse::<u64>()
-                        .map_err(|error| error.to_string())?,
-                );
-            }
-            argument => return Err(format!("UDP direct record does not support {argument}")),
-        }
-        index += 1;
-    }
-    let response_record = exchange_udp_stream_record_with_timeout(peer, &record, timeout)?;
-    let schema = load_tagged_schema();
-    println!(
-        "dmesh_udp_direct_reply target={peer} {}",
-        render_device_record(&schema, &response_record)
-    );
-    Ok(())
-}
-
 /// Exchange one direct record from the fixed dmesh-cli UDP source port.
 /// Keeping this tuple stable is deliberate: relay.pair binds its reverse path
 /// to it, while independent dmesh-cli invocations can reuse that binding.
@@ -1930,22 +1758,6 @@ pub(crate) fn exchange_udp_stream_record(
             )
             .await
         })
-        .map(|response| response.bytes)
-}
-
-fn exchange_udp_stream_record_with_timeout(
-    peer: SocketAddr,
-    record: &[u8],
-    timeout: Duration,
-) -> Result<Vec<u8>, String> {
-    let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
-    runtime
-        .block_on(crate::node_client::request_udp(
-            udp_bind_for_peer(peer),
-            peer,
-            record,
-            timeout,
-        ))
         .map(|response| response.bytes)
 }
 

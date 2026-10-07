@@ -1027,6 +1027,40 @@ async fn request_udp_stream(
     payload: &[u8],
     timeout: Duration,
 ) -> Result<Vec<u8>> {
+    match run_udp_stream(peer, payload, None, timeout).await? {
+        StreamReply::Record(record) => Ok(record),
+        StreamReply::Probe(_) => unreachable!("record request"),
+    }
+}
+
+enum StreamReply {
+    Record(Vec<u8>),
+    Probe(quic_lite::probe::ProbeResult),
+}
+
+async fn stream_exchange(
+    association: &quic_lite::tokio::TokioAssociation,
+    payload: &[u8],
+    probe: Option<dmesh_server::probe::ProbeServiceRequest>,
+) -> Result<StreamReply> {
+    Ok(match probe {
+        Some(request) => StreamReply::Probe(
+            dmesh_server::stream_client::probe_quic(association, payload, request).await?,
+        ),
+        None => {
+            let mut stream = association.open_stream().await
+                .map_err(|error| anyhow::anyhow!("open request stream: {error:?}"))?;
+            StreamReply::Record(dmesh_server::stream_client::exchange(&mut stream, &[payload]).await?)
+        }
+    })
+}
+
+async fn run_udp_stream(
+    peer: SocketAddr,
+    payload: &[u8],
+    probe: Option<dmesh_server::probe::ProbeServiceRequest>,
+    timeout: Duration,
+) -> Result<StreamReply> {
     let payload = payload.to_vec();
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
@@ -1037,7 +1071,7 @@ async fn request_udp_stream(
                 .build()
                 .map_err(anyhow::Error::from)
                 .and_then(|runtime| {
-                    runtime.block_on(request_udp_stream_local(peer, &payload, timeout))
+                    runtime.block_on(request_udp_stream_local(peer, &payload, probe, timeout))
                 });
             let _ = result_tx.send(result);
         })?;
@@ -1047,8 +1081,9 @@ async fn request_udp_stream(
 async fn request_udp_stream_local(
     peer: SocketAddr,
     payload: &[u8],
+    probe: Option<dmesh_server::probe::ProbeServiceRequest>,
     timeout: Duration,
-) -> Result<Vec<u8>> {
+) -> Result<StreamReply> {
 
     type Pool = quic_lite::packet_pool::PacketPool<8, { quic_lite::DEFAULT_PACKET_POOL_SLOT_SIZE }>;
     type Node = quic_lite::QuicNode<Pool>;
@@ -1087,16 +1122,12 @@ async fn request_udp_stream_local(
             .wait_established()
             .await
             .map_err(|error| anyhow::anyhow!("establish UDP association: {error:?}"))?;
-        let mut stream = association
-            .open_stream()
-            .await
-            .map_err(|error| anyhow::anyhow!("open UDP request stream: {error:?}"))?;
-        let response = dmesh_server::stream_client::exchange(&mut stream, &[payload]).await?;
+        let response = stream_exchange(&association, payload, probe).await?;
         association
             .finish()
             .await
             .map_err(|error| anyhow::anyhow!("finish UDP association: {error:?}"))?;
-        Result::<Vec<u8>>::Ok(response)
+        Result::<StreamReply>::Ok(response)
     };
     tokio::time::timeout(timeout, async {
         tokio::select! {
@@ -1117,6 +1148,20 @@ async fn request_now_stream(
     payload: &[u8],
     timeout: Duration,
 ) -> Result<Vec<u8>> {
+    match run_now_stream(node, bearer, peer, payload, None, timeout).await? {
+        StreamReply::Record(record) => Ok(record),
+        StreamReply::Probe(_) => unreachable!("record request"),
+    }
+}
+
+async fn run_now_stream(
+    node: quic_lite::tokio::TokioNode,
+    bearer: quic_lite::BearerId,
+    peer: [u8; 6],
+    payload: &[u8],
+    probe: Option<dmesh_server::probe::ProbeServiceRequest>,
+    timeout: Duration,
+) -> Result<StreamReply> {
 
     tokio::time::timeout(timeout, async {
         let association = node
@@ -1134,16 +1179,12 @@ async fn request_now_stream(
             .wait_established()
             .await
             .map_err(|error| anyhow::anyhow!("establish ESP-NOW QUIC association: {error:?}"))?;
-        let mut stream = association
-            .open_stream()
-            .await
-            .map_err(|error| anyhow::anyhow!("open ESP-NOW request stream: {error:?}"))?;
-        let response = dmesh_server::stream_client::exchange(&mut stream, &[payload]).await?;
+        let response = stream_exchange(&association, payload, probe).await?;
         association
             .finish()
             .await
             .map_err(|error| anyhow::anyhow!("finish ESP-NOW association: {error:?}"))?;
-        Result::<Vec<u8>>::Ok(response)
+        Result::<StreamReply>::Ok(response)
     })
     .await
     .context("ESP-NOW QUIC stream request timed out")?
@@ -1214,43 +1255,26 @@ impl LmeshService {
     ) -> Result<quic_lite::probe::ProbeResult> {
         let id = NEXT_ROUTED_PROBE_ID.fetch_add(1, Ordering::Relaxed).max(1);
         let mut wire = [0; dmesh_server::probe::PROBE_REQUEST_MAX];
+        let mut request = request;
+        request.peer = None;
         let used = dmesh_server::probe::encode_probe_handler_request(request, id, &mut wire)
             .context("encode routed QUIC probe request")?;
-        let started = std::time::Instant::now();
         let response = self
-            .request_probe_stream(destination, &wire[..used], timeout)
+            .request_probe_stream(destination, &wire[..used], request, timeout)
             .await?;
-        let expected = request.bytes.min(quic_lite::probe::MAX_BYTES);
-        let mut reader = dmesh_server::probe::ProbeResponseReader::new(expected);
-        reader.push(&response).map_err(|error| match error {
-            dmesh_server::probe::ProbeClientError::Rejected => {
-                anyhow::anyhow!("remote QUIC probe request was rejected")
-            }
-            other => anyhow::anyhow!("invalid QUIC probe response: {other:?}"),
-        })?;
-        if !reader.is_complete() {
-            anyhow::bail!(
-                "QUIC probe response ended after {} of {expected} bytes",
-                reader.bytes()
-            );
+        match response {
+            StreamReply::Probe(result) => Ok(result),
+            StreamReply::Record(_) => unreachable!("probe request"),
         }
-        let elapsed_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-        Ok(quic_lite::probe::ProbeResult {
-            bytes: reader.bytes(),
-            normal_bytes: reader.bytes(),
-            high_bytes: 0,
-            low_bytes: 0,
-            elapsed_us,
-            callback_errors: [0; 6],
-        })
     }
 
     async fn request_probe_stream(
         &self,
         destination: &str,
         request: &[u8],
+        probe: dmesh_server::probe::ProbeServiceRequest,
         timeout: Duration,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<StreamReply> {
         if let Some(peer) = parse_now_destination(destination) {
             self.require_owned_wifi_for_now()?;
             let (node, bearer) = self
@@ -1259,10 +1283,10 @@ impl LmeshService {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone()
                 .context("ESP-NOW bearer is not attached to the QUIC node")?;
-            request_now_stream(node, bearer, peer, request, timeout).await
+            run_now_stream(node, bearer, peer, request, Some(probe), timeout).await
         } else {
             let peer = self.resolve_udp_peer(destination).await?;
-            request_udp_stream(peer, request, timeout).await
+            run_udp_stream(peer, request, Some(probe), timeout).await
         }
     }
 
@@ -2351,4 +2375,3 @@ use dmesh_server::platform_api::{
     TelemetryMemoryResponse, TelemetryNanResponse, TelemetryNowResponse, TelemetryQuicResponse,
     TelemetryUdp6Response, TelemetryWifiLinkResponse,
 };
-

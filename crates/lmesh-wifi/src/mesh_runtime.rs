@@ -736,7 +736,7 @@ impl Handler for ProbeStartHandler {
             let started = std::time::Instant::now();
             let timeout = std::time::Duration::from_millis(dmesh_server::probe::probe_timeout_ms(
                 call.context.timeout_ms,
-                request.bytes,
+                request.total_bytes(),
             ));
             let outcome = self
                 .0
@@ -848,7 +848,7 @@ impl mesh::wire::TaggedRecordHandler for LmeshCborHandler {
         // route selection at this HTTP/QUIC boundary, never a recursively
         // forwarded application field.
         record.to = None;
-        let wire = raw_wifi_tx_wire(&record, &id)?.unwrap_or(mesh::cbor::encode_record(&record)?);
+        let wire = CONTROL_CATALOG.encode_request(&record)?;
         // The caller's `timeout` bounds the whole directed exchange; the
         // remote gets the same allowance in the record it receives.
         let response = match record.timeout {
@@ -879,45 +879,6 @@ impl mesh::wire::TaggedRecordHandler for LmeshCborHandler {
             ))),
         }
     }
-}
-
-/// Encode the one raw-frame handler through DMesh's shared adapter. JSON and
-/// text use `hex:` only at this boundary; the forwarded tagged-CBOR record
-/// contains the compact byte string expected by firmware.
-fn raw_wifi_tx_wire(
-    record: &mesh::tagged::TaggedRecord,
-    id: &serde_json::Value,
-) -> Result<Option<Vec<u8>>> {
-    let is_tx = matches!(
-        (&record.component, &record.method),
-        (
-            mesh::tagged::NameOrTag::Tag(4),
-            mesh::tagged::NameOrTag::Tag(71)
-        )
-    );
-    if !is_tx {
-        return Ok(None);
-    }
-    let id = id
-        .as_u64()
-        .context("radio.tx request ID must be an unsigned integer")?;
-    let mut fields = serde_json::Map::new();
-    for (key, value) in &record.env {
-        let name = match key {
-            mesh::tagged::NameOrTag::Tag(1) => "frame",
-            mesh::tagged::NameOrTag::Tag(2) => "channel",
-            mesh::tagged::NameOrTag::Tag(3) => "interface",
-            mesh::tagged::NameOrTag::Tag(4) => "system_sequence",
-            mesh::tagged::NameOrTag::Tag(5) => "rate",
-            mesh::tagged::NameOrTag::Tag(6) => "disable_11b",
-            _ => anyhow::bail!("unknown radio.tx field"),
-        };
-        fields.insert(name.to_owned(), value.clone());
-    }
-    let mut wire = vec![0; dmesh_server::raw_wifi::RAW_WIFI_MAX_FRAME + 64];
-    let used = dmesh_server::raw_wifi::encode_raw_wifi_tx_json_request(&fields, id, &mut wire)?;
-    wire.truncate(used);
-    Ok(Some(wire))
 }
 
 fn record_keeps_to_as_local_argument(record: &mesh::tagged::TaggedRecord) -> bool {
@@ -1644,9 +1605,7 @@ mod tests {
                 }),
             )
             .unwrap();
-        let wire = raw_wifi_tx_wire(&record, record.id.as_ref().unwrap())
-            .unwrap()
-            .unwrap();
+        let wire = CONTROL_CATALOG.encode_request(&record).unwrap();
         let request = dmesh_server::raw_wifi::decode_raw_wifi_tx_record(
             dmesh_server::tagged::decode(&wire).unwrap(),
         )

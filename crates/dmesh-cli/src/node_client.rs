@@ -314,11 +314,7 @@ async fn exchange_probe(
     payload: &[u8],
     request: dmesh_server::probe::ProbeServiceRequest,
 ) -> Result<quic_lite::probe::ProbeResult, String> {
-    let mut stream = association
-        .open_stream()
-        .await
-        .map_err(node_error("open QUIC probe stream"))?;
-    let result = dmesh_server::stream_client::probe(&mut stream, payload, request)
+    let result = dmesh_server::stream_client::probe_quic(&association, payload, request)
         .await
         .map_err(|error| format!("probe stream exchange: {error}"))?;
     association
@@ -589,22 +585,32 @@ mod tests {
                 let (server, driver) =
                     TokioNodeDriver::new(node, AssociationLimits::host().connection);
                 let serve = async {
-                    let mut stream =
-                        tokio::time::timeout(Duration::from_secs(3), server.accept_stream())
-                            .await
-                            .expect("server did not accept the UDP probe")
-                            .expect("server stream acceptance failed");
-                    // The probed node serves `probe.handler` as a registered
-                    // handler: a header, then the payload as the body.
-                    let registry = std::sync::Arc::new(dmesh_server::registry::Registry::new());
-                    assert!(registry.register_stream(
-                        dmesh_server::registry::methods::PROBE_HANDLER,
-                        dmesh_server::probe::ProbeHandler,
-                    ));
-                    dmesh_server::stream_service::RegistryStreamHandler::new(registry)
-                        .serve(&mut stream)
-                        .await
-                        .unwrap();
+                    for index in 0..3 {
+                        let mut stream =
+                            tokio::time::timeout(Duration::from_secs(3), server.accept_stream())
+                                .await
+                                .expect("server did not accept the UDP probe")
+                                .expect("server stream acceptance failed");
+                        // The probed node serves `probe.handler` as a registered
+                        // handler: a header, then the payload as the body.
+                        let registry = std::sync::Arc::new(dmesh_server::registry::Registry::new());
+                        assert!(registry.register_stream(
+                            dmesh_server::registry::methods::PROBE_HANDLER,
+                            dmesh_server::probe::ProbeHandler,
+                        ));
+                        let service =
+                            dmesh_server::stream_service::RegistryStreamHandler::new(registry);
+                        if index == 2 {
+                            let mut second = server.accept_stream().await.unwrap();
+                            tokio::try_join!(
+                                service.serve(&mut stream),
+                                service.serve(&mut second)
+                            )
+                            .unwrap();
+                        } else {
+                            service.serve(&mut stream).await.unwrap();
+                        }
+                    }
                 };
                 tokio::select! {
                     result = driver.run() => panic!("UDP server driver stopped: {result:?}"),
@@ -613,28 +619,35 @@ mod tests {
             });
         });
 
-        let probe_request = dmesh_server::probe::ProbeServiceRequest::new(256 * 1024, 512);
-        let mut request_wire = [0u8; dmesh_server::probe::PROBE_REQUEST_MAX];
-        let request_len = dmesh_server::probe::encode_probe_handler_request(
-            probe_request,
-            0x5678,
-            &mut request_wire,
-        )
-        .unwrap();
-        let result = tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(super::probe_udp(
-                "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
-                server_address,
-                &request_wire[..request_len],
+        for direction in [
+            dmesh_server::probe::ProbeDirection::Download,
+            dmesh_server::probe::ProbeDirection::Upload,
+            dmesh_server::probe::ProbeDirection::Both,
+        ] {
+            let mut probe_request = dmesh_server::probe::ProbeServiceRequest::new(256 * 1024, 512);
+            probe_request.direction = direction;
+            let mut request_wire = [0u8; dmesh_server::probe::PROBE_REQUEST_MAX];
+            let request_len = dmesh_server::probe::encode_probe_handler_request(
                 probe_request,
-                Duration::from_secs(3),
-            ))
-            .expect("UDP probe did not finish");
+                0x5678,
+                &mut request_wire,
+            )
+            .unwrap();
+            let result = tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(super::probe_udp(
+                    "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+                    server_address,
+                    &request_wire[..request_len],
+                    probe_request,
+                    Duration::from_secs(3),
+                ))
+                .expect("UDP probe did not finish");
+            assert_eq!(result.bytes, probe_request.total_bytes());
+            assert_eq!(result.normal_bytes, probe_request.total_bytes());
+            assert_eq!(result.callback_errors, [0; 6]);
+            assert!(result.elapsed_us > 0);
+        }
         server.join().unwrap();
-        assert_eq!(result.bytes, probe_request.bytes);
-        assert_eq!(result.normal_bytes, probe_request.bytes);
-        assert_eq!(result.callback_errors, [0; 6]);
-        assert!(result.elapsed_us > 0);
     }
 }

@@ -1450,64 +1450,70 @@
       "name": "probe.start",
       "description": "Call the probe.start QUIC stream handler: run a probe against peer",
       "inputSchema": {
-        "type": "object",
         "properties": {
-          "to": {
-            "type": "string",
-            "x-protobuf-index": 15,
-            "x-dmesh-kind": "uri"
-          },
-          "bytes": {
+          "ack_delay_ms": {
             "type": "integer",
-            "x-protobuf-index": 1,
-            "x-dmesh-kind": "u64"
-          },
-          "packet_size": {
-            "type": "integer",
-            "x-protobuf-index": 2,
-            "x-dmesh-kind": "u16"
+            "x-protobuf-index": 7,
+            "x-protobuf-type": "u8"
           },
           "ack_frequency": {
             "type": "integer",
             "x-protobuf-index": 6,
-            "x-dmesh-kind": "u8"
+            "x-protobuf-type": "u8"
           },
-          "ack_delay_ms": {
+          "bytes": {
             "type": "integer",
-            "x-protobuf-index": 7,
-            "x-dmesh-kind": "u8"
-          },
-          "low_priority_bytes": {
-            "type": "integer",
-            "x-protobuf-index": 8,
-            "x-dmesh-kind": "u32"
-          },
-          "high_priority_bytes": {
-            "type": "integer",
-            "x-protobuf-index": 9,
-            "x-dmesh-kind": "u32"
-          },
-          "parallel_streams": {
-            "type": "integer",
-            "x-protobuf-index": 10,
-            "x-dmesh-kind": "u8"
-          },
-          "initial_consume_delay_ms": {
-            "type": "integer",
-            "x-protobuf-index": 11,
-            "x-dmesh-kind": "u32"
+            "x-protobuf-index": 1,
+            "x-protobuf-type": "u64"
           },
           "consume_delay_ms": {
             "type": "integer",
             "x-protobuf-index": 12,
-            "x-dmesh-kind": "u32"
+            "x-protobuf-type": "u32"
+          },
+          "direction": {
+            "type": "string",
+            "x-protobuf-index": 14,
+            "x-protobuf-type": "string"
+          },
+          "high_priority_bytes": {
+            "type": "integer",
+            "x-protobuf-index": 9,
+            "x-protobuf-type": "u32"
+          },
+          "initial_consume_delay_ms": {
+            "type": "integer",
+            "x-protobuf-index": 11,
+            "x-protobuf-type": "u32"
+          },
+          "low_priority_bytes": {
+            "type": "integer",
+            "x-protobuf-index": 8,
+            "x-protobuf-type": "u32"
+          },
+          "packet_size": {
+            "type": "integer",
+            "x-protobuf-index": 2,
+            "x-protobuf-type": "u16"
+          },
+          "parallel_streams": {
+            "type": "integer",
+            "x-protobuf-index": 10,
+            "x-protobuf-type": "u8"
           },
           "peer": {
             "type": "string",
             "x-protobuf-index": 13,
-            "x-dmesh-kind": "uri"
+            "x-protobuf-type": "string"
+          },
+          "to": {
+            "type": "string",
+            "x-protobuf-index": 15,
+            "x-protobuf-type": "string"
           }
-        }
+        },
+        "required": [],
+        "type": "object"
       },
       "outputSchema": {
         "properties": {
@@ -1560,54 +1566,60 @@
       "name": "probe.handler",
       "description": "Call the probe.handler QUIC stream handler: the response header is followed by the probe payload",
       "inputSchema": {
-        "type": "object",
         "properties": {
-          "bytes": {
+          "ack_delay_ms": {
             "type": "integer",
-            "x-protobuf-index": 1,
-            "x-dmesh-kind": "u64"
-          },
-          "packet_size": {
-            "type": "integer",
-            "x-protobuf-index": 2,
-            "x-dmesh-kind": "u16"
+            "x-protobuf-index": 7,
+            "x-protobuf-type": "u8"
           },
           "ack_frequency": {
             "type": "integer",
             "x-protobuf-index": 6,
-            "x-dmesh-kind": "u8"
+            "x-protobuf-type": "u8"
           },
-          "ack_delay_ms": {
+          "bytes": {
             "type": "integer",
-            "x-protobuf-index": 7,
-            "x-dmesh-kind": "u8"
-          },
-          "low_priority_bytes": {
-            "type": "integer",
-            "x-protobuf-index": 8,
-            "x-dmesh-kind": "u32"
-          },
-          "high_priority_bytes": {
-            "type": "integer",
-            "x-protobuf-index": 9,
-            "x-dmesh-kind": "u32"
-          },
-          "parallel_streams": {
-            "type": "integer",
-            "x-protobuf-index": 10,
-            "x-dmesh-kind": "u8"
-          },
-          "initial_consume_delay_ms": {
-            "type": "integer",
-            "x-protobuf-index": 11,
-            "x-dmesh-kind": "u32"
+            "x-protobuf-index": 1,
+            "x-protobuf-type": "u64"
           },
           "consume_delay_ms": {
             "type": "integer",
             "x-protobuf-index": 12,
-            "x-dmesh-kind": "u32"
+            "x-protobuf-type": "u32"
+          },
+          "direction": {
+            "type": "string",
+            "x-protobuf-index": 14,
+            "x-protobuf-type": "string"
+          },
+          "high_priority_bytes": {
+            "type": "integer",
+            "x-protobuf-index": 9,
+            "x-protobuf-type": "u32"
+          },
+          "initial_consume_delay_ms": {
+            "type": "integer",
+            "x-protobuf-index": 11,
+            "x-protobuf-type": "u32"
+          },
+          "low_priority_bytes": {
+            "type": "integer",
+            "x-protobuf-index": 8,
+            "x-protobuf-type": "u32"
+          },
+          "packet_size": {
+            "type": "integer",
+            "x-protobuf-index": 2,
+            "x-protobuf-type": "u16"
+          },
+          "parallel_streams": {
+            "type": "integer",
+            "x-protobuf-index": 10,
+            "x-protobuf-type": "u8"
           }
-        }
+        },
+        "required": [],
+        "type": "object"
       },
       "outputSchema": {
         "properties": {
@@ -1620,6 +1632,11 @@
             "type": "integer",
             "x-protobuf-index": 2,
             "x-protobuf-type": "u64"
+          },
+          "uploaded_bytes": {
+            "type": "integer",
+            "x-protobuf-index": 3,
+            "x-protobuf-type": "u64"
           }
         },
         "required": [],
@@ -1629,7 +1646,9 @@
       "x-method-index": 2,
       "x-ui-visibility": "advanced",
       "x-dmesh-device": true,
-      "x-tier": "debug"
+      "x-tier": "debug",
+      "x-check-all": null,
+      "x-check-all-platforms": null
     },
     {
       "name": "object.flash",
@@ -2775,7 +2794,10 @@
         "internal"
       ],
       "x-dmesh-device": true,
-      "x-tier": "internal"
+      "x-tier": "internal",
+      "x-ui-visibility": "advanced",
+      "x-check-all": null,
+      "x-check-all-platforms": null
     },
     {
       "description": "Return aggregate QUIC counters for live associations",
@@ -2883,41 +2905,11 @@
         "unavailable",
         "internal"
       ],
-      "x-tier": "internal"
-    },
-    {
-      "description": "Return QUIC transport state for each live association",
-      "inputSchema": {
-        "properties": {},
-        "required": [],
-        "type": "object"
-      },
-      "name": "telemetry.quic_associations",
-      "outputSchema": {
-        "properties": {
-          "associations": {
-            "type": "array",
-            "x-protobuf-index": 1,
-            "x-protobuf-type": "QuicAssociation[]"
-          }
-        },
-        "required": [],
-        "type": "object"
-      },
-      "x-component-index": 7,
-      "x-method-index": 8,
-      "x-standard-errors": [
-        "unauthenticated",
-        "permission_denied",
-        "timeout",
-        "remote_exception",
-        "invalid_argument",
-        "not_found",
-        "conflict",
-        "unavailable",
-        "internal"
-      ],
-      "x-tier": "internal"
+      "x-tier": "internal",
+      "x-dmesh-device": true,
+      "x-ui-visibility": "advanced",
+      "x-check-all": null,
+      "x-check-all-platforms": null
     },
     {
       "description": "Return software version and hardware capacity",
@@ -2964,6 +2956,44 @@
       },
       "x-component-index": 7,
       "x-method-index": 13,
+      "x-standard-errors": [
+        "unauthenticated",
+        "permission_denied",
+        "timeout",
+        "remote_exception",
+        "invalid_argument",
+        "not_found",
+        "conflict",
+        "unavailable",
+        "internal"
+      ],
+      "x-tier": "internal",
+      "x-dmesh-device": true,
+      "x-ui-visibility": "advanced",
+      "x-check-all": null,
+      "x-check-all-platforms": null
+    },
+    {
+      "description": "Return QUIC transport state for each live association",
+      "inputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "telemetry.quic_associations",
+      "outputSchema": {
+        "properties": {
+          "associations": {
+            "type": "array",
+            "x-protobuf-index": 1,
+            "x-protobuf-type": "QuicAssociation[]"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "x-component-index": 7,
+      "x-method-index": 8,
       "x-standard-errors": [
         "unauthenticated",
         "permission_denied",

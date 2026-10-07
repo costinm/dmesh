@@ -225,7 +225,6 @@ workflow needs to call lmesh directly: dmesh-cli lmesh wifi.interface.list.
 For a direct bootstrap diagnostic while owning a local serial port:
 
 ~~~sh
-dmesh-cli SERIAL --msg 'transport.set mode=nan now=1' # Send one direct tagged control record.
 ~~~
 
 Normal API calls use tagged service streams over QUIC, including relay paths.
