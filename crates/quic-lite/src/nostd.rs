@@ -19,7 +19,7 @@ use crate::{
 
 struct IngressQueue<B> {
     packets: Mutex<VecDeque<crate::bearer::ReceivedPacket<B>>>,
-    capacity: usize,
+    capacity: AtomicUsize,
     enqueue_drops: AtomicUsize,
 }
 
@@ -27,13 +27,37 @@ impl<B> IngressQueue<B> {
     fn new(capacity: usize) -> Self {
         Self {
             packets: Mutex::new(VecDeque::with_capacity(capacity)),
-            capacity,
+            capacity: AtomicUsize::new(capacity),
             enqueue_drops: AtomicUsize::new(0),
         }
     }
 
     fn pop(&self) -> Option<crate::bearer::ReceivedPacket<B>> {
         self.packets.lock().pop_front()
+    }
+
+    fn pop_matching(&self, mut eligible: impl FnMut(&crate::bearer::ReceivedPacket<B>) -> bool)
+        -> Option<crate::bearer::ReceivedPacket<B>>
+    {
+        let mut packets = self.packets.lock();
+        let index = packets.iter().position(|packet| eligible(packet))?;
+        packets.remove(index)
+    }
+
+    /// Only the serialized owner may allocate receive metadata. A heap pool
+    /// can grow after registration; keeping the initial queue ceiling would
+    /// discard bursts despite having packet buffers available. Failed growth
+    /// keeps the old admission limit and callbacks never allocate or wait.
+    fn reserve_for_pool(&self, capacity: usize) {
+        let capacity = capacity.max(1);
+        if self.capacity.load(Ordering::Acquire) == capacity {
+            return;
+        }
+        let mut packets = self.packets.lock();
+        let additional = capacity.saturating_sub(packets.len());
+        if packets.try_reserve(additional).is_ok() {
+            self.capacity.store(capacity, Ordering::Release);
+        }
     }
 
     fn take_enqueue_drops(&self) -> usize {
@@ -52,7 +76,7 @@ impl<B: AsRef<[u8]> + Send> crate::bearer::PacketIngressQueue<B> for IngressQueu
             drop(packet);
             return;
         };
-        if packets.len() == self.capacity {
+        if packets.len() >= self.capacity.load(Ordering::Acquire) {
             self.enqueue_drops.fetch_add(1, Ordering::Relaxed);
             drop(packet);
         } else {
@@ -250,6 +274,50 @@ mod tests {
     }
 
     #[test]
+    fn established_ingress_drains_while_another_bearer_retains_blocked_egress() {
+        static CLIENT: Pool = Pool::new();
+        static SERVER: Pool = Pool::new();
+        let (outgoing, incoming, mut network) = FakePacketBearer::<Pool>::pair_with_network(
+            BearerName::new("client").unwrap(), BearerName::new("server").unwrap(),
+            FakeNetworkConfig::default(),
+        );
+        let mut client: NoStdRuntime<Pool> = NoStdRuntime::new(QuicNode::new(&CLIENT), ConnectionLimits::default());
+        let mut server: NoStdRuntime<Pool> = NoStdRuntime::new(QuicNode::new(&SERVER), ConnectionLimits::default());
+        let bearer = client.add_bearer(outgoing).unwrap();
+        server.add_bearer(incoming).unwrap();
+        let association = client.associate(PacketMeta {
+            bearer, peer_l2_address: PeerL2Address::new(1).unwrap(), received_at_us: 0,
+        }, 0).unwrap();
+        for _ in 0..8 {
+            network.advance_to(0);
+            client.progress_all().unwrap();
+            server.progress_all().unwrap();
+        }
+        assert!(client.association_is_established(association));
+        let mut stream = client.open_stream(association).unwrap();
+        client.write_stream(&mut stream, b"request").unwrap();
+        network.advance_to(0);
+        server.progress_all().unwrap();
+        let mut response = server.next_stream_chunk().unwrap().stream;
+        server.write_stream(&mut response, b"response").unwrap();
+        network.advance_to(0);
+
+        let context = Arc::new(Mutex::new(None));
+        let blocked = client.add_bearer(ToggleBlocker {
+            context, blocked: Arc::new(AtomicBool::new(true)),
+        }).unwrap();
+        let mut writer = PacketPool::acquire_writer(&CLIENT, crate::PACKET_PREFIX_RESERVE, 0).unwrap();
+        writer.payload_mut()[0] = 42;
+        let packet = crate::PacketWriter::commit(writer, 1).unwrap();
+        client.node.submit_egress(blocked, PeerL2Address::new(1).unwrap(), packet).unwrap();
+        assert!(!client.node.can_progress_ingress());
+        assert!(client.progress_all().unwrap() > 0);
+        assert_eq!(client.next_stream_chunk().unwrap().bytes, b"response");
+        assert!(client.ingress.packets.lock().is_empty());
+        assert!(!client.node.can_progress_ingress(), "blocked lease remains retained");
+    }
+
+    #[test]
     fn blocked_egress_pauses_ingress_until_bearer_readiness() {
         let context = Arc::new(Mutex::new(None));
         let blocked = Arc::new(AtomicBool::new(true));
@@ -365,6 +433,355 @@ mod tests {
         run_virtual_single_path_stream_baseline(true);
     }
 
+    #[test]
+    fn pacing_timer_without_transport_packet_unblocks_application_write() {
+        type Pool = FixedPool<16, { crate::DEFAULT_PACKET_POOL_SLOT_SIZE }>;
+        static CLIENT_POOL: Pool = Pool::new();
+        static SERVER_POOL: Pool = Pool::new();
+        let (outgoing, incoming, mut network) = FakePacketBearer::<Pool>::pair_with_network(
+            BearerName::new("paced-client").unwrap(),
+            BearerName::new("paced-server").unwrap(),
+            FakeNetworkConfig::default(),
+        );
+        let mut client: NoStdRuntime<Pool> =
+            NoStdRuntime::new(QuicNode::new(&CLIENT_POOL), ConnectionLimits::default());
+        let mut server: NoStdRuntime<Pool> =
+            NoStdRuntime::new(QuicNode::new(&SERVER_POOL), ConnectionLimits::default());
+        let mut limits = crate::AssociationLimits::host();
+        limits.pacing.max_burst_packets = 1;
+        client.set_default_association_limits(limits).unwrap();
+        let bearer = client.add_bearer(outgoing).unwrap();
+        server.add_bearer(incoming).unwrap();
+        let association = client
+            .associate(
+                PacketMeta {
+                    bearer,
+                    peer_l2_address: PeerL2Address::new(1).unwrap(),
+                    received_at_us: 0,
+                },
+                0,
+            )
+            .unwrap();
+        for _ in 0..16 {
+            network.advance_to(0);
+            client.progress_all().unwrap();
+            server.progress_all().unwrap();
+            client.advance_time(0).unwrap();
+            server.advance_time(0).unwrap();
+        }
+        assert!(client.association_is_established(association));
+        let mut stream = client.open_stream(association).unwrap();
+        assert_eq!(client.write_stream(&mut stream, &[1; 500]).unwrap(), 500);
+        // Release physical submission capacity without letting the server
+        // consume or acknowledge the data. The next block is pacing alone.
+        network.advance_to(0);
+        client.progress_all().unwrap();
+        assert!(
+            client
+                .write_stream(&mut stream, &[2; 500])
+                .unwrap_err()
+                .is_retryable()
+        );
+        // The owner can have valid receive work queued while its producer
+        // is pacing-blocked. It must be able to service the actual timer
+        // without first draining that backlog (which could keep refilling).
+        server.progress_all().unwrap();
+        let mut incoming = server.next_stream_chunk().unwrap().stream;
+        network.advance_to(0);
+        server.progress_all().unwrap();
+        assert_eq!(server.write_stream(&mut incoming, b"reply").unwrap(), 5);
+        network.advance_to(0);
+        let queued = client.ingress.packets.lock().len();
+        assert!(queued > 0);
+        let deadline = client.next_deadline().unwrap();
+        assert!(!client.advance_time(deadline - 1).unwrap());
+        assert_eq!(client.next_deadline(), Some(deadline), "future pacing wake remains armed");
+        // Do not consume the queued response/ACK. Only the pacing clock
+        // changes; its expiry is sufficient to retry the same pending bytes.
+        assert!(!client.advance_time(deadline).unwrap());
+        assert_eq!(client.ingress.packets.lock().len(), queued,
+            "timer progress does not require consuming queued stream/ACK packets");
+        assert!(client.next_deadline().is_none_or(|next| next > deadline),
+            "an expired pacing wake must not stay armed if the application cannot immediately retry");
+        assert_eq!(client.write_stream(&mut stream, &[2; 500]).unwrap(), 500);
+        network.advance_to(deadline);
+        client.progress_all().unwrap();
+        assert!(client.write_stream(&mut stream, &[3; 500]).unwrap_err().is_retryable());
+        assert!(client.next_deadline().is_some_and(|next| next > deadline),
+            "a new pacing rejection must rearm its one-shot wake");
+    }
+
+    #[test]
+    fn heap_pool_growth_expands_no_std_ingress_without_callback_allocation() {
+        type Pool = crate::heap_packet_pool::HeapPacketPool<32, { crate::DEFAULT_PACKET_POOL_SLOT_SIZE }>;
+        static POOL: Pool = Pool::new();
+        POOL.resize(8).unwrap();
+        let mut runtime: NoStdRuntime<Pool> =
+            NoStdRuntime::new(QuicNode::new(&POOL), ConnectionLimits::default());
+        POOL.resize(32).unwrap();
+        assert!(!runtime.progress().unwrap());
+        let capacity = runtime.ingress.packets.lock().capacity();
+        for _ in 0..16 {
+            let mut writer = crate::PacketPool::acquire_writer(&POOL, crate::PACKET_PREFIX_RESERVE, 0).unwrap();
+            crate::PacketWriter::payload_mut(&mut writer)[0] = 0x40;
+            let packet = crate::PacketWriter::commit(writer, 1).unwrap();
+            runtime.ingress.enqueue_packet(PacketMeta {
+                bearer: crate::BearerId::new(1).unwrap(),
+                peer_l2_address: PeerL2Address::new(1).unwrap(),
+                received_at_us: 1,
+            }, packet);
+        }
+        assert_eq!(runtime.ingress.take_enqueue_drops(), 0);
+        assert_eq!(runtime.ingress.packets.lock().len(), 16);
+        assert_eq!(runtime.ingress.packets.lock().capacity(), capacity,
+            "receive callback must only use owner-reserved metadata storage");
+        while runtime.ingress.pop().is_some() {}
+        POOL.resize(8).unwrap();
+    }
+
+    #[test]
+    fn ingress_pool_shrink_preserves_queued_packets_and_withholds_new_admission() {
+        let queue = IngressQueue::new(16);
+        let meta = PacketMeta {
+            bearer: crate::BearerId::new(1).unwrap(),
+            peer_l2_address: PeerL2Address::new(1).unwrap(),
+            received_at_us: 1,
+        };
+        for _ in 0..8 {
+            queue.enqueue_packet(meta, OwnedPacket::new([0x40], 0..1).unwrap());
+        }
+        queue.reserve_for_pool(4);
+        queue.enqueue_packet(meta, OwnedPacket::new([0x40], 0..1).unwrap());
+        assert_eq!(queue.take_enqueue_drops(), 1);
+        assert_eq!(queue.packets.lock().len(), 8, "shrink must not discard retained leases");
+        for _ in 0..5 { assert!(queue.pop().is_some()); }
+        queue.enqueue_packet(meta, OwnedPacket::new([0x40], 0..1).unwrap());
+        assert_eq!(queue.packets.lock().len(), 4);
+        assert_eq!(queue.take_enqueue_drops(), 0);
+    }
+
+    #[test]
+    fn lossless_embedded_duplex_probe_uses_fast_link_without_stop_and_wait() {
+        assert!(run_embedded_duplex_probe(false) > 5.0);
+    }
+
+    #[test]
+    fn embedded_duplex_probe_recovers_initial_receive_burst_loss() {
+        assert!(run_embedded_duplex_probe(true) > 1.0);
+    }
+
+    fn run_embedded_duplex_probe(burst_loss: bool) -> f64 {
+        run_embedded_duplex_probe_with_pressure(burst_loss, false, false, false)
+    }
+
+    #[test]
+    fn embedded_duplex_probe_recovers_jitter_loss_and_retryable_pressure() {
+        // Unlike the fast, deterministic control, exercise variable ACK
+        // arrival and temporary bearer refusals with the embedded ledger.
+        assert!(run_embedded_duplex_probe_with_pressure(false, true, true, true) > 1.0);
+    }
+
+    #[test]
+    fn embedded_duplex_probe_recovers_lossless_jitter_and_retryable_pressure() {
+        assert!(run_embedded_duplex_probe_with_pressure(false, true, false, true) > 0.1);
+    }
+
+    #[test]
+    fn embedded_duplex_probe_recovers_lossless_jitter_without_pressure() {
+        // Reordering must not repeatedly collapse the window on a lossless
+        // link. This deterministic seed previously achieved only 0.544 Mbps.
+        assert!(run_embedded_duplex_probe_with_pressure(false, false, false, true) > 1.5);
+    }
+
+    #[test]
+    fn embedded_duplex_probe_recovers_pressure_without_jitter() {
+        assert!(run_embedded_duplex_probe_with_pressure(false, true, false, false) > 0.1);
+    }
+
+    fn run_embedded_duplex_probe_with_pressure(burst_loss: bool, pressure: bool, random_loss: bool, jitter: bool) -> f64 {
+        run_embedded_duplex_probe_with_faults(burst_loss, pressure, random_loss, jitter, false)
+    }
+
+    #[test]
+    fn embedded_duplex_probe_recovers_late_server_loss_with_pressure() {
+        assert!(run_embedded_duplex_probe_with_faults(false, true, false, false, true) > 0.1);
+    }
+
+    fn run_embedded_duplex_probe_with_faults(burst_loss: bool, pressure: bool, random_loss: bool, jitter: bool, late_server_loss: bool) -> f64 {
+        type Pool = crate::heap_packet_pool::HeapPacketPool<128, { crate::DEFAULT_PACKET_POOL_SLOT_SIZE }>;
+        type Runtime = NoStdRuntime<Pool>;
+        static CLIENT_POOL: Pool = Pool::new();
+        static SERVER_POOL: Pool = Pool::new();
+        static LOSS_CLIENT_POOL: Pool = Pool::new();
+        static LOSS_SERVER_POOL: Pool = Pool::new();
+        static PRESSURE_CLIENT_POOL: Pool = Pool::new();
+        static PRESSURE_SERVER_POOL: Pool = Pool::new();
+        static JITTER_CLIENT_POOL: Pool = Pool::new();
+        static JITTER_SERVER_POOL: Pool = Pool::new();
+        static JITTER_ONLY_CLIENT_POOL: Pool = Pool::new();
+        static JITTER_ONLY_SERVER_POOL: Pool = Pool::new();
+        static PRESSURE_ONLY_CLIENT_POOL: Pool = Pool::new();
+        static PRESSURE_ONLY_SERVER_POOL: Pool = Pool::new();
+        static LATE_LOSS_CLIENT_POOL: Pool = Pool::new();
+        static LATE_LOSS_SERVER_POOL: Pool = Pool::new();
+        let (client_pool, server_pool) = if late_server_loss {
+            (&LATE_LOSS_CLIENT_POOL, &LATE_LOSS_SERVER_POOL)
+        } else if jitter && !pressure {
+            (&JITTER_ONLY_CLIENT_POOL, &JITTER_ONLY_SERVER_POOL)
+        } else if pressure && !jitter {
+            (&PRESSURE_ONLY_CLIENT_POOL, &PRESSURE_ONLY_SERVER_POOL)
+        } else if pressure && !random_loss {
+            (&JITTER_CLIENT_POOL, &JITTER_SERVER_POOL)
+        } else if pressure {
+            (&PRESSURE_CLIENT_POOL, &PRESSURE_SERVER_POOL)
+        } else if burst_loss {
+            (&LOSS_CLIENT_POOL, &LOSS_SERVER_POOL)
+        } else {
+            (&CLIENT_POOL, &SERVER_POOL)
+        };
+        client_pool.resize(96).unwrap();
+        server_pool.resize(96).unwrap();
+        let profile = FakeLinkProfile {
+            latency_us: if pressure || jitter { 10_000 } else { 1_000 },
+            jitter_us: if jitter { 75_000 } else { 0 },
+            loss_per_million: if random_loss { 20_000 } else { 0 },
+            would_block_every: if pressure { 7 } else { 0 },
+            readiness_delay_us: 1_000,
+            bitrate_bps: 40_000_000,
+            completion_delay_us: 50,
+            ..FakeLinkProfile::default()
+        };
+        let (outgoing, incoming, mut network) = FakePacketBearer::<Pool>::pair_with_network(
+            BearerName::new("duplex-host").unwrap(),
+            BearerName::new("duplex-embedded").unwrap(),
+            FakeNetworkConfig {
+                first_to_second: FakeLinkProfile {
+                    loss_burst_start_packet: if burst_loss { 5 } else { 0 },
+                    loss_burst_packets: if burst_loss { 2 } else { 0 },
+                    ..profile
+                },
+                second_to_first: FakeLinkProfile {
+                    loss_burst_start_packet: if late_server_loss { 900 } else { 0 },
+                    loss_burst_packets: if late_server_loss { 4 } else { 0 },
+                    ..profile
+                },
+                ..FakeNetworkConfig::default()
+            },
+        );
+        let mut embedded = crate::AssociationLimits::embedded();
+        embedded.history_packets = 32;
+        embedded.transmission_records = 64;
+        embedded.connection.max_stream_data = 16 * 1024;
+        let mut client: Runtime = Runtime::new(QuicNode::new(client_pool), ConnectionLimits::default());
+        let mut server: Runtime = Runtime::new(QuicNode::new(server_pool), embedded.connection);
+        client.set_default_association_limits(crate::AssociationLimits::host()).unwrap();
+        server.set_default_association_limits(embedded).unwrap();
+        let bearer = client.add_bearer(outgoing).unwrap();
+        server.add_bearer(incoming).unwrap();
+        let association = client.associate(PacketMeta {
+            bearer, peer_l2_address: PeerL2Address::new(1).unwrap(), received_at_us: 0,
+        }, 0).unwrap();
+        let total = 1024 * 1024;
+        let mut payload = alloc::vec![0; total];
+        assert_eq!(crate::probe::ProbePayload::new(total as u64, 1024).unwrap().fill(&mut payload), total);
+        let mut upload_reader = crate::probe::ProbePayload::new(total as u64, 1024).unwrap();
+        let mut download_reader = crate::probe::ProbePayload::new(total as u64, 1024).unwrap();
+        let mut local = None;
+        let mut remote = None;
+        let (mut uploaded, mut downloaded) = (0, 0);
+        let (mut upload_received, mut download_received) = (0, 0);
+        let (mut upload_fin, mut download_fin) = (false, false);
+        let (mut upload_sent_fin, mut download_sent_fin) = (false, false);
+        let mut start_us = 0;
+        let mut completed_us = None;
+        let send = |runtime: &mut Runtime, stream: &mut crate::QuicStream, sent: &mut usize, fin: &mut bool| {
+            for _ in 0..16 {
+                if *fin { break; }
+                let end = (*sent + 1024).min(total);
+                let result = if end == total {
+                    runtime.write_stream_and_finish(stream, &payload[*sent..end])
+                } else {
+                    runtime.write_stream(stream, &payload[*sent..end])
+                };
+                match result {
+                    Ok(count) => { *sent += count; *fin = *sent == total; }
+                    Err(error) if error.is_retryable() => break,
+                    Err(error) => panic!("duplex write: {error:?}"),
+                }
+            }
+        };
+        fn allow_retry<T>(result: Result<T, crate::QuicNodeEgressError>) {
+            if let Err(error) = result {
+                assert!(error.is_retryable(), "duplex owner: {error:?}");
+            }
+        }
+        // Late-loss regression includes millisecond owner latency rather than
+        // masking scheduling trouble with the usual 100us simulator cadence.
+        for now_us in (0..if pressure || jitter { 60_000_000 } else { 20_000_000 })
+            .step_by(if late_server_loss { 3_000 } else { 100 }) {
+            network.advance_to(now_us);
+            if !late_server_loss || client.next_deadline().is_some_and(|deadline| deadline <= now_us) {
+                allow_retry(client.advance_time(now_us));
+            }
+            if !late_server_loss || server.next_deadline().is_some_and(|deadline| deadline <= now_us) {
+                allow_retry(server.advance_time(now_us));
+            }
+            allow_retry(client.progress_all_with_stream(|_, offset, fin, bytes| {
+                assert_eq!(offset, download_received as u64);
+                download_reader.check(bytes).unwrap();
+                download_received += bytes.len();
+                download_fin |= fin;
+                Ok(bytes.len())
+            }));
+            allow_retry(server.progress_all_with_stream(|stream, offset, fin, bytes| {
+                assert_eq!(offset, upload_received as u64);
+                upload_reader.check(bytes).unwrap();
+                upload_received += bytes.len();
+                upload_fin |= fin;
+                if remote.is_none() { remote = Some(stream); }
+                Ok(bytes.len())
+            }));
+            if local.is_none() && client.association_is_established(association) {
+                local = Some(client.open_stream(association).unwrap());
+                start_us = now_us;
+            }
+            if let Some(stream) = local.as_mut() { send(&mut client, stream, &mut uploaded, &mut upload_sent_fin); }
+            if let Some(stream) = remote.as_mut() { send(&mut server, stream, &mut downloaded, &mut download_sent_fin); }
+            if upload_fin && download_fin {
+                completed_us = Some(now_us);
+                break;
+            }
+        }
+        let elapsed_us = completed_us.expect("duplex probe must finish").saturating_sub(start_us);
+        let mbps = (2 * total) as f64 * 8.0 / elapsed_us as f64;
+        let mut circuit = [CircuitInfo::default(); 1];
+        client.circuits(association, &mut circuit);
+        let transport = client.association_telemetry(association).unwrap().transport;
+        eprintln!("loss_reasons packet={} time={}", transport.loss_packet_threshold_packets, transport.loss_time_threshold_packets);
+        eprintln!("embedded_duplex burst_loss={burst_loss} pressure={pressure} jitter={jitter} random_loss={random_loss} mbps={mbps:.3} elapsed_us={elapsed_us} cwnd={} rtt_us={} lost={} spurious={} retransmitted={} network={:?}",
+            circuit[0].cwnd_bytes, circuit[0].srtt_us, circuit[0].packets_lost, circuit[0].spurious_losses, circuit[0].retransmitted_packets, network.stats());
+        assert_eq!(upload_received, total);
+        assert_eq!(download_received, total);
+        if late_server_loss {
+            let server_association = remote.as_ref().unwrap().association().unwrap();
+            let server_transport = server.association_telemetry(server_association).unwrap().transport;
+            assert!(server_transport.retransmitted_packets > 0,
+                "late loss must exercise data repair, not only disposable ACK loss");
+        }
+        if pressure {
+            assert!(network.stats().would_block > 0);
+        } else {
+            assert_eq!(network.stats().would_block, 0);
+        }
+        if random_loss {
+            assert!(network.stats().loss_drops > 0);
+        } else {
+            assert_eq!(network.stats().loss_drops,
+                (if burst_loss { 2 } else { 0 }) + (if late_server_loss { 4 } else { 0 }));
+        }
+        mbps
+    }
+
     fn run_virtual_single_path_stream_baseline(burst_loss: bool) {
         let profile = FakeLinkProfile {
             latency_us: 3_000,
@@ -383,10 +800,12 @@ mod tests {
                 BearerName::new("baseline-c").unwrap(),
                 BearerName::new("baseline-s").unwrap(),
                 FakeNetworkConfig {
-                    first_to_second: profile,
-                    second_to_first: FakeLinkProfile {
+                    first_to_second: FakeLinkProfile {
                         loss_burst_start_packet: if burst_loss { 10 } else { 0 },
                         loss_burst_packets: if burst_loss { 3 } else { 0 },
+                        ..profile
+                    },
+                    second_to_first: FakeLinkProfile {
                         would_block_every: 7,
                         readiness_delay_us: 1_000,
                         ..profile
@@ -415,7 +834,9 @@ mod tests {
             )
             .unwrap();
 
-        let payload = (0..8192)
+        // Exercise the data-direction burst (packets 10..12) independently
+        // of how many redundant ACKs the receiver chooses to send.
+        let payload = (0..32768)
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>();
         let mut received = Vec::with_capacity(payload.len());
@@ -2219,6 +2640,8 @@ mod tests {
         let mut completion_time_us = None;
         let mut loss_injected_at_us = None;
         let mut loss_detected_at_us = None;
+        let mut last_loss_detected_at_us = None;
+        let mut previous_loss_counts = [0; 2];
         let mut fast_pto_timeout_us = None;
         let mut fast_suspended = false;
         let mut ack_eviction = None;
@@ -2420,6 +2843,12 @@ mod tests {
                 || (forward_outage && fast_suspended)
             {
                 loss_detected_at_us.get_or_insert(now_us);
+            }
+            for (path_id, circuit) in circuits[..circuit_count].iter().enumerate() {
+                if circuit.packets_lost > previous_loss_counts[path_id] {
+                    last_loss_detected_at_us = Some(now_us);
+                }
+                previous_loss_counts[path_id] = circuit.packets_lost;
             }
             let flight_empty = circuits[..circuit_count]
                 .iter()
@@ -2652,9 +3081,19 @@ mod tests {
                 "lost application data must be repaired on the alternate circuit"
             );
             if forward_burst || forward_outage || reverse_outage || p5_seeded_loss {
+                // Seeded losses occur throughout the transfer, not in one
+                // initial burst. A loss of a later packet cannot recover
+                // within one RTT of detecting an earlier unrelated loss.
+                // Keep the original first-loss bound for burst/outage cases;
+                // measure the final detected loss for the ongoing-loss case.
+                let recovery_start_us = if p5_seeded_loss {
+                    last_loss_detected_at_us.unwrap()
+                } else {
+                    loss_detected_at_us.unwrap()
+                };
                 let recovery_delay_us = completion_time_us
                     .unwrap()
-                    .saturating_sub(loss_detected_at_us.unwrap());
+                    .saturating_sub(recovery_start_us);
                 let receiver_scheduling_budget_us = if p5_seeded_loss { 35_000 } else { 25_000 };
                 let surviving_delivery_budget_us =
                     u64::from(circuits[1].srtt_us) + receiver_scheduling_budget_us;
@@ -2681,15 +3120,37 @@ mod tests {
         } else {
             (15_000..=25_000, 50_000..=70_000)
         };
+        // The first RTT sample includes delayed-ACK time: there is not yet
+        // a measured minimum against which to subtract it. Piggybacking can
+        // retire earlier flight across the fast path, leaving the slow FIN
+        // as that first matched sample. Account only for delay actually
+        // allowed by the receiver's ACK policy, not an arbitrary wider RTT
+        // tolerance. The ACK's reported delay can refer to a newer ACK-only
+        // packet in the same range, rather than that older STREAM sample.
+        let slow_reported_ack_delay = slow_ack_capture.lock().unwrap().iter().map(|packet| {
+            let (_, mut offset) = crate::ShortHeader::decode(packet).unwrap();
+            let mut largest_delay = 0;
+            while offset < packet.len() {
+                let (frame, used) = crate::decode_frame(&packet[offset..]).unwrap();
+                if let crate::Frame::Ack { delay, .. } | crate::Frame::AckRanges { delay, .. } = frame {
+                    largest_delay = largest_delay.max(delay);
+                }
+                offset += used;
+            }
+            largest_delay
+        }).max().unwrap_or(0);
+        assert!(slow_reported_ack_delay <= 25_000);
+        let receiver_ack_delay = server.node.max_ack_delay_for_test(server_association.unwrap()).unwrap();
         assert!(
             fast_rtt_range.contains(&circuits[0].srtt_us),
             "fast path RTT was {} us",
             circuits[0].srtt_us
         );
         assert!(
-            slow_rtt_range.contains(&circuits[1].srtt_us),
-            "slow path RTT was {} us",
-            circuits[1].srtt_us
+            (*slow_rtt_range.start()..=(*slow_rtt_range.end() as u32).saturating_add(receiver_ack_delay as u32))
+                .contains(&circuits[1].srtt_us),
+            "slow path RTT was {} us with {} us reported ACK delay",
+            circuits[1].srtt_us, slow_reported_ack_delay
         );
         assert!(peak_client_leases > 0 && peak_server_leases > 0);
         assert!(peak_client_leases <= client.node.packet_capacity());
@@ -3371,14 +3832,22 @@ where
     ///
     /// An RTOS task calls this after its bearer wake notification. Returning
     /// `true` means one packet was consumed; returning `false` means ingress
-    /// was empty or is paused until a retained egress packet can be retried.
+    /// was empty or only packets requiring immediate output remain while
+    /// egress is blocked. Established endpoint traffic can still release
+    /// receive leases and apply ACKs; its control output is deferred.
     /// The method does not wait or poll in a loop.
     pub fn progress(&mut self) -> Result<bool, QuicNodeEgressError> {
+        self.ingress.reserve_for_pool(self.node.packet_capacity());
         self.node.drain_bearer_events();
-        if !self.node.can_progress_ingress() {
-            return Ok(false);
+        if self.node.retry_one_pending_control()? {
+            return Ok(true);
         }
-        let Some(received) = self.ingress.pop() else {
+        let received = if self.node.can_progress_ingress() {
+            self.ingress.pop()
+        } else {
+            self.ingress.pop_matching(|packet| self.node.ingress_can_defer_output(packet.packet.bytes()))
+        };
+        let Some(received) = received else {
             return Ok(false);
         };
         self.process_packet::<fn(crate::QuicStream, u64, bool, &[u8]) -> Result<usize, crate::Error>>(
@@ -3415,6 +3884,7 @@ where
     where
         F: FnMut(crate::QuicStream, u64, bool, &[u8]) -> Result<usize, crate::Error>,
     {
+        self.ingress.reserve_for_pool(self.node.packet_capacity());
         self.node.drain_bearer_events();
         // Control generated by a consumed application chunk may have been
         // deferred while a bearer retained its previous packet. Retry it on
@@ -3422,13 +3892,15 @@ where
         if self.node.retry_one_pending_control()? {
             return Ok(true);
         }
-        // Processing another packet can itself generate an ACK or flow-control
-        // packet. Leave ingress queued until any previously blocked egress is
-        // retried, rather than submitting past the bearer-owned retained slot.
-        if !self.node.can_progress_ingress() {
-            return Ok(false);
-        }
-        let Some(received) = self.ingress.pop() else {
+        // Established traffic may release ACKed storage and queued RX leases
+        // even while a WouldBlock packet is retained. Its ACK/credit output is
+        // deferred; setup/relay/path-control still waits for output admission.
+        let received = if self.node.can_progress_ingress() {
+            self.ingress.pop()
+        } else {
+            self.ingress.pop_matching(|packet| self.node.ingress_can_defer_output(packet.packet.bytes()))
+        };
+        let Some(received) = received else {
             return Ok(false);
         };
         self.process_packet(received.meta, received.packet, Some(&mut on_stream))?;
@@ -3453,7 +3925,11 @@ where
     }
 
     /// Advance transport timers and retain any terminal association event.
+    /// The boolean reports transport work, not application write readiness.
+    /// Owners must retry pending writes after an expired deadline even when
+    /// this returns false: a pacing refill need not generate a timer packet.
     pub fn advance_time(&mut self, now_us: u64) -> Result<bool, QuicNodeEgressError> {
+        self.ingress.reserve_for_pool(self.node.packet_capacity());
         self.node.advance_clock(now_us);
         match self.node.timer_expired(now_us)? {
             Some(crate::node::NodeTimer::Egress(packet)) => {
@@ -3579,7 +4055,7 @@ where
             NodeIngress::Association { association, .. }
             | NodeIngress::Datagram { association } => {
                 self.node
-                    .submit_or_defer_control(association.association())?;
+                    .defer_control(association.association())?;
             }
             NodeIngress::StatelessReset { response } => self.node.submit_egress(
                 response.bearer,

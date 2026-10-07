@@ -12,7 +12,7 @@
 pub use crate::probe_service::{
     PROBE_COMPONENT, PROBE_MAX_BYTES, PROBE_MAX_NORMAL_STREAMS, PROBE_START, PROBE_REQUEST_MAX,
     PROBE_HANDLER, ProbeClientError, ProbeDestination, ProbeResponseReader, ProbeServicePlan,
-    ProbeServiceRequest, ProbeHandler, decode_probe_start_record, decode_probe_handler_record,
+    ProbeServiceRequest, ProbeDirection, ProbeHandler, decode_probe_start_record, decode_probe_handler_record,
     encode_probe_result_response, probe_timeout_ms, encode_probe_start_request, encode_probe_handler_request,
     encode_probe_handler_response,
 };

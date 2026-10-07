@@ -1230,10 +1230,20 @@ where
         }
         while let Some(id) = self.completions.pop_ready() {
             progressed = true;
+            #[cfg(feature = "tokio")]
+            let capture_offset = self.packet_capture.as_ref().and_then(|capture| {
+                self.bearers.get_mut(id)?.pending_packet_bytes()
+                    .and_then(|bytes| capture.stage_egress(id, bytes))
+            });
             let accepted = self
                 .bearers
                 .get_mut(id)
                 .and_then(|bearer| bearer.retry_pending());
+            #[cfg(feature = "tokio")]
+            if let (Some(capture), Some(offset)) = (&self.packet_capture, capture_offset) {
+                let submitted = self.bearers.get_mut(id).is_some_and(|bearer| !bearer.has_pending_submission());
+                capture.finish_egress(offset, submitted);
+            }
             if let Some(accepted) = accepted {
                 let control_copy = self.take_pending_control_copy(accepted);
                 self.record_packet_acceptance(accepted, self.clock_us);
@@ -1253,6 +1263,23 @@ where
             .iter()
             .filter(|bearer| bearer.state().enabled)
             .all(|bearer| bearer.can_submit())
+    }
+
+    /// Established endpoint traffic can release memory while egress is busy.
+    /// Setup, relay and path-control packets may require immediate output and
+    /// must retain their existing admission ordering.
+    pub(crate) fn ingress_can_defer_output(&self, bytes: &[u8]) -> bool {
+        // Ordinary accepted sends awaiting completion retain their historical
+        // scheduling. The deadlock escape is for an unaccepted WouldBlock
+        // packet, whose retry may depend on draining inbound ACKs/leases.
+        if !self.bearers.iter().any(|bearer| bearer.has_pending_submission()) {
+            return false;
+        }
+        if !matches!(classify_server_packet(bytes), Ok(ServerPacket::Established { .. })) {
+            return false;
+        }
+        matches!(self.router.target(bytes), Ok(RouterTarget::Endpoint(id)) if self.slot(*id).is_some())
+            && matches!(crate::decode_path_control_packet(bytes), Ok(None))
     }
 
     pub(crate) fn submit_egress(
@@ -1286,10 +1313,13 @@ where
             return Err(QuicNodeEgressError::BearerBusy);
         }
         #[cfg(feature = "tokio")]
-        if let Some(capture) = &self.packet_capture {
-            capture.record(false, bearer_id, packet.bytes());
-        }
+        let capture_offset = self.packet_capture.as_ref()
+            .and_then(|capture| capture.stage_egress(bearer_id, packet.bytes()));
         let accepted = bearer.submit_or_retain(peer, packet, acceptance);
+        #[cfg(feature = "tokio")]
+        if let (Some(capture), Some(offset)) = (&self.packet_capture, capture_offset) {
+            capture.finish_egress(offset, accepted);
+        }
         Ok(accepted)
     }
 
@@ -1303,9 +1333,6 @@ where
         let control_copy = acceptance.and_then(|acceptance| {
             self.control_duplication_candidate(acceptance, packet.packet.bytes())
         });
-        if let Some(slot) = self.slot_mut(packet.association) {
-            slot.last_activity_us = clock_us;
-        }
         let accepted = match self.submit_egress_tagged(
             packet.bearer,
             packet.peer_l2_address,
@@ -1385,6 +1412,11 @@ where
             Association::Client(client) => client.connection().endpoint()?,
             Association::Server(server) => &server.mux.endpoint,
         };
+        // No alternate path exists. Avoid a ledger scan and another decode
+        // of every ACK/MAX_* packet merely to discard the candidate later.
+        if endpoint.path_count() == 1 {
+            return None;
+        }
         if endpoint.is_proactive_duplicate(acceptance.packet_number) {
             return None;
         }
@@ -1448,18 +1480,28 @@ where
         let Some(slot) = self.slot_mut(acceptance.association) else {
             return;
         };
-        match &mut slot.state {
+        let ack_eliciting = match &mut slot.state {
             Association::Client(client) => {
                 if let Ok(endpoint) = client.connection_mut().endpoint_mut() {
-                    endpoint.packet_submission_accepted(acceptance.packet_number, now_us);
+                    let credit = endpoint.credit_packet_number == Some(acceptance.packet_number);
+                    endpoint.packet_submission_accepted(acceptance.packet_number, now_us) || credit
+                } else {
+                    false
                 }
             }
             Association::Server(server) => {
+                let credit = server.mux.endpoint.credit_packet_number == Some(acceptance.packet_number);
                 server
                     .mux
                     .endpoint
-                    .packet_submission_accepted(acceptance.packet_number, now_us);
+                    .packet_submission_accepted(acceptance.packet_number, now_us) || credit
             }
+        };
+        // Only the first accepted ack-eliciting send after peer activity
+        // restarts idle. Retransmissions cannot keep a silent peer alive.
+        if ack_eliciting && !slot.ack_eliciting_sent_since_receive {
+            slot.last_activity_us = slot.last_activity_us.max(now_us);
+            slot.ack_eliciting_sent_since_receive = true;
         }
     }
 
@@ -1474,6 +1516,9 @@ where
         let Some(endpoint) = endpoint else {
             return;
         };
+        if endpoint.path_count() == 1 {
+            return;
+        }
         let Some(source_path) = endpoint.proactive_copy_source_path(acceptance.packet_number)
         else {
             return;
@@ -1651,19 +1696,40 @@ where
     ) -> Result<(), QuicNodeEgressError> {
         match self.submit_pending_control(association) {
             Ok(()) => Ok(()),
-            Err(error) if error.is_retryable() => {
-                if !self.pending_controls.contains(&association) {
-                    if self.pending_controls.len() >= self.node_limits.max_associations
-                        || self.pending_controls.try_reserve(1).is_err()
-                    {
-                        return Err(QuicNodeEgressError::StreamEventsFull);
-                    }
-                    self.pending_controls.push_back(association);
-                }
-                Ok(())
-            }
+            Err(error) if error.is_retryable() => self.defer_control(association),
             Err(error) => Err(error),
         }
+    }
+
+    /// Give a ready application writer the remainder of this owner turn to
+    /// piggyback ACK/credit output. The next progress turn flushes anything
+    /// still due; transport deadlines remain armed even without new ingress.
+    pub(crate) fn defer_control(
+        &mut self,
+        association: QuicAssociation,
+    ) -> Result<(), QuicNodeEgressError> {
+        if !self.association_control_due(association)? {
+            return Ok(());
+        }
+        if !self.pending_controls.contains(&association) {
+            if self.pending_controls.len() >= self.node_limits.max_associations
+                || self.pending_controls.try_reserve(1).is_err()
+            {
+                return Err(QuicNodeEgressError::StreamEventsFull);
+            }
+            self.pending_controls.push_back(association);
+        }
+        Ok(())
+    }
+
+    fn association_control_due(&self, association: QuicAssociation) -> Result<bool, QuicNodeEgressError> {
+        let slot = self.slot(association).ok_or(QuicNodeError::MissingAssociation)?;
+        let endpoint = match &slot.state {
+            Association::Client(client) => client.connection().endpoint(),
+            Association::Server(server) => Some(&server.mux.endpoint),
+        };
+        Ok(endpoint.is_some_and(|endpoint| endpoint.pending_control_path().is_some()
+            || endpoint.pending_path_status(self.clock_us()).is_some()))
     }
 
     /// Retry at most one deferred association control packet.
@@ -1672,17 +1738,23 @@ where
     /// call this after a bearer readiness or packet-completion event without
     /// constructing a polling loop inside the protocol state machine.
     pub(crate) fn retry_one_pending_control(&mut self) -> Result<bool, QuicNodeEgressError> {
-        let Some(association) = self.pending_controls.pop_front() else {
-            return Ok(false);
-        };
-        match self.submit_pending_control(association) {
-            Ok(()) => Ok(true),
-            Err(error) if error.is_retryable() => {
-                self.pending_controls.push_front(association);
-                Ok(false)
+        while let Some(association) = self.pending_controls.pop_front() {
+            // Application output may already have piggybacked this intent.
+            // Retire such entries without borrowing a pool packet or
+            // reporting another owner turn of fictitious transmit progress.
+            if !self.association_control_due(association)? {
+                continue;
             }
-            Err(error) => Err(error),
+            return match self.submit_pending_control(association) {
+                Ok(()) => Ok(true),
+                Err(error) if error.is_retryable() => {
+                    self.pending_controls.push_front(association);
+                    Ok(false)
+                }
+                Err(error) => Err(error),
+            };
         }
+        Ok(false)
     }
 }
 
@@ -1714,6 +1786,7 @@ struct AssociationSlot<Client, Server> {
     bootstrap: Option<ClientBootstrap>,
     close_code: Option<u64>,
     last_activity_us: u64,
+    ack_eliciting_sent_since_receive: bool,
     client_delivery: crate::callback::CallbackStreams<Arc<Vec<u8>>>,
     limits: AssociationLimits,
 }
@@ -2752,6 +2825,7 @@ impl<P: PacketPool, const PACKET: usize> QuicNode<P, PACKET> {
             bootstrap: None,
             close_code: None,
             last_activity_us: self.clock_us,
+            ack_eliciting_sent_since_receive: false,
             client_delivery: crate::callback::CallbackStreams::new(
                 self.default_association_limits.max_pending_streams,
                 client_retention.min(self.default_association_limits.max_buffered_stream_bytes),
@@ -3345,6 +3419,16 @@ impl<P: PacketPool, const PACKET: usize> QuicNode<P, PACKET> {
     }
 
     #[cfg(test)]
+    pub(crate) fn max_ack_delay_for_test(&self, association: QuicAssociation) -> Option<u64> {
+        let slot = self.slot(association)?;
+        let endpoint = match &slot.state {
+            Association::Client(client) => client.connection().endpoint()?,
+            Association::Server(server) => &server.mux.endpoint,
+        };
+        Some(endpoint.max_ack_delay_us())
+    }
+
+    #[cfg(test)]
     pub(crate) fn path_pto_timeout_for_test(
         &self,
         association: QuicAssociation,
@@ -3595,6 +3679,7 @@ impl<P: PacketPool, const PACKET: usize> QuicNode<P, PACKET> {
         let address = (meta.bearer, meta.peer_l2_address);
         Self::remember_slot_address(slot, address);
         slot.last_activity_us = clock_us;
+        slot.ack_eliciting_sent_since_receive = false;
     }
 
     fn remember_ingress_path_address(
@@ -3615,6 +3700,7 @@ impl<P: PacketPool, const PACKET: usize> QuicNode<P, PACKET> {
             }
         }
         slot.last_activity_us = clock_us;
+        slot.ack_eliciting_sent_since_receive = false;
     }
 }
 
@@ -4619,11 +4705,13 @@ where
                 if path.congestion.bytes_in_flight >= path.congestion.congestion_window {
                     continue;
                 }
-                let (_, _, _, _, sent, ..) = path.circuit_telemetry();
                 let key = (
                     ready,
-                    u8::from(sent != 0),
-                    path.measured_send_cost_us(),
+                    u8::from(path.packets_sent != 0),
+                    // There is no ranking decision with one circuit. Avoid
+                    // RTT/probability divisions whose result cannot affect
+                    // the chosen path; retain full scoring for multipath.
+                    if count == 1 { 0 } else { path.measured_send_cost_us() },
                     (path_id + count - rotation) % count.max(1),
                     path_id,
                 );
@@ -5333,10 +5421,22 @@ where
             .expect("selected association remains installed");
         let packet = match &mut slot.state {
             Association::Client(client) => {
-                Self::build_optional_packet(self.pool, |output| client.poll_timer(now, output))?
+                // Select the due association before consuming its pacing
+                // wake: that wake must also retry pacing-blocked recovery,
+                // not just application writes. Clearing it before selection
+                // can postpone recovery until an unrelated future timer.
+                Self::build_optional_packet(self.pool, |output| {
+                    if let Ok(endpoint) = client.connection_mut().endpoint_mut() {
+                        endpoint.on_bearer_timeout();
+                    }
+                    client.poll_timer(now, output)
+                })?
             }
             Association::Server(server) => {
-                Self::build_optional_packet(self.pool, |output| server.poll_timer(now, output))?
+                Self::build_optional_packet(self.pool, |output| {
+                    server.mux.endpoint.on_bearer_timeout();
+                    server.poll_timer(now, output)
+                })?
             }
         };
         let Some(packet) = packet else {
@@ -7117,69 +7217,7 @@ where
                 };
                 match target {
                     Target::Endpoint(id, path_id) => {
-                        match self.receive_path_control(id, path_id, meta, bytes) {
-                            Ok(Some(Some(response))) => Ok(NodeIngress::PathControl {
-                                association: id,
-                                response,
-                            }),
-                            Ok(Some(None)) => Ok(NodeIngress::Association {
-                                association: self
-                                    .association_ingress(id)
-                                    .expect("path control keeps its association installed"),
-                                packet,
-                            }),
-                            // Local suspension/probing and peer standby only
-                            // affect the corresponding transmit direction. A
-                            // circuit remains a valid receive path until it
-                            // is abandoned.
-                            Ok(None)
-                                if self
-                                    .slot(id)
-                                    .and_then(|slot| Self::slot_path_state(slot, path_id))
-                                    .is_some_and(crate::PathState::is_closed)
-                                    && !crate::is_control_only_packet(bytes) =>
-                            {
-                                Ok(NodeIngress::NonQuic {
-                                    error: Error::Invalid,
-                                    packet,
-                                })
-                            }
-                            Ok(None) => match self.receive_association_bytes(
-                                id,
-                                path_id,
-                                meta,
-                                bytes,
-                                &mut on_stream,
-                            ) {
-                                Ok(association) => Ok(NodeIngress::Association {
-                                    association,
-                                    packet,
-                                }),
-                                Err(QuicNodePacketRejection::Packet(Error::PeerRestarted)) => {
-                                    let _ = self.remove(id);
-                                    self.push_association_event(AssociationEvent::Reset {
-                                        association: id,
-                                    });
-                                    Ok(NodeIngress::PeerReset {
-                                        association: id,
-                                        packet,
-                                    })
-                                }
-                                Err(QuicNodePacketRejection::PeerClosed(code)) => {
-                                    self.push_association_event(AssociationEvent::Closed {
-                                        association: id,
-                                        code,
-                                    });
-                                    Ok(NodeIngress::PeerClosed {
-                                        association: id,
-                                        code,
-                                        packet,
-                                    })
-                                }
-                                Err(reason) => Err(RejectedNodePacket { reason, packet }),
-                            },
-                            Err(reason) => Err(RejectedNodePacket { reason, packet }),
-                        }
+                        self.receive_endpoint_packet(id, path_id, meta, packet, &mut on_stream)
                     }
                     Target::Forward(rule) => {
                         let active = match self.router.forward_lease_active(bytes, self.clock_us) {
@@ -7301,6 +7339,88 @@ where
             }
         }
     }
+
+    // Both the opaque owned path and serializer fallback use the same
+    // endpoint semantics. Routing has already selected this association/path.
+    #[inline(never)]
+    pub(super) fn receive_endpoint_packet<B, StreamEvent>(
+        &mut self,
+        id: QuicAssociation,
+        path_id: usize,
+        meta: PacketMeta,
+        packet: OwnedPacket<B>,
+        on_stream: &mut StreamEvent,
+    ) -> Result<NodeIngress<B, P::Buffer, ForwardNextHop>, RejectedNodePacket<B>>
+    where
+        B: AsRef<[u8]>,
+        StreamEvent: FnMut(ApplicationStreamSource, u64, u64, bool, &[u8]) -> Result<usize, Error>,
+    {
+        let bytes = packet.bytes();
+        match self.receive_path_control(id, path_id, meta, bytes) {
+            Ok(Some(Some(response))) => Ok(NodeIngress::PathControl {
+                association: id,
+                response,
+            }),
+            Ok(Some(None)) => Ok(NodeIngress::Association {
+                association: self
+                    .association_ingress(id)
+                    .expect("path control keeps its association installed"),
+                packet,
+            }),
+            // Local suspension/probing and peer standby only
+            // affect the corresponding transmit direction. A
+            // circuit remains a valid receive path until it
+            // is abandoned.
+            Ok(None)
+                if self
+                    .slot(id)
+                    .and_then(|slot| Self::slot_path_state(slot, path_id))
+                    .is_some_and(crate::PathState::is_closed)
+                    && !crate::is_control_only_packet(bytes) =>
+            {
+                Ok(NodeIngress::NonQuic {
+                    error: Error::Invalid,
+                    packet,
+                })
+            }
+            Ok(None) => match self.receive_association_bytes(
+                id,
+                path_id,
+                meta,
+                bytes,
+                on_stream,
+            ) {
+                Ok(association) => Ok(NodeIngress::Association {
+                    association,
+                    packet,
+                }),
+                Err(QuicNodePacketRejection::Packet(Error::PeerRestarted)) => {
+                    let _ = self.remove(id);
+                    self.push_association_event(AssociationEvent::Reset {
+                        association: id,
+                    });
+                    Ok(NodeIngress::PeerReset {
+                        association: id,
+                        packet,
+                    })
+                }
+                Err(QuicNodePacketRejection::PeerClosed(code)) => {
+                    self.push_association_event(AssociationEvent::Closed {
+                        association: id,
+                        code,
+                    });
+                    Ok(NodeIngress::PeerClosed {
+                        association: id,
+                        code,
+                        packet,
+                    })
+                }
+                Err(reason) => Err(RejectedNodePacket { reason, packet }),
+            },
+            Err(reason) => Err(RejectedNodePacket { reason, packet }),
+        }
+    }
+
 
     fn receive_path_control(
         &mut self,
@@ -7815,7 +7935,9 @@ where
                                 })?;
                             if sink.consumed != 0 {
                                 client
-                                    .stream_consumed(payload.stream_id, sink.consumed, false)
+                                    // Match server delivery: consumption releases credit,
+                                    // but does not override the negotiated ACK policy.
+                                    .stream_consumed(payload.stream_id, sink.consumed, true)
                                     .map_err(QuicNodePacketRejection::Packet)?;
                             }
                         }
@@ -7823,7 +7945,7 @@ where
                     AssociationIngress::Client(id)
                 }
                 Association::Server(server) => {
-                    let mut received_streams = Vec::new();
+                    let mut received_streams = SmallVec::<[u64; 4]>::new();
                     server
                         .receive_stream_events_on_path(
                             bytes,
@@ -7969,7 +8091,7 @@ where
                     })?;
                 if sink.consumed != 0 {
                     client
-                        .stream_consumed(stream_id, sink.consumed, false)
+                        .stream_consumed(stream_id, sink.consumed, true)
                         .map_err(QuicNodePacketRejection::Packet)?;
                 }
                 Ok(sink.consumed)
@@ -8085,6 +8207,95 @@ mod tests {
 
     fn cid(value: u64) -> ConnectionId {
         ConnectionId::new(value).unwrap()
+    }
+
+    #[test]
+    fn single_path_control_does_not_prepare_an_impossible_alternate_copy() {
+        type Pool = crate::packet_pool::PacketPool<2, DEFAULT_PACKET_POOL_SLOT_SIZE>;
+        static POOL: Pool = Pool::new();
+        let mut node = QuicNode::<Pool>::new(&POOL);
+        let mut bytes = [0; crate::DEFAULT_MAX_PACKET_SIZE];
+        let len = crate::encode_bootstrap_open_packet(cid(0x91), 0, &mut bytes).unwrap();
+        let initial = node.accept_initial(ingress_meta(), &bytes[..len], cid(0x92), ConnectionLimits::default()).unwrap();
+        let acceptance = PacketAcceptance { association: initial.association, packet_number: 20 };
+        let mut used = ShortHeader {
+            flags: FLAG_FIXED, dcid: cid(0x91), packet_number: 20, packet_number_len: 4,
+        }.encode(&mut bytes).unwrap();
+        used += Frame::Ack { largest: 1, delay: 0 }.encode(&mut bytes[used..]).unwrap();
+        used += Frame::MaxData(4096).encode(&mut bytes[used..]).unwrap();
+        assert!(node.control_duplication_candidate(acceptance, &bytes[..used]).is_none());
+        let Association::Server(server) = &mut node.slot_mut(initial.association).unwrap().state else {
+            panic!("server association");
+        };
+        server.mux.endpoint.add_path_state().unwrap();
+        // Do not suppress normal multipath candidate discovery. Readiness,
+        // budget and per-path eligibility remain the scheduler's decisions.
+        assert!(node.control_duplication_candidate(acceptance, &bytes[..used]).is_some());
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn local_retransmissions_do_not_keep_a_silent_peer_alive() {
+        use crate::{bearer::BearerName, fake::FakePacketBearer};
+        type Pool = crate::packet_pool::PacketPool<4, DEFAULT_PACKET_POOL_SLOT_SIZE>;
+        static POOL: Pool = Pool::new();
+        let mut client = QuicNode::<Pool>::new(&POOL);
+        let bearer = client.add_bearer(FakePacketBearer::<Pool>::new(
+            BearerName::new("silent-peer-test").unwrap(),
+        )).unwrap();
+        let meta = PacketMeta {
+            bearer, peer_l2_address: PeerL2Address::new(11).unwrap(), received_at_us: 1,
+        };
+        let open = client.start_association(cid(0x75), meta, 0).unwrap();
+        let association = open.association;
+        let receive_cid = client.receive_cid(association).unwrap();
+        let mut server = QuicNode::<Pool>::new(&POOL);
+        let NodeIngress::Initial { response, .. } = server.receive_packet(
+            meta, open.packet,
+            |_| Some(InitialAdmission { local_limits: ConnectionLimits::default() }),
+            |_, _, _, _, bytes| Ok(bytes.len()),
+        ).unwrap() else { panic!("initial admission"); };
+        client.receive_packet(meta, response.packet, |_| None,
+            |_, _, _, _, bytes| Ok(bytes.len())).unwrap();
+        while client.next_association_event().is_some() {}
+        client.set_idle_timeout_us(5_000_000);
+        let before = client.slot(association).unwrap().last_activity_us;
+        // A packet without a retained ack-eliciting record (e.g. a pure
+        // ACK) must not consume the first-send idle extension.
+        client.record_packet_acceptance(PacketAcceptance {
+            association, packet_number: u32::MAX,
+        }, 50);
+        assert_eq!(client.slot(association).unwrap().last_activity_us, before);
+        assert!(!client.slot(association).unwrap().ack_eliciting_sent_since_receive);
+        client.advance_clock(100);
+        let stream = client.allocate_stream(association).unwrap();
+        let packet = client.send_stream(association, stream, 0, true, b"retained body").unwrap();
+        client.submit_node_packet(packet).unwrap();
+        assert_eq!(client.slot(association).unwrap().last_activity_us, 100);
+        assert!(client.slot(association).unwrap().ack_eliciting_sent_since_receive);
+        // The bearer accepts sends, but nothing is delivered back from the
+        // peer. Drive ordinary PTOs and submit the retained replacements.
+        let mut retransmissions = 0;
+        for step in 1..=8 {
+            let now = 100 + step * 1_000_000;
+            match client.timer_expired(now).unwrap() {
+                Some(NodeTimer::Egress(packet)) => {
+                    client.submit_node_packet(packet).unwrap();
+                    retransmissions += 1;
+                }
+                Some(NodeTimer::IdleTimedOut { association: expired }) => {
+                    assert_eq!(expired, association);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(retransmissions > 0, "exercise actual submitted PTO replacements");
+        assert_eq!(client.association_count(), 0, "local retries must not refresh idle forever");
+        assert!(!client.router.contains(receive_cid));
+        client.drain_bearer_events();
+        assert_eq!(POOL.available(), POOL.capacity());
+        assert_eq!(client.next_association_event(), Some(AssociationEvent::IdleTimeout { association }));
     }
 
     #[cfg(feature = "tokio")]
@@ -9445,19 +9656,67 @@ mod tests {
     }
 
     #[test]
-    fn blocked_bearer_retry_preserves_packet_acceptance_identity() {
+    fn credit_acceptance_restarts_idle_once_and_peer_receive_rearms_it() {
+        let mut node: QuicNode<TestPool> = QuicNode::new(&TEST_POOL);
+        let local = cid(0x76);
+        let association = node.add_client(local, ClientAssociation::new(local)).unwrap();
+        let mut open = [0; crate::DEFAULT_MAX_PACKET_SIZE];
+        let mut response = [0; 16];
+        let len = ShortHeader {
+            flags: FLAG_FIXED, dcid: local, packet_number: 0, packet_number_len: 1,
+        }.encode(&mut response).unwrap();
+        let Association::Client(client) = &mut node.slot_mut(association).unwrap().state else {
+            panic!("client");
+        };
+        client.connection_mut().start(&mut open).unwrap();
+        client.connection_mut().receive_initial_short_header(&response[..len], 0).unwrap();
+        client.connection_mut().endpoint_mut().unwrap().credit_packet_number = Some(7);
+        let acceptance = PacketAcceptance { association, packet_number: 7 };
+        node.record_packet_acceptance(acceptance, 100);
+        assert_eq!(node.slot(association).unwrap().last_activity_us, 100);
+        node.record_packet_acceptance(acceptance, 200);
+        assert_eq!(node.slot(association).unwrap().last_activity_us, 100);
+        let meta = PacketMeta {
+            bearer: BearerId::new(1).unwrap(),
+            peer_l2_address: PeerL2Address::new(11).unwrap(), received_at_us: 300,
+        };
+        node.advance_clock(300);
+        node.remember_address(association, meta);
+        assert!(!node.slot(association).unwrap().ack_eliciting_sent_since_receive);
+        node.record_packet_acceptance(acceptance, 400);
+        assert_eq!(node.slot(association).unwrap().last_activity_us, 400);
+        node.record_packet_acceptance(acceptance, 500);
+        assert_eq!(node.slot(association).unwrap().last_activity_us, 400);
+        node.advance_clock(600);
+        node.remember_ingress_path_address(association, 0, meta, false);
+        assert!(!node.slot(association).unwrap().ack_eliciting_sent_since_receive);
+        assert_eq!(node.slot(association).unwrap().last_activity_us, 600);
+    }
+
+    #[test]
+    fn repeated_blocked_bearer_retry_preserves_packet_and_acceptance_identity() {
         use core::cell::Cell;
 
-        struct RejectOnce(Cell<u8>);
+        struct RejectRepeatedly(Cell<u8>);
 
-        impl PacketEgress<[u8; 8]> for RejectOnce {
+        impl PacketEgress<[u8; 8]> for RejectRepeatedly {
             fn submit(
                 &mut self,
-                _peer: PeerL2Address,
+                peer: PeerL2Address,
                 submission: EgressSubmission<[u8; 8]>,
             ) -> Result<(), PacketSubmitError<[u8; 8]>> {
-                if self.0.get() == 0 {
-                    self.0.set(1);
+                assert_eq!(peer, PeerL2Address::new(1).unwrap());
+                assert_eq!(submission.packet().packet_range(), 2..6);
+                assert_eq!(submission.packet().bytes(), &[2, 3, 4, 5]);
+                let (packet, completion) = submission.into_parts();
+                let (mut storage, range) = packet.into_parts();
+                // Model an in-place L2 framing attempt. Only headroom changes;
+                // the opaque QUIC bytes and completion identity survive retry.
+                storage[..2].copy_from_slice(&[9, 8]);
+                let packet = OwnedPacket::new(storage, range).unwrap();
+                let submission = EgressSubmission::from_parts(packet, completion);
+                if self.0.get() < 3 {
+                    self.0.set(self.0.get() + 1);
                     Err(PacketSubmitError::WouldBlock(submission))
                 } else {
                     submission.complete(crate::PacketSendOutcome::Sent, 0);
@@ -9483,7 +9742,7 @@ mod tests {
                     nominal_bitrate_bps: 0,
                     local_mac: None,
                 },
-                RejectOnce(Cell::new(0)),
+                RejectRepeatedly(Cell::new(0)),
                 events.clone(),
             )
             .unwrap();
@@ -9498,12 +9757,21 @@ mod tests {
 
         assert!(!bearer.submit_or_retain(
             PeerL2Address::new(1).unwrap(),
-            OwnedPacket::new([0; 8], 0..8).unwrap(),
+            OwnedPacket::new([0, 1, 2, 3, 4, 5, 6, 7], 2..6).unwrap(),
             Some(acceptance),
         ));
+        for _ in 0..2 {
+            assert!(events.pop_completion().is_none());
+            assert!(bearer.has_pending_submission());
+            assert_eq!(bearer.retry_pending(), None);
+        }
+        assert!(events.pop_completion().is_none());
         assert_eq!(bearer.retry_pending(), Some(acceptance));
+        assert!(!bearer.has_pending_submission());
         let completion = events.pop_completion().unwrap();
         assert_eq!(completion.acceptance, Some(acceptance));
+        assert_eq!(completion.packet.bytes(), &[2, 3, 4, 5]);
+        assert!(events.pop_completion().is_none());
     }
 
     #[test]
@@ -10854,13 +11122,12 @@ mod tests {
         let primary_cid =
             if let Association::Server(server_state) = &server_node.slot(server).unwrap().state {
                 let endpoint = &server_state.mux.endpoint;
-                assert!(
-                    endpoint.path_state(0).unwrap().measured_send_cost_us()
-                        < endpoint
-                            .path_state(server_path)
-                            .unwrap()
-                            .measured_send_cost_us()
-                );
+                // A piggyback ACK can already have retired the alternate's
+                // PATH_RESPONSE. Its cost need not exceed the primary's;
+                // neither server circuit has a matched RTT sample yet. Test
+                // the actual response CID/routing below, not that incidental
+                // pre-piggyback ordering of incompletely measured costs.
+                assert!(endpoint.path_state(0).unwrap().is_usable_for_data());
                 endpoint.peer_connection_id_on_path(0).unwrap()
             } else {
                 panic!("the server association must remain installed");
@@ -11035,6 +11302,14 @@ mod tests {
                 )
                 .unwrap();
         }
+        // Priority is sender-local duplication policy, not a wire request
+        // for immediate ACKs. One packet per path can wait for ACK delay.
+        let ack_delay = match &server_node.slot(server).unwrap().state {
+            Association::Server(server) => server.mux.endpoint.max_ack_delay_us,
+            Association::Client(_) => unreachable!(),
+        };
+        let ack_at = server_node.clock_us().saturating_add(ack_delay.max(1));
+        server_node.advance_clock(ack_at);
         let priority_ack = server_node
             .poll_association_control(server)
             .unwrap()
@@ -11044,7 +11319,7 @@ mod tests {
                 PacketMeta {
                     bearer: priority_ack.bearer,
                     peer_l2_address: priority_ack.peer_l2_address,
-                    received_at_us: probe_deadline + 60_003,
+                    received_at_us: ack_at + 1,
                 },
                 priority_ack.packet,
                 |_| None,
@@ -11374,7 +11649,7 @@ mod tests {
         let mut request_body = None;
         let mut request_stream = None;
         server_node
-            .receive_packet(
+            .receive_owned_packet(
                 server_meta,
                 request.packet,
                 |_| None,
@@ -11399,7 +11674,7 @@ mod tests {
             .unwrap();
         let mut response_body = None;
         client_node
-            .receive_packet(
+            .receive_owned_packet(
                 client_meta,
                 response.packet,
                 |_| None,

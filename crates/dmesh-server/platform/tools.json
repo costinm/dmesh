@@ -982,6 +982,11 @@
           "x-protobuf-index": 12,
           "x-protobuf-type": "u32"
         },
+        "direction": {
+          "type": "string",
+          "x-protobuf-index": 14,
+          "x-protobuf-type": "string"
+        },
         "high_priority_bytes": {
           "type": "integer",
           "x-protobuf-index": 9,
@@ -1093,6 +1098,11 @@
           "x-protobuf-index": 12,
           "x-protobuf-type": "u32"
         },
+        "direction": {
+          "type": "string",
+          "x-protobuf-index": 14,
+          "x-protobuf-type": "string"
+        },
         "high_priority_bytes": {
           "type": "integer",
           "x-protobuf-index": 9,
@@ -1133,6 +1143,11 @@
         "packet_size": {
           "type": "integer",
           "x-protobuf-index": 2,
+          "x-protobuf-type": "u64"
+        },
+        "uploaded_bytes": {
+          "type": "integer",
+          "x-protobuf-index": 3,
           "x-protobuf-type": "u64"
         }
       },

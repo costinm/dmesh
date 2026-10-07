@@ -48,10 +48,50 @@ pub fn track_progress<T>(
     result
 }
 
+/// Whether an incomplete request has exhausted its application-idle allowance.
+///
+/// A response producer awaiting transport admission is not an idle request.
+/// Its connection/stream lifecycle must end it if the peer disappears; do not
+/// silently discard its unsent body because credit, pacing or recovery stalls.
+/// Deferred application work likewise owns its own completion deadline.
+pub fn handler_idle_expired(
+    now_ms: u64,
+    last_progress_ms: u64,
+    idle_ms: u64,
+    deferred_work: bool,
+    response_pending: bool,
+) -> bool {
+    !deferred_work && !response_pending && now_ms.saturating_sub(last_progress_ms) >= idle_ms
+}
+
 #[cfg(test)]
 mod progress_tests {
-    use super::track_progress;
+    use super::{handler_idle_expired, track_progress};
     use core::cell::Cell;
+
+    #[test]
+    fn pending_response_survives_transport_stall_past_request_idle_allowance() {
+        let mut last = 1_000;
+        // A retryable transport refusal correctly records no application
+        // progress. It must not cause the owner to discard the response.
+        track_progress(&mut last, || 33_000, || ((), false));
+        assert!(!handler_idle_expired(33_000, last, 15_000, false, true));
+        assert!(!handler_idle_expired(90_000, last, 15_000, false, true));
+        // A later accepted write resumes the same producer and timestamp.
+        track_progress(&mut last, || 90_001, || ((), true));
+        assert_eq!(last, 90_001);
+    }
+
+    #[test]
+    fn incomplete_request_still_expires_and_deferred_work_does_not() {
+        assert!(!handler_idle_expired(15_999, 1_000, 15_000, false, false));
+        assert!(handler_idle_expired(16_000, 1_000, 15_000, false, false));
+        assert!(!handler_idle_expired(90_000, 1_000, 15_000, true, false));
+        assert!(!handler_idle_expired(0, 1_000, 15_000, false, false));
+        // Once there is no pending response, the incomplete request is again
+        // subject to expiry (e.g. the peer never sent its request FIN).
+        assert!(handler_idle_expired(90_000, 1_000, 15_000, false, false));
+    }
 
     #[test]
     fn blocking_handler_uses_completion_time_and_continued_upload_survives() {

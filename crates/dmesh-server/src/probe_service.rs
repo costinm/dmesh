@@ -7,6 +7,7 @@ use crate::{
     cbor::{Decoder, Encoder},
     tagged::{Name, Record},
 };
+use alloc::vec::Vec;
 
 pub use quic_lite::probe::{
     MAX_BYTES as PROBE_MAX_BYTES, MAX_NORMAL_STREAMS as PROBE_MAX_NORMAL_STREAMS,
@@ -21,7 +22,7 @@ pub const PROBE_START: u64 = 1;
 /// the exchange and the response body is the probe payload.
 pub const PROBE_HANDLER: u64 = 2;
 /// Bounded storage for one complete canonical `probe.start` request.
-pub const PROBE_REQUEST_MAX: usize = 160;
+pub const PROBE_REQUEST_MAX: usize = 224;
 
 /// How long a `probe.start` job may run, in milliseconds: the caller's
 /// `timeout` envelope field when given, else a default that grows with the
@@ -118,6 +119,7 @@ impl ProbeDestination {
 /// Existing `probe` workload plus an optional device-directed peer route.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProbeServiceRequest {
+    pub direction: ProbeDirection,
     pub bytes: u64,
     pub packet_size: u16,
     pub ack_frequency: Option<u8>,
@@ -134,6 +136,7 @@ pub struct ProbeServiceRequest {
 impl ProbeServiceRequest {
     pub const fn new(bytes: u64, packet_size: u16) -> Self {
         Self {
+            direction: ProbeDirection::Download,
             bytes,
             packet_size,
             ack_frequency: None,
@@ -147,6 +150,24 @@ impl ProbeServiceRequest {
         }
     }
 
+    pub const fn upload_bytes(self) -> u64 {
+        match self.direction {
+            ProbeDirection::Download => 0,
+            _ => self.bytes,
+        }
+    }
+
+    pub const fn download_bytes(self) -> u64 {
+        match self.direction {
+            ProbeDirection::Upload => 0,
+            _ => self.bytes,
+        }
+    }
+
+    pub const fn total_bytes(self) -> u64 {
+        self.upload_bytes().saturating_add(self.download_bytes())
+    }
+
     pub const fn workload(self) -> ProbeWorkloadRequest {
         ProbeWorkloadRequest {
             bytes: self.bytes,
@@ -158,6 +179,33 @@ impl ProbeServiceRequest {
             parallel_streams: self.parallel_streams,
             initial_consume_delay_ms: self.initial_consume_delay_ms,
             consume_delay_ms: self.consume_delay_ms,
+        }
+    }
+}
+
+/// Direction relative to the probe client. Both runs two streams concurrently.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProbeDirection {
+    Download,
+    Upload,
+    Both,
+}
+
+impl ProbeDirection {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Download => "download",
+            Self::Upload => "upload",
+            Self::Both => "both",
+        }
+    }
+
+    fn parse(value: &[u8]) -> Option<Self> {
+        match value {
+            b"download" => Some(Self::Download),
+            b"upload" => Some(Self::Upload),
+            b"both" => Some(Self::Both),
+            _ => None,
         }
     }
 }
@@ -193,7 +241,8 @@ fn encode_probe_request(
         + usize::from(request.parallel_streams.is_some())
         + usize::from(request.initial_consume_delay_ms.is_some())
         + usize::from(request.consume_delay_ms.is_some())
-        + usize::from(request.peer.is_some());
+        + usize::from(request.peer.is_some())
+        + usize::from(request.direction != ProbeDirection::Download);
     let mut e = Encoder::new(output);
     e.map(4)?;
     e.uint(1)?;
@@ -241,6 +290,10 @@ fn encode_probe_request(
         e.uint(FIELD_PEER)?;
         e.text_value(peer.as_str().as_bytes())?;
     }
+    if request.direction != ProbeDirection::Download {
+        e.uint(14)?;
+        e.text_value(request.direction.as_str().as_bytes())?;
+    }
     Some(e.len())
 }
 
@@ -270,14 +323,14 @@ fn decode_probe_record(record: Record<'_>, method: u64) -> Option<(u64, ProbeSer
     }
     let mut d = Decoder::new(record.fields?);
     let (major, count) = d.head()?;
-    if major != 5 || count == u64::MAX || count > 13 {
+    if major != 5 || count == u64::MAX || count > 14 {
         return None;
     }
     let mut seen = 0u16;
     let mut request = ProbeServiceRequest::new(0, 0);
     for _ in 0..count {
         let field = d.uint()?;
-        if !(1..=13).contains(&field) || matches!(field, 3..=5) {
+        if !(1..=14).contains(&field) || matches!(field, 3..=5) {
             return None;
         }
         let bit = 1u16.checked_shl((field - 1) as u32)?;
@@ -286,6 +339,7 @@ fn decode_probe_record(record: Record<'_>, method: u64) -> Option<(u64, ProbeSer
         }
         seen |= bit;
         match field {
+            14 => request.direction = ProbeDirection::parse(d.text_ref()?)?,
             FIELD_PEER => {
                 request.peer = ProbeDestination::parse(core::str::from_utf8(d.text_ref()?).ok()?)
             }
@@ -381,12 +435,92 @@ pub fn encode_probe_handler_response(
     )
 }
 
-/// The probed node's end of a probe: answer with a header, then stream the
-/// probe payload as the response body. It wraps the transport-neutral
-/// `quic_lite::probe` workload; the request header is the only CBOR involved.
+/// The probed node's end of a probe: validate the optional upload through FIN,
+/// then answer with a header and the optional download body. Both directions
+/// use the same transport-neutral `quic_lite::probe` workload.
 pub struct ProbeHandler;
 
 struct ProbeBody(quic_lite::probe::ProbePayload);
+
+struct ProbeUpload {
+    id: u64,
+    request: ProbeServiceRequest,
+    packet_size: usize,
+    payload: quic_lite::probe::ProbePayload,
+}
+
+impl ProbeUpload {
+    fn rejected(&self) -> Vec<u8> {
+        let mut header = alloc::vec![0; 96];
+        let len = crate::tagged::encode_numeric_error(
+            PROBE_COMPONENT,
+            PROBE_HANDLER,
+            self.id,
+            b"invalid probe upload",
+            &mut header,
+        )
+        .unwrap_or(0);
+        header.truncate(len);
+        header
+    }
+}
+
+impl crate::stream::BodySink for ProbeUpload {
+    fn write(&mut self, chunk: &[u8], fin: bool) -> Result<usize, Vec<u8>> {
+        if self.payload.check(chunk).is_err() || (fin && !self.payload.is_complete()) {
+            return Err(self.rejected());
+        }
+        Ok(chunk.len())
+    }
+
+    fn finish(self: alloc::boxed::Box<Self>) -> crate::stream::Response {
+        if !self.payload.is_complete() {
+            return crate::stream::Response::header(self.rejected());
+        }
+        probe_response(self.id, self.request, self.packet_size).expect("validated probe response")
+    }
+}
+
+fn probe_response(
+    id: u64,
+    request: ProbeServiceRequest,
+    packet_size: usize,
+) -> Option<crate::stream::Response> {
+    let mut header = alloc::vec![0; 96];
+    let used = if request.upload_bytes() == 0 {
+        encode_probe_handler_response(id, request.download_bytes(), packet_size, &mut header)?
+    } else {
+        let mut value = [0; 48];
+        let mut e = Encoder::new(&mut value);
+        e.map(3)?;
+        e.uint(1)?;
+        e.uint(request.download_bytes())?;
+        e.uint(2)?;
+        e.uint(packet_size as u64)?;
+        e.uint(3)?;
+        e.uint(request.upload_bytes())?;
+        let len = e.len();
+        crate::tagged::encode_numeric_response(
+            PROBE_COMPONENT,
+            PROBE_HANDLER,
+            id,
+            &value[..len],
+            &mut header,
+        )?
+    };
+    header.truncate(used);
+    if request.download_bytes() == 0 {
+        Some(crate::stream::Response::header(header))
+    } else {
+        Some(crate::stream::Response::with_body(
+            header,
+            ProbeBody(quic_lite::probe::ProbePayload::new(
+                request.download_bytes(),
+                packet_size,
+            )?),
+        ))
+    }
+}
 
 impl crate::stream::BodySource for ProbeBody {
     fn read(&mut self, out: &mut [u8]) -> (usize, bool) {
@@ -398,7 +532,8 @@ impl crate::stream::BodySource for ProbeBody {
 impl ProbeHandler {
     /// The request limits shared by every platform.
     fn accept(request: &ProbeServiceRequest) -> bool {
-        request.bytes != 0
+        request.direction != ProbeDirection::Both
+            && request.bytes != 0
             && request.bytes <= PROBE_MAX_BYTES
             && request.peer.is_none()
             && request.parallel_streams.is_none_or(|streams| streams == 1)
@@ -420,13 +555,25 @@ impl crate::stream::StreamHandler for ProbeHandler {
                 probe.workload(),
                 quic_lite::DEFAULT_MAX_STREAM_PAYLOAD,
             );
-            let payload = quic_lite::probe::ProbePayload::new(probe.bytes, plan.packet_size)?;
-            let mut header = alloc::vec![0u8; 64];
-            let used = encode_probe_handler_response(id, probe.bytes, plan.packet_size, &mut header)?;
-            header.truncate(used);
-            Some(crate::stream::Outcome::Respond(
-                crate::stream::Response::with_body(header, ProbeBody(payload)),
-            ))
+            if probe.upload_bytes() != 0 {
+                Some(crate::stream::Outcome::Receive(alloc::boxed::Box::new(
+                    ProbeUpload {
+                        id,
+                        request: probe,
+                        packet_size: plan.packet_size,
+                        payload: quic_lite::probe::ProbePayload::new(
+                            probe.upload_bytes(),
+                            plan.packet_size,
+                        )?,
+                    },
+                )))
+            } else {
+                Some(crate::stream::Outcome::Respond(probe_response(
+                    id,
+                    probe,
+                    plan.packet_size,
+                )?))
+            }
         })();
         alloc::boxed::Box::pin(core::future::ready(outcome))
     }
@@ -449,6 +596,9 @@ pub struct ProbeResponseReader {
     buffer: alloc::vec::Vec<u8>,
     payload: Option<quic_lite::probe::ProbePayload>,
     expected: u64,
+    expected_upload: u64,
+    uploaded: u64,
+    header_done: bool,
 }
 
 impl ProbeResponseReader {
@@ -458,13 +608,29 @@ impl ProbeResponseReader {
             buffer: alloc::vec::Vec::new(),
             payload: None,
             expected,
+            expected_upload: 0,
+            uploaded: 0,
+            header_done: false,
         }
+    }
+
+    /// Validate download bytes and the peer's terminal upload receipt.
+    pub fn for_request(request: ProbeServiceRequest) -> Self {
+        Self {
+            expected_upload: request.upload_bytes(),
+            ..Self::new(request.download_bytes())
+        }
+    }
+
+    /// Request bytes confirmed by the peer, not merely queued by the sender.
+    pub fn uploaded_bytes(&self) -> u64 {
+        self.uploaded
     }
 
     /// Feed the next ordered response bytes.
     pub fn push(&mut self, bytes: &[u8]) -> Result<(), ProbeClientError> {
         let mut bytes = bytes;
-        if self.payload.is_none() {
+        if !self.header_done {
             self.buffer.extend_from_slice(bytes);
             match crate::stream::scan_header(&self.buffer) {
                 crate::stream::Header::NeedMore => return Ok(()),
@@ -475,29 +641,54 @@ impl ProbeResponseReader {
                     if record.error.is_some() {
                         return Err(ProbeClientError::Rejected);
                     }
+                    if record.component != Some(Name::Tag(PROBE_COMPONENT))
+                        || record.method != Some(Name::Tag(PROBE_HANDLER))
+                    {
+                        return Err(ProbeClientError::Header);
+                    }
                     let mut d = Decoder::new(record.result.ok_or(ProbeClientError::Header)?);
                     let (major, count) = d.head().ok_or(ProbeClientError::Header)?;
-                    if major != 5 || count != 2 {
+                    if major != 5 || !(2..=3).contains(&count) {
                         return Err(ProbeClientError::Header);
                     }
                     let (mut length_field, mut packet_size) = (None, None);
+                    let mut uploaded = None;
+                    let mut seen = 0u8;
                     for _ in 0..count {
-                        match d.uint().ok_or(ProbeClientError::Header)? {
+                        let field = d.uint().ok_or(ProbeClientError::Header)?;
+                        if !(1..=3).contains(&field) || seen & (1 << field) != 0 {
+                            return Err(ProbeClientError::Header);
+                        }
+                        seen |= 1 << field;
+                        match field {
                             1 => length_field = d.uint(),
                             2 => packet_size = d.uint(),
+                            3 => uploaded = d.uint(),
                             _ => return Err(ProbeClientError::Header),
                         }
                     }
+                    if !d.is_finished() || uploaded.unwrap_or(0) != self.expected_upload {
+                        return Err(ProbeClientError::Header);
+                    }
+                    self.uploaded = uploaded.unwrap_or(0);
                     let announced = length_field.ok_or(ProbeClientError::Header)?;
                     if announced != self.expected {
                         return Err(ProbeClientError::Header);
                     }
                     let packet_size = usize::try_from(packet_size.ok_or(ProbeClientError::Header)?)
                         .map_err(|_| ProbeClientError::Header)?;
-                    self.payload = Some(
-                        quic_lite::probe::ProbePayload::new(announced, packet_size)
-                            .ok_or(ProbeClientError::Header)?,
-                    );
+                    self.payload = if announced == 0 {
+                        None
+                    } else {
+                        Some(
+                            quic_lite::probe::ProbePayload::new(announced, packet_size)
+                                .ok_or(ProbeClientError::Header)?,
+                        )
+                    };
+                    if packet_size < 4 {
+                        return Err(ProbeClientError::Header);
+                    }
+                    self.header_done = true;
                     let body = self.buffer.split_off(length);
                     self.buffer.clear();
                     return self.check(&body);
@@ -510,10 +701,9 @@ impl ProbeResponseReader {
 
     fn check(&mut self, bytes: &[u8]) -> Result<(), ProbeClientError> {
         match self.payload.as_mut() {
-            Some(payload) => payload
-                .check(bytes)
-                .map_err(|_| ProbeClientError::Payload),
-            None => Ok(()),
+            Some(payload) => payload.check(bytes).map_err(|_| ProbeClientError::Payload),
+            None if bytes.is_empty() => Ok(()),
+            None => Err(ProbeClientError::Payload),
         }
     }
 
@@ -524,7 +714,12 @@ impl ProbeResponseReader {
 
     /// Whether the whole payload arrived and was valid.
     pub fn is_complete(&self) -> bool {
-        self.payload.as_ref().is_some_and(|payload| payload.is_complete())
+        self.header_done
+            && (self.expected == 0
+                || self
+                    .payload
+                    .as_ref()
+                    .is_some_and(|payload| payload.is_complete()))
     }
 }
 
@@ -561,8 +756,120 @@ mod tests {
     };
 
     #[test]
+    fn direction_round_trips_and_unknown_modes_are_rejected() {
+        for direction in [
+            super::ProbeDirection::Download,
+            super::ProbeDirection::Upload,
+            super::ProbeDirection::Both,
+        ] {
+            let mut request = ProbeServiceRequest::new(100, 32);
+            request.direction = direction;
+            let mut wire = [0; super::PROBE_REQUEST_MAX];
+            let len = super::encode_probe_handler_request(request, 1, &mut wire).unwrap();
+            assert_eq!(
+                super::decode_probe_handler_record(crate::tagged::decode(&wire[..len]).unwrap()),
+                Some((1, request))
+            );
+            if direction != super::ProbeDirection::Download {
+                wire[len - 1] = b'x';
+                assert!(
+                    super::decode_probe_handler_record(
+                        crate::tagged::decode(&wire[..len]).unwrap()
+                    )
+                    .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn upload_waits_for_fin_and_rejects_corruption_truncation_and_overrun() {
+        use crate::registry::{CallContext, Registry, methods};
+        use crate::stream::ServerStream;
+        for direction in [super::ProbeDirection::Upload] {
+            for fault in 0..4 {
+                let registry = Registry::new();
+                assert!(registry.register_stream(methods::PROBE_HANDLER, super::ProbeHandler));
+                let mut request = ProbeServiceRequest::new(100, 32);
+                request.direction = direction;
+                let mut wire = [0; 160];
+                let len = super::encode_probe_handler_request(request, 9, &mut wire).unwrap();
+                let mut server = ServerStream::new(CallContext::default());
+                assert!(
+                    server
+                        .push(&registry, 0, false, &wire[..len])
+                        .response
+                        .is_none()
+                );
+                let mut body = [0; 101];
+                quic_lite::probe::ProbePayload::new(100, 32)
+                    .unwrap()
+                    .fill(&mut body);
+                let count = match fault {
+                    1 => {
+                        body[20] ^= 1;
+                        100
+                    }
+                    2 => 99,
+                    3 => 101,
+                    _ => 100,
+                };
+                let received = server.push(&registry, len as u64, fault != 0, &body[..count]);
+                let response = if fault == 0 {
+                    assert!(
+                        received.response.is_none(),
+                        "complete body without FIN is not success"
+                    );
+                    server
+                        .push(&registry, (len + count) as u64, true, &[])
+                        .response
+                        .unwrap()
+                } else {
+                    received.response.unwrap()
+                };
+                let mut reader = super::ProbeResponseReader::for_request(request);
+                let mut response = response.into_reader();
+                let mut bytes = [0; 256];
+                let mut collected = alloc::vec::Vec::new();
+                loop {
+                    let (count, done) = response.read(&mut bytes);
+                    collected.extend_from_slice(&bytes[..count]);
+                    if done {
+                        break;
+                    }
+                }
+                if fault == 0 {
+                    reader.push(&collected).unwrap();
+                    assert!(reader.is_complete());
+                    assert_eq!(reader.uploaded_bytes(), 100);
+                    assert_eq!(reader.bytes(), request.download_bytes());
+                } else {
+                    assert_eq!(
+                        reader.push(&collected),
+                        Err(super::ProbeClientError::Rejected)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wrong_upload_counter_is_not_success() {
+        let mut request = ProbeServiceRequest::new(100, 32);
+        request.direction = super::ProbeDirection::Upload;
+        let response = super::probe_response(1, request, 32).unwrap();
+        request.bytes = 99;
+        let mut reader = super::ProbeResponseReader::for_request(request);
+        assert_eq!(
+            reader.push(&response.header),
+            Err(super::ProbeClientError::Header)
+        );
+    }
+
+    #[test]
     fn tagged_probe_run_round_trips_with_a_uri_destination() {
         let request = ProbeServiceRequest {
+            direction: super::ProbeDirection::Both,
             bytes: 65_536,
             packet_size: 1200,
             ack_frequency: Some(8),
@@ -595,6 +902,7 @@ mod tests {
     #[test]
     fn plan_has_one_shared_bounded_stream_and_ack_shape() {
         let request = ProbeServiceRequest {
+            direction: super::ProbeDirection::Download,
             bytes: 10,
             packet_size: 65_535,
             ack_frequency: Some(255),
@@ -623,7 +931,12 @@ mod tests {
         use crate::stream::{Outcome, Request};
         let registry = Registry::new();
         assert!(registry.register_stream(
-            Method::new(super::PROBE_COMPONENT, "probe", super::PROBE_HANDLER, "source"),
+            Method::new(
+                super::PROBE_COMPONENT,
+                "probe",
+                super::PROBE_HANDLER,
+                "source"
+            ),
             super::ProbeHandler
         ));
         let request = ProbeServiceRequest::new(5000, 512);
@@ -657,7 +970,12 @@ mod tests {
         use crate::stream::{Outcome, Request};
         let registry = Registry::new();
         assert!(registry.register_stream(
-            Method::new(super::PROBE_COMPONENT, "probe", super::PROBE_HANDLER, "source"),
+            Method::new(
+                super::PROBE_COMPONENT,
+                "probe",
+                super::PROBE_HANDLER,
+                "source"
+            ),
             super::ProbeHandler
         ));
         let request = ProbeServiceRequest::new(700, 100);
@@ -692,7 +1010,12 @@ mod tests {
         use crate::stream::{Outcome, Request};
         let registry = Registry::new();
         assert!(registry.register_stream(
-            Method::new(super::PROBE_COMPONENT, "probe", super::PROBE_HANDLER, "source"),
+            Method::new(
+                super::PROBE_COMPONENT,
+                "probe",
+                super::PROBE_HANDLER,
+                "source"
+            ),
             super::ProbeHandler
         ));
         let mut request = ProbeServiceRequest::new(100, 512);

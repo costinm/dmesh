@@ -4510,13 +4510,16 @@ pub struct ProbeStartRequest {
     /// API field `peer`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer: Option<String>,
+    /// API field `direction`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
     /// API field `to`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<String>,
 }
 
 impl mesh::tagged::TaggedFields for ProbeStartRequest {
-    const FIELDS: &'static [(&'static str, u32)] = &[("bytes", 1), ("packet_size", 2), ("ack_frequency", 6), ("ack_delay_ms", 7), ("low_priority_bytes", 8), ("high_priority_bytes", 9), ("parallel_streams", 10), ("initial_consume_delay_ms", 11), ("consume_delay_ms", 12), ("peer", 13), ("to", 15)];
+    const FIELDS: &'static [(&'static str, u32)] = &[("bytes", 1), ("packet_size", 2), ("ack_frequency", 6), ("ack_delay_ms", 7), ("low_priority_bytes", 8), ("high_priority_bytes", 9), ("parallel_streams", 10), ("initial_consume_delay_ms", 11), ("consume_delay_ms", 12), ("peer", 13), ("direction", 14), ("to", 15)];
 }
 
 impl ProbeStartRequest {
@@ -4536,7 +4539,7 @@ impl ProbeStartRequest {
     /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
     pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
         let mut e = crate::cbor::Encoder::new(out);
-        e.map(0u64 + u64::from(self.bytes.is_some()) + u64::from(self.packet_size.is_some()) + u64::from(self.ack_frequency.is_some()) + u64::from(self.ack_delay_ms.is_some()) + u64::from(self.low_priority_bytes.is_some()) + u64::from(self.high_priority_bytes.is_some()) + u64::from(self.parallel_streams.is_some()) + u64::from(self.initial_consume_delay_ms.is_some()) + u64::from(self.consume_delay_ms.is_some()) + u64::from(self.peer.is_some()) + u64::from(self.to.is_some()))?;
+        e.map(0u64 + u64::from(self.bytes.is_some()) + u64::from(self.packet_size.is_some()) + u64::from(self.ack_frequency.is_some()) + u64::from(self.ack_delay_ms.is_some()) + u64::from(self.low_priority_bytes.is_some()) + u64::from(self.high_priority_bytes.is_some()) + u64::from(self.parallel_streams.is_some()) + u64::from(self.initial_consume_delay_ms.is_some()) + u64::from(self.consume_delay_ms.is_some()) + u64::from(self.peer.is_some()) + u64::from(self.direction.is_some()) + u64::from(self.to.is_some()))?;
         if let Some(value) = &self.bytes {
         e.uint(1)?;
         e.uint(u64::from(*value))?;
@@ -4577,6 +4580,10 @@ impl ProbeStartRequest {
         e.uint(13)?;
         e.text_value(value.as_bytes())?;
         }
+        if let Some(value) = &self.direction {
+        e.uint(14)?;
+        e.text_value(value.as_bytes())?;
+        }
         if let Some(value) = &self.to {
         e.uint(15)?;
         e.text_value(value.as_bytes())?;
@@ -4606,6 +4613,7 @@ impl ProbeStartRequest {
                 11 => out.initial_consume_delay_ms = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
                 12 => out.consume_delay_ms = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
                 13 => out.peer = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                14 => out.direction = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
                 15 => out.to = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
                 _ => d.skip().ok_or("invalid value")?,
             }
@@ -4753,10 +4761,13 @@ pub struct ProbeHandlerRequest {
     /// API field `consume_delay_ms`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consume_delay_ms: Option<u32>,
+    /// API field `direction`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
 }
 
 impl mesh::tagged::TaggedFields for ProbeHandlerRequest {
-    const FIELDS: &'static [(&'static str, u32)] = &[("bytes", 1), ("packet_size", 2), ("ack_frequency", 6), ("ack_delay_ms", 7), ("low_priority_bytes", 8), ("high_priority_bytes", 9), ("parallel_streams", 10), ("initial_consume_delay_ms", 11), ("consume_delay_ms", 12)];
+    const FIELDS: &'static [(&'static str, u32)] = &[("bytes", 1), ("packet_size", 2), ("ack_frequency", 6), ("ack_delay_ms", 7), ("low_priority_bytes", 8), ("high_priority_bytes", 9), ("parallel_streams", 10), ("initial_consume_delay_ms", 11), ("consume_delay_ms", 12), ("direction", 14)];
 }
 
 impl ProbeHandlerRequest {
@@ -4776,7 +4787,7 @@ impl ProbeHandlerRequest {
     /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
     pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
         let mut e = crate::cbor::Encoder::new(out);
-        e.map(0u64 + u64::from(self.bytes.is_some()) + u64::from(self.packet_size.is_some()) + u64::from(self.ack_frequency.is_some()) + u64::from(self.ack_delay_ms.is_some()) + u64::from(self.low_priority_bytes.is_some()) + u64::from(self.high_priority_bytes.is_some()) + u64::from(self.parallel_streams.is_some()) + u64::from(self.initial_consume_delay_ms.is_some()) + u64::from(self.consume_delay_ms.is_some()))?;
+        e.map(0u64 + u64::from(self.bytes.is_some()) + u64::from(self.packet_size.is_some()) + u64::from(self.ack_frequency.is_some()) + u64::from(self.ack_delay_ms.is_some()) + u64::from(self.low_priority_bytes.is_some()) + u64::from(self.high_priority_bytes.is_some()) + u64::from(self.parallel_streams.is_some()) + u64::from(self.initial_consume_delay_ms.is_some()) + u64::from(self.consume_delay_ms.is_some()) + u64::from(self.direction.is_some()))?;
         if let Some(value) = &self.bytes {
         e.uint(1)?;
         e.uint(u64::from(*value))?;
@@ -4813,6 +4824,10 @@ impl ProbeHandlerRequest {
         e.uint(12)?;
         e.uint(u64::from(*value))?;
         }
+        if let Some(value) = &self.direction {
+        e.uint(14)?;
+        e.text_value(value.as_bytes())?;
+        }
         Some(e.len())
     }
 
@@ -4837,6 +4852,7 @@ impl ProbeHandlerRequest {
                 10 => out.parallel_streams = Some(u8::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
                 11 => out.initial_consume_delay_ms = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
                 12 => out.consume_delay_ms = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                14 => out.direction = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
                 _ => d.skip().ok_or("invalid value")?,
             }
         }
@@ -4863,10 +4879,13 @@ pub struct ProbeHandlerResponse {
     /// API field `packet_size`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub packet_size: Option<u64>,
+    /// API field `uploaded_bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uploaded_bytes: Option<u64>,
 }
 
 impl mesh::tagged::TaggedFields for ProbeHandlerResponse {
-    const FIELDS: &'static [(&'static str, u32)] = &[("bytes", 1), ("packet_size", 2)];
+    const FIELDS: &'static [(&'static str, u32)] = &[("bytes", 1), ("packet_size", 2), ("uploaded_bytes", 3)];
 }
 
 impl ProbeHandlerResponse {
@@ -4886,13 +4905,17 @@ impl ProbeHandlerResponse {
     /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
     pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
         let mut e = crate::cbor::Encoder::new(out);
-        e.map(0u64 + u64::from(self.bytes.is_some()) + u64::from(self.packet_size.is_some()))?;
+        e.map(0u64 + u64::from(self.bytes.is_some()) + u64::from(self.packet_size.is_some()) + u64::from(self.uploaded_bytes.is_some()))?;
         if let Some(value) = &self.bytes {
         e.uint(1)?;
         e.uint(u64::from(*value))?;
         }
         if let Some(value) = &self.packet_size {
         e.uint(2)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.uploaded_bytes {
+        e.uint(3)?;
         e.uint(u64::from(*value))?;
         }
         Some(e.len())
@@ -4912,6 +4935,7 @@ impl ProbeHandlerResponse {
             match tag {
                 1 => out.bytes = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
                 2 => out.packet_size = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                3 => out.uploaded_bytes = Some(u64::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
                 _ => d.skip().ok_or("invalid value")?,
             }
         }

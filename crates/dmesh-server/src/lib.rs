@@ -87,6 +87,7 @@ pub mod stream_client;
 pub mod tagged;
 /// Portable local discovery status and transport-owned metric views.
 pub mod telemetry;
+pub mod packet_pool_policy;
 /// Common ingress provenance and policy-driven egress selection shared by
 /// QUIC-lite, discovery/control adapters, and future relay paths.
 pub mod transport_path;

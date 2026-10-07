@@ -76,8 +76,9 @@ impl<const MTU: usize> Drop for PendingSlot<MTU> {
 ///
 /// Only its small pointer/reference table is static. `resize` grows from the
 /// heap and shrinking frees idle slots immediately. A removed slot which is
-/// still leased is freed by the final lease drop, so resize never invalidates
-/// an ingress, connection, relay, or egress owner.
+/// still leased is freed on final drop or the next owner maintenance if that
+/// drop races with resize. Resize never invalidates an ingress, connection,
+/// relay, or egress owner, and driver completion never spins behind resize.
 pub struct HeapPacketPool<const MAX_SLOTS: usize, const MTU: usize> {
     lock: AtomicBool,
     capacity: AtomicUsize,
@@ -141,9 +142,10 @@ impl<const MAX_SLOTS: usize, const MTU: usize> HeapPacketPool<MAX_SLOTS, MTU> {
                 }
             }
             self.capacity.store(target, Ordering::Release);
+            self.reclaim_retired_locked(target);
             return Ok(());
         }
-        if target < current {
+        if target <= current {
             let _guard = self.guard();
             self.capacity.store(target, Ordering::Release);
             for slot in target..current {
@@ -151,6 +153,7 @@ impl<const MAX_SLOTS: usize, const MTU: usize> HeapPacketPool<MAX_SLOTS, MTU> {
                     self.retire_locked(slot);
                 }
             }
+            self.reclaim_retired_locked(target);
         }
         Ok(())
     }
@@ -327,9 +330,22 @@ impl<const MAX_SLOTS: usize, const MTU: usize> HeapPacketPool<MAX_SLOTS, MTU> {
         if slot < self.capacity() {
             return;
         }
-        let _guard = self.guard();
+        // Completion/RX can preempt the resizing owner on a single-core MCU.
+        // Never spin here: a contended retired slot is reclaimed by the next
+        // owner resize/maintenance pass, including resize to the same capacity.
+        let Some(_guard) = self.try_guard() else { return; };
         if slot >= self.capacity() && self.references[slot].load(Ordering::Acquire) == 0 {
             self.retire_locked(slot);
+        }
+    }
+
+    fn reclaim_retired_locked(&self, capacity: usize) {
+        for slot in capacity..MAX_SLOTS {
+            if self.references[slot].load(Ordering::Acquire) == 0
+                && !self.buffers[slot].load(Ordering::Acquire).is_null()
+            {
+                self.retire_locked(slot);
+            }
         }
     }
 
@@ -511,6 +527,23 @@ mod tests {
     use super::*;
 
     static POOL: HeapPacketPool<8, 64> = HeapPacketPool::new();
+
+    #[test]
+    fn retired_lease_drop_never_spins_behind_preempted_owner() {
+        static RETIRED: HeapPacketPool<2, 64> = HeapPacketPool::new();
+        RETIRED.resize(2).unwrap();
+        let first = RETIRED.build_packet(0, 0, |_| Ok::<_, ()>(1)).unwrap();
+        let second = RETIRED.build_packet(0, 0, |_| Ok::<_, ()>(1)).unwrap();
+        RETIRED.resize(1).unwrap();
+        let guard = RETIRED.guard();
+        drop(second);
+        assert_eq!(RETIRED.allocated(), 2);
+        drop(guard);
+        RETIRED.resize(1).unwrap();
+        assert_eq!(RETIRED.allocated(), 1);
+        drop(first);
+        RETIRED.resize(0).unwrap();
+    }
 
     #[test]
     fn growth_and_shrink_release_heap_slots_after_leases_finish() {

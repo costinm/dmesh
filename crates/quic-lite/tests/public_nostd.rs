@@ -14,6 +14,8 @@ use quic_lite::{
 type Pool = PacketPool<8, { quic_lite::DEFAULT_PACKET_POOL_SLOT_SIZE }>;
 static CLIENT_POOL: Pool = Pool::new();
 static SERVER_POOL: Pool = Pool::new();
+static DELAYED_CLIENT_POOL: Pool = Pool::new();
+static DELAYED_SERVER_POOL: Pool = Pool::new();
 
 #[test]
 fn retryability_is_available_to_external_no_std_drivers() {
@@ -105,8 +107,19 @@ fn copy_into_pool(
 
 #[test]
 fn synchronous_driver_receives_and_replies_to_stream_shaped_message() {
+    run_synchronous_response(false);
+}
+
+#[test]
+fn client_stream_consumption_preserves_delayed_ack_policy() {
+    run_synchronous_response(true);
+}
+
+fn run_synchronous_response(check_delayed_ack: bool) {
+    let client_pool = if check_delayed_ack { &DELAYED_CLIENT_POOL } else { &CLIENT_POOL };
+    let server_pool = if check_delayed_ack { &DELAYED_SERVER_POOL } else { &SERVER_POOL };
     let (client_bearer, client_context, client_sent) = Capture::<Pool>::new("client-uart");
-    let client = QuicNode::<Pool>::new(&CLIENT_POOL);
+    let client = QuicNode::<Pool>::new(client_pool);
     let mut client = NoStdRuntime::new(client, ConnectionLimits::default());
     let client_bearer_id = client.add_bearer(client_bearer).unwrap();
     let client_address = PacketMeta {
@@ -115,7 +128,7 @@ fn synchronous_driver_receives_and_replies_to_stream_shaped_message() {
         received_at_us: 1,
     };
     let (server_bearer, server_context, server_sent) = Capture::<Pool>::new("server-uart");
-    let server = QuicNode::<Pool>::new(&SERVER_POOL);
+    let server = QuicNode::<Pool>::new(server_pool);
     let mut server = NoStdRuntime::new(server, ConnectionLimits::default());
     let server_bearer_id = server.add_bearer(server_bearer).unwrap();
     let server_address = PacketMeta {
@@ -131,7 +144,7 @@ fn synchronous_driver_receives_and_replies_to_stream_shaped_message() {
         .unwrap()
         .as_ref()
         .unwrap()
-        .enqueue_packet(server_address, copy_into_pool(&SERVER_POOL, &initial));
+        .enqueue_packet(server_address, copy_into_pool(server_pool, &initial));
     assert!(server.progress().unwrap());
     assert!(server.next_association().is_some());
     let open_ack = server_sent.lock().unwrap().pop().unwrap();
@@ -140,7 +153,7 @@ fn synchronous_driver_receives_and_replies_to_stream_shaped_message() {
         .unwrap()
         .as_ref()
         .unwrap()
-        .enqueue_packet(client_address, copy_into_pool(&CLIENT_POOL, &open_ack));
+        .enqueue_packet(client_address, copy_into_pool(client_pool, &open_ack));
     assert!(client.progress().unwrap());
     assert!(client.association_is_established(association));
 
@@ -162,7 +175,7 @@ fn synchronous_driver_receives_and_replies_to_stream_shaped_message() {
             .unwrap()
             .enqueue_packet(
                 server_address,
-                copy_into_pool(&SERVER_POOL, &request_packet),
+                copy_into_pool(server_pool, &request_packet),
             );
         assert!(
             server
@@ -184,7 +197,31 @@ fn synchronous_driver_receives_and_replies_to_stream_shaped_message() {
     assert!(server.next_stream_chunk().is_none());
     let mut received = received_stream.unwrap();
 
+    if check_delayed_ack {
+        for (index, body) in [b"first".as_slice(), b"second".as_slice()].into_iter().enumerate() {
+            assert_eq!(server.write_stream(&mut received, body).unwrap(), body.len());
+            let packet = server_sent.lock().unwrap().pop().unwrap();
+            client_context.lock().unwrap().as_ref().unwrap().enqueue_packet(
+                client_address, copy_into_pool(client_pool, &packet));
+            assert!(client.progress().unwrap());
+            let chunk = client.next_stream_chunk().unwrap();
+            assert_eq!(chunk.bytes, body);
+            assert!(!chunk.fin);
+            if index == 0 {
+                assert!(!client.progress().unwrap(),
+                    "consuming the first response chunk must not force an immediate ACK");
+                assert!(client_sent.lock().unwrap().is_empty());
+            } else {
+                assert!(client.progress().unwrap(), "the second response packet makes ACK due");
+                assert_eq!(client_sent.lock().unwrap().len(), 1);
+            }
+        }
+        return;
+    }
+
     let control_packets = server_sent.lock().unwrap().len();
+    assert_eq!(control_packets, 0,
+        "the due request ACK gets a response-piggyback opportunity before standalone submission");
     assert_eq!(
         server
             .write_stream_and_finish(&mut received, b"pong")
@@ -204,12 +241,19 @@ fn synchronous_driver_receives_and_replies_to_stream_shaped_message() {
             .unwrap()
             .as_ref()
             .unwrap()
-            .enqueue_packet(client_address, copy_into_pool(&CLIENT_POOL, &response));
+            .enqueue_packet(client_address, copy_into_pool(client_pool, &response));
         assert!(client.progress().unwrap());
     }
     let response = client.next_stream_chunk().unwrap();
     assert_eq!(response.bytes, b"pong");
     assert!(response.fin);
     assert!(client.next_stream_chunk().is_none());
+    let before_flush = client_sent.lock().unwrap().len();
+    assert!(client.progress().unwrap(),
+        "without response data, the next owner turn must flush its owed ACK/window update");
+    assert_eq!(client_sent.lock().unwrap().len(), before_flush + 1);
     assert!(!client.progress().unwrap());
+    assert!(!server.progress().unwrap(),
+        "piggybacked control must not produce a duplicate standalone packet or false progress");
+    assert!(server_sent.lock().unwrap().is_empty());
 }

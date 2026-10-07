@@ -363,6 +363,11 @@ mod tests {
         profile.ssid[..4].copy_from_slice(b"test");
         profile.uart = super::UART_115200;
         assert!(profile.is_nan_only());
+        // The default NOW spelling is active, not an off/sleepy value.
+        // NAN discovery windows may coexist with it but must not turn the
+        // shared Wi-Fi driver into modem power-save between those windows.
+        profile.now = 0;
+        assert!(!profile.is_nan_only());
         profile.now = 1;
         assert!(!profile.is_nan_only());
         profile.now = 2;

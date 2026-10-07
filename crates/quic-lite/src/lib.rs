@@ -20,6 +20,8 @@ pub mod bearer;
 pub mod bearer_framed;
 pub mod callback;
 mod connection;
+#[cfg(test)]
+mod capture_analysis;
 #[cfg(feature = "packet-protection")]
 mod crypto;
 mod mux;
@@ -1999,11 +2001,7 @@ impl<'a> Frame<'a> {
                 Ok(p)
             }
             Frame::Stream(s) => {
-                let typ = FRAME_STREAM_BASE | 0x04 | 0x02 | if s.fin { 1 } else { 0 };
-                put(typ, out, &mut p)?;
-                put(s.id, out, &mut p)?;
-                put(s.offset, out, &mut p)?;
-                put(s.data.len() as u64, out, &mut p)?;
+                p = encode_stream_prefix(s, out)?;
                 if out.len() < p + s.data.len() {
                     return Err(Error::BufferTooSmall);
                 }
@@ -2111,7 +2109,23 @@ impl<'a> Frame<'a> {
     }
 }
 
+// Encode the length-bearing STREAM metadata without copying its payload.
+// This is shared with send preflight so blocked writes do not fill a packet
+// that will immediately be returned to the pool.
+fn encode_stream_prefix(stream: &StreamFrame<'_>, out: &mut [u8]) -> Result<usize, Error> {
+    let mut used = 0;
+    for value in [
+        FRAME_STREAM_BASE | 0x04 | 0x02 | u64::from(stream.fin),
+        stream.id, stream.offset, stream.data.len() as u64,
+    ] {
+        used += put_varint(value, &mut out[used..])?;
+    }
+    Ok(used)
+}
+
 pub(crate) fn decode_frame<'a>(input: &'a [u8]) -> Result<(Frame<'a>, usize), Error> {
+    #[cfg(test)]
+    tests::count_frame_decode();
     let (typ, mut p) = get_varint(input)?;
     match typ {
         FRAME_PADDING => Ok((Frame::Padding, p)),
@@ -2492,6 +2506,23 @@ impl<const N: usize> AckRanges<N> {
     pub(crate) fn insert_range(&mut self, mut new: AckRange) -> bool {
         if new.start > new.end {
             return false;
+        }
+        if self.len != 0 {
+            let newest = self.ranges[0];
+            if u64::from(new.start) <= u64::from(newest.end) + 1
+                && u64::from(new.end) + 1 >= u64::from(newest.start)
+                && (self.len == 1
+                    || u64::from(new.start) > u64::from(self.ranges[1].end) + 1)
+            {
+                // Normal in-order reception extends the newest range. Keep
+                // older gaps untouched instead of removing this range,
+                // scanning the tail and shifting it twice to reinsert it.
+                self.ranges[0] = AckRange {
+                    start: min(new.start, newest.start),
+                    end: max(new.end, newest.end),
+                };
+                return false;
+            }
         }
         let mut dropped = false;
         let mut i = 0;
@@ -3386,6 +3417,22 @@ impl ConnectionState {
     }
 }
 
+/// Frame-only control serialization, committed only after the containing
+/// packet has passed its capacity, flow-control and congestion checks.
+/// This is shared by standalone control packets and STREAM piggybacking.
+#[derive(Default)]
+struct EncodedControlFrames {
+    used: usize,
+    ack: bool,
+    credit: bool,
+    credit_stream_count: usize,
+    credit_max_streams_bidi: bool,
+    ack_frequency: bool,
+    immediate_ack: bool,
+    ack_threshold_due: bool,
+    ack_timer_due: bool,
+}
+
 /// Bearer-neutral endpoint state shared by host and embedded users.
 ///
 /// The bearer owns sockets, timers, and packet storage.  This type owns the
@@ -3417,6 +3464,11 @@ pub(crate) struct EndpointState<const P: usize = DEFAULT_MAX_PACKET_SIZE> {
     /// per-transmission metadata refers to that range instead of embedding a
     /// packet-sized payload array in every history record.
     send_buffer: Vec<Option<RetainedSendRange>>,
+    // One empty scratch pair, not retained stream data or packet history.
+    // Reuse the most recently ACKed allocation; growth still follows live
+    // runtime limits and dropping the association releases this storage.
+    reusable_send_payload: Vec<u8>,
+    reusable_send_acknowledged: Vec<u64>,
     send_buffer_limit_bytes: usize,
     transmission_limit: usize,
     local_cid: Option<ConnectionId>,
@@ -3430,6 +3482,8 @@ pub(crate) struct EndpointState<const P: usize = DEFAULT_MAX_PACKET_SIZE> {
     ack_reordering_threshold: u32,
     largest_ack_frequency_sequence: Option<u64>,
     pending_ack_frequency: Option<(u64, u64, u64, u64)>,
+    // Anchor for first credit publication, then for the in-flight credit PTO.
+    // Ordinary ACKs must not postpone a publication already awaiting its ACK.
     last_ack_time: u64,
     largest_received_at: u64,
     max_ack_delay_us: u64,
@@ -3451,9 +3505,9 @@ pub(crate) struct EndpointState<const P: usize = DEFAULT_MAX_PACKET_SIZE> {
     /// until the peer ACKs the packet that carried it.
     credit_pending: bool,
     credit_packet_number: Option<u32>,
-    // Consumption may advance the absolute MAX_* limits while the previous
-    // publication is still in flight.  Retain one packet until it is ACKed;
-    // this bit requests exactly one replacement carrying the newest limits.
+    // Consumption may advance absolute MAX_* limits while an earlier
+    // publication is still in flight. Publish the latest values, but do not
+    // repeat an unchanged publication before its ACK or adaptive PTO.
     credit_dirty: bool,
     credit_retry_backoff: u8,
     max_streams_bidi_pending: bool,
@@ -3523,49 +3577,54 @@ struct RetainedSendRange {
 }
 
 impl RetainedSendRange {
-    fn mark_acknowledged(&mut self, offset: u64, length: usize) {
+    fn mark_acknowledged(&mut self, offset: u64, length: usize) -> Option<Vec<u8>> {
         let start = offset.max(self.offset);
         let end = offset
             .saturating_add(length as u64)
             .min(self.offset.saturating_add(self.data_len as u64));
         if start >= end {
-            return;
+            return None;
         }
-        for stream_offset in start..end {
-            let index = (stream_offset - self.offset) as usize;
-            self.acknowledged[index / 64] |= 1_u64 << (index % 64);
+        let first = (start - self.offset) as usize;
+        let last = (end - self.offset - 1) as usize;
+        for word_index in first / 64..=last / 64 {
+            let low = if word_index == first / 64 { first % 64 } else { 0 };
+            let high = if word_index == last / 64 { last % 64 } else { 63 };
+            self.acknowledged[word_index] |= (u64::MAX << low) & (u64::MAX >> (63 - high));
         }
-        self.compact_acknowledged_edges();
+        self.compact_acknowledged_edges()
     }
 
-    fn compact_acknowledged_edges(&mut self) {
-        let acknowledged = &self.acknowledged;
-        let Some(payload) = self.payload.as_mut() else {
-            return;
+    fn compact_acknowledged_edges(&mut self) -> Option<Vec<u8>> {
+        let Some(payload) = self.payload.as_ref() else {
+            return None;
         };
         let stored_end = self.payload_start + payload.len();
-        let Some(first_live) = (self.payload_start..stored_end).find(|index| {
-            !acknowledged
-                .get(*index / 64)
-                .is_some_and(|word| word & (1_u64 << (*index % 64)) != 0)
-        }) else {
-            self.payload = None;
+        let Some((first_live, last_live_end)) = self.unacknowledged_bounds(self.payload_start, stored_end) else {
             self.payload_start = self.data_len;
-            return;
+            return self.payload.take();
         };
+        let payload = self.payload.as_mut().expect("retained payload was checked above");
         if first_live > self.payload_start {
             payload.drain(..first_live - self.payload_start);
             self.payload_start = first_live;
         }
-        let stored_end = self.payload_start + payload.len();
-        let last_live_end = (self.payload_start..stored_end)
-            .rfind(|index| {
-                !acknowledged
-                    .get(*index / 64)
-                    .is_some_and(|word| word & (1_u64 << (*index % 64)) != 0)
-            })
-            .map_or(self.payload_start, |index| index + 1);
         payload.truncate(last_live_end - self.payload_start);
+        None
+    }
+
+    fn unacknowledged_bounds(&self, start: usize, end: usize) -> Option<(usize, usize)> {
+        if start >= end { return None; }
+        let live_word = |index: usize| {
+            let low = if index == start / 64 { start % 64 } else { 0 };
+            let high = if index == (end - 1) / 64 { (end - 1) % 64 } else { 63 };
+            !self.acknowledged.get(index).copied().unwrap_or(0)
+                & (u64::MAX << low) & (u64::MAX >> (63 - high))
+        };
+        let first_word = (start / 64..=(end - 1) / 64).find(|index| live_word(*index) != 0)?;
+        let last_word = (first_word..=(end - 1) / 64).rfind(|index| live_word(*index) != 0)?;
+        Some((first_word * 64 + live_word(first_word).trailing_zeros() as usize,
+            last_word * 64 + 64 - live_word(last_word).leading_zeros() as usize))
     }
 
     fn is_byte_acknowledged(&self, index: usize) -> bool {
@@ -3575,17 +3634,30 @@ impl RetainedSendRange {
     }
 
     fn all_data_acknowledged(&self) -> bool {
-        (0..self.data_len).all(|index| self.is_byte_acknowledged(index))
+        // Compaction advances this to the original end once the last live
+        // byte is ACKed. Do not rescan every payload byte for every packet ACK,
+        // especially on 32-bit targets where variable u64 shifts are costly.
+        self.payload_start == self.data_len
     }
 
     fn first_unacknowledged_run(&self) -> Option<(usize, usize)> {
-        self.payload.as_ref()?;
         let stored_end = self.payload_start + self.payload.as_ref()?.len();
-        let start =
-            (self.payload_start..stored_end).find(|index| !self.is_byte_acknowledged(*index))?;
-        let end = (start + 1..=stored_end)
-            .find(|index| *index == stored_end || self.is_byte_acknowledged(*index))
-            .unwrap_or(stored_end);
+        let first_bit = |start: usize, acked: bool| {
+            if start >= stored_end { return None; }
+            for index in start / 64..=(stored_end - 1) / 64 {
+                let word = self.acknowledged.get(index).copied().unwrap_or(0);
+                let low = if index == start / 64 { start % 64 } else { 0 };
+                let high = if index == (stored_end - 1) / 64 { (stored_end - 1) % 64 } else { 63 };
+                let bits = (if acked { word } else { !word })
+                    & (u64::MAX << low) & (u64::MAX >> (63 - high));
+                if bits != 0 {
+                    return Some(index * 64 + bits.trailing_zeros() as usize);
+                }
+            }
+            None
+        };
+        let start = first_bit(self.payload_start, false)?;
+        let end = first_bit(start + 1, true).unwrap_or(stored_end);
         Some((start, end))
     }
 
@@ -3664,6 +3736,48 @@ struct CongestionHistoryPacket {
     excluded: bool,
 }
 
+/// Refill both pacing budgets from one byte-rate quotient. For positive
+/// integer divisors, floor(floor(n / rtt) / mss) = floor(n / (rtt * mss)).
+/// Do not clamp the byte quotient before computing packet tokens: that would
+/// change overflowing inputs. Ordinary windows/intervals fit the narrow path.
+fn pacing_refill_tokens(elapsed: u64, window: u64, rtt: u64, mss: u64) -> (u64, u64) {
+    let rtt = rtt.max(1);
+    let mss = mss.max(1);
+    if let Some(numerator) = elapsed.checked_mul(window).and_then(|n| n.checked_mul(1 << 16)) {
+        let bytes = numerator / rtt;
+        return (bytes, bytes / mss);
+    }
+    let bytes = u128::from(elapsed)
+        .saturating_mul(u128::from(window))
+        .saturating_mul(1 << 16) / u128::from(rtt);
+    (bytes.min(u128::from(u64::MAX)) as u64,
+        (bytes / u128::from(mss)).min(u128::from(u64::MAX)) as u64)
+}
+
+// Preserve the existing saturating ceiling calculation, using a narrow
+// quotient when its product and rounding addition both fit. This matters on
+// 32-bit targets where 128-bit division is a software routine.
+fn pacing_wait_us(deficit: u64, scale: u128, denominator: u128) -> u64 {
+    let denominator = denominator.max(1);
+    if deficit == 0 { return 0; }
+    if let (Ok(scale), Ok(divisor)) = (u64::try_from(scale), u64::try_from(denominator)) {
+        if let Some(numerator) = deficit.checked_mul(scale)
+            .and_then(|value| value.checked_add(divisor - 1))
+        {
+            return numerator / divisor;
+        }
+    }
+    wide_pacing_wait_us(deficit, scale, denominator)
+}
+
+#[cold]
+#[inline(never)]
+fn wide_pacing_wait_us(deficit: u64, scale: u128, denominator: u128) -> u64 {
+    (u128::from(deficit).saturating_mul(scale)
+        .saturating_add(denominator - 1) / denominator)
+        .min(u128::from(u64::MAX)) as u64
+}
+
 /// State for one endpoint-selected network path.
 ///
 /// Packet numbering, stream retention, and receive state remain association
@@ -3691,6 +3805,8 @@ pub(crate) struct PathState {
     ack_pending: bool,
     ack_packets: u8,
     ack_immediate: bool,
+    // First outstanding ACK intent, independent of later ACK-only ingress.
+    ack_started_at: u64,
     largest_received_packet: Option<u32>,
     largest_received_at: u64,
     local_cid: Option<ConnectionId>,
@@ -3708,6 +3824,11 @@ pub(crate) struct PathState {
     packets_acked: u64,
     packets_lost: u64,
     spurious_losses: u64,
+    // Start with RFC 9002's three-packet threshold. A late ACK proves a
+    // larger reordering distance on this path; retain that evidence rather
+    // than repeatedly reducing congestion for the same reorder pattern.
+    packet_reordering_threshold: u64,
+    loss_time_ratio_q16: u64,
     packets_duplicated: u64,
     duplicate_bytes_prepared: u64,
     probe_bytes_prepared: u64,
@@ -3736,6 +3857,16 @@ pub(crate) struct PathState {
 }
 
 impl PathState {
+    fn loss_base_rtt_us(&self) -> u64 {
+        self.rtt.latest().unwrap_or(25_000)
+            .max(self.rtt.smoothed().unwrap_or(25_000)).max(1)
+    }
+
+    fn loss_delay_us(&self, max_ack_delay_us: u64) -> u64 {
+        self.loss_base_rtt_us().saturating_mul(self.loss_time_ratio_q16)
+            .div_ceil(1 << 16).saturating_add(max_ack_delay_us)
+    }
+
     fn new(max_packet_size: u64, transmission_capacity: usize) -> Self {
         Self {
             congestion: CongestionController::new(max_packet_size),
@@ -3759,6 +3890,7 @@ impl PathState {
             ack_pending: false,
             ack_packets: 0,
             ack_immediate: false,
+            ack_started_at: 0,
             largest_received_packet: None,
             largest_received_at: 0,
             local_cid: None,
@@ -3776,6 +3908,8 @@ impl PathState {
             packets_acked: 0,
             packets_lost: 0,
             spurious_losses: 0,
+            packet_reordering_threshold: 3,
+            loss_time_ratio_q16: 9 * (1 << 16) / 8,
             packets_duplicated: 0,
             duplicate_bytes_prepared: 0,
             probe_bytes_prepared: 0,
@@ -3813,6 +3947,19 @@ impl PathState {
     }
 
     fn try_reserve_pacing(&mut self, packet_bytes: u64, now_us: u64) -> bool {
+        if !self.can_send_paced(packet_bytes, now_us) {
+            return false;
+        }
+        if self.pacing_config.enabled {
+            self.pacing_byte_tokens_q16 -= packet_bytes.saturating_mul(1 << 16);
+            self.pacing_packet_tokens_q16 -= 1 << 16;
+        }
+        true
+    }
+
+    // Refill/check without charging tokens. Stream writes use this before
+    // allocating reliable storage, then reserve only after allocation succeeds.
+    fn can_send_paced(&mut self, packet_bytes: u64, now_us: u64) -> bool {
         if !self.pacing_config.enabled {
             self.pacing_deadline_us = None;
             return true;
@@ -3825,16 +3972,9 @@ impl PathState {
         if elapsed != 0 {
             let byte_cap = u64::from(self.pacing_config.max_burst_bytes) << 16;
             let packet_cap = u64::from(self.pacing_config.max_burst_packets) << 16;
-            let byte_refill = (u128::from(elapsed)
-                .saturating_mul(window)
-                .saturating_mul(Q16)
-                / rtt)
-                .min(u128::from(u64::MAX)) as u64;
-            let packet_refill = (u128::from(elapsed)
-                .saturating_mul(window)
-                .saturating_mul(Q16)
-                / rtt.saturating_mul(mss).max(1))
-            .min(u128::from(u64::MAX)) as u64;
+            let (byte_refill, packet_refill) = pacing_refill_tokens(
+                elapsed, window as u64, rtt as u64, mss as u64,
+            );
             self.pacing_byte_tokens_q16 = self
                 .pacing_byte_tokens_q16
                 .saturating_add(byte_refill)
@@ -3851,15 +3991,7 @@ impl PathState {
         let packet_deficit = needed_packet.saturating_sub(self.pacing_packet_tokens_q16);
         if byte_deficit != 0 || packet_deficit != 0 {
             let byte_denominator = window.saturating_mul(Q16).max(1);
-            let byte_wait = if byte_deficit == 0 {
-                0
-            } else {
-                (u128::from(byte_deficit)
-                    .saturating_mul(rtt)
-                    .saturating_add(byte_denominator - 1)
-                    / byte_denominator)
-                    .min(u128::from(u64::MAX)) as u64
-            };
+            let byte_wait = pacing_wait_us(byte_deficit, rtt, byte_denominator);
             let packet_denominator = rtt.saturating_mul(mss).max(1);
             let packet_wait = if packet_deficit == 0 {
                 0
@@ -3868,16 +4000,12 @@ impl PathState {
                 // rate. A multi-second RTT can make Q16 packets/us round to
                 // zero; retrying every microsecond then rounds every refill
                 // to zero too, permanently starving a pending write.
-                (u128::from(packet_deficit).saturating_mul(packet_denominator)
-                    .saturating_add(byte_denominator - 1) / byte_denominator)
-                    .min(u128::from(u64::MAX)) as u64
+                pacing_wait_us(packet_deficit, packet_denominator, byte_denominator)
             };
             self.pacing_deadline_us =
                 Some(now_us.saturating_add(byte_wait.max(packet_wait).max(1)));
             return false;
         }
-        self.pacing_byte_tokens_q16 -= needed_bytes;
-        self.pacing_packet_tokens_q16 -= needed_packet;
         self.pacing_deadline_us = None;
         true
     }
@@ -4313,6 +4441,8 @@ impl PathState {
 /// the windows by their sum. This keeps the intermediate products within
 /// `u128` while preserving the LIA equation for the supported four paths.
 fn linked_congestion_increase_q32(paths: &[PathState], path_id: usize, acked_bytes: u64) -> u128 {
+    #[cfg(test)]
+    tests::count_lia_calculation();
     const Q32: u128 = 1u128 << 32;
     if acked_bytes == 0 {
         return 0;
@@ -4335,6 +4465,21 @@ fn linked_congestion_increase_q32(paths: &[PathState], path_id: usize, acked_byt
         .sum::<u128>();
     if total_window == 0 {
         return 0;
+    }
+    if paths.len() == 1 {
+        // With one eligible path, x=t=1 and alpha=1 exactly. Evaluate
+        // Reno's Q32 increase directly rather than normalizing RTT/window
+        // ratios and dividing them back out. Keep the same saturating product.
+        if let Some(numerator) = acked_bytes
+            .checked_mul(target.congestion.max_packet_size)
+            .and_then(|product| product.checked_mul(1 << 32))
+        {
+            return u128::from(numerator / target.congestion.congestion_window);
+        }
+        return u128::from(acked_bytes)
+            .saturating_mul(u128::from(target.congestion.max_packet_size))
+            .saturating_mul(Q32)
+            / total_window;
     }
     let min_rtt = paths
         .iter()
@@ -4379,6 +4524,37 @@ fn linked_congestion_increase_q32(paths: &[PathState], path_id: usize, acked_byt
 }
 
 const MAX_PATH_STATES: usize = 4;
+// Gather timer candidates in one pass through the shared transmission ledger,
+// instead of rescanning it twice for every path. Thresholds are applied after
+// choosing the oldest timestamps: saturating addition preserves their order.
+fn packet_timer_heads<'a>(
+    paths: &[PathState],
+    packets: impl Iterator<Item = &'a SentPacket>,
+) -> ([Option<u64>; MAX_PATH_STATES], [Option<u64>; MAX_PATH_STATES], bool) {
+    let mut earliest = [None; MAX_PATH_STATES];
+    let mut loss = [None; MAX_PATH_STATES];
+    let mut loss_candidate = false;
+    for packet in packets {
+        if !packet.accepted {
+            continue;
+        }
+        if packet.lost {
+            // Conservative gate only: retained payload, pending FIN and
+            // newer-transmission coverage are still checked by the existing
+            // loss selector. With no candidate, avoid its second ledger scan.
+            loss_candidate |= !packet.data_delivered || packet.fin;
+            continue;
+        }
+        let Some(path) = paths.get(packet.path_id) else { continue; };
+        let head = &mut earliest[packet.path_id];
+        *head = Some(head.map_or(packet.sent_at, |old: u64| old.min(packet.sent_at)));
+        if path.largest_acked_send_order.is_some_and(|order| packet.send_order < order) {
+            let head = &mut loss[packet.path_id];
+            *head = Some(head.map_or(packet.sent_at, |old: u64| old.min(packet.sent_at)));
+        }
+    }
+    (earliest, loss, loss_candidate)
+}
 pub(crate) const MAX_PATH_JOIN_ATTEMPTS: u8 = 5;
 
 impl<const P: usize> EndpointState<P> {
@@ -4414,6 +4590,8 @@ impl<const P: usize> EndpointState<P> {
             core::ptr::addr_of_mut!((*out).sent_packets)
                 .write(alloc::vec![None; transmission_capacity]);
             core::ptr::addr_of_mut!((*out).send_buffer).write(alloc::vec![None; history_capacity]);
+            core::ptr::addr_of_mut!((*out).reusable_send_payload).write(Vec::new());
+            core::ptr::addr_of_mut!((*out).reusable_send_acknowledged).write(Vec::new());
             core::ptr::addr_of_mut!((*out).send_buffer_limit_bytes)
                 .write(history_capacity.saturating_mul(P));
             core::ptr::addr_of_mut!((*out).transmission_limit)
@@ -4505,6 +4683,8 @@ impl<const P: usize> EndpointState<P> {
             largest_acked_by_peer: None,
             sent_packets: alloc::vec![None; history_capacity.saturating_mul(2)],
             send_buffer: alloc::vec![None; history_capacity],
+            reusable_send_payload: Vec::new(),
+            reusable_send_acknowledged: Vec::new(),
             send_buffer_limit_bytes: history_capacity.saturating_mul(P),
             transmission_limit: history_capacity.saturating_mul(2),
             local_cid: None,
@@ -4713,6 +4893,9 @@ impl<const P: usize> EndpointState<P> {
         let Some(path) = self.paths.get_mut(path_id) else {
             return;
         };
+        if !path.ack_pending {
+            path.ack_started_at = path.send_clock;
+        }
         path.ack_pending = true;
         path.ack_packets = path.ack_packets.saturating_add(1);
         path.ack_immediate |= immediate;
@@ -4725,11 +4908,21 @@ impl<const P: usize> EndpointState<P> {
             return;
         };
         if !path.ack_pending {
+            path.ack_started_at = path.send_clock;
             path.largest_received_at = path.send_clock;
         }
         path.ack_pending = true;
         path.ack_immediate |= immediate;
         self.ack_pending = true;
+    }
+
+    fn pending_receive_ack_path(&self) -> usize {
+        self.paths
+            .iter()
+            .enumerate()
+            .filter(|(_, path)| path.ack_pending)
+            .max_by_key(|(_, path)| path.largest_received_at)
+            .map_or(0, |(path_id, _)| path_id)
     }
 
     pub(crate) fn request_path_validation_ack(&mut self, path_id: usize) {
@@ -4766,7 +4959,7 @@ impl<const P: usize> EndpointState<P> {
             path.ack_pending
                 && (path.ack_packets >= self.ack_frequency
                     || path.ack_immediate
-                    || path.send_clock.saturating_sub(path.largest_received_at)
+                    || path.send_clock.saturating_sub(path.ack_started_at)
                         >= self.max_ack_delay_us)
         });
         if ack_path.is_some() {
@@ -5419,6 +5612,12 @@ impl<const P: usize> EndpointState<P> {
             return Err(Error::HistoryFull);
         }
         self.send_buffer_limit_bytes = limit;
+        if self.reusable_send_payload.capacity() > limit {
+            self.reusable_send_payload = Vec::new();
+        }
+        if self.reusable_send_acknowledged.capacity() > limit.div_ceil(64) {
+            self.reusable_send_acknowledged = Vec::new();
+        }
         Ok(())
     }
 
@@ -5488,6 +5687,8 @@ impl<const P: usize> EndpointState<P> {
                 * core::mem::size_of::<(BearerId, PeerL2Address)>()
             + self.history_storage_slots() * core::mem::size_of::<Option<SentPacket>>()
             + self.send_buffer.len() * core::mem::size_of::<Option<RetainedSendRange>>()
+            + self.reusable_send_payload.capacity()
+            + self.reusable_send_acknowledged.capacity() * core::mem::size_of::<u64>()
             + self
                 .send_buffer
                 .iter()
@@ -5537,7 +5738,7 @@ impl<const P: usize> EndpointState<P> {
         self.send_buffer_limit_bytes
     }
 
-    /// Advance the transport clock in milliseconds.
+    /// Advance the transport clock in microseconds.
     ///
     /// Every host and embedded adapter must convert its platform monotonic
     /// source at this boundary. ACK delay, credit retry, RTT/PTO samples, and
@@ -5634,7 +5835,7 @@ impl<const P: usize> EndpointState<P> {
                     Some(path.send_clock)
                 } else if path.ack_pending {
                     Some(
-                        path.largest_received_at
+                        path.ack_started_at
                             .saturating_add(self.max_ack_delay_us),
                     )
                 } else {
@@ -5656,7 +5857,7 @@ impl<const P: usize> EndpointState<P> {
         // first publication and a later unacknowledged publication.
         let credit_deadline =
             self.credit_pending
-                .then_some(self.last_ack_time.saturating_add(
+                .then(|| self.last_ack_time.saturating_add(
                     if self.credit_packet_number.is_some() {
                         // A MAX_* update is reliable connection state. Once it has
                         // been sent, retry it on the normal adaptive loss clock, not
@@ -5686,39 +5887,19 @@ impl<const P: usize> EndpointState<P> {
             .iter()
             .filter_map(PathState::pacing_deadline_us)
             .min();
+        let (earliest_sent, loss_sent, loss_candidate) = packet_timer_heads(
+            &self.paths, self.sent_packets.iter().flatten(),
+        );
         let (loss_deadline, pto_deadline) = self.paths.iter().enumerate().fold(
             (None, None),
             |(loss_deadline, pto_deadline), (path_id, path)| {
-                let largest_acked = path.largest_acked_send_order;
-                let base_rtt = path
-                    .rtt
-                    .latest()
-                    .unwrap_or(25_000)
-                    .max(path.rtt.smoothed().unwrap_or(25_000))
-                    .max(1);
-                let loss_threshold =
-                    base_rtt.saturating_mul(9).saturating_add(7) / 8 + self.peer_max_ack_delay_us;
-                let path_loss_deadline = largest_acked.and_then(|largest_acked| {
-                    self.sent_packets
-                        .iter()
-                        .flatten()
-                        .filter(|packet| {
-                            packet.accepted
-                                && !packet.lost
-                                && packet.path_id == path_id
-                                && packet.send_order < largest_acked
-                        })
-                        .map(|packet| packet.sent_at.saturating_add(loss_threshold))
-                        .min()
+                // No ACK frontier below an outstanding transmission means
+                // there is no time-threshold loss timer to calculate yet.
+                let path_loss_deadline = loss_sent[path_id].map(|sent_at| {
+                    let threshold = path.loss_delay_us(self.peer_max_ack_delay_us);
+                    sent_at.saturating_add(threshold)
                 });
-                let earliest_sent = self
-                    .sent_packets
-                    .iter()
-                    .flatten()
-                    .filter(|packet| packet.accepted && !packet.lost && packet.path_id == path_id)
-                    .map(|packet| packet.sent_at)
-                    .min();
-                let path_pto_deadline = earliest_sent.map(|sent_at| {
+                let path_pto_deadline = earliest_sent[path_id].map(|sent_at| {
                     let pto = self.pto_timeout_for_path(path_id);
                     let interval =
                         pto.saturating_mul(1u64 << path.pto_backoff.min(MAX_PTO_BACKOFF_EXPONENT));
@@ -5732,7 +5913,7 @@ impl<const P: usize> EndpointState<P> {
                 )
             },
         );
-        let loss_retransmission_deadline = (self.has_retransmittable_loss()
+        let loss_retransmission_deadline = (loss_candidate && self.has_retransmittable_loss()
             && self.paths.iter().enumerate().any(|(path_id, path)| {
                 path.is_usable_for_data()
                     && self.peer_connection_id_on_path(path_id).is_some()
@@ -6216,6 +6397,9 @@ impl<const P: usize> EndpointState<P> {
         let mut streams = [None; 8];
         let mut stream_count = 0usize;
         let mut has_ack = false;
+        let mut acknowledged = AckRangeSet::new();
+        let mut reported_ack_delay = 0;
+        let mut has_flow_control = false;
         let mut ack_eliciting = false;
         let mut path_status = false;
         let mut ack_frequency = None;
@@ -6226,10 +6410,26 @@ impl<const P: usize> EndpointState<P> {
                 return Err(Error::Invalid);
             }
             match frame {
-                Frame::Ack { .. } | Frame::AckRanges { .. } => has_ack = true,
+                Frame::Ack { largest, delay } => {
+                    has_ack = true;
+                    acknowledged.insert(largest);
+                    reported_ack_delay = delay;
+                }
+                Frame::AckRanges { ranges, delay, .. } => {
+                    has_ack = true;
+                    reported_ack_delay = delay;
+                    for index in 0..ranges.len() {
+                        if let Some(range) = ranges.get(index) {
+                            acknowledged.insert_range(range);
+                        }
+                    }
+                }
+                Frame::MaxData(_) | Frame::MaxStreamData { .. } => {
+                    has_flow_control = true;
+                    ack_eliciting = true;
+                }
+                Frame::MaxStreamsBidi(_) | Frame::MaxStreamsUni(_) => has_flow_control = true,
                 Frame::Ping
-                | Frame::MaxData(_)
-                | Frame::MaxStreamData { .. }
                 | Frame::PathJoin { .. }
                 | Frame::PathJoinAck { .. }
                 | Frame::PathChallenge { .. }
@@ -6289,8 +6489,14 @@ impl<const P: usize> EndpointState<P> {
             return Err(Error::Invalid);
         }
         if has_ack {
-            self.receive_ack_packet_on_path(input, ingress_path)?;
-        } else {
+            // Parsing above validates the complete packet before changing
+            // endpoint state. Reuse its ACK ranges rather than decoding all
+            // frames again. Mixed credit remains applied before ACK retirement.
+            if has_flow_control {
+                self.receive_flow_control_packet(input)?;
+            }
+            self.apply_ack_ranges_on_path(acknowledged, reported_ack_delay, ingress_path)?;
+        } else if has_flow_control {
             // MAX_DATA/MAX_STREAM_DATA are independently meaningful control
             // frames. A receiver that releases storage after its ACK turn may
             // emit a credit-only packet while the sender is flow blocked.
@@ -6601,7 +6807,18 @@ impl<const P: usize> EndpointState<P> {
     /// delayed-ACK deadline is actually due.  Forcing `control_pending` here
     /// turns each short socket timeout into an immediate ACK and throttles
     /// otherwise continuous Wi-Fi traffic.
-    pub(crate) fn on_bearer_timeout(&mut self) {}
+    pub(crate) fn on_bearer_timeout(&mut self) {
+        // Pacing wakes are one-shot application readiness notifications, not
+        // retransmission timers. Once delivered, retire the wake even if the
+        // producer is now blocked on credit, congestion or bearer capacity.
+        // A later pacing rejection arms a new deadline. Leaving this in the
+        // past makes event-driven owners spin continuously on a due timer.
+        for path in &mut self.paths {
+            if path.pacing_deadline_us.is_some_and(|deadline| deadline <= path.send_clock) {
+                path.pacing_deadline_us = None;
+            }
+        }
+    }
 
     /// Report application bytes made durable while leaving control-packet
     /// scheduling to the bearer’s next [`Self::poll_transmit`] call.
@@ -6629,7 +6846,8 @@ impl<const P: usize> EndpointState<P> {
         bytes: usize,
     ) -> Result<(), Error> {
         self.receive.consume(stream_id, bytes as u64)?;
-        self.schedule_ack(0, false);
+        let ack_path = self.pending_receive_ack_path();
+        self.schedule_application_ack(ack_path, false);
         Ok(())
     }
 
@@ -6689,11 +6907,8 @@ impl<const P: usize> EndpointState<P> {
 
     fn queue_stream_credit(&mut self, stream_id: u64) -> Result<(), Error> {
         // A MAX_* packet may be in flight while the application consumes more
-        // ordered bytes.  Keep that one reliable publication intact and mark
-        // the latest absolute limit dirty.  Clearing its marker here made an
-        // event-driven receiver re-send MAX_* at every delayed-ACK tick until
-        // the peer replied, creating a control backlog at ordinary Wi-Fi RTT.
-        // Its ACK releases exactly one replacement carrying the newest value.
+        // ordered bytes. Mark the newest absolute limit dirty without losing
+        // the existing publication's ACK/PTO tracking before it is replaced.
         self.credit_dirty |= self.credit_packet_number.is_some();
         self.credit_pending = true;
         if self
@@ -6728,7 +6943,12 @@ impl<const P: usize> EndpointState<P> {
         if force_control {
             self.control_pending = true;
         }
-        self.schedule_application_ack(0, force_control);
+        // Receive already scheduled an ACK on the actual ingress path.
+        // Consumption must not invent an earlier ACK on path zero: it can
+        // remove the other path's flight before that path supplies an RTT
+        // sample. If its ACK already went out, credit gets its own wake.
+        let ack_path = self.pending_receive_ack_path();
+        self.schedule_application_ack(ack_path, force_control);
         self.queue_stream_credit(stream_id)?;
         self.try_retire_stream(stream_id);
         Ok(())
@@ -6787,13 +7007,72 @@ impl<const P: usize> EndpointState<P> {
         path_id: usize,
         out: &mut [u8],
     ) -> Result<Option<usize>, Error> {
+        if path_id >= self.paths.len() {
+            return Err(Error::Invalid);
+        }
+        if self.pending_control_path().is_none() {
+            return Ok(None);
+        }
+        let dcid = self
+            .peer_connection_id_on_path(path_id)
+            .ok_or(Error::WrongConnectionId)?;
+        let mut p = ShortHeader {
+            flags: FLAG_FIXED,
+            dcid,
+            packet_number: self.next_packet_number,
+            packet_number_len: self.next_packet_number_len(),
+        }
+        .encode(out)?;
+        let body_end = self.control_body_end(out.len());
+        if p > body_end {
+            return Err(Error::BufferTooSmall);
+        }
+        let Some(control) = self.encode_control_frames_on_path(path_id, &mut out[p..body_end], false)? else {
+            return Ok(None);
+        };
+        p += control.used;
+        let next_packet_number = self.next_packet_number.checked_add(1)
+            .ok_or(Error::PacketNumberExhausted)?;
+        #[cfg(feature = "packet-protection")]
+        if self.protection.is_some() {
+            p = self.protect_packet_in_place(path_id, out, p)?;
+        }
+        self.commit_control_frames(path_id, self.next_packet_number, &control);
+        self.stats.sent_packets += 1;
+        self.stats.sent_control_packets += 1;
+        self.next_packet_number = next_packet_number;
+        Ok(Some(p))
+    }
+
+    fn control_body_end(&self, capacity: usize) -> usize {
+        #[cfg(feature = "packet-protection")]
+        if self.protection.is_some() {
+            return capacity.saturating_sub(crypto::AEAD_TAG_LEN);
+        }
+        capacity
+    }
+
+    /// Serialize pending controls without consuming their state. Piggyback
+    /// mode can ACK before the delayed-ACK threshold: no extra packet is
+    /// needed. If controls do not fit, their standalone timer remains armed.
+    fn encode_control_frames_on_path(
+        &self,
+        path_id: usize,
+        out: &mut [u8],
+        piggyback: bool,
+    ) -> Result<Option<EncodedControlFrames>, Error> {
         let Some(path) = self.paths.get(path_id) else {
             return Err(Error::Invalid);
         };
+        // Preserve the ACK return-path selection used by standalone control
+        // output. A data packet on another circuit must not consume it.
+        if piggyback && path_id != self.pending_control_path().unwrap_or_else(|| self.pending_receive_ack_path()) {
+            return Ok(None);
+        }
         let path_clock = path.send_clock;
         let ack_threshold_due = path.ack_pending && path.ack_packets >= self.ack_frequency;
         let ack_timer_due = path.ack_pending
-            && path_clock.saturating_sub(path.largest_received_at) >= self.max_ack_delay_us;
+            && path_clock.saturating_sub(path.ack_started_at) >= self.max_ack_delay_us;
         let delayed_ack_due = ack_threshold_due || ack_timer_due;
         // Retry a lost MAX_* control packet on the endpoint's adaptive PTO.
         // This is intentionally independent of the bearer: a sender may be
@@ -6808,37 +7087,42 @@ impl<const P: usize> EndpointState<P> {
                 } else {
                     self.max_ack_delay_us
                 };
-        let send_ack = self.control_pending || delayed_ack_due || credit_retry_due;
+        // Keep an unchanged reliable MAX_* publication until its ACK or PTO.
+        // Receiving more data can require an ACK while that publication is
+        // still in flight; repeating MAX_* here would replace the packet
+        // number and make the original publication's ACK ineffective.
+        let send_credit = self.credit_pending
+            && (self.credit_packet_number.is_none() || self.credit_dirty || credit_retry_due);
+        let send_ack = self.control_pending || path.ack_immediate || delayed_ack_due || credit_retry_due
+            || (piggyback && (path.ack_pending || send_credit));
         let ack_frequency = (path_id == 0)
             .then_some(self.pending_ack_frequency)
             .flatten();
         if !send_ack && ack_frequency.is_none() {
             return Ok(None);
         }
-        let dcid = self
-            .peer_connection_id_on_path(path_id)
-            .ok_or(Error::WrongConnectionId)?;
-        let mut p = ShortHeader {
-            flags: FLAG_FIXED,
-            dcid,
-            packet_number: self.next_packet_number,
-            packet_number_len: self.next_packet_number_len(),
-        }
-        .encode(out)?;
+        let mut control = EncodedControlFrames {
+            ack_threshold_due,
+            ack_timer_due,
+            immediate_ack: (path_id == 0 && self.control_pending) || path.ack_immediate,
+            ..EncodedControlFrames::default()
+        };
+        let mut p = 0;
         if send_ack {
-            let mut credit_stream_count = 0usize;
-            let mut credit_max_streams_bidi = false;
-            let immediate_ack =
-                (path_id == 0 && self.control_pending) || self.paths[path_id].ack_immediate;
             let largest = self.largest_received().ok_or(Error::Invalid)?;
-            p += Frame::AckRanges {
+            let ack = Frame::AckRanges {
                 largest,
                 delay: path_clock
                     .saturating_sub(self.paths[path_id].largest_received_at)
                     .min(self.max_ack_delay_us),
                 ranges: self.received_packets,
             }
-            .encode(&mut out[p..])?;
+            .encode(&mut out[p..]);
+            match ack {
+                Ok(used) => { p += used; control.ack = true; }
+                Err(Error::Truncated | Error::BufferTooSmall) if piggyback => return Ok(None),
+                Err(error) => return Err(error),
+            }
             // ACK-only packets must remain non-ack-eliciting.  In
             // particular, continuously restating the current MAX_* values
             // turns an ordinary ACK into a peer ACK/control packet, causing
@@ -6846,8 +7130,15 @@ impl<const P: usize> EndpointState<P> {
             // consumer queues these frames only when it actually publishes
             // new receive capacity through `stream_consumed` or
             // `grant_receive_window`.
-            if self.credit_pending {
-                p += Frame::MaxData(self.receive.connection.max_data).encode(&mut out[p..])?;
+            if send_credit {
+                match Frame::MaxData(self.receive.connection.max_data).encode(&mut out[p..]) {
+                    Ok(used) => { p += used; control.credit = true; }
+                    Err(Error::Truncated | Error::BufferTooSmall) if piggyback => {
+                        control.used = p;
+                        return Ok(Some(control));
+                    }
+                    Err(error) => return Err(error),
+                }
                 let stream_limit = if self.credit_packet_number.is_some() && !self.credit_dirty {
                     self.credit_inflight_stream_count
                         .min(self.pending_stream_ids.len())
@@ -6862,7 +7153,7 @@ impl<const P: usize> EndpointState<P> {
                     match (Frame::MaxStreamData { id: stream_id, max }).encode(&mut out[p..]) {
                         Ok(used) => {
                             p += used;
-                            credit_stream_count += 1;
+                            control.credit_stream_count += 1;
                         }
                         Err(Error::Truncated | Error::BufferTooSmall) => break,
                         Err(error) => return Err(error),
@@ -6874,65 +7165,69 @@ impl<const P: usize> EndpointState<P> {
                     {
                         Ok(used) => {
                             p += used;
-                            credit_max_streams_bidi = true;
+                            control.credit_max_streams_bidi = true;
                         }
                         Err(Error::Truncated | Error::BufferTooSmall) => {}
                         Err(error) => return Err(error),
                     }
                 }
             }
+        }
+        if let Some((sequence, packet_threshold, max_ack_delay_us, reordering_threshold)) = ack_frequency {
+            match (Frame::AckFrequency {
+                sequence,
+                packet_threshold,
+                max_ack_delay_us,
+                reordering_threshold,
+            }).encode(&mut out[p..]) {
+                Ok(used) => { p += used; control.ack_frequency = true; }
+                Err(Error::Truncated | Error::BufferTooSmall) if piggyback => {}
+                Err(error) => return Err(error),
+            }
+        }
+        control.used = p;
+        Ok((p != 0).then_some(control))
+    }
+
+    fn commit_control_frames(&mut self, path_id: usize, packet_number: u32, control: &EncodedControlFrames) {
+        let path_clock = self.paths[path_id].send_clock;
+        if control.ack {
             self.control_pending = false;
             self.paths[path_id].ack_pending = false;
             self.paths[path_id].ack_packets = 0;
             self.paths[path_id].ack_immediate = false;
             self.refresh_ack_summary();
-            self.last_ack_time = path_clock;
-            let retrying_credit = self.credit_pending && self.credit_packet_number.is_some();
-            if self.credit_pending {
-                self.credit_packet_number = Some(self.next_packet_number);
-                self.credit_inflight_stream_count = credit_stream_count;
-                self.credit_inflight_max_streams_bidi = credit_max_streams_bidi;
+            if control.credit || self.credit_packet_number.is_none() {
+                self.last_ack_time = path_clock;
+            }
+            let retrying_credit = self.credit_packet_number.is_some() && !self.credit_dirty;
+            if control.credit {
+                self.credit_packet_number = Some(packet_number);
+                self.credit_inflight_stream_count = control.credit_stream_count;
+                self.credit_inflight_max_streams_bidi = control.credit_max_streams_bidi;
                 self.credit_dirty = false;
                 if retrying_credit {
                     self.credit_retry_backoff = self
                         .credit_retry_backoff
                         .saturating_add(1)
                         .min(MAX_PTO_BACKOFF_EXPONENT);
+                } else {
+                    self.credit_retry_backoff = 0;
                 }
             }
             self.stats.ack_packets += 1;
-            if immediate_ack {
+            if control.immediate_ack {
                 self.stats.ack_immediate_packets += 1;
-            } else if ack_threshold_due {
+            } else if control.ack_threshold_due {
                 self.stats.ack_threshold_packets += 1;
-            } else if ack_timer_due {
+            } else if control.ack_timer_due {
                 self.stats.ack_timer_packets += 1;
             }
         }
-        if let Some((sequence, packet_threshold, max_ack_delay_us, reordering_threshold)) =
-            ack_frequency
-        {
-            p += Frame::AckFrequency {
-                sequence,
-                packet_threshold,
-                max_ack_delay_us,
-                reordering_threshold,
-            }
-            .encode(&mut out[p..])?;
+        if control.ack_frequency {
             self.pending_ack_frequency = None;
             self.stats.ack_frequency_sent = self.stats.ack_frequency_sent.saturating_add(1);
         }
-        #[cfg(feature = "packet-protection")]
-        if self.protection.is_some() {
-            p = self.protect_packet_in_place(path_id, out, p)?;
-        }
-        self.stats.sent_packets += 1;
-        self.stats.sent_control_packets += 1;
-        self.next_packet_number = self
-            .next_packet_number
-            .checked_add(1)
-            .ok_or(Error::PacketNumberExhausted)?;
-        Ok(Some(p))
     }
 
     /// Encode one path-control frame using the association-wide packet-number
@@ -7183,6 +7478,15 @@ impl<const P: usize> EndpointState<P> {
             }
             offset += used;
         }
+        self.apply_ack_ranges_on_path(acknowledged, reported_ack_delay, ingress_path)
+    }
+
+    fn apply_ack_ranges_on_path(
+        &mut self,
+        acknowledged: AckRangeSet,
+        reported_ack_delay: u64,
+        ingress_path: usize,
+    ) -> Result<(), Error> {
         if acknowledged.len() == 0 {
             return Err(Error::Invalid);
         }
@@ -7196,15 +7500,29 @@ impl<const P: usize> EndpointState<P> {
         }
         if self
             .credit_packet_number
-            .is_some_and(|packet_number| acknowledged.contains(packet_number))
+            .is_some_and(|packet_number| {
+                acknowledged.contains(packet_number)
+                    || self.sent_packets.iter().flatten().any(|sent| {
+                        sent.accepted
+                            && sent.send_buffer_slot.is_none()
+                            && sent.duplication_charge != 0
+                            && sent.logical_packet_number == packet_number
+                            && acknowledged.contains(sent.packet_number)
+                    })
+            })
         {
             self.credit_packet_number = None;
             self.credit_retry_backoff = 0;
             if self.credit_dirty {
                 // Preserve all stream IDs and publish the latest absolute
-                // limits on the next transport turn.
+                // limits with the next normal ACK/control deadline. Forcing
+                // output for every ACK of an older credit update defeats
+                // delayed ACKs during sustained application consumption.
+                // Tiny windows cannot absorb a delayed publication safely
+                // without stop-and-wait, so keep their immediate wake.
                 self.credit_pending = true;
-                self.control_pending = true;
+                self.control_pending |= self.receive_growth_limits.max_stream_data
+                    <= (P as u64).saturating_mul(2);
                 self.credit_inflight_stream_count = 0;
                 self.credit_inflight_max_streams_bidi = false;
             } else {
@@ -7240,9 +7558,11 @@ impl<const P: usize> EndpointState<P> {
         let mut rtt_sample = None;
         let mut ack_progress_by_path = [false; MAX_PATH_STATES];
         let mut growth_bytes_by_path = [0u64; MAX_PATH_STATES];
-        let mut acknowledged_fins = Vec::new();
-        let mut acknowledged_data = Vec::new();
-        let mut acknowledged_status = Vec::new();
+        // Keep ordinary ACK batches inline; larger batches still spill rather
+        // than imposing a limit on delivery or retransmission bookkeeping.
+        let mut acknowledged_fins = smallvec::SmallVec::<[(u64, u64); 8]>::new();
+        let mut acknowledged_data = smallvec::SmallVec::<[(u64, u64, usize); 8]>::new();
+        let mut acknowledged_status = smallvec::SmallVec::<[(CircuitKey, u64); 8]>::new();
         let mut newly_acked = false;
         for slot in &mut self.sent_packets {
             if let Some(sent) = *slot {
@@ -7250,6 +7570,24 @@ impl<const P: usize> EndpointState<P> {
                     if sent.inferred_lost {
                         self.paths[sent.path_id].spurious_losses =
                             self.paths[sent.path_id].spurious_losses.saturating_add(1);
+                        let path = &mut self.paths[sent.path_id];
+                        let distance = path.largest_acked_send_order.unwrap_or(sent.send_order)
+                            .saturating_sub(sent.send_order).saturating_add(1);
+                        // Limit adaptation: very old ACKs must not suppress
+                        // packet-threshold repair indefinitely. The time
+                        // threshold and PTO remain independent safeguards.
+                        path.packet_reordering_threshold = path.packet_reordering_threshold
+                            .max(distance.min(128));
+                        // A late original ACK proves the observed elapsed
+                        // time was not loss. Add the same 9/8 safety margin
+                        // used initially, but cap tolerance at four RTTs.
+                        // PTO remains unchanged and can repair a real gap
+                        // earlier than this reordering-aware loss deadline.
+                        let elapsed = path.send_clock.saturating_sub(sent.sent_at);
+                        let ratio = elapsed.saturating_mul(9 * (1 << 16))
+                            .div_ceil(path.loss_base_rtt_us().saturating_mul(8));
+                        path.loss_time_ratio_q16 = path.loss_time_ratio_q16
+                            .max(ratio.min(4 * (1 << 16)));
                     }
                     if let Some(status) = sent.path_status {
                         acknowledged_status.push(status);
@@ -7313,36 +7651,7 @@ impl<const P: usize> EndpointState<P> {
                 }
             }
         }
-        let mut increase_q32_by_path = [0u128; MAX_PATH_STATES];
-        for path_id in 0..self.paths.len() {
-            let acked_bytes = growth_bytes_by_path[path_id];
-            if acked_bytes != 0 {
-                increase_q32_by_path[path_id] =
-                    linked_congestion_increase_q32(&self.paths, path_id, acked_bytes);
-            }
-        }
-        for path_id in 0..self.paths.len() {
-            let acked_bytes = growth_bytes_by_path[path_id];
-            if acked_bytes == 0 {
-                continue;
-            }
-            let increase_q32 = increase_q32_by_path[path_id];
-            let path = &mut self.paths[path_id];
-            if path.congestion.congestion_window < path.congestion.slow_start_threshold {
-                path.congestion.congestion_window = path
-                    .congestion
-                    .congestion_window
-                    .saturating_add(acked_bytes);
-                path.ca_remainder_q32 = 0;
-            } else {
-                let accumulated = u128::from(path.ca_remainder_q32).saturating_add(increase_q32);
-                path.congestion.congestion_window = path
-                    .congestion
-                    .congestion_window
-                    .saturating_add((accumulated >> 32).min(u64::MAX as u128) as u64);
-                path.ca_remainder_q32 = accumulated as u32;
-            }
-        }
+        self.apply_ack_congestion_growth(growth_bytes_by_path);
         for (key, sequence) in acknowledged_status {
             if let Some(path) = self
                 .paths
@@ -7367,7 +7676,14 @@ impl<const P: usize> EndpointState<P> {
         for (stream_id, offset, length) in acknowledged_data {
             for range in self.send_buffer.iter_mut().flatten() {
                 if range.stream_id == stream_id {
-                    range.mark_acknowledged(offset, length);
+                    if let Some(mut payload) = range.mark_acknowledged(offset, length) {
+                        payload.clear();
+                        if payload.capacity() <= self.send_buffer_limit_bytes
+                            && payload.capacity() > self.reusable_send_payload.capacity()
+                        {
+                            self.reusable_send_payload = payload;
+                        }
+                    }
                 }
             }
         }
@@ -7381,7 +7697,7 @@ impl<const P: usize> EndpointState<P> {
                 }
             }
         }
-        let mut retired_ranges = Vec::new();
+        let mut retired_ranges = smallvec::SmallVec::<[usize; 8]>::new();
         for (index, range) in self.send_buffer.iter_mut().enumerate() {
             let Some(range) = range.as_mut() else {
                 continue;
@@ -7423,7 +7739,14 @@ impl<const P: usize> EndpointState<P> {
             let _ = index;
         }
         for range_index in retired_ranges {
-            self.send_buffer[range_index] = None;
+            if let Some(mut range) = self.send_buffer[range_index].take() {
+                range.acknowledged.clear();
+                if range.acknowledged.capacity() <= self.send_buffer_limit_bytes.div_ceil(64)
+                    && range.acknowledged.capacity() > self.reusable_send_acknowledged.capacity()
+                {
+                    self.reusable_send_acknowledged = range.acknowledged;
+                }
+            }
         }
         acknowledged_fins.sort_unstable();
         acknowledged_fins.dedup();
@@ -7465,6 +7788,46 @@ impl<const P: usize> EndpointState<P> {
             self.detect_persistent_congestion(path_id);
         }
         Ok(())
+    }
+
+    // Keep the wider linked-increases arithmetic out of the packet retirement
+    // code footprint, including under LTO. Calculate all increases before
+    // updating any window so multipath uses the same pre-growth snapshot.
+    #[inline(never)]
+    fn apply_ack_congestion_growth(&mut self, growth_bytes_by_path: [u64; MAX_PATH_STATES]) {
+        let mut increase_q32_by_path = [0u128; MAX_PATH_STATES];
+        for path_id in 0..self.paths.len() {
+            let acked_bytes = growth_bytes_by_path[path_id];
+            if acked_bytes != 0
+                && self.paths[path_id].congestion.congestion_window
+                    >= self.paths[path_id].congestion.slow_start_threshold
+            {
+                increase_q32_by_path[path_id] =
+                    linked_congestion_increase_q32(&self.paths, path_id, acked_bytes);
+            }
+        }
+        for path_id in 0..self.paths.len() {
+            let acked_bytes = growth_bytes_by_path[path_id];
+            if acked_bytes == 0 {
+                continue;
+            }
+            let increase_q32 = increase_q32_by_path[path_id];
+            let path = &mut self.paths[path_id];
+            if path.congestion.congestion_window < path.congestion.slow_start_threshold {
+                path.congestion.congestion_window = path
+                    .congestion
+                    .congestion_window
+                    .saturating_add(acked_bytes);
+                path.ca_remainder_q32 = 0;
+            } else {
+                let accumulated = u128::from(path.ca_remainder_q32).saturating_add(increase_q32);
+                path.congestion.congestion_window = path
+                    .congestion
+                    .congestion_window
+                    .saturating_add((accumulated >> 32).min(u64::MAX as u128) as u64);
+                path.ca_remainder_q32 = accumulated as u32;
+            }
+        }
     }
 
     fn receive_flow_control_packet(&mut self, input: &[u8]) -> Result<(), Error> {
@@ -7544,13 +7907,37 @@ impl<const P: usize> EndpointState<P> {
             packet_number_len: self.next_packet_number_len(),
         };
         let mut p = header.encode(out)?;
-        p += Frame::Stream(StreamFrame {
+        let frame = StreamFrame {
             id: stream_id,
             offset,
             fin,
             data,
-        })
-        .encode(&mut out[p..])?;
+        };
+        #[cfg(feature = "packet-protection")]
+        let protected = self.protection.is_some();
+        #[cfg(not(feature = "packet-protection"))]
+        let protected = false;
+        let body_end = self.control_body_end(out.len());
+        if p > body_end {
+            return Err(Error::BufferTooSmall);
+        }
+        let payload_start;
+        if protected {
+            p += Frame::Stream(frame).encode(&mut out[p..body_end])?;
+            payload_start = p;
+        } else {
+            p += encode_stream_prefix(&frame, &mut out[p..body_end])?;
+            payload_start = p;
+            p = p.checked_add(data.len()).ok_or(Error::BufferTooSmall)?;
+            if p > body_end {
+                return Err(Error::BufferTooSmall);
+            }
+        }
+        let stream_end = p;
+        let control = self.encode_control_frames_on_path(path_id, &mut out[p..body_end], true)?;
+        if let Some(control) = &control {
+            p += control.used;
+        }
         #[cfg(feature = "packet-protection")]
         if self.protection.is_some() {
             p = self.protect_packet_in_place(path_id, out, p)?;
@@ -7572,12 +7959,24 @@ impl<const P: usize> EndpointState<P> {
         {
             return Err(Error::HistoryFull);
         }
-        let mut retained_data = Vec::new();
+        // A retry under congestion/pacing backpressure must not allocate,
+        // copy and immediately free a retransmission payload and ACK bitmap.
+        if !self.paths[path_id].congestion.can_send(p as u64) {
+            return Err(Error::Blocked);
+        }
+        let path_send_clock = self.paths[path_id].send_clock;
+        if !self.paths[path_id].can_send_paced(p as u64, path_send_clock) {
+            return Err(Error::Blocked);
+        }
+        if !protected {
+            out[payload_start..stream_end].copy_from_slice(data);
+        }
+        let mut retained_data = core::mem::take(&mut self.reusable_send_payload);
         retained_data
             .try_reserve(data.len())
             .map_err(|_| Error::HistoryFull)?;
         retained_data.extend_from_slice(data);
-        let mut acknowledged_bitmap = Vec::new();
+        let mut acknowledged_bitmap = core::mem::take(&mut self.reusable_send_acknowledged);
         acknowledged_bitmap
             .try_reserve(data.len().div_ceil(64))
             .map_err(|_| Error::HistoryFull)?;
@@ -7586,10 +7985,6 @@ impl<const P: usize> EndpointState<P> {
             .next_packet_number
             .checked_add(1)
             .ok_or(Error::PacketNumberExhausted)?;
-        if !self.paths[path_id].congestion.can_send(p as u64) {
-            return Err(Error::Blocked);
-        }
-        let path_send_clock = self.paths[path_id].send_clock;
         if !self.paths[path_id].try_reserve_pacing(p as u64, path_send_clock) {
             return Err(Error::Blocked);
         }
@@ -7655,6 +8050,9 @@ impl<const P: usize> EndpointState<P> {
         );
         if fin {
             self.send.finish_stream(stream_id)?;
+        }
+        if let Some(control) = &control {
+            self.commit_control_frames(path_id, packet_number, control);
         }
         self.stats.sent_packets += 1;
         self.stats.sent_stream_packets += 1;
@@ -8352,28 +8750,21 @@ impl<const P: usize> EndpointState<P> {
     /// PTO. The bearer simply polls normal transport output for the resulting
     /// fresh-number retransmission.
     fn detect_ack_losses(&mut self, path_id: usize, largest_acked: Option<u64>) {
-        const PACKET_THRESHOLD: u32 = 3;
         let Some(largest_acked) = largest_acked else {
             return;
         };
         let Some(path) = self.paths.get(path_id) else {
             return;
         };
-        let base_rtt = path
-            .rtt
-            .latest()
-            .unwrap_or(25_000)
-            .max(path.rtt.smoothed().unwrap_or(25_000))
-            .max(1);
         // RFC 9002's 9/8 time threshold, rounded up in the microsecond clock.
         // `base_rtt` is ACK-delay compensated, while an outstanding sibling
         // packet may still be waiting for the peer's negotiated delayed ACK.
         // Include that association parameter here: otherwise a normal
         // delayed ACK makes a same-burst packet appear lost and collapses the
         // congestion window into stop-and-wait pacing.
-        let time_threshold =
-            base_rtt.saturating_mul(9).saturating_add(7) / 8 + self.peer_max_ack_delay_us;
+        let time_threshold = path.loss_delay_us(self.peer_max_ack_delay_us);
         let path_send_clock = path.send_clock;
+        let packet_threshold = path.packet_reordering_threshold;
         let mut lost_bytes = 0u64;
         let mut largest_lost: Option<u32> = None;
         for slot in &mut self.sent_packets {
@@ -8389,7 +8780,7 @@ impl<const P: usize> EndpointState<P> {
             }
             let packet_threshold_lost = packet
                 .send_order
-                .saturating_add(u64::from(PACKET_THRESHOLD))
+                .saturating_add(packet_threshold)
                 <= largest_acked;
             let time_threshold_lost =
                 path_send_clock.saturating_sub(packet.sent_at) >= time_threshold;
@@ -8494,6 +8885,540 @@ mod tests {
     use std::collections::VecDeque;
     use std::vec;
     use std::vec::Vec;
+
+    // Per-thread counting leaves other concurrently running tests unaffected.
+    struct CountingAllocator;
+    std::thread_local! {
+        static ALLOCATION_COUNT: core::cell::Cell<Option<usize>> = const {
+            core::cell::Cell::new(None)
+        };
+        static FRAME_DECODE_COUNT: core::cell::Cell<Option<usize>> = const {
+            core::cell::Cell::new(None)
+        };
+        static LIA_CALCULATION_COUNT: core::cell::Cell<Option<usize>> = const {
+            core::cell::Cell::new(None)
+        };
+    }
+    pub(super) fn count_lia_calculation() {
+        let _ = LIA_CALCULATION_COUNT.try_with(|count| {
+            if let Some(value) = count.get() {
+                count.set(Some(value + 1));
+            }
+        });
+    }
+    pub(super) fn count_frame_decode() {
+        let _ = FRAME_DECODE_COUNT.try_with(|count| {
+            if let Some(value) = count.get() {
+                count.set(Some(value + 1));
+            }
+        });
+    }
+    fn count_allocation() {
+        let _ = ALLOCATION_COUNT.try_with(|count| {
+            if let Some(value) = count.get() {
+                count.set(Some(value + 1));
+            }
+        });
+    }
+    unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+            count_allocation();
+            unsafe { std::alloc::System.alloc(layout) }
+        }
+        unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+            count_allocation();
+            unsafe { std::alloc::System.alloc_zeroed(layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+            count_allocation();
+            unsafe { std::alloc::System.realloc(ptr, layout, size) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+            unsafe { std::alloc::System.dealloc(ptr, layout) }
+        }
+    }
+    #[global_allocator]
+    static TEST_ALLOCATOR: CountingAllocator = CountingAllocator;
+
+    #[test]
+    fn established_in_order_mux_delivery_does_not_allocate_packet_metadata() {
+        const PACKET: usize = 256;
+        let local = ConnectionId::new(0x7b1).unwrap();
+        let peer = ConnectionId::new(0x7b2).unwrap();
+        let limits = ConnectionLimits::with_receive_profile(16_384, 16_384, 8);
+        let mut receiver = crate::mux::StreamMux::<PACKET>::new_with_history_capacity(
+            Role::Server, limits, PACKET as u64, 1, 8, 16_384, 8,
+        );
+        receiver.install_connection_ids(local, peer).unwrap();
+        let data = [0x57; 64];
+        let mut received = 0;
+        for pn in 0..65 {
+            let mut packet = [0; PACKET];
+            let mut used = ShortHeader {
+                flags: FLAG_FIXED,
+                dcid: local,
+                packet_number: pn,
+                packet_number_len: 2,
+            }.encode(&mut packet).unwrap();
+            used += Frame::Stream(StreamFrame {
+                id: FIRST_CLIENT_BIDI_STREAM_ID,
+                offset: u64::from(pn) * data.len() as u64,
+                fin: pn == 64,
+                data: &data,
+            }).encode(&mut packet[used..]).unwrap();
+            // Creating persistent stream state is allowed to allocate. Once
+            // established, in-order delivery should only borrow the packet.
+            if pn != 0 {
+                ALLOCATION_COUNT.with(|count| count.set(Some(0)));
+            }
+            let result = receiver.receive_stream_events(&packet[..used], |id, offset, fin, bytes| {
+                assert_eq!(id, FIRST_CLIENT_BIDI_STREAM_ID);
+                assert_eq!(offset, received as u64);
+                assert_eq!(fin, pn == 64);
+                assert_eq!(bytes, data);
+                received += bytes.len();
+                Ok(bytes.len())
+            });
+            let count = ALLOCATION_COUNT.with(|count| count.replace(None));
+            result.unwrap();
+            if pn != 0 {
+                assert_eq!(count, Some(0), "packet {pn} metadata allocated");
+            }
+        }
+        assert_eq!(received, 65 * data.len());
+    }
+
+    #[test]
+    fn borrowed_mux_consumption_keeps_ack_threshold_and_credit_deadline() {
+        const PACKET: usize = 256;
+        for delayed in [false, true] {
+            let local = ConnectionId::new(0x7d1).unwrap();
+            let peer = ConnectionId::new(0x7d2).unwrap();
+            let limits = ConnectionLimits::with_receive_profile(16_384, 16_384, 8);
+            let mut receiver = crate::mux::StreamMux::<PACKET>::new_with_history_capacity(
+                Role::Server, limits, PACKET as u64, 1, 8, 16_384, 8,
+            );
+            receiver.install_connection_ids(local, peer).unwrap();
+            receiver.endpoint.ack_frequency = 8;
+            receiver.endpoint.max_ack_delay_us = 8_000;
+            let data = [0x58; 64];
+            let mut out = [0; PACKET];
+            let count = if delayed { 1 } else { 8 };
+            for pn in 0..count {
+                let mut packet = [0; PACKET];
+                let mut used = ShortHeader {
+                    flags: FLAG_FIXED,
+                    dcid: local,
+                    packet_number: pn,
+                    packet_number_len: 1,
+                }.encode(&mut packet).unwrap();
+                used += Frame::Stream(StreamFrame {
+                    id: FIRST_CLIENT_BIDI_STREAM_ID,
+                    offset: u64::from(pn) * data.len() as u64,
+                    fin: false,
+                    data: &data,
+                }).encode(&mut packet[used..]).unwrap();
+                receiver.receive_stream_events(&packet[..used], |_, _, _, bytes| {
+                    Ok(bytes.len())
+                }).unwrap();
+                if pn < 7 {
+                    assert_eq!(receiver.endpoint.poll_transmit(&mut out), Ok(None));
+                }
+            }
+            if delayed {
+                receiver.endpoint.set_time(7_999);
+                assert_eq!(receiver.endpoint.poll_transmit(&mut out), Ok(None));
+                receiver.endpoint.set_time(8_000);
+            }
+            let used = receiver.endpoint.poll_transmit(&mut out).unwrap().unwrap();
+            let (_, mut offset) = ShortHeader::decode(&out[..used]).unwrap();
+            let mut ack = false;
+            let mut credit = false;
+            while offset < used {
+                let (frame, size) = decode_frame(&out[offset..used]).unwrap();
+                match frame {
+                    Frame::Ack { largest, .. } | Frame::AckRanges { largest, .. } => {
+                        assert_eq!(largest, count - 1);
+                        ack = true;
+                    }
+                    Frame::MaxStreamData { id, max } => {
+                        assert_eq!(id, FIRST_CLIENT_BIDI_STREAM_ID);
+                        assert_eq!(max, 16_384 + u64::from(count) * data.len() as u64);
+                        credit = true;
+                    }
+                    _ => {}
+                }
+                offset += size;
+            }
+            assert!(ack && credit);
+        }
+    }
+
+    #[test]
+    fn path_immediate_ack_is_emitted_before_threshold_or_timer() {
+        let mut endpoint = EndpointState::<256>::new_established(
+            Role::Server, ConnectionLimits::default(), 256,
+            ConnectionIds::new(ConnectionId::new(0x7e1).unwrap(), ConnectionId::new(0x7e2).unwrap()).unwrap(),
+        );
+        endpoint.ack_frequency = 8;
+        endpoint.max_ack_delay_us = 8_000;
+        endpoint.observe_packet_on_path(1, 0);
+        endpoint.schedule_ack(0, true);
+        assert!(!endpoint.control_pending);
+        assert_eq!(endpoint.pending_control_path(), Some(0));
+        assert!(endpoint.poll_transmit(&mut [0; 256]).unwrap().is_some());
+    }
+
+    #[test]
+    fn packet_metadata_spills_without_limiting_coalesced_streams() {
+        const STREAMS: usize = 6;
+        const PACKET: usize = 512;
+        let local = ConnectionId::new(0x7c1).unwrap();
+        let peer = ConnectionId::new(0x7c2).unwrap();
+        let limits = ConnectionLimits::with_receive_profile(16_384, 16_384, STREAMS as u64);
+        let mut receiver = crate::mux::StreamMux::<PACKET>::new_with_history_capacity(
+            Role::Server, limits, PACKET as u64, 1, STREAMS, 16_384, 8,
+        );
+        receiver.install_connection_ids(local, peer).unwrap();
+        let data = [0x39];
+        let mut seen = [false; STREAMS];
+        for pn in 0..2 {
+            let mut packet = [0; PACKET];
+            let mut used = ShortHeader {
+                flags: FLAG_FIXED,
+                dcid: local,
+                packet_number: pn,
+                packet_number_len: 1,
+            }.encode(&mut packet).unwrap();
+            for stream in 0..STREAMS {
+                used += Frame::Stream(StreamFrame {
+                    id: FIRST_CLIENT_BIDI_STREAM_ID + 4 * stream as u64,
+                    offset: 0,
+                    fin: true,
+                    data: &data,
+                }).encode(&mut packet[used..]).unwrap();
+            }
+            receiver.receive_stream_events(&packet[..used], |id, offset, fin, bytes| {
+                assert_eq!(pn, 0, "completed streams must not be delivered twice");
+                let stream = ((id - FIRST_CLIENT_BIDI_STREAM_ID) / 4) as usize;
+                assert!(!seen[stream]);
+                seen[stream] = true;
+                assert_eq!(offset, 0);
+                assert!(fin);
+                assert_eq!(bytes, data);
+                Ok(bytes.len())
+            }).unwrap();
+        }
+        assert!(seen.into_iter().all(|value| value));
+    }
+
+    #[test]
+    fn ordinary_mux_receive_decodes_each_frame_only_twice() {
+        let local = ConnectionId::new(0x801).unwrap();
+        let peer = ConnectionId::new(0x802).unwrap();
+        let limits = ConnectionLimits::with_receive_profile(4096, 4096, 4);
+        let mut receiver = crate::mux::StreamMux::<256>::new_with_history_capacity(
+            Role::Server, limits, 256, 1, 4, 4096, 8,
+        );
+        receiver.install_connection_ids(local, peer).unwrap();
+        let mut packet = [0; 256];
+        let data = [0x61; 64];
+        for pn in 0..2 {
+            let mut used = ShortHeader {
+                flags: FLAG_FIXED, dcid: local, packet_number: pn,
+                packet_number_len: 1,
+            }.encode(&mut packet).unwrap();
+            used += Frame::Stream(StreamFrame {
+                id: 4, offset: u64::from(pn) * data.len() as u64,
+                fin: pn == 1, data: &data,
+            }).encode(&mut packet[used..]).unwrap();
+            let mut delivered = 0;
+            FRAME_DECODE_COUNT.with(|count| count.set(Some(0)));
+            let result = receiver.receive_stream_events(&packet[..used], |id, offset, fin, bytes| {
+                assert_eq!((id, offset, fin), (4, u64::from(pn) * 64, pn == 1));
+                assert_eq!(bytes, data);
+                delivered += bytes.len();
+                Ok(bytes.len())
+            });
+            let decodes = FRAME_DECODE_COUNT.with(|count| count.replace(None).unwrap());
+            result.unwrap();
+            assert_eq!(delivered, data.len());
+            assert_eq!(decodes, 2, "packet {pn}: preflight and endpoint validation only");
+            // A duplicate packet must still be ACKed without redelivery.
+            receiver.receive_stream_events(&packet[..used], |_, _, _, _| {
+                panic!("duplicate stream bytes redelivered")
+            }).unwrap();
+        }
+    }
+
+    #[test]
+    fn duplicate_mux_packet_resumes_only_previously_withheld_bytes() {
+        let local = ConnectionId::new(0x821).unwrap();
+        let peer = ConnectionId::new(0x822).unwrap();
+        let limits = ConnectionLimits::with_receive_profile(4096, 4096, 4);
+        let mut receiver = crate::mux::StreamMux::<256>::new_with_history_capacity(
+            Role::Server, limits, 256, 1, 4, 4096, 8,
+        );
+        receiver.install_connection_ids(local, peer).unwrap();
+        let mut packet = [0; 256];
+        let data = [0x63; 64];
+        let mut used = ShortHeader {
+            flags: FLAG_FIXED, dcid: local, packet_number: 0,
+            packet_number_len: 1,
+        }.encode(&mut packet).unwrap();
+        used += Frame::Stream(StreamFrame { id: 4, offset: 0, fin: true, data: &data })
+            .encode(&mut packet[used..]).unwrap();
+        receiver.receive_stream_events(&packet[..used], |_, offset, _, bytes| {
+            assert_eq!(offset, 0);
+            assert_eq!(bytes, data);
+            Ok(16)
+        }).unwrap();
+        let mut resumed = 0;
+        receiver.receive_stream_events(&packet[..used], |_, offset, fin, bytes| {
+            assert_eq!(offset, 16);
+            assert!(fin);
+            assert_eq!(bytes, &data[16..]);
+            resumed += bytes.len();
+            Ok(bytes.len())
+        }).unwrap();
+        assert_eq!(resumed, 48);
+        receiver.receive_stream_events(&packet[..used], |_, _, _, _| {
+            panic!("consumed duplicate bytes redelivered")
+        }).unwrap();
+    }
+
+    #[test]
+    fn mux_receive_preserves_mixed_credit_and_rejects_malformed_tail() {
+        let local = ConnectionId::new(0x811).unwrap();
+        let peer = ConnectionId::new(0x812).unwrap();
+        let limits = ConnectionLimits::with_receive_profile(4096, 4096, 4);
+        let mut receiver = crate::mux::StreamMux::<256>::new_with_history_capacity(
+            Role::Server, limits, 256, 1, 4, 4096, 8,
+        );
+        receiver.install_connection_ids(local, peer).unwrap();
+        receiver.endpoint.set_initial_peer_credit(100, 100).unwrap();
+        receiver.endpoint.open_send_stream(4, 100).unwrap();
+        let mut packet = [0; 256];
+        let data = [0x62; 64];
+        let mut used = ShortHeader {
+            flags: FLAG_FIXED, dcid: local, packet_number: 0,
+            packet_number_len: 1,
+        }.encode(&mut packet).unwrap();
+        for frame in [
+            Frame::MaxData(500),
+            Frame::MaxStreamData { id: 4, max: 400 },
+            Frame::MaxStreamsBidi(88),
+            Frame::MaxStreamsUni(99),
+            Frame::Stream(StreamFrame { id: 4, offset: 0, fin: true, data: &data }),
+        ] {
+            used += frame.encode(&mut packet[used..]).unwrap();
+        }
+        // The first byte of an eight-byte varint without its remaining
+        // bytes: validation must fail before credit, ACK or callbacks change.
+        packet[used] = 0xff;
+        assert!(receiver.receive_stream_events(&packet[..used + 1], |_, _, _, _| {
+            panic!("malformed packet delivered application bytes")
+        }).is_err());
+        assert_eq!(receiver.endpoint.peer_send_credit(4), Some((100, 100)));
+        assert_eq!(receiver.endpoint.peer_max_streams_bidi, 4);
+        assert_eq!(receiver.endpoint.received_packet_count(), 0);
+        let mut delivered = 0;
+        receiver.receive_stream_events(&packet[..used], |id, offset, fin, bytes| {
+            assert_eq!((id, offset, fin), (4, 0, true));
+            assert_eq!(bytes, data);
+            delivered += bytes.len();
+            Ok(bytes.len())
+        }).unwrap();
+        assert_eq!(delivered, data.len());
+        assert_eq!(receiver.endpoint.peer_send_credit(4), Some((500, 400)));
+        assert_eq!(receiver.endpoint.peer_max_streams_bidi, 88);
+        assert_eq!(receiver.endpoint.peer_max_streams_uni, 99);
+    }
+
+    #[test]
+    fn slow_start_ack_skips_unused_linked_congestion_math() {
+        for slow_start in [true, false] {
+            let local = ConnectionId::new(0x831).unwrap();
+            let peer = ConnectionId::new(0x832).unwrap();
+            let mut sender = EndpointState::<256>::new_established(
+                Role::Client, ConnectionLimits::default(), 256,
+                ConnectionIds::new(local, peer).unwrap(),
+            );
+            sender.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
+            sender.set_pacing_config(PacingConfig {
+                enabled: false, max_burst_packets: 8, max_burst_bytes: 2048,
+            }).unwrap();
+            sender.paths[0].congestion.congestion_window = 512;
+            sender.paths[0].congestion.slow_start_threshold = if slow_start { 1024 } else { 512 };
+            sender.paths[0].rtt.update(10_000);
+            let mut packet = [0; 256];
+            let data = [0x64; 64];
+            let mut ranges = AckRangeSet::new();
+            for index in 0..5 {
+                let (_, number) = sender.encode_stream_packet(
+                    peer, 4, index * data.len() as u64, false, &data, &mut packet,
+                ).unwrap();
+                ranges.insert(number);
+            }
+            let growth_bytes = sender.sent_packets.iter().flatten()
+                .filter(|sent| sent.window_limited).map(|sent| sent.bytes).sum::<u64>();
+            assert!(growth_bytes > 0);
+            let increase_q32 = linked_congestion_increase_q32(&sender.paths, 0, growth_bytes);
+            assert!(increase_q32 > 0);
+            let mut used = ShortHeader {
+                flags: FLAG_FIXED, dcid: local, packet_number: 0, packet_number_len: 1,
+            }.encode(&mut packet).unwrap();
+            used += Frame::AckRanges {
+                largest: ranges.get(0).unwrap().end, delay: 0, ranges,
+            }.encode(&mut packet[used..]).unwrap();
+            sender.set_time(10_000);
+            LIA_CALCULATION_COUNT.with(|count| count.set(Some(0)));
+            let result = sender.receive_ack_packet(&packet[..used]);
+            let calculations = LIA_CALCULATION_COUNT.with(|count| count.replace(None).unwrap());
+            result.unwrap();
+            assert_eq!(sender.paths[0].congestion.bytes_in_flight, 0);
+            let expected_growth = if slow_start { growth_bytes } else { (increase_q32 >> 32) as u64 };
+            assert_eq!(sender.paths[0].congestion.congestion_window, 512 + expected_growth);
+            assert_eq!(calculations, usize::from(!slow_start), "slow_start={slow_start}");
+        }
+    }
+
+    #[test]
+    fn single_path_linked_increase_matches_general_equation_at_extremes() {
+        for window in [0, 1, 256, 16_384, u64::MAX] {
+            for mss in [0, 1, 256, 1100, u64::MAX] {
+                for acked in [0, 1, 256, u64::MAX] {
+                    for rtt in [1, 20_000, u64::MAX] {
+                        let mut path = PathState::new(256, 1);
+                        path.congestion.max_packet_size = mss;
+                        path.congestion.congestion_window = window;
+                        path.rtt.update(rtt);
+                        let mut excluded = path.clone();
+                        excluded.suspended = true;
+                        // A suspended second path selects the unchanged
+                        // general equation, with the same eligible set.
+                        let expected = linked_congestion_increase_q32(
+                            &[path.clone(), excluded], 0, acked,
+                        );
+                        let actual = linked_congestion_increase_q32(&[path], 0, acked);
+                        assert_eq!(actual, expected,
+                            "window={window} mss={mss} acked={acked} rtt={rtt}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_ack_batches_do_not_allocate_retirement_metadata() {
+        for batch in [1, 4, 8, 24] {
+            let local = ConnectionId::new(0x7f1).unwrap();
+            let peer = ConnectionId::new(0x7f2).unwrap();
+            let mut sender = EndpointState::<256>::new_with_history_capacity(
+                Role::Client, ConnectionLimits::default(), 256, 32,
+            );
+            sender.install_connection_ids(local, peer).unwrap();
+            sender.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
+            sender.set_pacing_config(PacingConfig {
+                enabled: false, max_burst_packets: 32, max_burst_bytes: 8192,
+            }).unwrap();
+            let mut packet = [0; 256];
+            let data = [0x51; 64];
+            for turn in 0..3 {
+                let mut ranges = AckRangeSet::new();
+                for index in 0..batch {
+                    let offset = (turn * batch + index) * data.len();
+                    let fin = turn == 2 && index == batch - 1;
+                    let (_, packet_number) = sender.encode_stream_packet(
+                        peer, 4, offset as u64, fin, &data, &mut packet,
+                    ).unwrap();
+                    ranges.insert(packet_number);
+                }
+                let mut used = ShortHeader {
+                    flags: FLAG_FIXED, dcid: local,
+                    packet_number: turn as u32, packet_number_len: 1,
+                }.encode(&mut packet).unwrap();
+                used += Frame::AckRanges {
+                    largest: ranges.get(0).unwrap().end, delay: 0, ranges,
+                }.encode(&mut packet[used..]).unwrap();
+                sender.set_time((turn as u64 + 1) * 10_000);
+                ALLOCATION_COUNT.with(|count| count.set(Some(0)));
+                let result = sender.receive_ack_packet(&packet[..used]);
+                let allocations = ALLOCATION_COUNT.with(|count| count.replace(None).unwrap());
+                result.unwrap();
+                assert!(sender.send_buffer.iter().all(Option::is_none));
+                assert!(sender.sent_packets.iter().all(Option::is_none));
+                assert_eq!(sender.paths[0].congestion.bytes_in_flight, 0);
+                if batch <= 8 {
+                    assert_eq!(allocations, 0, "batch={batch} turn={turn}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stream_prefix_roundtrips_varint_boundaries_without_payload_copy() {
+        let values = [0, 63, 64, 16_383, 16_384, (1 << 30) - 1, 1 << 30, (1 << 62) - 1];
+        let data = [0xa5; 1036];
+        for id in values {
+            for offset in values {
+                for length in [0, 1, 63, 64, data.len()] {
+                    for fin in [false, true] {
+                        let frame = StreamFrame { id, offset, fin, data: &data[..length] };
+                        let mut out = [0xcc; 1200];
+                        let prefix = encode_stream_prefix(&frame, &mut out).unwrap();
+                        assert!(out[prefix..].iter().all(|byte| *byte == 0xcc));
+                        out[prefix..prefix + length].copy_from_slice(frame.data);
+                        let (decoded, used) = decode_frame(&out[..prefix + length]).unwrap();
+                        let Frame::Stream(decoded) = decoded else { panic!("STREAM"); };
+                        assert_eq!((decoded.id, decoded.offset, decoded.fin, decoded.data),
+                                   (id, offset, fin, frame.data));
+                        assert_eq!(used, prefix + length);
+                    }
+                }
+            }
+        }
+        let invalid = StreamFrame { id: 1 << 62, offset: 0, fin: false, data: &[] };
+        assert_eq!(encode_stream_prefix(&invalid, &mut [0; 32]), Err(Error::InvalidVarint));
+        let valid = StreamFrame { id: 64, offset: 0, fin: false, data: &[] };
+        assert_eq!(encode_stream_prefix(&valid, &mut [0; 1]), Err(Error::BufferTooSmall));
+    }
+
+    #[test]
+    fn blocked_stream_retries_do_not_allocate_retransmission_storage() {
+        for pacing in [false, true] {
+            let local = ConnectionId::new(0x7a1).unwrap();
+            let peer = ConnectionId::new(0x7a2).unwrap();
+            let mut endpoint = EndpointState::<1200>::new_established(
+                Role::Client, ConnectionLimits::default(), 1200,
+                ConnectionIds::new(local, peer).unwrap(),
+            );
+            endpoint.set_pacing_config(crate::PacingConfig {
+                enabled: pacing, max_burst_packets: 1, max_burst_bytes: 1200,
+            }).unwrap();
+            endpoint.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
+            let mut out = [0; 1200];
+            let data = [1; 1024];
+            endpoint.encode_stream_packet(peer, 4, 0, false, &data, &mut out).unwrap();
+            if !pacing {
+                let path = &mut endpoint.paths[0];
+                path.congestion.congestion_window = path.congestion.bytes_in_flight;
+            }
+            out.fill(0xcc);
+            ALLOCATION_COUNT.with(|count| count.set(Some(0)));
+            let rejected = (0..64).all(|_| {
+                endpoint.encode_stream_packet(peer, 4, 1024, false, &data, &mut out)
+                    == Err(Error::Blocked)
+            });
+            let count = ALLOCATION_COUNT.with(|count| count.replace(None).unwrap());
+            assert!(rejected);
+            assert_eq!(count, 0, "pacing={pacing}");
+            assert_eq!(endpoint.stats.sent_stream_packets, 1);
+            assert_eq!(endpoint.allocated_payload_bytes(), 1024);
+            assert!(out[64..1024].iter().all(|byte| *byte == 0xcc),
+                "blocked retries must not copy payload into the packet, pacing={pacing}");
+        }
+    }
 
     #[test]
     fn deterministic_parser_fuzz_smoke_never_panics_or_mutates_on_rejection() {
@@ -8682,6 +9607,79 @@ mod tests {
         assert_eq!(a.get(0), Some(AckRange { start: 8, end: 9 }));
         assert_eq!(a.get(1), Some(AckRange { start: 2, end: 4 }));
         assert!(a.contains(3));
+    }
+
+    #[test]
+    fn ack_range_insertion_matches_sorted_union_reference() {
+        fn check<const N: usize>() {
+            let mut actual = AckRanges::<N>::new();
+            let mut reference: Vec<AckRange> = Vec::new();
+            let mut random = 0x6d2b_79f5_u32;
+            for step in 0..20_000 {
+                random ^= random << 13;
+                random ^= random >> 17;
+                random ^= random << 5;
+                let start = match step % 9 {
+                    0 => 0,
+                    1 => u32::MAX - (random % 32),
+                    2 | 3 => actual.get(0).map_or(random % 256, |r| {
+                        r.end.saturating_add(u32::from(step % 9 == 3))
+                    }),
+                    _ => random % 256,
+                };
+                let new = AckRange {
+                    start,
+                    end: if step % 17 == 0 {
+                        start.saturating_sub(1)
+                    } else {
+                        start.saturating_add(random % 8)
+                    },
+                };
+                let mut expected_drop = false;
+                if new.start <= new.end {
+                    reference.push(new);
+                    reference.sort_unstable_by_key(|r| r.start);
+                    let mut union: Vec<AckRange> = Vec::new();
+                    for range in reference.drain(..) {
+                        match union.last_mut() {
+                            Some(last) if u64::from(range.start) <= u64::from(last.end) + 1 => {
+                                last.end = max(last.end, range.end);
+                            }
+                            _ => union.push(range),
+                        }
+                    }
+                    union.reverse();
+                    expected_drop = union.len() > N;
+                    union.truncate(N);
+                    reference = union;
+                }
+                assert_eq!(actual.insert_range(new), expected_drop, "N={N} step={step}");
+                assert_eq!(&actual.ranges[..actual.len], &reference, "N={N} step={step}");
+            }
+        }
+        check::<0>();
+        check::<1>();
+        check::<2>();
+        check::<32>();
+    }
+
+    #[test]
+    fn newest_ack_extension_preserves_older_gaps_and_merges_when_needed() {
+        let mut ranges = AckRanges::<32>::new();
+        for pn in (0..64).step_by(2) {
+            ranges.insert(pn);
+        }
+        let tail = ranges.ranges[1..].to_vec();
+        for pn in 63..128 {
+            assert!(!ranges.insert(pn));
+            assert_eq!(&ranges.ranges[1..], tail.as_slice());
+        }
+        assert_eq!(ranges.len(), 32);
+        assert_eq!(ranges.get(0), Some(AckRange { start: 62, end: 127 }));
+        // A downward extension crossing older gaps must use the full merge.
+        assert!(!ranges.insert_range(AckRange { start: 0, end: 126 }));
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges.get(0), Some(AckRange { start: 0, end: 127 }));
     }
 
     #[test]
@@ -10052,6 +11050,42 @@ mod tests {
     }
 
     #[test]
+    fn acknowledged_send_storage_is_reused_without_steady_state_allocations() {
+        let local = ConnectionId::new(0x4715).unwrap();
+        let peer = ConnectionId::new(0x4716).unwrap();
+        let mut sender = EndpointState::<1100>::new(Role::Client, ConnectionLimits::default(), 1200);
+        let mut receiver = EndpointState::<1100>::new(Role::Server, ConnectionLimits::default(), 1200);
+        sender.install_connection_ids(local, peer).unwrap();
+        receiver.install_connection_ids(peer, local).unwrap();
+        sender.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
+        receiver.set_ack_frequency(1);
+        let mut packet = [0; 1200];
+        let mut ack = [0; 1200];
+        for turn in 0..16_u64 {
+            sender.set_time(turn * 100_000);
+            let payload = [turn as u8; 1024];
+            ALLOCATION_COUNT.with(|count| count.set(Some(0)));
+            let result = sender.encode_stream_packet(peer, 4, turn * 1024, false, &payload, &mut packet);
+            let allocations = ALLOCATION_COUNT.with(|count| count.replace(None).unwrap());
+            let (used, _) = result.unwrap();
+            if turn != 0 { assert_eq!(allocations, 0, "turn={turn}"); }
+            let range = sender.send_buffer.iter().flatten().next().unwrap();
+            assert_eq!(range.first_unacknowledged_run(), Some((0, 1024)));
+            assert_eq!(range.payload.as_deref(), Some(payload.as_slice()));
+            receiver.receive_packet(&packet[..used]).unwrap();
+            let used = receiver.poll_transmit(&mut ack).unwrap().unwrap();
+            sender.receive_packet(&ack[..used]).unwrap();
+            assert_eq!(sender.retained_payload_bytes(), 0);
+            assert_eq!(sender.history_len(), 0);
+        }
+        assert!(sender.reusable_send_payload.capacity() >= 1024);
+        assert!(sender.reusable_send_acknowledged.capacity() >= 16);
+        sender.set_send_buffer_limit_bytes(0).unwrap();
+        assert_eq!(sender.reusable_send_payload.capacity(), 0);
+        assert_eq!(sender.reusable_send_acknowledged.capacity(), 0);
+    }
+
+    #[test]
     fn association_send_buffer_has_an_independent_cap_and_survives_loss() {
         let local = ConnectionId::new(0x4713).unwrap();
         let peer = ConnectionId::new(0x4714).unwrap();
@@ -11159,6 +12193,182 @@ mod tests {
     }
 
     #[test]
+    fn retained_ack_word_updates_match_byte_reference_for_overlaps_and_edges() {
+        for length in [0, 1, 63, 64, 65, 127, 128, 129, 1024] {
+            let original = alloc::vec![0x5a; length];
+            let mut range = RetainedSendRange {
+                stream_id: 4, offset: 17, data_len: length, fin: true,
+                payload: Some(original.clone()), payload_start: 0,
+                acknowledged: alloc::vec![0; length.div_ceil(64)],
+                fin_acked: false, logical_packet_number: 1,
+                prior_packets: [PriorPacketLineage::default(); 16], prior_packet_count: 0,
+            };
+            let mut reference = alloc::vec![false; length];
+            // Include disjoint/interior ACKs, duplicate ACKs, clipped ranges,
+            // zero lengths and offsets beyond the retained extent.
+            let mut seed = 0x9876_u64;
+            for turn in 0..100 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let offset = if turn == 99 { 0 } else { seed % (length as u64 + 40) };
+                let count = if turn == 99 { length + 40 } else { (seed >> 32) as usize % 95 };
+                let _ = range.mark_acknowledged(offset, count);
+                for (index, acked) in reference.iter_mut().enumerate() {
+                    let position = 17 + index as u64;
+                    *acked |= position >= offset && position < offset.saturating_add(count as u64);
+                    assert_eq!(range.is_byte_acknowledged(index), *acked);
+                }
+                assert_eq!(range.all_data_acknowledged(), reference.iter().all(|acked| *acked));
+                assert_eq!(range.acknowledged_payload_bytes(), reference.iter().filter(|acked| !**acked).count());
+                let expected_run = reference.iter().position(|acked| !*acked).map(|first| {
+                    let end = (first + 1..length).find(|index| reference[*index]).unwrap_or(length);
+                    (first, end)
+                });
+                assert_eq!(range.first_unacknowledged_run(), expected_run);
+                if let Some(first) = reference.iter().position(|acked| !*acked) {
+                    let end = reference.iter().rposition(|acked| !*acked).unwrap() + 1;
+                    assert_eq!(range.payload_start, first);
+                    assert_eq!(range.payload.as_ref().unwrap(), &original[first..end]);
+                } else {
+                    assert!(range.payload.as_ref().is_none_or(Vec::is_empty));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selective_ack_holes_and_lost_tail_repair_without_new_application_writes() {
+        let local = ConnectionId::new(0x769).unwrap();
+        let peer = ConnectionId::new(0x76a).unwrap();
+        let mut sender = EndpointState::<128>::new(Role::Server, ConnectionLimits::default(), 1200);
+        sender.install_connection_ids(local, peer).unwrap();
+        sender.set_history_capacity(32).unwrap();
+        sender.set_transmission_capacity(64).unwrap();
+        sender.open_send_stream(8, INITIAL_MAX_STREAM_DATA).unwrap();
+        let mut packet = [0u8; 256];
+        let mut ack_packet = [0u8; 512];
+        let mut acknowledged = AckRangeSet::new();
+        let mut received = [false; 4096];
+        let mut ack_pn = 1000;
+        let mut clock = 0;
+        let mut tail = 0;
+        let acknowledge = |sender: &mut EndpointState<128>, ranges: AckRangeSet,
+                           ack_pn: u32, out: &mut [u8]| {
+            let mut used = ShortHeader {
+                flags: FLAG_FIXED, dcid: local, packet_number: ack_pn, packet_number_len: 4,
+            }.encode(out).unwrap();
+            used += Frame::AckRanges {
+                largest: ranges.get(0).unwrap().end, delay: 0, ranges,
+            }.encode(&mut out[used..]).unwrap();
+            sender.receive_ack_packet_on_path(&out[..used], 0).unwrap();
+        };
+        for chunk in 0..64usize {
+            clock += 1_000_000;
+            sender.set_time(clock);
+            let data = [chunk as u8; 64];
+            let (_, pn) = sender.encode_stream_packet(
+                peer, 8, (chunk * 64) as u64, chunk == 63, &data, &mut packet,
+            ).unwrap();
+            tail = pn;
+            // Selective losses leave holes while later data is acknowledged.
+            // Lose the tail too: there is no subsequent application write to
+            // provide a packet-threshold frontier for that final packet.
+            if chunk % 5 != 0 && chunk != 63 {
+                received[chunk * 64..(chunk + 1) * 64].fill(true);
+                acknowledged.insert(pn);
+                acknowledge(&mut sender, acknowledged, ack_pn, &mut ack_packet);
+                ack_pn += 1;
+            }
+        }
+        assert!(sender.retained_payload_bytes() > 0);
+        assert!(sender.mark_lost(tail));
+        let mut fin_received = false;
+        for attempt in 0..128 {
+            clock += 1_000_000;
+            sender.set_time(clock);
+            let Some((used, pn)) = sender.retransmit_due(clock, 600, &mut packet).unwrap() else {
+                break;
+            };
+            // Lose the first repair too, exercising fresh packet numbers and
+            // old transmission lineage without feeding any new stream data.
+            if attempt == 0 {
+                assert!(sender.mark_lost(pn));
+                continue;
+            }
+            let (_, header_len) = ShortHeader::decode(&packet[..used]).unwrap();
+            let Frame::Stream(frame) = decode_frame(&packet[header_len..used]).unwrap().0 else {
+                panic!("repair must carry retained STREAM data");
+            };
+            for (index, byte) in frame.data.iter().copied().enumerate() {
+                let position = frame.offset as usize + index;
+                assert_eq!(byte, (position / 64) as u8);
+                received[position] = true;
+            }
+            fin_received |= frame.fin;
+            acknowledged.insert(pn);
+            acknowledge(&mut sender, acknowledged, ack_pn, &mut ack_packet);
+            ack_pn += 1;
+        }
+        assert!(received.into_iter().all(|byte| byte), "all selective-ACK holes must repair");
+        assert!(fin_received, "lost tail FIN must repair without new writes");
+        assert_eq!(sender.retained_payload_bytes(), 0);
+        assert!(sender.send_buffer.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn pacing_wait_matches_wide_reference_including_rounding_overflow() {
+        let deficits = [0, 1, 63, 65_535, 65_536, 1 << 32, 1 << 63, u64::MAX];
+        let values = [0, 1, 2, 1100, 250_000, 1 << 32, u64::MAX as u128,
+                      1 << 64, 1 << 127, u128::MAX];
+        for deficit in deficits {
+            for scale in values {
+                for denominator in values {
+                    let divisor = denominator.max(1);
+                    let expected = if deficit == 0 { 0 } else {
+                        (u128::from(deficit).saturating_mul(scale)
+                            .saturating_add(divisor - 1) / divisor)
+                            .min(u128::from(u64::MAX)) as u64
+                    };
+                    assert_eq!(pacing_wait_us(deficit, scale, denominator), expected,
+                        "deficit={deficit} scale={scale} divisor={divisor}");
+                }
+            }
+        }
+        // Ordinary embedded pacing values, fractional ceilings and exact
+        // quotients, independent of the extreme-value cross product above.
+        for deficit in 1..=4096 {
+            for scale in [1, 6_081, 250_000, 250_000 * 1100] {
+                let divisor = 32_768u128 << 16;
+                let expected = ((u128::from(deficit) * scale + divisor - 1) / divisor) as u64;
+                assert_eq!(pacing_wait_us(deficit, scale, divisor), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn pacing_refill_matches_wide_reference_including_saturation() {
+        let values = [0, 1, 2, 1100, 16_384, 100_000, 1 << 32, u64::MAX];
+        for elapsed in values {
+            for window in values {
+                for rtt in values {
+                    for mss in values {
+                        let numerator = u128::from(elapsed)
+                            .saturating_mul(u128::from(window))
+                            .saturating_mul(1 << 16);
+                        let expected = (
+                            (numerator / u128::from(rtt.max(1)))
+                                .min(u128::from(u64::MAX)) as u64,
+                            (numerator / (u128::from(rtt.max(1)) * u128::from(mss.max(1))))
+                                .min(u128::from(u64::MAX)) as u64,
+                        );
+                        assert_eq!(pacing_refill_tokens(elapsed, window, rtt, mss), expected,
+                            "elapsed={elapsed} window={window} rtt={rtt} mss={mss}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn evicted_partial_transmission_lineage_acknowledges_only_its_extent() {
         let local = ConnectionId::new(0x767).unwrap();
         let peer = ConnectionId::new(0x768).unwrap();
@@ -11173,8 +12383,8 @@ mod tests {
         assert!(sender.mark_lost(original));
         {
             let range = sender.send_buffer[0].as_mut().unwrap();
-            range.mark_acknowledged(0, 2);
-            range.mark_acknowledged(4, 2);
+            let _ = range.mark_acknowledged(0, 2);
+            let _ = range.mark_acknowledged(4, 2);
         }
         let (partial_len, partial_pn) =
             sender.retransmit_marked_loss(&mut packet).unwrap().unwrap();
@@ -11339,6 +12549,88 @@ mod tests {
         receiver.set_time(25_000);
         receiver.on_bearer_timeout();
         assert!(receiver.poll_transmit(&mut ack).unwrap().is_some());
+    }
+
+    #[test]
+    fn late_ack_adapts_packet_reordering_without_disabling_loss_repair() {
+        let local = ConnectionId::new(0x7511).unwrap();
+        let peer = ConnectionId::new(0x7512).unwrap();
+        let mut sender = EndpointState::<128>::new(Role::Client, ConnectionLimits::default(), 1200);
+        let mut receiver = EndpointState::<128>::new(Role::Server, ConnectionLimits::default(), 1200);
+        sender.install_connection_ids(local, peer).unwrap();
+        receiver.install_connection_ids(peer, local).unwrap();
+        sender.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
+        receiver.set_ack_frequency(1);
+        let mut packet = [0; 256];
+        let mut ack = [0; 256];
+        let mut delayed = Vec::new();
+        for offset in 0..4 {
+            let (used, _) = sender.encode_stream_packet(peer, 4, offset, false, b"x", &mut packet).unwrap();
+            if offset == 0 { delayed.extend_from_slice(&packet[..used]); }
+            if offset == 3 { receiver.receive_packet(&packet[..used]).unwrap(); }
+        }
+        let used = receiver.poll_transmit(&mut ack).unwrap().unwrap();
+        sender.receive_packet(&ack[..used]).unwrap();
+        assert!(sender.sent_packets.iter().flatten().any(|sent| sent.packet_number == 0 && sent.lost));
+        receiver.receive_packet(&delayed).unwrap();
+        let used = receiver.poll_transmit(&mut ack).unwrap().unwrap();
+        sender.receive_packet(&ack[..used]).unwrap();
+        assert_eq!(sender.paths[0].spurious_losses, 1);
+        for offset in 4..8 {
+            let (used, _) = sender.encode_stream_packet(peer, 4, offset, false, b"x", &mut packet).unwrap();
+            if offset == 7 { receiver.receive_packet(&packet[..used]).unwrap(); }
+        }
+        let used = receiver.poll_transmit(&mut ack).unwrap().unwrap();
+        sender.receive_packet(&ack[..used]).unwrap();
+        assert!(sender.sent_packets.iter().flatten().any(|sent| sent.packet_number == 4 && !sent.lost));
+        // Adaptation must not make a real missing packet immortal.
+        sender.set_time(1_000_000);
+        sender.detect_ack_losses(0, sender.paths[0].largest_acked_send_order);
+        assert!(sender.sent_packets.iter().flatten().any(|sent| sent.packet_number == 4 && sent.lost));
+    }
+
+    #[test]
+    fn late_ack_adapts_time_reordering_and_keeps_a_loss_deadline() {
+        let local = ConnectionId::new(0x7513).unwrap();
+        let peer = ConnectionId::new(0x7514).unwrap();
+        let mut sender = EndpointState::<128>::new(Role::Client, ConnectionLimits::default(), 1200);
+        let mut receiver = EndpointState::<128>::new(Role::Server, ConnectionLimits::default(), 1200);
+        sender.install_connection_ids(local, peer).unwrap();
+        receiver.install_connection_ids(peer, local).unwrap();
+        sender.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
+        receiver.set_ack_frequency(1);
+        let mut packet = [0; 256];
+        let mut ack = [0; 256];
+        sender.set_time(1);
+        let (used, _) = sender.encode_stream_packet(peer, 4, 0, false, b"x", &mut packet).unwrap();
+        let delayed = packet[..used].to_vec();
+        let (used, _) = sender.encode_stream_packet(peer, 4, 1, false, b"x", &mut packet).unwrap();
+        receiver.receive_packet(&packet[..used]).unwrap();
+        let used = receiver.poll_transmit(&mut ack).unwrap().unwrap();
+        sender.set_time(20_000);
+        sender.receive_packet(&ack[..used]).unwrap();
+        sender.set_time(80_000);
+        sender.detect_ack_losses(0, Some(1));
+        assert!(sender.sent_packets.iter().flatten().any(|sent| sent.packet_number == 0 && sent.lost));
+        receiver.receive_packet(&delayed).unwrap();
+        let used = receiver.poll_transmit(&mut ack).unwrap().unwrap();
+        sender.set_time(90_000);
+        sender.receive_packet(&ack[..used]).unwrap();
+        sender.set_time(100_000);
+        sender.encode_stream_packet(peer, 4, 2, false, b"x", &mut packet).unwrap();
+        let (used, _) = sender.encode_stream_packet(peer, 4, 3, false, b"x", &mut packet).unwrap();
+        receiver.receive_packet(&packet[..used]).unwrap();
+        let used = receiver.poll_transmit(&mut ack).unwrap().unwrap();
+        sender.set_time(120_000);
+        sender.receive_packet(&ack[..used]).unwrap();
+        sender.set_time(150_000);
+        sender.detect_ack_losses(0, Some(3));
+        assert!(sender.sent_packets.iter().flatten().any(|sent| sent.packet_number == 2 && !sent.lost));
+        let deadline = sender.next_bearer_deadline().unwrap();
+        assert!(deadline > 150_000 && deadline < 1_000_000);
+        sender.set_time(1_000_000);
+        sender.detect_ack_losses(0, Some(3));
+        assert!(sender.sent_packets.iter().flatten().any(|sent| sent.packet_number == 2 && sent.lost));
     }
 
     #[test]
@@ -12226,6 +13518,94 @@ mod tests {
     }
 
     #[test]
+    fn mixed_ack_credit_validates_tail_before_retiring_transmission() {
+        let local = ConnectionId::new(55).unwrap();
+        let peer = ConnectionId::new(56).unwrap();
+        let mut sender = EndpointState::<128>::new(
+            Role::Client, ConnectionLimits::default(), 1200,
+        );
+        sender.install_connection_ids(local, peer).unwrap();
+        sender.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
+        let mut packet = [0u8; 256];
+        let (_, pn) = sender.encode_stream_packet(peer, 4, 0, false, b"x", &mut packet)
+            .unwrap();
+        let old_credit = sender.send.max_data;
+        let old_flight = sender.paths[0].congestion.bytes_in_flight;
+        let mut used = ShortHeader {
+            flags: FLAG_FIXED, dcid: local, packet_number: 0, packet_number_len: 4,
+        }.encode(&mut packet).unwrap();
+        used += Frame::Ack { largest: pn, delay: 0 }.encode(&mut packet[used..]).unwrap();
+        used += Frame::MaxData(old_credit + 1024).encode(&mut packet[used..]).unwrap();
+        packet[used] = 0xff;
+        assert!(sender.receive_packet(&packet[..used + 1]).is_err());
+        assert_eq!(sender.send.max_data, old_credit);
+        assert_eq!(sender.paths[0].congestion.bytes_in_flight, old_flight);
+        assert_eq!(sender.largest_acked_by_peer, None);
+        assert!(sender.sent_packets.iter().flatten().any(|sent| sent.packet_number == pn));
+        sender.receive_packet(&packet[..used]).unwrap();
+        assert_eq!(sender.send.max_data, old_credit + 1024);
+        assert_eq!(sender.paths[0].congestion.bytes_in_flight, 0);
+        assert_eq!(sender.largest_acked_by_peer, Some(pn));
+        assert!(sender.sent_packets.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn ack_rtt_selection_is_independent_of_ledger_order_and_lost_highest() {
+        for rotation in 0..3 {
+            for highest_lost in [false, true] {
+                for highest_eligible in [false, true] {
+                    let local = ConnectionId::new(55).unwrap();
+                    let peer = ConnectionId::new(56).unwrap();
+                    let mut sender = EndpointState::<128>::new(
+                        Role::Client, ConnectionLimits::default(), 1200,
+                    );
+                    sender.install_connection_ids(local, peer).unwrap();
+                    sender.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
+                    let mut packet = [0u8; 256];
+                    let mut numbers = [0; 3];
+                    for (index, number) in numbers.iter_mut().enumerate() {
+                        sender.set_time(100_000 + index as u64 * 10_000);
+                        let (_, pn) = sender.encode_stream_packet(
+                            peer, 4, index as u64, false, b"x", &mut packet,
+                        ).unwrap();
+                        *number = pn;
+                    }
+                    for sent in sender.sent_packets.iter_mut().flatten() {
+                        if sent.packet_number == numbers[2] {
+                            sent.lost = highest_lost;
+                            sent.rtt_eligible = highest_eligible;
+                        }
+                    }
+                    sender.sent_packets.rotate_left(rotation);
+                    let mut used = ShortHeader {
+                        flags: FLAG_FIXED, dcid: local, packet_number: 0,
+                        packet_number_len: 4,
+                    }.encode(&mut packet).unwrap();
+                    let mut ranges = AckRangeSet::new();
+                    ranges.insert_range(AckRange {
+                        start: numbers[0], end: numbers[2],
+                    });
+                    used += Frame::AckRanges {
+                        largest: numbers[2], delay: 0, ranges,
+                    }.encode(&mut packet[used..]).unwrap();
+                    sender.set_time(150_000);
+                    sender.receive_ack_packet_on_path(&packet[..used], 0).unwrap();
+                    let expected = if !highest_eligible {
+                        Some(40_000)
+                    } else if highest_lost {
+                        None
+                    } else {
+                        Some(30_000)
+                    };
+                    assert_eq!(sender.latest_rtt(), expected,
+                        "rotation={rotation} lost={highest_lost} eligible={highest_eligible}");
+                    assert!(sender.sent_packets.iter().all(Option::is_none));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn ack_clock_updates_rtt_and_adaptive_pto() {
         let local = ConnectionId::new(55).unwrap();
         let peer = ConnectionId::new(56).unwrap();
@@ -12620,6 +14000,81 @@ mod tests {
                 .packet_number,
             0
         );
+    }
+
+    #[test]
+    fn rolling_megabyte_transfer_retains_late_missing_ranges() {
+        let local = ConnectionId::new(901).unwrap();
+        let peer = ConnectionId::new(902).unwrap();
+        let limits = ConnectionLimits {
+            max_data: 2 * 1024 * 1024,
+            max_stream_data: 2 * 1024 * 1024,
+            ..ConnectionLimits::default()
+        };
+        let mut sender = EndpointState::<1100>::new_with_history_capacity(
+            Role::Server, limits, 1100, 32,
+        );
+        let mut receiver = EndpointState::<1100>::new(Role::Client, limits, 1100);
+        sender.install_connection_ids(local, peer).unwrap();
+        receiver.install_connection_ids(peer, local).unwrap();
+        sender.open_send_stream(1, limits.max_stream_data).unwrap();
+        sender.set_pacing_config(crate::PacingConfig {
+            enabled: false, ..crate::PacingConfig::default()
+        }).unwrap();
+        let mut seen = vec![false; 1024];
+        let mut saw_fin = false;
+        let mut packet = [0u8; 1100];
+        for batch in 0..64 {
+            sender.paths[0].congestion.congestion_window = 32 * 1100;
+            let mut missing = Vec::new();
+            for item in 0..16 {
+                let index = batch * 16 + item;
+                let data = [index as u8; 1024];
+                let (used, pn) = sender.encode_stream_packet(
+                    peer, 1, (index * 1024) as u64, index == 1023, &data, &mut packet,
+                ).unwrap();
+                // Loss after hundreds of ledger-slot reuse cycles, including
+                // consecutive holes: the hardware failure was late, not OPEN.
+                if matches!(index, 749 | 754 | 755 | 756 | 1023) {
+                    missing.push(pn);
+                    continue;
+                }
+                if let TransportFrame::Stream { frame, .. } = receiver.receive_packet(&packet[..used]).unwrap() {
+                    assert_eq!(frame.data, &[index as u8; 1024]);
+                    seen[index] = true;
+                    saw_fin |= frame.fin;
+                }
+            }
+            receiver.set_time((batch as u64 + 1) * 100_000);
+            if let Some(used) = receiver.poll_transmit(&mut packet).unwrap() {
+                sender.receive_packet(&packet[..used]).unwrap();
+            }
+            for pn in missing {
+                let (used, replacement) = sender.retransmit_stream_packet(pn, &mut packet).unwrap()
+                    .expect("unreceived bytes must retain retransmission ownership");
+                assert_ne!(pn, replacement);
+                if let TransportFrame::Stream { frame, .. } = receiver.receive_packet(&packet[..used]).unwrap() {
+                    let index = frame.offset as usize / 1024;
+                    assert_eq!(frame.data, &[index as u8; 1024]);
+                    seen[index] = true;
+                    saw_fin |= frame.fin;
+                }
+            }
+            receiver.set_time((batch as u64 + 1) * 100_000 + 30_000);
+            if let Some(used) = receiver.poll_transmit(&mut packet).unwrap() {
+                sender.receive_packet(&packet[..used]).unwrap();
+            }
+            assert_eq!(sender.retained_payload_bytes(), 0, "batch {batch}");
+        }
+        assert!(seen.into_iter().all(|received| received));
+        assert!(saw_fin);
+        // The lost original FIN transmission can remain in the flight ledger
+        // after its replacement ACK; its payload is already retired. Advance
+        // the loss timer rather than requiring immediate ledger removal.
+        sender.set_time(10_000_000);
+        sender.detect_ack_losses(0, sender.paths[0].largest_acked_send_order);
+        assert_eq!(sender.history_len(), 0, "remaining {:?}", sender.sent_packets.iter().flatten()
+            .map(|p| (p.packet_number, p.offset, p.fin, p.lost, p.data_delivered)).collect::<Vec<_>>());
     }
 
     #[test]
@@ -13043,6 +14498,33 @@ mod tests {
         assert!(ready_at_us > 0);
         assert!(path.try_reserve_pacing(1200, ready_at_us));
         assert_eq!(path.pacing_deadline_us(), None);
+    }
+
+    #[test]
+    fn per_path_pacer_exposes_sub_tick_deadline_and_accepts_late_owner_wakeup() {
+        let mut path = PathState::new(1200, 8);
+        path.rtt.update_at(1_000, 0);
+        path.congestion.congestion_window = 12_000;
+        path.set_pacing_config(crate::PacingConfig {
+            max_burst_bytes: 4 * 1200,
+            ..crate::PacingConfig::embedded()
+        });
+        for _ in 0..4 {
+            assert!(path.try_reserve_pacing(1200, 0));
+        }
+        assert!(!path.try_reserve_pacing(1200, 0));
+        assert_eq!(path.pacing_deadline_us(), Some(100));
+        let mut late = path.clone();
+        assert!(path.try_reserve_pacing(1200, 100));
+        // A 10 ms owner tick does not break correctness, but releases only
+        // the configured four-packet burst, not 10 ms of accumulated traffic.
+        // Adapters must preserve this deadline to avoid rate-limiting every
+        // bearer through their scheduler's timer granularity.
+        for _ in 0..4 {
+            assert!(late.try_reserve_pacing(1200, 10_000));
+        }
+        assert!(!late.try_reserve_pacing(1200, 10_000));
+        assert_eq!(late.pacing_deadline_us(), Some(10_100));
     }
 
     #[test]
@@ -13771,6 +15253,63 @@ mod tests {
     }
 
     #[test]
+    fn timer_heads_match_per_path_scans_with_one_ledger_visit() {
+        let local = ConnectionId::new(7).unwrap();
+        let peer = ConnectionId::new(8).unwrap();
+        let mut endpoint = EndpointState::<256>::new(Role::Client, ConnectionLimits::default(), 256);
+        endpoint.install_connection_ids(local, peer).unwrap();
+        endpoint.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
+        let mut wire = [0; 256];
+        endpoint.encode_stream_packet(peer, 4, 0, false, &[1; 64], &mut wire).unwrap();
+        let seed = *endpoint.sent_packets.iter().flatten().next().unwrap();
+        for path_count in 1..=MAX_PATH_STATES {
+            let mut paths: Vec<_> = (0..path_count).map(|_| PathState::new(256, 1)).collect();
+            for threshold in [None, Some(0), Some(7), Some(u64::MAX)] {
+                for path in &mut paths { path.largest_acked_send_order = threshold; }
+                for mask in 0..8 {
+                    let packets: Vec<_> = (0..32).map(|index| {
+                        let mut packet = seed;
+                        // Include an unknown path, prepared packets, loss and
+                        // timestamps near saturation in an unsorted ledger.
+                        packet.path_id = index % (path_count + 1);
+                        packet.send_order = index as u64;
+                        packet.sent_at = if index % 7 == 0 { u64::MAX - index as u64 }
+                            else { (32 - index) as u64 * 1000 };
+                        packet.accepted = (index & mask) != 0;
+                        packet.lost = index % 3 == 0;
+                        packet.data_delivered = index % 2 == 0;
+                        packet.fin = index % 5 == 0;
+                        packet
+                    }).collect();
+                    let visits = core::cell::Cell::new(0);
+                    let (earliest, loss, loss_candidate) = packet_timer_heads(&paths, packets.iter().inspect(|_| {
+                        visits.set(visits.get() + 1);
+                    }));
+                    assert_eq!(visits.get(), packets.len());
+                    assert_eq!(loss_candidate, packets.iter().any(|packet|
+                        packet.accepted && packet.lost && (!packet.data_delivered || packet.fin)));
+                    for (id, path) in paths.iter().enumerate() {
+                        let old_earliest = packets.iter()
+                            .filter(|p| p.accepted && !p.lost && p.path_id == id)
+                            .map(|p| p.sent_at).min();
+                        let old_loss = path.largest_acked_send_order.and_then(|order| packets.iter()
+                            .filter(|p| p.accepted && !p.lost && p.path_id == id && p.send_order < order)
+                            .map(|p| p.sent_at).min());
+                        assert_eq!(earliest[id], old_earliest);
+                        assert_eq!(loss[id], old_loss);
+                        for delay in [0, 25_000, u64::MAX] {
+                            let old_deadline = path.largest_acked_send_order.and_then(|order| packets.iter()
+                                .filter(|p| p.accepted && !p.lost && p.path_id == id && p.send_order < order)
+                                .map(|p| p.sent_at.saturating_add(delay)).min());
+                            assert_eq!(loss[id].map(|at| at.saturating_add(delay)), old_deadline);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn deferred_consumption_after_an_already_emitted_ack_gets_a_credit_deadline() {
         let limits = ConnectionLimits::with_receive_window(64);
         let mut endpoint = EndpointState::<256>::new(Role::Server, limits, 256);
@@ -13838,6 +15377,396 @@ mod tests {
         assert!(endpoint.poll_transmit(&mut packet).unwrap().is_some());
         assert_eq!(endpoint.credit_retry_backoff, 1);
         assert_eq!(endpoint.next_bearer_deadline(), Some(1_600_010));
+    }
+
+    #[test]
+    fn ordinary_acks_preserve_inflight_credit_and_its_retry_deadline() {
+        let client_cid = ConnectionId::new(7).unwrap();
+        let server_cid = ConnectionId::new(8).unwrap();
+        let limits = ConnectionLimits::with_receive_window(1024);
+        let mut client = EndpointState::<256>::new(Role::Client, limits, 256);
+        let mut server = EndpointState::<256>::new(Role::Server, limits, 256);
+        client.install_connection_ids(client_cid, server_cid).unwrap();
+        server.install_connection_ids(server_cid, client_cid).unwrap();
+        client.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
+        let mut data = [0u8; 256];
+        let (used, _) = client
+            .encode_stream_packet(server_cid, 4, 0, false, b"abc", &mut data)
+            .unwrap();
+        server.receive_packet_batch(&data[..used]).unwrap();
+        server.stream_consumed(4, 3).unwrap();
+        server.set_time(1);
+        let mut control = [0u8; 256];
+        let credit_len = server.poll_transmit(&mut control).unwrap().unwrap();
+        let original_credit = control[..credit_len].to_vec();
+        let original_number = server.credit_packet_number.unwrap();
+        let retry_at = server.next_bearer_deadline().unwrap();
+
+        // While the reliable publication is delayed, a fresh data packet
+        // still needs its ordinary ACK. Do not turn that ACK into another
+        // reliable credit publication or restart the original one's PTO.
+        server.set_time(10_000);
+        let (used, _) = client
+            .encode_stream_packet(server_cid, 4, 3, false, b"def", &mut data)
+            .unwrap();
+        server.receive_packet_batch(&data[..used]).unwrap();
+        server.request_stream_reack();
+        let ack_len = server.poll_transmit(&mut control).unwrap().unwrap();
+        let (_, mut offset) = ShortHeader::decode(&control[..ack_len]).unwrap();
+        while offset < ack_len {
+            let (frame, used) = decode_frame(&control[offset..ack_len]).unwrap();
+            assert!(
+                matches!(frame, Frame::Ack { .. } | Frame::AckRanges { .. }),
+                "an unrelated ACK must not repeat in-flight MAX_* frames"
+            );
+            offset += used;
+        }
+        assert_eq!(server.credit_packet_number, Some(original_number));
+        assert_eq!(server.next_bearer_deadline(), Some(retry_at));
+
+        // An ACK of the first publication must release it, even though a
+        // newer ACK-only packet has gone out in the meantime.
+        client.receive_packet_batch(&original_credit).unwrap();
+        client.set_time(100_000);
+        let ack_len = client.poll_transmit(&mut control).unwrap().unwrap();
+        server.receive_packet_batch(&control[..ack_len]).unwrap();
+        assert_eq!(server.credit_packet_number, None);
+        assert!(!server.credit_pending);
+    }
+
+    #[test]
+    fn credit_retry_keeps_its_clock_and_new_limits_reset_retry_backoff() {
+        let limits = ConnectionLimits::with_receive_window(64);
+        let mut endpoint = EndpointState::<256>::new(Role::Server, limits, 256);
+        endpoint
+            .install_connection_ids(ConnectionId::new(7).unwrap(), ConnectionId::new(8).unwrap())
+            .unwrap();
+        endpoint.receive.accept(4, 0, 32, false).unwrap();
+        endpoint.received_packets.insert(0);
+        endpoint.set_time(1);
+        endpoint.stream_consumed(4, 32).unwrap();
+        let mut packet = [0u8; 256];
+        endpoint.poll_transmit(&mut packet).unwrap().unwrap();
+        let first = endpoint.credit_packet_number;
+        let retry_at = endpoint.next_bearer_deadline().unwrap();
+        for now in [10_000, 50_000, retry_at - 1] {
+            endpoint.set_time(now);
+            endpoint.request_stream_reack();
+            endpoint.poll_transmit(&mut packet).unwrap().unwrap();
+            assert_eq!(endpoint.credit_packet_number, first);
+            assert_eq!(endpoint.next_bearer_deadline(), Some(retry_at));
+        }
+        endpoint.set_time(retry_at);
+        endpoint.poll_transmit(&mut packet).unwrap().unwrap();
+        assert_ne!(endpoint.credit_packet_number, first);
+        assert_eq!(endpoint.credit_retry_backoff, 1);
+
+        endpoint.set_time(retry_at + 1);
+        endpoint.receive.accept(4, 32, 16, false).unwrap();
+        endpoint.stream_consumed(4, 16).unwrap();
+        endpoint.poll_transmit(&mut packet).unwrap().unwrap();
+        assert_eq!(endpoint.credit_retry_backoff, 0);
+        assert_eq!(
+            endpoint.next_bearer_deadline(),
+            Some(retry_at + 1 + endpoint.pto_timeout())
+        );
+    }
+
+    #[test]
+    fn acknowledged_credit_copy_releases_the_original_publication() {
+        let local = ConnectionId::new(7).unwrap();
+        let peer = ConnectionId::new(8).unwrap();
+        let alternate_local = ConnectionId::new(9).unwrap();
+        let alternate_peer = ConnectionId::new(10).unwrap();
+        let mut endpoint = EndpointState::<256>::new(
+            Role::Server, ConnectionLimits::with_receive_window(64), 256,
+        );
+        endpoint.install_connection_ids(local, peer).unwrap();
+        let path = endpoint
+            .add_path_state_with_ids(alternate_local, alternate_peer)
+            .unwrap();
+        endpoint.paths[path].validated = true;
+        endpoint.set_duplication_budget_capacity(4096);
+        endpoint.duplication_credit_bytes = 4096;
+        endpoint.receive.accept(4, 0, 32, false).unwrap();
+        endpoint.received_packets.insert(0);
+        endpoint.stream_consumed(4, 32).unwrap();
+        let mut packet = [0u8; 256];
+        endpoint.poll_transmit(&mut packet).unwrap().unwrap();
+        let original = endpoint.credit_packet_number.unwrap();
+        let (_, copy) = endpoint
+            .duplicate_credit_control_on_path(original, path, true, true, 1, false, &mut packet)
+            .unwrap().unwrap();
+        let mut used = ShortHeader {
+            flags: FLAG_FIXED,
+            dcid: alternate_local,
+            packet_number: 1,
+            packet_number_len: 1,
+        }.encode(&mut packet).unwrap();
+        used += Frame::Ack { largest: copy, delay: 0 }
+            .encode(&mut packet[used..]).unwrap();
+        endpoint
+            .receive_ack_packet_on_path(&packet[..used], path)
+            .unwrap();
+        assert_eq!(endpoint.credit_packet_number, None);
+        assert!(!endpoint.credit_pending);
+        assert!(endpoint.pending_stream_ids.is_empty());
+    }
+
+    #[test]
+    fn consumption_keeps_the_latest_ingress_ack_on_its_own_path() {
+        let local = ConnectionId::new(7).unwrap();
+        let peer = ConnectionId::new(8).unwrap();
+        let alternate_local = ConnectionId::new(9).unwrap();
+        let alternate_peer = ConnectionId::new(10).unwrap();
+        for with_credit in [false, true] {
+            let mut endpoint = EndpointState::<256>::new(
+                Role::Server, ConnectionLimits::with_receive_window(64), 256,
+            );
+            endpoint.install_connection_ids(local, peer).unwrap();
+            let path = endpoint
+                .add_path_state_with_ids(alternate_local, alternate_peer)
+                .unwrap();
+            endpoint.paths[path].validated = true;
+            endpoint.set_time(1);
+            endpoint.observe_packet_on_path(0, 0);
+            endpoint.schedule_ack(0, false);
+            endpoint.set_time(10_000);
+            let mut packet = [0u8; 256];
+            let mut used = ShortHeader {
+                flags: FLAG_FIXED,
+                dcid: alternate_local,
+                packet_number: 1,
+                packet_number_len: 1,
+            }.encode(&mut packet).unwrap();
+            used += Frame::Stream(StreamFrame {
+                id: 4, offset: 0, fin: false, data: b"abc",
+            }).encode(&mut packet[used..]).unwrap();
+            endpoint.receive_packet_batch_on_path(&packet[..used], path).unwrap();
+            if with_credit {
+                endpoint.stream_consumed(4, 3).unwrap();
+                assert_eq!(endpoint.pending_control_path(), Some(path));
+                let used = endpoint.poll_transmit_on_path(path, &mut packet)
+                    .unwrap().unwrap();
+                assert_eq!(
+                    ShortHeader::decode(&packet[..used]).unwrap().0.dcid,
+                    alternate_peer
+                );
+            } else {
+                let primary_packets = endpoint.paths[0].ack_packets;
+                endpoint.stream_consumed_without_credit(4, 3).unwrap();
+                assert_eq!(endpoint.paths[0].ack_packets, primary_packets);
+                assert!(!endpoint.paths[0].ack_immediate);
+            }
+        }
+    }
+
+    #[test]
+    fn ack_only_ingress_does_not_postpone_outstanding_delayed_ack() {
+        let local = ConnectionId::new(7).unwrap();
+        let peer = ConnectionId::new(8).unwrap();
+        let mut endpoint = EndpointState::<256>::new(Role::Server, ConnectionLimits::default(), 256);
+        endpoint.install_connection_ids(local, peer).unwrap();
+        endpoint.set_ack_policy(8, 25_000);
+        endpoint.set_time(100);
+        endpoint.observe_packet(0);
+        endpoint.schedule_ack(0, false);
+        let mut packet = [0; 256];
+        for number in 1..=4 {
+            endpoint.set_time(100 + number as u64 * 5000);
+            let mut used = ShortHeader { flags: FLAG_FIXED, dcid: local, packet_number: number, packet_number_len: 1 }.encode(&mut packet).unwrap();
+            used += Frame::Ack { largest: 0, delay: 0 }.encode(&mut packet[used..]).unwrap();
+            endpoint.receive_packet_batch(&packet[..used]).unwrap();
+            assert_eq!(endpoint.next_bearer_deadline(), Some(25_100));
+            assert!(endpoint.poll_transmit(&mut packet).unwrap().is_none());
+        }
+        endpoint.set_time(25_100);
+        assert!(endpoint.poll_transmit(&mut packet).unwrap().is_some());
+        assert!(!endpoint.paths[0].ack_pending);
+    }
+
+    #[cfg(feature = "packet-protection")]
+    #[test]
+    fn protected_stream_piggyback_reserves_the_aead_tag() {
+        let client_cid = ConnectionId::new(7).unwrap();
+        let server_cid = ConnectionId::new(8).unwrap();
+        let limits = ConnectionLimits::with_receive_profile(4096, 4096, 4);
+        let mut client = EndpointState::<256>::new(Role::Client, limits, 256);
+        let mut server = EndpointState::<256>::new(Role::Server, limits, 256);
+        client.install_connection_ids(client_cid, server_cid).unwrap();
+        server.install_connection_ids(server_cid, client_cid).unwrap();
+        let psk = [0x5c; 32];
+        let client_random = [0x11; crypto::ASSOCIATION_RANDOM_LEN];
+        let server_random = [0x22; crypto::ASSOCIATION_RANDOM_LEN];
+        client.configure_packet_protection(&psk, &client_random, &server_random).unwrap();
+        server.configure_packet_protection(&psk, &client_random, &server_random).unwrap();
+        client.open_send_stream(4, 4096).unwrap();
+        server.open_send_stream(4, 4096).unwrap();
+        let mut packet = [0; 256];
+        let (used, _) = client.encode_stream_packet(server_cid, 4, 0, false, b"request", &mut packet).unwrap();
+        server.receive_protected_packet_batch_on_path(&mut packet, used, 0).unwrap();
+        server.stream_consumed_deferred(4, 7).unwrap();
+        let (used, response) = server.encode_stream_packet(client_cid, 4, 0, false, &[0x5a; 220], &mut packet).unwrap();
+        assert!(used <= packet.len());
+        assert_eq!(server.credit_packet_number, Some(response));
+        let received = client.receive_protected_packet_batch_on_path(&mut packet, used, 0).unwrap();
+        assert_eq!(received.streams().next().unwrap().data, &[0x5a; 220]);
+        assert_eq!(client.history_len(), 0);
+        assert_eq!(client.send.max_data, 4103);
+        assert_eq!(client.send.stream_credit(4), Some(4103));
+    }
+
+    #[test]
+    fn stream_packet_piggybacks_ack_and_credit_with_one_packet_number() {
+        let client_cid = ConnectionId::new(7).unwrap();
+        let server_cid = ConnectionId::new(8).unwrap();
+        let limits = ConnectionLimits::with_receive_profile(4096, 4096, 4);
+        let mut client = EndpointState::<256>::new(Role::Client, limits, 256);
+        let mut server = EndpointState::<256>::new(Role::Server, limits, 256);
+        client.install_connection_ids(client_cid, server_cid).unwrap();
+        server.install_connection_ids(server_cid, client_cid).unwrap();
+        client.open_send_stream(4, 4096).unwrap();
+        server.open_send_stream(4, 4096).unwrap();
+        let mut packet = [0; 256];
+        let (used, request) = client.encode_stream_packet(server_cid, 4, 0, false, b"request", &mut packet).unwrap();
+        server.receive_packet_batch(&packet[..used]).unwrap();
+        server.stream_consumed_deferred(4, 7).unwrap();
+        let next = server.next_packet_number;
+        let (used, response) = server.encode_stream_packet(client_cid, 4, 0, true, b"response", &mut packet).unwrap();
+        assert_eq!(response, next);
+        assert_eq!(server.next_packet_number, next + 1);
+        assert_eq!(server.credit_packet_number, Some(response));
+        assert!(!server.paths[0].ack_pending);
+        let (_, mut offset) = ShortHeader::decode(&packet[..used]).unwrap();
+        let mut stream = false;
+        let mut ack = false;
+        let mut connection_credit = false;
+        let mut stream_credit = false;
+        while offset < used {
+            let (frame, n) = decode_frame(&packet[offset..used]).unwrap();
+            match frame {
+                Frame::Stream(frame) => { assert_eq!(frame.data, b"response"); assert!(frame.fin); stream = true; }
+                Frame::AckRanges { ranges, .. } => { assert!(ranges.contains(request)); ack = true; }
+                Frame::Ack { largest, .. } => { assert_eq!(largest, request); ack = true; }
+                Frame::MaxData(max) => { assert_eq!(max, 4103); connection_credit = true; }
+                Frame::MaxStreamData { id, max } => { assert_eq!((id, max), (4, 4103)); stream_credit = true; }
+                _ => panic!("unexpected piggyback frame"),
+            }
+            offset += n;
+        }
+        assert!(stream && ack && connection_credit && stream_credit);
+        let received = client.receive_packet_batch(&packet[..used]).unwrap();
+        assert_eq!(received.streams().next().unwrap().data, b"response");
+        assert_eq!(client.history_len(), 0, "piggyback ACK retires the request");
+        client.request_stream_reack();
+        let used = client.poll_transmit(&mut packet).unwrap().unwrap();
+        server.receive_packet_batch(&packet[..used]).unwrap();
+        assert_eq!(server.history_len(), 0, "one ACK retires STREAM and credit publication");
+        assert!(!server.credit_pending);
+        assert!(server.poll_transmit(&mut packet).unwrap().is_none());
+    }
+
+    #[test]
+    fn blocked_stream_piggyback_preserves_pending_control_state() {
+        let mut endpoint = EndpointState::<256>::new(Role::Server,
+            ConnectionLimits::with_receive_profile(4096, 4096, 4), 256);
+        let local = ConnectionId::new(7).unwrap();
+        let peer = ConnectionId::new(8).unwrap();
+        endpoint.install_connection_ids(local, peer).unwrap();
+        endpoint.open_send_stream(4, 4096).unwrap();
+        endpoint.receive.accept(4, 0, 8, false).unwrap();
+        endpoint.observe_packet(0);
+        endpoint.schedule_application_ack(0, false);
+        endpoint.stream_consumed_deferred(4, 8).unwrap();
+        let next = endpoint.next_packet_number;
+        let deadline = endpoint.next_bearer_deadline();
+        let mut packet = [0; 256];
+        endpoint.paths[0].congestion.congestion_window = 0;
+        assert_eq!(endpoint.encode_stream_packet(peer, 4, 0, false, b"reply", &mut packet), Err(Error::Blocked));
+        assert_eq!(endpoint.next_packet_number, next);
+        assert_eq!(endpoint.next_bearer_deadline(), deadline);
+        assert!(endpoint.paths[0].ack_pending && endpoint.credit_pending);
+        assert_eq!(endpoint.credit_packet_number, None);
+        assert_eq!(endpoint.send.stream_credit(4), Some(4096));
+        endpoint.paths[0].congestion.congestion_window = 4096;
+        let (_, number) = endpoint.encode_stream_packet(peer, 4, 0, false, b"reply", &mut packet).unwrap();
+        assert_eq!(endpoint.credit_packet_number, Some(number));
+        assert!(!endpoint.paths[0].ack_pending);
+    }
+
+    #[test]
+    fn stream_piggyback_without_control_space_keeps_standalone_timer() {
+        let mut endpoint = EndpointState::<256>::new(Role::Server,
+            ConnectionLimits::with_receive_profile(4096, 4096, 4), 256);
+        let local = ConnectionId::new(7).unwrap();
+        let peer = ConnectionId::new(8).unwrap();
+        endpoint.install_connection_ids(local, peer).unwrap();
+        endpoint.open_send_stream(4, 4096).unwrap();
+        let mut packet = [0; 256];
+        let mut scratch = endpoint.clone();
+        let (bare_len, _) = scratch.encode_stream_packet(peer, 4, 0, false, b"reply", &mut packet).unwrap();
+        endpoint.set_time(1);
+        endpoint.receive.accept(4, 0, 8, false).unwrap();
+        endpoint.observe_packet(0);
+        endpoint.schedule_application_ack(0, false);
+        endpoint.stream_consumed_deferred(4, 8).unwrap();
+        let deadline = endpoint.next_bearer_deadline();
+        let (used, _) = endpoint.encode_stream_packet(peer, 4, 0, false, b"reply", &mut packet[..bare_len]).unwrap();
+        assert_eq!(used, bare_len);
+        assert!(endpoint.paths[0].ack_pending && endpoint.credit_pending);
+        assert_eq!(endpoint.credit_packet_number, None);
+        assert_eq!(endpoint.next_bearer_deadline(), deadline);
+        endpoint.set_time(1 + endpoint.max_ack_delay_us());
+        assert!(endpoint.poll_transmit(&mut packet).unwrap().is_some());
+        assert!(endpoint.credit_packet_number.is_some());
+    }
+
+    #[test]
+    fn stream_piggyback_does_not_steal_another_circuits_ack() {
+        let mut endpoint = EndpointState::<256>::new(Role::Server,
+            ConnectionLimits::with_receive_profile(4096, 4096, 4), 256);
+        let local = ConnectionId::new(7).unwrap();
+        let peer = ConnectionId::new(8).unwrap();
+        endpoint.install_connection_ids(local, peer).unwrap();
+        let alternate = endpoint.add_path_state_with_ids(ConnectionId::new(9).unwrap(), ConnectionId::new(10).unwrap()).unwrap();
+        endpoint.open_send_stream(4, 4096).unwrap();
+        endpoint.observe_packet(0);
+        endpoint.schedule_application_ack(0, false);
+        let mut packet = [0; 256];
+        endpoint.encode_stream_packet_on_path(alternate, ConnectionId::new(10).unwrap(), 4, 0, false, b"other circuit", &mut packet).unwrap();
+        assert!(endpoint.paths[0].ack_pending);
+        endpoint.encode_stream_packet(peer, 4, 13, true, b"same circuit", &mut packet).unwrap();
+        assert!(!endpoint.paths[0].ack_pending);
+        assert_eq!(endpoint.stats.ack_packets, 1);
+    }
+
+    #[test]
+    fn larger_window_credit_ack_batches_newer_consumption_until_control_deadline() {
+        let limits = ConnectionLimits::with_receive_profile(4096, 4096, 4);
+        let mut endpoint = EndpointState::<256>::new(Role::Server, limits, 256);
+        endpoint.install_connection_ids(ConnectionId::new(7).unwrap(), ConnectionId::new(8).unwrap()).unwrap();
+        endpoint.receive.accept(4, 0, 32, false).unwrap();
+        endpoint.received_packets.insert(0);
+        endpoint.highest_received_packet = Some(0);
+        endpoint.set_time(1);
+        endpoint.stream_consumed(4, 32).unwrap();
+        let mut packet = [0u8; 256];
+        endpoint.poll_transmit(&mut packet).unwrap().unwrap();
+        let publication = endpoint.credit_packet_number.unwrap();
+        endpoint.receive.accept(4, 32, 16, false).unwrap();
+        endpoint.stream_consumed_deferred(4, 16).unwrap();
+        let mut ranges = AckRangeSet::new();
+        ranges.insert(publication);
+        endpoint.apply_ack_ranges_on_path(ranges, 0, 0).unwrap();
+        assert!(endpoint.credit_pending, "newer credit survives the old ACK");
+        assert_eq!(endpoint.credit_packet_number, None);
+        assert!(endpoint.poll_transmit(&mut packet).unwrap().is_none(),
+            "credit ACK alone must not force an immediate fresh publication");
+        let deadline = endpoint.next_bearer_deadline().unwrap();
+        assert_eq!(deadline, 1 + endpoint.max_ack_delay_us());
+        endpoint.set_time(deadline);
+        assert!(endpoint.poll_transmit(&mut packet).unwrap().is_some());
+        assert!(endpoint.credit_packet_number.is_some(), "publication does not depend on more peer data");
     }
 
     #[test]

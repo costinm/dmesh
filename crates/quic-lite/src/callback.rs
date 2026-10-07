@@ -10,6 +10,7 @@
 
 use alloc::{sync::Arc, vec::Vec};
 use core::ops::Range;
+use smallvec::SmallVec;
 
 /// A reference-counted or pool-backed received packet. Cloning this value must
 /// retain the packet, not copy its payload.
@@ -338,11 +339,11 @@ impl<P: PacketLease> CallbackStreams<P> {
     /// without cloning or mutating retained delivery state.
     pub(crate) fn validate_packet_frames(
         &self,
-        frames: &[(u64, u64, usize, bool)],
+        frames: impl IntoIterator<Item = (u64, u64, usize, bool)>,
     ) -> Result<(), CallbackError> {
-        let mut new_streams = Vec::new();
-        let mut packet_finals = Vec::new();
-        for &(id, offset, len, fin) in frames {
+        let mut new_streams = SmallVec::<[u64; 4]>::new();
+        let mut packet_finals = SmallVec::<[(u64, u64); 4]>::new();
+        for (id, offset, len, fin) in frames {
             let end = offset
                 .checked_add(len as u64)
                 .ok_or(CallbackError::InvalidFin)?;

@@ -563,11 +563,23 @@ impl<B: AsRef<[u8]>> EgressSubmission<B> {
         self.completion.complete(self.packet, outcome, elapsed_us);
     }
 
-    /// Split an accepted submission for asynchronous writing.
+    /// Split a submission for in-place framing or asynchronous writing.
     ///
-    /// The bearer must later return this same packet through the token.
+    /// After acceptance, return this same packet through the token. Before
+    /// acceptance, a zero-byte refusal can reassemble it with [`Self::from_parts`]
+    /// and return `WouldBlock` without completing the token.
     pub fn into_parts(self) -> (OwnedPacket<B>, PacketCompletionToken<B>) {
         (self.packet, self.completion)
+    }
+
+    /// Reassemble the same packet and token after an in-place submission attempt.
+    ///
+    /// If the bearer consumed no bytes, this can be returned as `WouldBlock`.
+    /// Preserve the original packet range and QUIC bytes; only unused framing
+    /// headroom may have changed. Do not mix packets and tokens from different
+    /// submissions or complete the token before returning it.
+    pub fn from_parts(packet: OwnedPacket<B>, completion: PacketCompletionToken<B>) -> Self {
+        Self { packet, completion }
     }
 }
 
@@ -644,10 +656,10 @@ impl<B: AsRef<[u8]>> OwnedPacket<B> {
 
     /// Split the packet into its complete pool slot and exact QUIC range.
     ///
-    /// A bearer calls this only after it has accepted ownership. It may then
+    /// A bearer normally calls this after it has accepted ownership. It may then
     /// replace bytes outside the range with its envelope and adjust the range
-    /// to the submitted frame. A bearer that may return `WouldBlock` must keep
-    /// the `OwnedPacket` intact instead.
+    /// to the submitted frame. Before returning `WouldBlock`, reconstruct the
+    /// same QUIC range with [`Self::new`]; never change its opaque QUIC bytes.
     pub fn into_parts(self) -> (B, Range<usize>) {
         (self.buffer, self.range)
     }
@@ -687,9 +699,83 @@ pub enum PacketSubmitError<B: AsRef<[u8]>> {
     WouldBlock(EgressSubmission<B>),
 }
 
+const SLOT_EMPTY: u8 = 0;
+const SLOT_WRITING: u8 = 1;
+const SLOT_READY: u8 = 2;
+const SLOT_READING: u8 = 3;
+
+struct CallbackSlot<T> {
+    state: core::sync::atomic::AtomicU8,
+    value: core::cell::UnsafeCell<core::mem::MaybeUninit<T>>,
+}
+
+// Only the successful state CAS owner accesses value. Release publication
+// and acquire reservation transfer ownership between producer and consumer.
+unsafe impl<T: Send> Sync for CallbackSlot<T> {}
+
+impl<T> Drop for CallbackSlot<T> {
+    fn drop(&mut self) {
+        if *self.state.get_mut() == SLOT_READY {
+            // Exclusive destruction: no producer/consumer still owns a slot.
+            unsafe { self.value.get_mut().assume_init_drop() };
+        }
+    }
+}
+
+/// Fixed-capacity, unordered callback mailbox. Never waits for another slot's
+/// owner: a higher-priority callback must be able to preempt the QUIC owner
+/// (or another callback) on a single core. A FIFO with a reserved-but-unpublished
+/// head would have the same priority-inversion problem as a spinlock.
+struct CallbackSlots<T> {
+    slots: Box<[CallbackSlot<T>]>,
+    cursor: core::sync::atomic::AtomicUsize,
+}
+
+impl<T> CallbackSlots<T> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            slots: (0..capacity).map(|_| CallbackSlot {
+                state: core::sync::atomic::AtomicU8::new(SLOT_EMPTY),
+                value: core::cell::UnsafeCell::new(core::mem::MaybeUninit::uninit()),
+            }).collect(),
+            cursor: core::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn push(&self, value: T) -> Result<(), T> {
+        use core::sync::atomic::Ordering;
+        for slot in &self.slots {
+            if slot.state.compare_exchange(SLOT_EMPTY, SLOT_WRITING, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                // This producer exclusively owns the uninitialized storage.
+                unsafe { (*slot.value.get()).write(value); }
+                slot.state.store(SLOT_READY, Ordering::Release);
+                return Ok(());
+            }
+        }
+        Err(value)
+    }
+
+    fn pop(&self) -> Option<T> {
+        use core::sync::atomic::Ordering;
+        let start = self.cursor.load(Ordering::Relaxed);
+        for offset in 0..self.slots.len() {
+            let index = (start + offset) % self.slots.len();
+            let slot = &self.slots[index];
+            if slot.state.compare_exchange(SLOT_READY, SLOT_READING, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                // This consumer exclusively owns the initialized value.
+                let value = unsafe { (*slot.value.get()).assume_init_read() };
+                slot.state.store(SLOT_EMPTY, Ordering::Release);
+                self.cursor.store((index + 1) % self.slots.len(), Ordering::Relaxed);
+                return Some(value);
+            }
+        }
+        None
+    }
+}
+
 pub(crate) struct CompletionQueue<B> {
-    completions: spin::Mutex<alloc::collections::VecDeque<PacketSendCompletion<B>>>,
-    ready: spin::Mutex<alloc::collections::VecDeque<BearerId>>,
+    completions: CallbackSlots<PacketSendCompletion<B>>,
+    ready: Box<[core::sync::atomic::AtomicU16]>,
     #[cfg(feature = "tokio")]
     changed: ::tokio::sync::Notify,
     #[cfg(feature = "tokio")]
@@ -700,8 +786,8 @@ impl<B> CompletionQueue<B> {
     pub(crate) fn new(capacity: usize) -> Self {
         assert!(capacity != 0, "completion queue capacity must be nonzero");
         Self {
-            completions: spin::Mutex::new(alloc::collections::VecDeque::with_capacity(capacity)),
-            ready: spin::Mutex::new(alloc::collections::VecDeque::with_capacity(capacity)),
+            completions: CallbackSlots::new(capacity),
+            ready: (0..capacity).map(|_| core::sync::atomic::AtomicU16::new(0)).collect(),
             #[cfg(feature = "tokio")]
             changed: ::tokio::sync::Notify::new(),
             #[cfg(feature = "tokio")]
@@ -710,11 +796,16 @@ impl<B> CompletionQueue<B> {
     }
 
     pub(crate) fn pop_completion(&self) -> Option<PacketSendCompletion<B>> {
-        self.completions.lock().pop_front()
+        self.completions.pop()
     }
 
     pub(crate) fn pop_ready(&self) -> Option<BearerId> {
-        self.ready.lock().pop_front()
+        for slot in &self.ready {
+            if let Some(bearer) = BearerId::new(slot.swap(0, core::sync::atomic::Ordering::AcqRel)) {
+                return Some(bearer);
+            }
+        }
+        None
     }
 
     #[cfg(feature = "tokio")]
@@ -729,7 +820,8 @@ impl<B> CompletionQueue<B> {
 
     #[cfg(feature = "tokio")]
     fn wake_poller(&self) {
-        if let Some(waker) = self.poll_waker.lock().take() {
+        let waker = self.poll_waker.lock().take();
+        if let Some(waker) = waker {
             waker.wake();
         }
     }
@@ -737,12 +829,10 @@ impl<B> CompletionQueue<B> {
 
 impl<B: Send> PacketEgressEvents<B> for CompletionQueue<B> {
     fn send_completed(&self, completion: PacketSendCompletion<B>) {
-        let mut queue = self.completions.lock();
         assert!(
-            queue.len() < queue.capacity(),
+            self.completions.push(completion).is_ok(),
             "completion queue invariant violated"
         );
-        queue.push_back(completion);
         #[cfg(feature = "tokio")]
         self.changed.notify_one();
         #[cfg(feature = "tokio")]
@@ -750,12 +840,19 @@ impl<B: Send> PacketEgressEvents<B> for CompletionQueue<B> {
     }
 
     fn send_ready(&self, bearer: BearerId) {
-        let mut queue = self.ready.lock();
-        assert!(
-            queue.len() < queue.capacity(),
-            "ready queue invariant violated"
-        );
-        queue.push_back(bearer);
+        use core::sync::atomic::Ordering;
+        let mut published = false;
+        for slot in &self.ready {
+            match slot.compare_exchange(0, bearer.value(), Ordering::Release, Ordering::Relaxed) {
+                Ok(_) => { published = true; break; }
+                // Readiness is a level, not an ownership-bearing packet event.
+                // Coalesce repeats so callbacks cannot fill the mailbox with
+                // duplicates while the owner is preempted.
+                Err(known) if known == bearer.value() => { published = true; break; }
+                Err(_) => {}
+            }
+        }
+        assert!(published, "ready queue invariant violated");
         #[cfg(feature = "tokio")]
         self.changed.notify_one();
         #[cfg(feature = "tokio")]
@@ -868,6 +965,11 @@ impl<B: AsRef<[u8]>> RegisteredBearer<B> {
 
     pub(crate) fn has_pending_submission(&self) -> bool {
         self.pending.is_some()
+    }
+
+    #[cfg(feature = "tokio")]
+    pub(crate) fn pending_packet_bytes(&self) -> Option<&[u8]> {
+        self.pending.as_ref().map(|(_, submission, _)| submission.packet().bytes())
     }
 
     /// Enable or disable this bearer without disturbing the QUIC owner.
@@ -1297,6 +1399,131 @@ mod tests {
     use alloc::rc::Rc;
     use alloc::vec;
     use core::cell::Cell;
+
+    #[test]
+    fn completion_callback_can_preempt_the_consumer_without_waiting_or_losing_lease() {
+        use core::sync::atomic::Ordering;
+        use crate::{PacketPool as _, PacketWriter as _};
+        type Pool = crate::packet_pool::PacketPool<2, 128>;
+        let pool = Box::leak(Box::new(Pool::new()));
+        let events = Arc::new(CompletionQueue::new(2));
+        let mut writer = crate::PacketPool::acquire_writer(pool, 16, 0).unwrap();
+        writer.payload_mut()[..3].copy_from_slice(&[1, 2, 3]);
+        let packet = crate::PacketWriter::commit(writer, 3).unwrap();
+        let address = packet.bytes().as_ptr();
+        let bearer = BearerId::new(1).unwrap();
+
+        // Freeze a lower-priority consumer in its critical section. Invoking
+        // the higher-priority callback synchronously models a single CPU:
+        // the consumer cannot resume until the callback has returned.
+        events.completions.slots[0].state.store(SLOT_READING, Ordering::Release);
+        events.send_ready(bearer);
+        let suspended_ready = events.pop_ready().unwrap();
+        EgressSubmission::new(bearer, packet, events.clone()).complete(PacketSendOutcome::Sent, 17);
+        events.send_ready(bearer);
+        assert_eq!(pool.available(), 1, "callback retains the original pool lease");
+        let completion = events.pop_completion().unwrap();
+        assert_eq!(completion.packet.bytes().as_ptr(), address);
+        assert_eq!(completion.packet.bytes(), &[1, 2, 3]);
+        assert_eq!(completion.elapsed_us, 17);
+        assert_eq!(events.pop_ready(), Some(bearer));
+        assert_eq!(suspended_ready, bearer);
+        assert!(events.pop_completion().is_none());
+        drop(completion);
+        assert_eq!(pool.available(), 2);
+        events.completions.slots[0].state.store(SLOT_EMPTY, Ordering::Release);
+    }
+
+    #[test]
+    fn repeated_readiness_coalesces_without_losing_a_post_consume_notification() {
+        let events = CompletionQueue::<[u8; 1]>::new(1);
+        let bearer = BearerId::new(1).unwrap();
+        for _ in 0..100 { events.send_ready(bearer); }
+        assert_eq!(events.pop_ready(), Some(bearer));
+        // The owner may be preempted after atomically taking the old event.
+        events.send_ready(bearer);
+        assert_eq!(events.pop_ready(), Some(bearer));
+        assert_eq!(events.pop_ready(), None);
+    }
+
+    #[test]
+    fn readiness_keeps_distinct_bearers_when_one_repeats() {
+        let events = CompletionQueue::<[u8; 1]>::new(2);
+        let first = BearerId::new(1).unwrap();
+        let second = BearerId::new(2).unwrap();
+        events.send_ready(first);
+        events.send_ready(second);
+        for _ in 0..100 { events.send_ready(second); }
+        assert_eq!(events.pop_ready(), Some(first));
+        assert_eq!(events.pop_ready(), Some(second));
+        assert_eq!(events.pop_ready(), None);
+    }
+
+    #[test]
+    fn callback_slots_skip_preempted_producer_and_return_full_value_unchanged() {
+        use core::sync::atomic::Ordering;
+        let slots = CallbackSlots::new(2);
+        // A reserved but unpublished slot cannot block either another
+        // callback's publication or the owner's consumption of ready slots.
+        slots.slots[0].state.store(SLOT_WRITING, Ordering::Release);
+        assert_eq!(slots.push(31), Ok(()));
+        assert_eq!(slots.push(47), Err(47));
+        assert_eq!(slots.pop(), Some(31));
+        assert_eq!(slots.pop(), None);
+        unsafe { (*slots.slots[0].value.get()).write(19); }
+        slots.slots[0].state.store(SLOT_READY, Ordering::Release);
+        assert_eq!(slots.pop(), Some(19));
+        assert_eq!(slots.push(47), Ok(()));
+        assert_eq!(slots.pop(), Some(47));
+    }
+
+    #[test]
+    fn callback_slots_drop_queued_values_once() {
+        struct CountDrop(Arc<core::sync::atomic::AtomicUsize>);
+        impl Drop for CountDrop {
+            fn drop(&mut self) { self.0.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
+        }
+        let dropped = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let slots = CallbackSlots::new(2);
+        assert!(slots.push(CountDrop(dropped.clone())).is_ok());
+        assert!(slots.push(CountDrop(dropped.clone())).is_ok());
+        drop(slots.pop());
+        assert_eq!(dropped.load(core::sync::atomic::Ordering::Relaxed), 1);
+        drop(slots);
+        assert_eq!(dropped.load(core::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn callback_slots_concurrent_producers_return_every_value_once() {
+        let slots = Arc::new(CallbackSlots::new(8));
+        let threads: alloc::vec::Vec<_> = (0..4).map(|producer| {
+            let slots = slots.clone();
+            std::thread::spawn(move || {
+                for index in 0..1024 {
+                    let mut value = producer * 1024 + index;
+                    loop {
+                        match slots.push(value) {
+                            Ok(()) => break,
+                            Err(retained) => { value = retained; std::thread::yield_now(); }
+                        }
+                    }
+                }
+            })
+        }).collect();
+        let mut seen = [false; 4096];
+        for _ in 0..seen.len() {
+            let value = loop {
+                if let Some(value) = slots.pop() { break value; }
+                std::thread::yield_now();
+            };
+            assert!(!seen[value], "duplicate completion");
+            seen[value] = true;
+        }
+        for thread in threads { thread.join().unwrap(); }
+        assert!(seen.iter().all(|seen| *seen));
+        assert!(slots.pop().is_none());
+    }
 
     #[test]
     fn owned_packet_mutation_respects_packet_range() {

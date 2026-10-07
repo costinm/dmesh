@@ -379,6 +379,9 @@ async fn paired_fake_establishes_and_delivers_multi_packet_fin_through_public_ap
 
 #[tokio::test]
 async fn small_pool_handles_multiple_associations_and_streams_without_cross_delivery() {
+    use quic_lite::tokio::TokioNodeDriver;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     static FIRST_POOL: Pool = Pool::new();
     static SECOND_POOL: Pool = Pool::new();
     let (first_bearer, second_bearer) = FakePacketBearer::<Pool>::pair(
@@ -394,84 +397,78 @@ async fn small_pool_handles_multiple_associations_and_streams_without_cross_deli
         peer_l2_address: PeerL2Address::new(1).unwrap(),
         received_at_us: 0,
     };
+    let (client, client_driver) =
+        TokioNodeDriver::new(client, quic_lite::ConnectionLimits::default());
+    let (server, server_driver) =
+        TokioNodeDriver::new(server, quic_lite::ConnectionLimits::default());
 
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+    let scenario = tokio::time::timeout(std::time::Duration::from_secs(3), async {
         let mut associations = Vec::new();
         for association_index in 0..4 {
-            let client_association = client.associate(address, 0).unwrap();
-            let server_future = server.accept_stream(quic_lite::ConnectionLimits::default());
+            let client_association = client.associate(address, 0).await.unwrap();
             let client_future = async {
-                client.wait_established(client_association).await.unwrap();
-                let mut stream = client.open_stream(client_association).unwrap();
-                client
-                    .write_stream(&mut stream, &[association_index as u8, 0xff])
+                client_association.wait_established().await.unwrap();
+                let mut stream = client_association.open_stream().await.unwrap();
+                stream
+                    .write_all(&[association_index as u8, 0xff])
+                    .await
                     .unwrap();
-                client.finish_stream(&mut stream).unwrap();
+                stream.shutdown().await.unwrap();
             };
-            let (received, ()) = tokio::join!(server_future, client_future);
-            assert_eq!(received.unwrap().bytes, [association_index as u8, 0xff]);
-            let fin = server
-                .accept_stream(quic_lite::ConnectionLimits::default())
-                .await
-                .unwrap();
-            assert!(fin.bytes.is_empty() && fin.fin);
+            let server_future = async {
+                let mut stream = server.accept_stream().await.unwrap();
+                let mut received = Vec::new();
+                stream.read_to_end(&mut received).await.unwrap();
+                assert_eq!(received, [association_index as u8, 0xff]);
+            };
+            tokio::join!(server_future, client_future);
             associations.push(client_association);
         }
 
-        for (association_index, client_association) in associations.iter().copied().enumerate() {
-            // This borrowed-node test deliberately does not run a client
-            // ingress driver for pure ACK packets. Keep its unacknowledged
-            // send history below the selected eight-packet limit; the owned
-            // Tokio driver tests sustained stream recycling separately.
+        for (association_index, association) in associations.iter().enumerate() {
             for stream_index in 0..2 {
                 let expected = [association_index as u8, stream_index as u8];
-                let mut stream = client.open_stream(client_association).unwrap();
-                client.write_stream(&mut stream, &expected).unwrap();
-                let received = server
-                    .accept_stream(quic_lite::ConnectionLimits::default())
-                    .await
-                    .unwrap();
-                assert_eq!(received.offset, 0);
-                assert_eq!(received.bytes, expected);
-                assert!(!received.fin);
-                client.finish_stream(&mut stream).unwrap();
-                let fin = server
-                    .accept_stream(quic_lite::ConnectionLimits::default())
-                    .await
-                    .unwrap();
-                assert!(fin.bytes.is_empty() && fin.fin);
+                let mut stream = association.open_stream().await.unwrap();
+                stream.write_all(&expected).await.unwrap();
+                stream.shutdown().await.unwrap();
+                let mut incoming = server.accept_stream().await.unwrap();
+                let mut received = Vec::new();
+                incoming.read_to_end(&mut received).await.unwrap();
+                assert_eq!(received, expected);
             }
         }
 
         // Queue one stream from every association before reading them in the
         // opposite order. Waiting for one association must retain, not discard,
         // chunks which arrived first for another association.
-        for (association_index, client_association) in associations.iter().copied().enumerate() {
-            let mut stream = client.open_stream(client_association).unwrap();
-            client
-                .write_stream(&mut stream, &[0xa0, association_index as u8])
-                .unwrap();
-            client.finish_stream(&mut stream).unwrap();
-        }
-        let mut received_ids = Vec::new();
-        for _ in 0..associations.len() * 2 {
-            let received = server
-                .accept_stream(quic_lite::ConnectionLimits::default())
+        for (association_index, association) in associations.iter().enumerate() {
+            let mut stream = association.open_stream().await.unwrap();
+            stream
+                .write_all(&[0xa0, association_index as u8])
                 .await
                 .unwrap();
-            if received.bytes.is_empty() {
-                assert!(received.fin);
-                continue;
-            }
-            assert_eq!(received.bytes[0], 0xa0);
-            received_ids.push(received.bytes[1]);
-            assert!(!received.fin);
+            stream.shutdown().await.unwrap();
+        }
+        let mut incoming = Vec::new();
+        for _ in &associations {
+            incoming.push(server.accept_stream().await.unwrap());
+        }
+        let mut received_ids = Vec::new();
+        for mut stream in incoming.into_iter().rev() {
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).await.unwrap();
+            assert_eq!(received.len(), 2);
+            assert_eq!(received[0], 0xa0);
+            received_ids.push(received[1]);
         }
         received_ids.sort_unstable();
         assert_eq!(received_ids, vec![0, 1, 2, 3]);
-    })
-    .await
-    .expect("small-pool multi-association stream traffic stalled");
+    });
+    tokio::select! {
+        result = scenario => result.expect("small-pool multi-association stream traffic stalled"),
+        result = client_driver.run() => panic!("client driver stopped: {result:?}"),
+        result = server_driver.run() => panic!("server driver stopped: {result:?}"),
+    }
 }
 
 #[tokio::test]

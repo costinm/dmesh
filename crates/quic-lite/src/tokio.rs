@@ -20,7 +20,7 @@ use std::{
     collections::hash_map::RandomState,
     fs::File,
     hash::BuildHasher,
-    io::{self, Write},
+    io::{self, Seek, SeekFrom, Write},
     sync::{
         Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
@@ -1319,11 +1319,43 @@ where
 /// Its small cooked header records ingress/egress direction and the bearer ID;
 /// bytes following that header are the exact opaque QUIC packet passed across
 /// the bearer boundary. Capture failures never alter packet delivery.
+/// Outgoing bytes are staged before ownership transfers; the cooked address
+/// is finalized after submission (1 accepted, 2 WouldBlock, 3 unresolved).
+/// The timestamp is attempt start, not wire delivery or peer acknowledgement.
 pub(crate) struct PacketCapture {
     file: Mutex<File>,
 }
 
 impl PacketCapture {
+    // Stage opaque bytes before ownership transfers, then classify the result.
+    // SLL2 address length 1 marks our private outcome byte: 1 accepted,
+    // 2 WouldBlock, 3 unresolved (e.g. interrupted process). No packet copy.
+    pub(crate) fn stage_egress(&self, bearer: BearerId, packet: &[u8]) -> Option<u64> {
+        match self.write_record_with_outcome(false, bearer, packet, 3) {
+            Ok(offset) => Some(offset),
+            Err(error) => {
+                std::eprintln!("quic-lite: packet capture write failed: {error}");
+                None
+            }
+        }
+    }
+
+    pub(crate) fn finish_egress(&self, offset: u64, accepted: bool) {
+        let result = (|| -> io::Result<()> {
+            let mut file = self.file.lock().unwrap_or_else(|p| p.into_inner());
+            let end = file.stream_position()?;
+            file.seek(SeekFrom::Start(offset + 16 + 12))?;
+            let write = file.write_all(&[if accepted { 1 } else { 2 }]);
+            let restore = file.seek(SeekFrom::Start(end));
+            write?;
+            restore?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            std::eprintln!("quic-lite: packet capture outcome write failed: {error}");
+        }
+    }
+
     pub(crate) fn from_env() -> Option<Self> {
         let path = std::env::var_os(PACKET_CAPTURE_ENV)?;
         match File::create(&path).and_then(|mut file| {
@@ -1356,6 +1388,10 @@ impl PacketCapture {
     }
 
     fn write_record(&self, ingress: bool, bearer: BearerId, packet: &[u8]) -> io::Result<()> {
+        self.write_record_with_outcome(ingress, bearer, packet, 0).map(|_| ())
+    }
+
+    fn write_record_with_outcome(&self, ingress: bool, bearer: BearerId, packet: &[u8], outcome: u8) -> io::Result<u64> {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
@@ -1367,6 +1403,7 @@ impl PacketCapture {
             .file
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let offset = file.stream_position()?;
         file.write_all(&(timestamp.as_secs() as u32).to_le_bytes())?;
         file.write_all(&timestamp.subsec_micros().to_le_bytes())?;
         file.write_all(&packet_len.to_le_bytes())?;
@@ -1375,9 +1412,76 @@ impl PacketCapture {
         file.write_all(&0_u16.to_be_bytes())?;
         file.write_all(&u32::from(bearer.value()).to_be_bytes())?;
         file.write_all(&0_u16.to_be_bytes())?;
-        file.write_all(&[if ingress { 0 } else { 4 }, 0])?;
-        file.write_all(&[0; 8])?;
-        file.write_all(packet)
+        file.write_all(&[if ingress { 0 } else { 4 }, u8::from(outcome != 0)])?;
+        file.write_all(&[outcome, 0, 0, 0, 0, 0, 0, 0])?;
+        file.write_all(packet)?;
+        Ok(offset)
+    }
+}
+
+#[cfg(test)]
+mod packet_loss_tests {
+    use super::*;
+
+    #[test]
+    fn capture_classifies_blocked_and_accepted_retry_without_changing_payload() {
+        let path = std::env::temp_dir().join(format!("quic-capture-{}-{}.pcap", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let capture = PacketCapture { file: Mutex::new(File::create(&path).unwrap()) };
+        let bearer = BearerId::new(1).unwrap();
+        let blocked = capture.stage_egress(bearer, b"unchanged").unwrap();
+        capture.record(true, bearer, b"incoming");
+        capture.finish_egress(blocked, false);
+        let retry = capture.stage_egress(bearer, b"unchanged").unwrap();
+        capture.finish_egress(retry, true);
+        drop(capture);
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        for (offset, outcome) in [(blocked, 2), (retry, 1)] {
+            let offset = offset as usize;
+            assert_eq!(bytes[offset + 27], 1);
+            assert_eq!(bytes[offset + 28], outcome);
+            assert_eq!(&bytes[offset + 36..offset + 45], b"unchanged");
+        }
+        assert_eq!(&bytes[81..89], b"incoming");
+    }
+
+    #[test]
+    fn truncated_stream_packet_does_not_stop_node_or_ack_missing_bytes() {
+        use crate::{BearerName, ConnectionId, OwnedPacket, PeerL2Address, fake::FakePacketBearer};
+        use crate::node::{InitialAdmission, NodeIngress};
+        type Pool = crate::packet_pool::PacketPool<8, { crate::DEFAULT_PACKET_POOL_SLOT_SIZE }>;
+        let pool = Box::leak(Box::new(Pool::new()));
+        let mut client = QuicNode::<Pool>::new(pool);
+        let mut server = QuicNode::<Pool>::new(pool);
+        let bearer = server.add_bearer(FakePacketBearer::<Pool>::new(BearerName::new("corruptible").unwrap())).unwrap();
+        let meta = crate::PacketMeta { bearer, peer_l2_address: PeerL2Address::new(1).unwrap(), received_at_us: 0 };
+        let initial = client.start_association(ConnectionId::new(71).unwrap(), meta, 0).unwrap();
+        let client_association = initial.association;
+        let NodeIngress::Initial { association, response } = server.receive_packet(
+            meta, initial.packet,
+            |_| Some(InitialAdmission { local_limits: crate::ConnectionLimits::default() }),
+            |_, _, _, _, bytes| Ok(bytes.len()),
+        ).unwrap() else { panic!("server initial") };
+        client.receive_packet(meta, response.packet, |_| None, |_, _, _, _, bytes| Ok(bytes.len())).unwrap();
+        let stream = client.allocate_stream(client_association).unwrap();
+        let packet = client.send_stream(client_association, stream, 0, true, &[0x5a; 100]).unwrap().packet;
+        let (buffer, range) = packet.into_parts();
+        let mut writer = crate::PacketPool::acquire_writer(pool, crate::PACKET_PREFIX_RESERVE, 0).unwrap();
+        let damaged = &buffer.as_ref()[range.start..range.end - 1];
+        crate::PacketWriter::payload_mut(&mut writer)[..damaged.len()].copy_from_slice(damaged);
+        let truncated = crate::PacketWriter::commit(writer, damaged.len()).unwrap();
+        let before = server.association_telemetry(association).unwrap();
+        server.process_received_packet(ReceivedPacket { meta, packet: truncated }, None).unwrap();
+        assert!(server.stream_chunks.is_empty());
+        assert_eq!(server.association_telemetry(association).unwrap(), before);
+        // The identical packet number and full body must still be accepted,
+        // proving that the corrupted packet was not ACKed as delivered.
+        let packet = OwnedPacket::new(buffer, range).unwrap();
+        server.process_received_packet(ReceivedPacket { meta, packet }, None).unwrap();
+        assert_eq!(server.stream_chunks.len(), 1);
+        let chunk = server.stream_chunks.pop_front().unwrap();
+        assert!(chunk.fin);
+        assert_eq!(chunk.bytes.as_slice(), &[0x5a; 100]);
     }
 }
 
@@ -1457,7 +1561,7 @@ where
             progressed |= !admission.chunks.is_empty();
             self.admit_stream_chunks(admission);
             if consumed != 0 {
-                if let Err(error) = self.submit_or_defer_control(association) {
+                if let Err(error) = self.defer_control(association) {
                     self.deferred_streams.extend(pending);
                     return Err(error);
                 }
@@ -1557,7 +1661,7 @@ where
             self.stream_chunk_limit,
             self.association_chunk_limits(),
         );
-        let ingress = self
+        let ingress = match self
             .receive_owned_packet(
                 received.meta,
                 received.packet,
@@ -1568,8 +1672,20 @@ where
                 |source, stream, offset, fin, bytes| {
                     admission.offer(source, stream, offset, fin, bytes)
                 },
-            )
-            .map_err(|rejected| match rejected.reason {
+            ) {
+            Ok(ingress) => ingress,
+            Err(rejected) => {
+                // An incomplete wire packet is a packet loss, not a failure
+                // of the entire node/driver. Endpoint decoding is transactional:
+                // it validates all frames before recording ACK/stream state.
+                // Leave reliable repair to the sender's ordinary loss recovery.
+                if matches!(rejected.reason,
+                    crate::node::QuicNodePacketRejection::Packet(crate::Error::Truncated)
+                    | crate::node::QuicNodePacketRejection::Egress(
+                        QuicNodeEgressError::Transport(crate::Error::Truncated))) {
+                    return Ok(());
+                }
+                return Err(match rejected.reason {
                 crate::node::QuicNodePacketRejection::Egress(error) => error,
                 crate::node::QuicNodePacketRejection::Packet(error)
                 | crate::node::QuicNodePacketRejection::Application(error) => {
@@ -1578,7 +1694,9 @@ where
                 crate::node::QuicNodePacketRejection::PeerClosed(_) => {
                     unreachable!("peer close is converted to NodeIngress::PeerClosed")
                 }
-            })?;
+                });
+            }
+        };
         match ingress {
             crate::node::NodeIngress::Initial { response, .. }
             | crate::node::NodeIngress::SetupReply { response }
@@ -1591,7 +1709,7 @@ where
             }
             crate::node::NodeIngress::Association { association, .. }
             | crate::node::NodeIngress::Datagram { association } => {
-                self.submit_or_defer_control(association.association())?;
+                self.defer_control(association.association())?;
             }
             crate::node::NodeIngress::Forward { next_hop, packet } => {
                 self.submit_egress(next_hop.bearer, next_hop.peer_l2_address, packet)?;

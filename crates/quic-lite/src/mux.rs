@@ -8,6 +8,7 @@
 use crate::callback::{CallbackError, CallbackStreams, CopyingError, CopyingStreamEvents};
 use crate::{ConnectionId, EndpointState, Error, Role};
 use alloc::{sync::Arc, vec::Vec};
+use smallvec::SmallVec;
 
 struct ValidationSink;
 
@@ -205,21 +206,19 @@ impl<const P: usize> StreamMux<P> {
                 .map_err(StreamDeliveryError::Packet)?;
         let mut offset = header_len;
         let mut has_stream = false;
-        let mut completed_before_packet = Vec::new();
-        let mut packet_frames = Vec::new();
+        // Inline metadata covers ordinary packets without per-packet heap
+        // churn. Larger coalesced packets spill, rather than impose a cap.
+        let mut packet_frames = SmallVec::<[crate::StreamFrame<'_>; 4]>::new();
         while offset < input.len() {
             let (frame, used) =
                 crate::decode_frame(&input[offset..]).map_err(StreamDeliveryError::Packet)?;
             if let crate::Frame::Stream(stream) = frame {
                 has_stream = true;
                 if self.endpoint.stream_delivery_complete(stream.id) {
-                    if !completed_before_packet.contains(&stream.id) {
-                        completed_before_packet.push(stream.id);
-                    }
                     offset += used;
                     continue;
                 }
-                packet_frames.push((stream.id, stream.offset, stream.data.len(), stream.fin));
+                packet_frames.push(stream);
             }
             offset += used;
         }
@@ -229,7 +228,9 @@ impl<const P: usize> StreamMux<P> {
                 .map_err(StreamDeliveryError::Packet)?;
             return Ok(());
         }
-        match self.ordered.validate_packet_frames(&packet_frames) {
+        match self.ordered.validate_packet_frames(packet_frames.iter().map(|frame| {
+            (frame.id, frame.offset, frame.data.len(), frame.fin)
+        })) {
             Ok(()) => {}
             Err(CallbackError::Capacity) => {
                 // Leave the packet unacknowledged. Normal loss recovery
@@ -240,23 +241,13 @@ impl<const P: usize> StreamMux<P> {
         }
         let packet_stream_bytes = packet_frames
             .iter()
-            .fold(0usize, |total, (_, _, len, _)| total.saturating_add(*len));
+            .fold(0usize, |total, frame| total.saturating_add(frame.data.len()));
         if self.ordered.retention_may_exceed(packet_stream_bytes) {
             // A lowered live retention policy can be smaller than credit the
             // peer has already received. Dry-run only this exceptional case
             // before endpoint state ACKs the packet.
             let mut staged = self.ordered.clone();
-            let mut offset = header_len;
-            while offset < input.len() {
-                let (decoded, used) =
-                    crate::decode_frame(&input[offset..]).map_err(StreamDeliveryError::Packet)?;
-                offset += used;
-                let crate::Frame::Stream(frame) = decoded else {
-                    continue;
-                };
-                if completed_before_packet.contains(&frame.id) {
-                    continue;
-                }
+            for frame in &packet_frames {
                 let mut sink = ValidationSink;
                 match staged.receive_copying_borrowed(
                     frame.id,
@@ -278,17 +269,14 @@ impl<const P: usize> StreamMux<P> {
             .receive_packet_on_path(input, ingress_path)
             .map_err(StreamDeliveryError::Packet)?;
 
-        let mut offset = header_len;
-        while offset < input.len() {
-            let (decoded, used) =
-                crate::decode_frame(&input[offset..]).map_err(StreamDeliveryError::Packet)?;
-            offset += used;
-            let crate::Frame::Stream(frame) = decoded else {
-                continue;
-            };
-            if completed_before_packet.contains(&frame.id) {
-                continue;
-            }
+        // Reuse the preflight's borrowed frame views after endpoint validation.
+        // Keep duplicates here: ordered delivery may resume a suffix which
+        // the application withheld on the first arrival, without redelivering
+        // already-consumed bytes. The endpoint's duplicate view is empty.
+        // These are borrowed packet views, not owned payloads. Iterate the
+        // views by reference rather than constructing SmallVec's owning
+        // iterator (and its separate remaining-elements drop path).
+        for frame in &packet_frames {
             let mut sink = ApplicationStreamSink {
                 handler: &mut on_stream,
                 bytes: 0,
@@ -310,8 +298,12 @@ impl<const P: usize> StreamMux<P> {
                 }
             }
             if sink.bytes != 0 {
+                // Consumption in the receive callback is part of this same
+                // packet's ACK turn, not an asynchronous credit release.
+                // Preserve the negotiated threshold/delay, as the client
+                // receive path does, instead of ACKing every STREAM packet.
                 self.endpoint
-                    .stream_consumed(frame.id, sink.bytes)
+                    .stream_consumed_deferred(frame.id, sink.bytes)
                     .map_err(StreamDeliveryError::Packet)?;
             }
         }
