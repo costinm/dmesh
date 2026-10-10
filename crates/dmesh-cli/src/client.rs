@@ -5,10 +5,6 @@
 //! optional initial record is opaque: commands/logs remain higher-level
 //! transport services and this adapter never decodes them.
 
-use crate::flash::{
-    FlashTarget, flash_upload_object, flash_upload_success, object_upload_timeout,
-    run_automated_flash,
-};
 use crate::uart::{DeviceSession, DeviceSessionEvent};
 use crate::{
     device::{DeviceProfile, load_device, resolve_catalog_target, resolve_udp_peer},
@@ -23,7 +19,6 @@ use std::{
     io::{ErrorKind, Read},
     net::{Ipv6Addr, SocketAddr, SocketAddrV6},
     os::fd::AsRawFd,
-    path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -105,7 +100,9 @@ pub fn run_dmesh_cli_args(args: impl IntoIterator<Item = String>) -> Result<(), 
         .first()
         .is_some_and(|argument| argument == "flash")
     {
-        return run_automated_flash(&arguments[1..]);
+        return Err("`dmesh-cli flash` was retired: sign the image with the esp-wifi-loader tools (tools/sign.py), \
+send it with tools/upload.py, or use scripts/flash-device.py over USB (docs/flashing.md)"
+            .into());
     }
     if arguments.get(1).is_some_and(|argument| argument == "check") {
         return run_check_command(&arguments);
@@ -256,7 +253,7 @@ fn run_check_command(arguments: &[String]) -> Result<(), String> {
     }
     if !target.starts_with('/') {
         if let Some(profile) = resolve_catalog_target(&target)? {
-            let selected = flash_target_from_catalog_profile(&profile)?;
+            let selected = device_target_from_catalog_profile(&profile)?;
             let (peer, _) = discover_and_nan_activate(&selected)?;
             return run_udp_direct_discovery(peer);
         }
@@ -372,12 +369,6 @@ fn run_serial_stream_command(arguments: &[String]) -> Result<(), String> {
     let body = encode_stream_argv_with_id(&service_arguments, fresh_request_id())
         .map_err(|error| error.to_string())?;
     let path = arguments.first().ok_or("missing serial path")?;
-    if dmesh_server::object_transfer::decode_flash_command(&body).is_some() {
-        return Err(
-            "object.flash is not supported over UART; use `dmesh-cli flash TARGET` for Wi-Fi flashing or scripts/flash-device.py for physical recovery"
-                .into(),
-        );
-    }
     let probe_request = dmesh_server::tagged::decode(&body)
         .and_then(dmesh_server::probe::decode_probe_start_record)
         .filter(|(_, request)| request.peer.is_none());
@@ -743,11 +734,8 @@ fn run_tcp_service_client(arguments: &[String]) -> Result<(), String> {
     let (arguments, timeout_override) = split_udp_timeout(arguments)?;
     let peer = parse_udp_peer(arguments.first().and_then(|s| s.strip_prefix("tcp://"))
         .ok_or("missing tcp:// endpoint")?)?;
-    let command = arguments.get(1).filter(|s| is_stream_command_name(s))
+    arguments.get(1).filter(|s| is_stream_command_name(s))
         .ok_or("missing schema service")?;
-    if command == "object.flash" {
-        return Err("use the automated flash workflow; Main TCP flash is not enabled by this adapter".into());
-    }
     let request = encode_stream_argv_with_id(&arguments[1..], fresh_request_id())
         .map_err(|e| e.to_string())?;
     let timeout = timeout_override.unwrap_or(stream_request_timeout(&request)?);
@@ -820,26 +808,18 @@ mod tcp_stream_tests {
 }
 
 pub(crate) fn run_udp_service_client(arguments: &[String]) -> Result<(), String> {
-    let audit = (arguments.get(1).map(String::as_str) == Some("object.flash"))
-        .then(|| crate::flash_log::begin(arguments.first().map_or("unknown", String::as_str),
-            arguments.iter().find_map(|a| a.trim_start_matches("--").strip_prefix("target=")).unwrap_or("unknown"),
-            arguments.iter().any(|a| a.trim_start_matches("--") == "dry_run=true"), None,
-            "response_and_fin")).flatten();
-    let result = run_udp_service_client_inner(arguments);
-    if let Some(audit) = audit { audit.finish(&result); }
-    result
+    run_udp_service_client_inner(arguments)
 }
 
 fn run_udp_service_client_inner(arguments: &[String]) -> Result<(), String> {
     let (arguments, timeout_override) = split_udp_timeout(arguments)?;
-    let (arguments, object_file) = split_object_file_argument(&arguments)?;
     let (arguments, uart_path, uart_baud) = split_uart_bearer_arguments(&arguments)?;
     let peer = arguments
         .first()
         .and_then(|target| target.strip_prefix("udp://"))
         .ok_or("UDP target must use udp://HOST:PORT")?;
     let peer = parse_udp_peer(peer)?;
-    let command = arguments
+    arguments
         .get(1)
         .filter(|command| is_stream_command_name(command))
         .ok_or("missing schema service; use dmesh-cli DEVICE METHOD [--field=value ...]")?;
@@ -851,32 +831,7 @@ fn run_udp_service_client_inner(arguments: &[String]) -> Result<(), String> {
     );
     let started = Instant::now();
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
-    let response = if command == "object.flash" {
-        if uart_path.is_some() {
-            return Err(
-                "object.flash selects UDP for bulk image transfer; omit --uart-bearer".into(),
-            );
-        }
-        let (_, flash) = dmesh_server::object_transfer::decode_flash_command(&request)
-            .ok_or("invalid object.flash request")?;
-        let (image, artifact) = flash_upload_object(flash.object, object_file.as_deref())?;
-        crate::flash_log::image("quic_udp", Some(&artifact), &image);
-        eprintln!(
-            "dmesh_cli_object_upload bearer=udp association=single stream=single artifact={}",
-            artifact.display()
-        );
-        let transfer_started = Instant::now();
-        let result = runtime
-            .block_on(crate::node_client::flash_udp(
-                udp_bind_for_peer(peer),
-                peer,
-                &request,
-                &image,
-                object_upload_timeout(),
-            ));
-        crate::flash_log::transfer(transfer_started.elapsed(), result.is_ok());
-        result?.bytes
-    } else {
+    let response = {
         if let Some((id, probe_request)) =
             probe_request.filter(|(_, request)| request.peer.is_none())
         {
@@ -924,9 +879,6 @@ fn run_udp_service_client_inner(arguments: &[String]) -> Result<(), String> {
             ))?
             .bytes
     };
-    if command == "object.flash" {
-        flash_upload_success(&response)?;
-    }
     println!(
         "dmesh_cli_stream_command target={peer} fin=true bytes={} elapsed_us={} {}",
         response.len(),
@@ -1036,27 +988,6 @@ fn probe_request_timeout(bytes: u64) -> Duration {
 /// Remove the CLI-only object source selector before schema encoding.  A
 /// source path is host policy, not a firmware command field, so it must never
 /// be sent to the device or become part of the object manifest.
-fn split_object_file_argument(
-    arguments: &[String],
-) -> Result<(Vec<String>, Option<PathBuf>), String> {
-    let mut retained = Vec::with_capacity(arguments.len());
-    let mut object_file = None;
-    let mut index = 0;
-    while index < arguments.len() {
-        if arguments[index] == "--file" {
-            let value = arguments.get(index + 1).ok_or("missing --file path")?;
-            if object_file.replace(PathBuf::from(value)).is_some() {
-                return Err("object.flash accepts only one --file path".into());
-            }
-            index += 2;
-        } else {
-            retained.push(arguments[index].clone());
-            index += 1;
-        }
-    }
-    Ok((retained, object_file))
-}
-
 /// Select the wildcard address family from the peer. A raw IPv6 bearer must
 /// not first fail in the host client by binding an IPv4 socket.
 /// Source port of `dmesh-cli` itself (override with `DMESH_UDP_SOURCE_PORT`).
@@ -1174,7 +1105,7 @@ fn run_catalog_target_service(arguments: &[String], profile: &DeviceProfile) -> 
         );
     }
 
-    let target = flash_target_from_catalog_profile(profile)?;
+    let target = device_target_from_catalog_profile(profile)?;
     let (peer, _) = discover_and_nan_activate(&target)?;
     println!("dmesh_catalog_fallback name={name} peer={peer} discovery=true nan_activation=true");
     let mut udp_arguments = command_arguments;
@@ -1265,7 +1196,20 @@ fn catalog_profile_matches_announce(
             .is_some_and(|mac| address.is_some_and(|address| link_local_matches_mac(address, mac)))
 }
 
-fn flash_target_from_catalog_profile(profile: &DeviceProfile) -> Result<FlashTarget, String> {
+/// A device selected for discovery and NAN wake: a stable signed identity, optionally with a temporary
+/// radio MAC only for waking an otherwise unreachable device.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DeviceTarget {
+    pub(crate) restore_sleepy: bool,
+    pub(crate) description: String,
+    pub(crate) node: Option<String>,
+    pub(crate) mac: Option<[u8; 6]>,
+    /// Catalogued direct UDP6 bearer. This is only an optimization before
+    /// multicast discovery; the signed announce remains the identity check.
+    pub(crate) known_peer: Option<SocketAddr>,
+}
+
+fn device_target_from_catalog_profile(profile: &DeviceProfile) -> Result<DeviceTarget, String> {
     let name = profile.name.as_deref().unwrap_or("catalog-device");
     let node = profile.vip6.map(|vip6| hex_encode(&vip6.octets()[8..]));
     if node.is_none() && profile.mac.is_none() {
@@ -1273,7 +1217,7 @@ fn flash_target_from_catalog_profile(profile: &DeviceProfile) -> Result<FlashTar
             "catalog device {name:?} has neither vip6 nor mac for discovery/NAN activation"
         ));
     }
-    Ok(FlashTarget {
+    Ok(DeviceTarget {
         restore_sleepy: profile.sleepy,
         description: profile
             .vip6
@@ -1289,12 +1233,12 @@ fn flash_target_from_catalog_profile(profile: &DeviceProfile) -> Result<FlashTar
 /// observer. This is deliberately the same signed discovery/NAN sequence as
 /// flash, without any flash-specific state change.
 pub(crate) fn discover_and_nan_activate(
-    target: &FlashTarget,
+    target: &DeviceTarget,
 ) -> Result<(SocketAddr, announce::Announce), String> {
     let target_mac = target.mac;
     let mut observed_node_id = target.node.clone();
     let mut peers = multicast_discover_peers()?;
-    if let Some(peer) = peers.iter().find(|peer| flash_target_matches(peer, target)) {
+    if let Some(peer) = peers.iter().find(|peer| device_target_matches(peer, target)) {
         return Ok((peer.peer, peer.announce));
     }
 
@@ -1385,61 +1329,12 @@ pub(crate) fn discover_and_nan_activate(
             observed_node_id
                 .as_deref()
                 .is_some_and(|node| peer.node.eq_ignore_ascii_case(node))
-                || flash_target_matches(peer, target)
+                || device_target_matches(peer, target)
         }) {
             return Ok((peer.peer, peer.announce));
         }
     }
     Err(format!("target_wake_timeout target={}", target.description))
-}
-
-/// Ask every directly reachable NAN-capable controller to wake a known sleepy
-/// radio MAC. A stream success is only local queue admission; callers must
-/// separately wait for the target's UDP identity before treating it as awake.
-pub(crate) fn submit_nan_wake_to_all(
-    peers: &[DiscoveredPeer],
-    target: &FlashTarget,
-) -> Result<u32, String> {
-    let target_mac = target.mac.ok_or_else(|| {
-        format!(
-            "target_wake_unavailable target={}; catalog has no radio MAC",
-            target.description
-        )
-    })?;
-    let plan = dmesh_server::wake::plan_nan_wake(
-        target.node.as_deref(),
-        Some(target_mac),
-        peers.iter().map(|peer| dmesh_server::wake::NanObservation {
-            observer: peer.peer,
-            observer_ready: peer.passive_ready,
-            node: None,
-            peer_mac: None,
-        }),
-    );
-    let mut accepted = 0u32;
-    for attempt in plan.attempts {
-        let request = encode_nan_wake_stream_request(attempt.target_mac)?;
-        match exchange_udp_stream_record(attempt.observer, &request)
-            .and_then(|response| ensure_stream_success(response, "nan.wakeup"))
-        {
-            Ok(()) => {
-                accepted = accepted.saturating_add(1);
-                println!(
-                    "dmesh_flash_wake_attempt observer={} target_mac={} accepted=true",
-                    attempt.observer,
-                    mac_encode(&target_mac)
-                );
-            }
-            Err(error) => println!(
-                "dmesh_flash_wake_attempt observer={} target_mac={} accepted=false error={error}",
-                attempt.observer,
-                mac_encode(&target_mac)
-            ),
-        }
-    }
-    (accepted != 0)
-        .then_some(accepted)
-        .ok_or_else(|| format!("target_wake_rejected target={}", target.description))
 }
 
 /// A stable operator-facing node identity read from the node records.
@@ -1627,13 +1522,13 @@ fn run_hosts_discovery() -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn flash_target_matches(peer: &DiscoveredPeer, target: &FlashTarget) -> bool {
-    flash_target_matches_announce(&peer.announce, target)
+pub(crate) fn device_target_matches(peer: &DiscoveredPeer, target: &DeviceTarget) -> bool {
+    device_target_matches_announce(&peer.announce, target)
 }
 
-pub(crate) fn flash_target_matches_announce(
+pub(crate) fn device_target_matches_announce(
     announce: &announce::Announce,
-    target: &FlashTarget,
+    target: &DeviceTarget,
 ) -> bool {
     if let Some(node) = target.node.as_deref() {
         return hex_encode(announce.device_id()).eq_ignore_ascii_case(node);
@@ -1659,15 +1554,6 @@ fn link_local_matches_mac(address: Ipv6Addr, mac: [u8; 6]) -> bool {
         && octets[15] == mac[5]
 }
 
-pub(crate) fn parse_mac(value: &str) -> Option<[u8; 6]> {
-    let mut mac = [0u8; 6];
-    let mut parts = value.split(':');
-    for byte in &mut mac {
-        *byte = u8::from_str_radix(parts.next()?, 16).ok()?;
-    }
-    parts.next().is_none().then_some(mac)
-}
-
 pub(crate) fn ensure_stream_success(response: Vec<u8>, action: &str) -> Result<(), String> {
     let record = dmesh_server::tagged::decode(&response)
         .ok_or_else(|| format!("{action} response is not tagged CBOR"))?;
@@ -1682,38 +1568,6 @@ fn encode_nan_wake_stream_request(target: [u8; 6]) -> Result<Vec<u8>, String> {
     let used = announce::encode_nan_wakeup_request(target, fresh_request_id(), &mut request)
         .ok_or("encode nan.wakeup request")?;
     Ok(request[..used].to_vec())
-}
-
-/// Return the exact running-image identity published by the common firmware
-/// handler.  It is compared only for one endpoint across a requested reboot;
-/// it is never used as a device identity or a substitute for the signed
-/// announce identity.
-pub(crate) fn firmware_identity(peer: SocketAddr) -> Result<String, String> {
-    let request = encode_stream_command_with_id("firmware.identity", fresh_request_id())
-        .map_err(|error| error.to_string())?;
-    let response = exchange_udp_stream_record(peer, &request)?;
-    let record = dmesh_server::tagged::decode(&response)
-        .ok_or("firmware.identity response is not tagged CBOR")?;
-    if record.error.is_some() {
-        return Err("firmware.identity rejected by peer".into());
-    }
-    // The identity handler carries the hash as a CBOR text result. It is
-    // still correlated by the enclosing record ID and is only compared across
-    // this one requested Main -> Recovery -> Main handoff.
-    let mut result = dmesh_server::cbor::Decoder::new(
-        record
-            .result
-            .ok_or("firmware.identity response has no result")?,
-    );
-    let identity = result
-        .text_ref()
-        .and_then(|value| core::str::from_utf8(value).ok())
-        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .ok_or("firmware.identity response is not a SHA-256 image hash")?;
-    if !result.is_finished() {
-        return Err("firmware.identity response has trailing fields".into());
-    }
-    Ok(identity.to_ascii_lowercase())
 }
 
 /// Send the common discovery request directly to every local IPv6 multicast
@@ -1927,7 +1781,7 @@ mod tests {
         assert!(super::split_udp_timeout(&["--timeout-secs".into()]).is_err());
     }
     use super::{
-        FlashTarget, flash_target_matches_announce, parse_serial_stream_arguments,
+        DeviceTarget, device_target_matches_announce, parse_serial_stream_arguments,
         probe_request_timeout, split_catalog_bearers,
     };
     use std::time::Duration;
@@ -2075,17 +1929,17 @@ mod tests {
         announce.set_sta_link_local_v6([
             0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x00, 0x11, 0x22, 0xff, 0xfe, 0x33, 0x44, 0x55,
         ]);
-        let target = FlashTarget {
+        let target = DeviceTarget {
             restore_sleepy: false,
             description: "node-under-test".into(),
             node: None,
             mac: Some(mac),
             known_peer: None,
         };
-        assert!(flash_target_matches_announce(&announce, &target));
-        assert!(!flash_target_matches_announce(
+        assert!(device_target_matches_announce(&announce, &target));
+        assert!(!device_target_matches_announce(
             &announce,
-            &FlashTarget {
+            &DeviceTarget {
                 mac: Some([0x02, 0x11, 0x22, 0x33, 0x44, 0x56]),
                 ..target
             }

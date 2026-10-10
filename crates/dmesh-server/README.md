@@ -283,69 +283,9 @@ next-hop description is resolved locally.
 
 ## Object transfer and flash
 
-`object.flash` is the CLI name of `POST /flash`: the generic REST request of the tagged-CBOR
-envelope (`http`, component 2002, method 2 `post`, path `/flash`, see `http.rs` and ssh-mesh
-`mesh-api/PROTOCOLS.md`). The host opens one bidirectional stream and sends the request header (the
-headers are `name`, `cpu`, `target`, `address`, `transport`, `dry_run` and `content-length`), then
-exactly `content-length` raw image bytes and QUIC FIN. There is no manifest, per-block CBOR or
-private framing. The device returns the terminal result header on that stream (status 200, or 400,
-413, 501 or 503), or resets it when the body is rejected.
-
-`flash` is the device streaming-handler contract, not an ESP transport feature: `FlashHandler` is
-registered in the one registry at the key `[http, post, 10]` (`register_stream_at`; the longest
-registered prefix of `[component, method, path...]` wins). The request names the CPU and image target; local
-device policy maps an admitted target to its writable partition or address and checks
-`content-length` against it before erasing. The device feeds ordinary ordered stream bytes to an
-`ImageWriter`, which offers whole blocks of the sink's own block size to an injected sink and checks
-the total against `content-length`. Firmware injects the CPU/target admission and erase/write
-partition sink; host tests inject `FileImageSink`. There is no digest or signature: the transport
-carries integrity (see `notes/design/object-transfer-integrity.md`). Invalid headers, a length that
-does not fit, a platform mismatch, or a body that is shorter or longer than declared rejects the
-stream before unsafe writes continue.
-
-The host may first use identity or status streams on the same association to
-select an artifact. The flash stream remains self-contained, and the device
-validates the request's CPU and target against local platform policy
-before erasing or accepting body bytes. The device sends the correlated result
-only after the sink is complete and durable; the handler does not block a
-bearer task.
-
-Only one association may own a mutable object sink at a time. The shared
-`ExclusiveTransfer` state admits and constructs that operation atomically from
-the application's point of view, without allocating for a contender. A request
-from another association receives the correlated application error
-`flash already in progress`; it cannot replace, release, or feed the incumbent
-operation. Only completion, rejection, owner close, or the bounded application
-idle timeout releases it. Multicast Recovery announcements are discovery and
-never imply automatic transfer ownership.
-
-The sink must be nonblocking on the receive path. It returns stream credit
-only after accepted bounded storage is available; failure aborts the transfer. No
-transport, UART, or radio adapter may create a private unbounded queue for
-flash records.
-
-Firmware derives its bounded storage-slot count from current available memory
-with `bounded_storage_slots`, then fallibly allocates those slots and advertises
-only the byte capacity actually obtained. The slot count is application sink
-configuration that host tests can inject; it is never a QUIC packet or bearer
-credit constant. Receiver storage is allocated before the platform sink factory
-runs, so allocation failure cannot leave a flash worker or file handle behind.
-
-Stream consumers enter through `prepare_inbound_stream` and
-`consume_inbound_stream`. The latter gives the application an ordered reader;
-each `read()` copies only the bytes the handler has accepted into its bounded
-parser or storage buffer, then the dispatcher publishes the corresponding
-reclaimed window. The handler neither observes QUIC chunks nor chooses a
-window. Exclusive mutable sinks use `consume_exclusive_inbound_stream`, which
-adds only association ownership and application-progress timeout refresh; both
-ordinary receive and asynchronous storage-ready turns use that same helper.
-An application-consumer failure removes and returns the failed operation with
-its request ID, allowing the handler to send one correlated error and admit a
-later request immediately; a transport publication error retains it because
-already-consumed application state must not be discarded.
-Raw chunk extraction and QUIC receive-window mutation are private to the shared
-transport module, so firmware flash, host file storage, and future upload probes
-cannot grow separate ACK, credit, or operation-liveness loops.
+Removed on 2026-10-10 (`object.flash`, `POST /flash`, `ObjectServer`). Firmware images are installed with the
+signed protocol of the esp-wifi-loader repository; see `docs/flashing.md` and that repository's
+`docs/dmesh-flash-lessons.md`.
 
 ## Radio laboratory handlers
 

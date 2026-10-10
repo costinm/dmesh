@@ -161,28 +161,6 @@ async fn exchange(association: TokioAssociation, payload: &[u8]) -> Result<Respo
     Ok(Response { bytes })
 }
 
-/// Send `object.flash` (`POST /flash`): the request header with the content length, then the
-/// image as the raw request body, then FIN. The response is the
-/// terminal header.
-async fn flash_exchange(
-    association: TokioAssociation,
-    request: &[u8],
-    image: &[u8],
-) -> Result<Response, String> {
-    let mut stream = association
-        .open_stream()
-        .await
-        .map_err(node_error("open object.flash stream"))?;
-    let bytes = dmesh_server::stream_client::flash(&mut stream, request, image)
-        .await
-        .map_err(|error| format!("object.flash stream exchange: {error}"))?;
-    association
-        .finish()
-        .await
-        .map_err(node_error("finish association"))?;
-    Ok(Response { bytes })
-}
-
 fn node_error(context: &'static str) -> impl FnOnce(QuicNodeEgressError) -> String {
     move |error| format!("{context}: {error:?}")
 }
@@ -336,27 +314,6 @@ async fn exchange_probe(
         .await
         .map_err(node_error("finish QUIC probe association"))?;
     Ok(result)
-}
-
-pub(crate) async fn flash_udp(
-    bind: SocketAddr,
-    peer: SocketAddr,
-    request: &[u8],
-    image: &[u8],
-    timeout: Duration,
-) -> Result<Response, String> {
-    let future = async {
-        let mut node = new_node();
-        let primary = attach_udp(&mut node, bind, peer).await?;
-        run_node(node, |client| async move {
-            let association = associate_paths(&client, primary, &[]).await?;
-            flash_exchange(association, request, image).await
-        })
-        .await
-    };
-    tokio::time::timeout(timeout, future)
-        .await
-        .map_err(|_| format!("UDP flash stream timed out after {timeout:?}"))?
 }
 
 pub(crate) async fn request_uart(

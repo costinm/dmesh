@@ -131,28 +131,6 @@ where
     Ok(response)
 }
 
-/// `POST /flash`: send the REST request (path `/flash`, headers from the caller's `object.flash`
-/// command plus `content-length` set to the image length), then the image bytes, then FIN, and
-/// return the terminal response. The command may omit `len` (a schema-built one does); a different
-/// declared `len` is an error.
-pub async fn flash<S>(stream: &mut S, request: &[u8], image: &[u8]) -> std::io::Result<Vec<u8>>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let invalid = |message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message);
-    let (id, mut flash) = crate::object_transfer::decode_flash_command(request)
-        .ok_or_else(|| invalid("invalid object.flash request"))?;
-    let len = u32::try_from(image.len()).map_err(|_| invalid("flash image exceeds u32 length"))?;
-    if flash.len != 0 && flash.len != len {
-        return Err(invalid("object.flash len differs from the image length"));
-    }
-    flash.len = len;
-    let mut header = [0u8; crate::object_transfer::REQUEST_MAX];
-    let used = crate::object_transfer::encode_flash_handler_request(flash, id, &mut header)
-        .ok_or_else(|| invalid("object.flash request does not fit"))?;
-    exchange(stream, &[&header[..used], image]).await
-}
-
 /// Request and validate a probe response over any asynchronous byte stream.
 /// Consumer delays are workload options, not transport backpressure policy.
 pub async fn probe<S>(
@@ -650,60 +628,7 @@ mod tests {
         .unwrap();
     }
 
-    #[tokio::test]
-    async fn flash_uses_the_same_helper_over_tcp() {
-        use crate::object_transfer::{
-            FlashRequest, ObjectId, decode_flash_handler_request, encode_flash_command,
-        };
-        let mut header = [0; 160];
-        let len = encode_flash_command(
-            FlashRequest {
-                object: ObjectId {
-                    name: None,
-                    cpu: 13,
-                    target: 3,
-                },
-                address: None,
-                transport: 0,
-                dry_run: true,
-                len: 0,
-            },
-            42,
-            &mut header,
-        )
-        .unwrap();
-        let header = &header[..len];
-        let image = vec![0x5a; 1024 * 1024];
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            let client = async {
-                let mut socket = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    flash(&mut socket, header, &image).await.unwrap(),
-                    b"terminal fixture"
-                );
-            };
-            let server = async {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut body = Vec::new();
-                socket.read_to_end(&mut body).await.unwrap();
-                // The header declares the content length; the image follows it unchanged.
-                let split = body.len() - image.len();
-                let (id, request) = decode_flash_handler_request(&body[..split]).unwrap();
-                assert_eq!((id, request.len), (42, image.len() as u32));
-                assert_eq!(&body[split..], &image[..]);
-                socket.write_all(b"terminal fixture").await.unwrap();
-                socket.shutdown().await.unwrap();
-            };
-            tokio::join!(client, server);
-        })
-        .await
-        .unwrap();
-    }
-
-    // Both directions exceed the socket buffers: sequential request/response
+        // Both directions exceed the socket buffers: sequential request/response
     // I/O would deadlock when the server writes before draining the request.
     #[tokio::test]
     async fn exchange_is_duplex_and_preserves_parts_and_half_close() {

@@ -176,23 +176,13 @@ dmesh-cli DEVICE module.stop                                   # Stop a loaded m
 
 transport.set replaces a complete volatile profile. radio.tx --frame=hex:...
 sends a caller-supplied raw frame and requires a valid complete frame; use it
-only for controlled radio diagnostics. The normal firmware update below
-handles Recovery handoff and completion checks.
+only for controlled radio diagnostics. Firmware updates are described in `docs/flashing.md`.
 
 ## Firmware updates
 
-~~~sh
-dmesh-cli flash DEVICE                             # Update Main using the selected artifact.
-dmesh-cli flash DEVICE --file /path/to/main.bin     # Use an explicit Main artifact.
-dmesh-cli flash DEVICE --target MODULE              # Update a named module artifact.
-~~~
-
-flash discovers the target, wakes it over NAN if needed, hands off to
-Recovery, transfers the object, then checks reboot identity and fresh Main
-health. object.flash is the underlying tagged service operation; a direct
-call requires matching artifact and target metadata and a Wi-Fi/UDP target.
-It is rejected on UART. For initial provisioning or physical repair, use
-scripts/flash-device.py.
+`dmesh-cli flash` and `object.flash` were retired on 2026-10-10. Firmware is installed with the signed protocol of
+the esp-wifi-loader repository (`tools/sign.py`, `tools/upload.py`; see `docs/flashing.md`). For initial
+provisioning or physical repair, use `scripts/flash-device.py`.
 
 ## Companion BLE and lmesh radio requests
 
