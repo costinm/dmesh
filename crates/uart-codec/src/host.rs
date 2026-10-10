@@ -80,7 +80,8 @@ impl SidebandText {
                 b'\r' => {}
                 b'\n' if !self.line.is_empty() => {
                     if self.overflow {
-                        self.line.extend_from_slice(b" [uart_log_truncated limit=4096]");
+                        self.line
+                            .extend_from_slice(b" [uart_log_truncated limit=4096]");
                     }
                     if let Ok(text) = String::from_utf8(core::mem::take(&mut self.line)) {
                         line(text);
@@ -255,12 +256,62 @@ impl UartPort {
         // subsequent default-baud session unless we restore the protocol's
         // physical UART default here. Native USB-JTAG ignores this setting.
         configure(&file, Some(baud.unwrap_or(DEFAULT_BAUD)))?;
-        Ok(Self {
+        let mut port = Self {
             file,
             path: path.to_path_buf(),
             decoder: Decoder::with_max(DEFAULT_RECORD_MAX),
             sideband: SidebandText::new(),
-        })
+        };
+        // Temporary opt-in laboratory handshake; never changes boot/NVS baud.
+        if let Some(value) = std::env::var_os("UART_CODEC_NEGOTIATE_BAUD") {
+            let rate = value.to_str().and_then(|v| v.parse().ok())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid negotiation baud"))?;
+            port.negotiate_baud_blocking(rate)?;
+        }
+        Ok(port)
+    }
+
+    fn negotiate_baud_blocking(&mut self, baud: u32) -> io::Result<()> {
+        let request = crate::BaudHandshake { acknowledged: false, baud }.record()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "unsupported negotiation baud"))?;
+        let wire = crate::codec::encode_payload(&request, request.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "baud framing"))?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut offset = 0;
+        while offset < wire.len() {
+            if std::time::Instant::now() >= deadline {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "baud request write timeout"));
+            }
+            match self.file.write(&wire[offset..]) {
+                Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "UART closed")),
+                Ok(n) => offset += n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    wait_fd(&self.file, libc::POLLOUT, Duration::from_millis(20))?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let expected = crate::BaudHandshake { acknowledged: true, baud };
+        let mut bytes = [0u8; 1024];
+        while std::time::Instant::now() < deadline {
+            wait_fd(&self.file, libc::POLLIN, Duration::from_millis(20))?;
+            match self.file.read(&mut bytes) {
+                Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "UART closed")),
+                Ok(n) => {
+                    let records = self.decoder.push(&bytes[..n])
+                        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "baud ACK framing"))?;
+                    if records.iter().any(|r| crate::BaudHandshake::decode(r) == Some(expected)) {
+                        configure(&self.file, Some(baud))?;
+                        self.decoder = Decoder::with_max(DEFAULT_RECORD_MAX);
+                        self.sideband.reset();
+                        return Ok(());
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Err(io::Error::new(io::ErrorKind::TimedOut, "baud ACK timeout; peer may have switched, reset before retry"))
     }
 
     pub fn path(&self) -> &Path {
@@ -285,30 +336,42 @@ impl UartPort {
 
     /// Send the tiny out-of-band wake record understood by sleepy Main. This
     /// does not create a QUIC-lite packet or bypass the shared PPP framing.
+    /// Repeat for one second: UART light-sleep wake can lose trigger bytes,
+    /// and each fresh framed record lets the decoder resynchronize. This is
+    /// not an acknowledgement that the peer woke. Call from a blocking thread.
     pub fn send_wake_blocking(&mut self) -> io::Result<()> {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        let mut encoder = crate::encode_wake()
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-        let mut bytes = [0u8; 8];
-        while !encoder.is_finished() {
-            let used = encoder.write(&mut bytes);
-            let mut written = 0;
-            while written < used {
-                match self.file.write(&bytes[written..used]) {
-                    Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "UART closed")),
-                    Ok(count) => written += count,
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        if std::time::Instant::now() >= deadline {
-                            return Err(io::Error::new(
-                                io::ErrorKind::TimedOut,
-                                "UART wake write timed out",
-                            ));
+        let repeat_until = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let mut encoder = crate::encode_wake()
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+            let mut bytes = [0u8; 8];
+            while !encoder.is_finished() {
+                let used = encoder.write(&mut bytes);
+                let mut written = 0;
+                while written < used {
+                    match self.file.write(&bytes[written..used]) {
+                        Ok(0) => {
+                            return Err(io::Error::new(io::ErrorKind::WriteZero, "UART closed"));
                         }
-                        wait_fd(&self.file, libc::POLLOUT, Duration::from_millis(100))?;
+                        Ok(count) => written += count,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            if std::time::Instant::now() >= deadline {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    "UART wake write timed out",
+                                ));
+                            }
+                            wait_fd(&self.file, libc::POLLOUT, Duration::from_millis(100))?;
+                        }
+                        Err(error) => return Err(error),
                     }
-                    Err(error) => return Err(error),
                 }
             }
+            if std::time::Instant::now() >= repeat_until {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
         Ok(())
     }
@@ -742,7 +805,9 @@ impl<const SLOTS: usize, const MTU: usize> TokioUartReader<SLOTS, MTU> {
 pub fn render_sideband_record(bytes: &[u8]) -> String {
     fn value(d: &mut mesh_api::cbor::Decoder<'_>, out: &mut String, depth: usize) -> Option<()> {
         use std::fmt::Write;
-        if depth > 8 { return None; }
+        if depth > 8 {
+            return None;
+        }
         let start = d.position();
         let (major, count) = d.head()?;
         match major {
@@ -755,9 +820,14 @@ pub fn render_sideband_record(bytes: &[u8]) -> String {
             4 | 5 if count <= 128 => {
                 out.push(if major == 5 { '{' } else { '[' });
                 for i in 0..count {
-                    if i != 0 { out.push(' '); }
+                    if i != 0 {
+                        out.push(' ');
+                    }
                     value(d, out, depth + 1)?;
-                    if major == 5 { out.push('='); value(d, out, depth + 1)?; }
+                    if major == 5 {
+                        out.push('=');
+                        value(d, out, depth + 1)?;
+                    }
                 }
                 out.push(if major == 5 { '}' } else { ']' });
             }
@@ -771,14 +841,20 @@ pub fn render_sideband_record(bytes: &[u8]) -> String {
     let mut decoder = mesh_api::cbor::Decoder::new(bytes);
     let mut out = String::new();
     if bytes.first().is_some_and(|byte| byte >> 5 == 5)
-        && value(&mut decoder, &mut out, 0).is_some() && decoder.is_finished() {
+        && value(&mut decoder, &mut out, 0).is_some()
+        && decoder.is_finished()
+    {
         return out;
     }
-    if let Ok(text) = core::str::from_utf8(bytes) { return String::from(text); }
+    if let Ok(text) = core::str::from_utf8(bytes) {
+        return String::from(text);
+    }
     use std::fmt::Write;
     out.clear();
     out.push_str("cbor_invalid hex=");
-    for byte in bytes { let _ = write!(out, "{byte:02x}"); }
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
     out
 }
 
@@ -997,16 +1073,31 @@ mod tests {
     #[test]
     fn passive_frames_separate_structured_logs_from_quic() {
         let log = [0xa1, 1, 3];
-        assert_eq!(super::framed_record(&log), Some(super::UartRecord::Log("{1=3}".into())));
-        assert_eq!(super::framed_record(&[crate::PACKET_MARKER, 0x40, 1]),
-            Some(super::UartRecord::Datagram(vec![0x40, 1])));
+        assert_eq!(
+            super::framed_record(&log),
+            Some(super::UartRecord::Log("{1=3}".into()))
+        );
+        assert_eq!(
+            super::framed_record(&[crate::PACKET_MARKER, 0x40, 1]),
+            Some(super::UartRecord::Datagram(vec![0x40, 1]))
+        );
         assert_eq!(super::framed_record(b"boot text"), None);
-        assert!(matches!(super::framed_record(&[0xa1, 1]), Some(super::UartRecord::Log(s)) if s.starts_with("cbor_invalid")));
+        assert!(
+            matches!(super::framed_record(&[0xa1, 1]), Some(super::UartRecord::Log(s)) if s.starts_with("cbor_invalid"))
+        );
     }
     #[test]
     fn structured_sideband_preserves_numeric_tags_and_values() {
-        assert_eq!(super::render_sideband_record(&[0xa2, 1, 0x67, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 2, 3]), "{1=\"example\" 2=3}");
-        assert_eq!(super::render_sideband_record(&[0xa1, 7, 0xa2, 1, 0xf5, 2, 0xf6]), "{7={1=true 2=null}}");
+        assert_eq!(
+            super::render_sideband_record(&[
+                0xa2, 1, 0x67, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 2, 3
+            ]),
+            "{1=\"example\" 2=3}"
+        );
+        assert_eq!(
+            super::render_sideband_record(&[0xa1, 7, 0xa2, 1, 0xf5, 2, 0xf6]),
+            "{7={1=true 2=null}}"
+        );
     }
 
     #[test]
@@ -1015,7 +1106,9 @@ mod tests {
         let wire = crate::codec::encode_payload(&payload, 128).unwrap();
         let mut decoder = super::SidebandText::new();
         let mut lines = Vec::new();
-        for chunk in wire.chunks(3) { decoder.push(chunk, |line| lines.push(line)); }
+        for chunk in wire.chunks(3) {
+            decoder.push(chunk, |line| lines.push(line));
+        }
         decoder.push(b"boot text\n", |line| lines.push(line));
         assert_eq!(lines, vec!["boot text"]);
     }
@@ -1026,7 +1119,10 @@ mod tests {
     }
     #[test]
     fn long_flash_console_line_survives_fragmented_reads() {
-        let expected = format!("event=object_flash.quic_progress {} quic_submission_failures=17", "counter=1234567890 ".repeat(90));
+        let expected = format!(
+            "event=object_flash.quic_progress {} quic_submission_failures=17",
+            "counter=1234567890 ".repeat(90)
+        );
         let wire = format!("{expected}\r\n");
         let mut decoder = super::SidebandText::new();
         let mut lines = Vec::new();
@@ -1038,14 +1134,23 @@ mod tests {
 
     #[test]
     fn oversized_console_line_keeps_prefix_and_reports_truncation_once() {
-        let wire = format!("{}\nnext complete line\n", "x".repeat(super::MAX_LOG_LINE + 1024));
+        let wire = format!(
+            "{}\nnext complete line\n",
+            "x".repeat(super::MAX_LOG_LINE + 1024)
+        );
         let mut decoder = super::SidebandText::new();
         let mut lines = Vec::new();
         for chunk in wire.as_bytes().chunks(73) {
             decoder.push(chunk, |line| lines.push(line));
         }
         assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0], format!("{} [uart_log_truncated limit=4096]", "x".repeat(super::MAX_LOG_LINE)));
+        assert_eq!(
+            lines[0],
+            format!(
+                "{} [uart_log_truncated limit=4096]",
+                "x".repeat(super::MAX_LOG_LINE)
+            )
+        );
         assert_eq!(lines[1], "next complete line");
     }
 
@@ -1053,8 +1158,20 @@ mod tests {
     fn marked_packet_after_oversized_text_does_not_leak_into_console() {
         let mut decoder = super::SidebandText::new();
         let mut lines = Vec::new();
-        decoder.push(&vec![b'x'; super::MAX_LOG_LINE + 1], |line| lines.push(line));
-        decoder.push(&[super::UART_FLAG, super::PACKET_MARKER, b'h', b'i', b'\n', super::UART_FLAG], |line| lines.push(line));
+        decoder.push(&vec![b'x'; super::MAX_LOG_LINE + 1], |line| {
+            lines.push(line)
+        });
+        decoder.push(
+            &[
+                super::UART_FLAG,
+                super::PACKET_MARKER,
+                b'h',
+                b'i',
+                b'\n',
+                super::UART_FLAG,
+            ],
+            |line| lines.push(line),
+        );
         decoder.push(b"real console\n", |line| lines.push(line));
         assert_eq!(lines, vec!["real console"]);
     }
@@ -1065,6 +1182,72 @@ mod tests {
 
     static NODE_POOL: PacketPool<4, { quic_lite::DEFAULT_PACKET_POOL_SLOT_SIZE }> =
         PacketPool::new();
+
+    #[test]
+    fn baud_negotiation_waits_for_matching_ack_then_changes_termios() {
+        let mut master = 0;
+        let mut slave = 0;
+        assert_eq!(unsafe { libc::openpty(&mut master, &mut slave,
+            std::ptr::null_mut(), std::ptr::null(), std::ptr::null()) }, 0);
+        let mut master = unsafe { File::from_raw_fd(master) };
+        let slave = unsafe { File::from_raw_fd(slave) };
+        let path = fs::read_link(format!("/proc/self/fd/{}", slave.as_raw_fd())).unwrap();
+        let mut port = UartPort::open(path, None).unwrap();
+        let peer = std::thread::spawn(move || {
+            let mut decoder = Decoder::with_max(64);
+            let mut bytes = [0u8; 64];
+            loop {
+                let n = master.read(&mut bytes).unwrap();
+                for record in decoder.push(&bytes[..n]).unwrap() {
+                    let mut request = crate::BaudHandshake::decode(&record).unwrap();
+                    assert_eq!(request.baud, 921600);
+                    assert!(!request.acknowledged);
+                    let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+                    assert_eq!(unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut termios) }, 0);
+                    assert_eq!(unsafe { libc::cfgetispeed(&termios) }, libc::B115200);
+                    request.acknowledged = true;
+                    let record = request.record().unwrap();
+                    master.write_all(&crate::codec::encode_payload(&record, 6).unwrap()).unwrap();
+                    return (master, slave);
+                }
+            }
+        });
+        port.negotiate_baud_blocking(921600).unwrap();
+        let (_master, _slave) = peer.join().unwrap();
+        let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::tcgetattr(port.file.as_raw_fd(), &mut termios) }, 0);
+        assert_eq!(unsafe { libc::cfgetispeed(&termios) }, libc::B921600);
+    }
+
+    #[test]
+    fn wake_train_resynchronizes_after_lost_trigger_bytes() {
+        let mut master = 0;
+        let mut slave = 0;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        let mut master = unsafe { File::from_raw_fd(master) };
+        let slave = unsafe { File::from_raw_fd(slave) };
+        let path = fs::read_link(format!("/proc/self/fd/{}", slave.as_raw_fd())).unwrap();
+        let mut port = UartPort::open(path, None).unwrap();
+        port.send_wake_blocking().unwrap();
+        let mut wire = [0u8; 512];
+        let len = master.read(&mut wire).unwrap();
+        assert!(len >= 6, "wake sender must retry complete records");
+        let mut decoder = Decoder::with_max(8);
+        let records = decoder.push(&wire[2..len]).unwrap();
+        assert!(records.iter().any(|record| record == &[crate::WAKE_MARKER]));
+        assert!(records.iter().all(|record| record == &[crate::WAKE_MARKER]));
+    }
 
     #[test]
     fn open_without_baud_restores_protocol_default_from_b0() {

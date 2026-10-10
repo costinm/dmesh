@@ -20,6 +20,38 @@ pub const PACKET_MARKER: u8 = 0xf7;
 /// its configured debug grace period. It is not a QUIC packet.
 pub const WAKE_MARKER: u8 = 0xf8;
 
+/// Experimental physical-UART baud negotiation, distinct from QUIC and wake.
+/// Record: marker, operation (request=0, acknowledged=1), baud in big endian.
+pub const BAUD_MARKER: u8 = 0xf9;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BaudHandshake {
+    pub acknowledged: bool,
+    pub baud: u32,
+}
+
+impl BaudHandshake {
+    pub fn record(self) -> Option<[u8; 6]> {
+        if !matches!(self.baud, 115200 | 460800 | 921600) {
+            return None;
+        }
+        let baud = self.baud.to_be_bytes();
+        Some([BAUD_MARKER, self.acknowledged as u8, baud[0], baud[1], baud[2], baud[3]])
+    }
+
+    pub fn decode(record: &[u8]) -> Option<Self> {
+        if record.len() != 6 || record[0] != BAUD_MARKER || record[1] > 1 {
+            return None;
+        }
+        let handshake = Self {
+            acknowledged: record[1] == 1,
+            baud: u32::from_be_bytes(record[2..6].try_into().ok()?),
+        };
+        handshake.record()?;
+        Some(handshake)
+    }
+}
+
 #[deprecated(note = "UART carries opaque QUIC packets; use PACKET_MARKER")]
 pub const DATAGRAM_MARKER: u8 = PACKET_MARKER;
 
@@ -95,6 +127,27 @@ pub mod host_pair;
 #[cfg(test)]
 mod datagram_tests {
     use super::*;
+
+    #[test]
+    fn baud_handshake_is_framed_sideband_not_quic() {
+        for baud in [115200, 460800, 921600] {
+            for acknowledged in [false, true] {
+                let handshake = BaudHandshake { acknowledged, baud };
+                let record = handshake.record().unwrap();
+                let wire = codec::encode_payload(&record, 6).unwrap();
+                let mut decoder = codec::Decoder::with_max(6);
+                let records = decoder.push(&wire).unwrap();
+                assert_eq!(BaudHandshake::decode(&records[0]), Some(handshake));
+                assert_eq!(decode_packet(&records[0]), Err(PacketFrameError::NotPacket));
+                assert!(BaudHandshake::decode(&record[..5]).is_none());
+                let mut invalid = record;
+                invalid[1] = 2;
+                assert!(BaudHandshake::decode(&invalid).is_none());
+            }
+        }
+        assert!(BaudHandshake { acknowledged: false, baud: 123456 }.record().is_none());
+        assert!(BaudHandshake::decode(&[WAKE_MARKER]).is_none());
+    }
 
     #[test]
     fn one_marker_wraps_every_opaque_quic_packet() {
