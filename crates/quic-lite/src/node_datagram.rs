@@ -252,7 +252,8 @@ impl<P: PacketPool + 'static, const PACKET: usize> QuicNode<P, PACKET> {
         // The caller already classified and routed this owned short-header
         // packet. Do not repeat registry lookup through the bootstrap/relay
         // serializer; share its endpoint handler instead.
-        let result = self.receive_endpoint_packet(association, path_id, meta, packet, &mut on_stream);
+        let result =
+            self.receive_endpoint_packet(association, path_id, meta, packet, &mut on_stream);
         #[cfg(feature = "packet-protection")]
         if let Some(endpoint) = self.datagram_endpoint_mut(association) {
             endpoint.opened_packet_number = None;

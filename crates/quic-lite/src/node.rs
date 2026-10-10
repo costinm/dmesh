@@ -800,7 +800,9 @@ pub(crate) enum ApplicationStreamSource {
 
 /// Complete outcome of submitting one opaque packet to [`QuicNode`].
 pub(crate) enum NodeIngress<B, EgressBuffer, NextHop> {
-    Datagram { association: AssociationIngress },
+    Datagram {
+        association: AssociationIngress,
+    },
     Association {
         association: AssociationIngress,
         packet: OwnedPacket<B>,
@@ -1232,7 +1234,9 @@ where
             progressed = true;
             #[cfg(feature = "tokio")]
             let capture_offset = self.packet_capture.as_ref().and_then(|capture| {
-                self.bearers.get_mut(id)?.pending_packet_bytes()
+                self.bearers
+                    .get_mut(id)?
+                    .pending_packet_bytes()
                     .and_then(|bytes| capture.stage_egress(id, bytes))
             });
             let accepted = self
@@ -1241,7 +1245,10 @@ where
                 .and_then(|bearer| bearer.retry_pending());
             #[cfg(feature = "tokio")]
             if let (Some(capture), Some(offset)) = (&self.packet_capture, capture_offset) {
-                let submitted = self.bearers.get_mut(id).is_some_and(|bearer| !bearer.has_pending_submission());
+                let submitted = self
+                    .bearers
+                    .get_mut(id)
+                    .is_some_and(|bearer| !bearer.has_pending_submission());
                 capture.finish_egress(offset, submitted);
             }
             if let Some(accepted) = accepted {
@@ -1265,6 +1272,26 @@ where
             .all(|bearer| bearer.can_submit())
     }
 
+    /// Direct setup only needs its own response bearer. An unrelated
+    /// unwritable interface must not prevent a fresh association from
+    /// establishing. Relay/path setup retains the conservative ordering.
+    pub(crate) fn direct_setup_can_progress(&self, meta: PacketMeta, bytes: &[u8]) -> bool {
+        let output = match classify_server_packet(bytes) {
+            Ok(ServerPacket::Initial(_)) => Some(meta.bearer),
+            Ok(ServerPacket::BootstrapAck { .. }) => match self.router.target(bytes) {
+                Ok(RouterTarget::Endpoint(id)) => self
+                    .slot(*id)
+                    .and_then(Self::slot_active_address)
+                    .map(|(bearer, _)| bearer),
+                _ => None,
+            },
+            _ => None,
+        };
+        output
+            .and_then(|bearer| self.bearers.get(bearer))
+            .is_some_and(|bearer| bearer.can_submit())
+    }
+
     /// Established endpoint traffic can release memory while egress is busy.
     /// Setup, relay and path-control packets may require immediate output and
     /// must retain their existing admission ordering.
@@ -1272,10 +1299,17 @@ where
         // Ordinary accepted sends awaiting completion retain their historical
         // scheduling. The deadlock escape is for an unaccepted WouldBlock
         // packet, whose retry may depend on draining inbound ACKs/leases.
-        if !self.bearers.iter().any(|bearer| bearer.has_pending_submission()) {
+        if !self
+            .bearers
+            .iter()
+            .any(|bearer| bearer.has_pending_submission())
+        {
             return false;
         }
-        if !matches!(classify_server_packet(bytes), Ok(ServerPacket::Established { .. })) {
+        if !matches!(
+            classify_server_packet(bytes),
+            Ok(ServerPacket::Established { .. })
+        ) {
             return false;
         }
         matches!(self.router.target(bytes), Ok(RouterTarget::Endpoint(id)) if self.slot(*id).is_some())
@@ -1313,7 +1347,9 @@ where
             return Err(QuicNodeEgressError::BearerBusy);
         }
         #[cfg(feature = "tokio")]
-        let capture_offset = self.packet_capture.as_ref()
+        let capture_offset = self
+            .packet_capture
+            .as_ref()
             .and_then(|capture| capture.stage_egress(bearer_id, packet.bytes()));
         let accepted = bearer.submit_or_retain(peer, packet, acceptance);
         #[cfg(feature = "tokio")]
@@ -1341,10 +1377,13 @@ where
         ) {
             Ok(accepted) => accepted,
             Err(error) => {
-                if matches!(error, QuicNodeEgressError::BearerBusy)
-                    && let Some(acceptance) = acceptance
-                {
-                    self.record_packet_blocked(acceptance);
+                if let Some(acceptance) = acceptance {
+                    // The packet was dropped, not retained in the bearer's
+                    // WouldBlock slot. Retire its prepared flight and make
+                    // retained stream bytes eligible for repair; otherwise
+                    // an unaccepted record waits forever for a nonexistent
+                    // acceptance event and eventually fills the ledger.
+                    self.record_packet_send_failure(acceptance);
                 }
                 return Err(error);
             }
@@ -1490,11 +1529,13 @@ where
                 }
             }
             Association::Server(server) => {
-                let credit = server.mux.endpoint.credit_packet_number == Some(acceptance.packet_number);
+                let credit =
+                    server.mux.endpoint.credit_packet_number == Some(acceptance.packet_number);
                 server
                     .mux
                     .endpoint
-                    .packet_submission_accepted(acceptance.packet_number, now_us) || credit
+                    .packet_submission_accepted(acceptance.packet_number, now_us)
+                    || credit
             }
         };
         // Only the first accepted ack-eliciting send after peer activity
@@ -1722,14 +1763,21 @@ where
         Ok(())
     }
 
-    fn association_control_due(&self, association: QuicAssociation) -> Result<bool, QuicNodeEgressError> {
-        let slot = self.slot(association).ok_or(QuicNodeError::MissingAssociation)?;
+    fn association_control_due(
+        &self,
+        association: QuicAssociation,
+    ) -> Result<bool, QuicNodeEgressError> {
+        let slot = self
+            .slot(association)
+            .ok_or(QuicNodeError::MissingAssociation)?;
         let endpoint = match &slot.state {
             Association::Client(client) => client.connection().endpoint(),
             Association::Server(server) => Some(&server.mux.endpoint),
         };
-        Ok(endpoint.is_some_and(|endpoint| endpoint.pending_control_path().is_some()
-            || endpoint.pending_path_status(self.clock_us()).is_some()))
+        Ok(endpoint.is_some_and(|endpoint| {
+            endpoint.pending_control_path().is_some()
+                || endpoint.pending_path_status(self.clock_us()).is_some()
+        }))
     }
 
     /// Retry at most one deferred association control packet.
@@ -2726,7 +2774,8 @@ impl<P: PacketPool, const PACKET: usize> QuicNode<P, PACKET> {
                 .find(|path| path.circuit_key() == Some(key)),
         }
         .ok_or(QuicNodeEgressError::Transport(Error::Invalid))?;
-        debug_assert!(path.record_join_retry());
+        let recorded = path.record_join_retry();
+        debug_assert!(recorded);
         Ok(NodeEgress {
             association,
             bearer: address.0,
@@ -2993,7 +3042,13 @@ impl<P: PacketPool, const PACKET: usize> QuicNode<P, PACKET> {
         let entry = self.associations[slot]
             .take()
             .ok_or(QuicNodeError::MissingAssociation)?;
-        self.datagram_handlers.retain(|(association, _)| *association != id);
+        // Deferred ACK/credit intents have no endpoint to act on after any
+        // close/reset/timeout. Leaving one queued would make a later owner
+        // turn fail the whole node with MissingAssociation.
+        self.pending_controls
+            .retain(|association| *association != id);
+        self.datagram_handlers
+            .retain(|(association, _)| *association != id);
         let mut removed_all = true;
         for cid in entry.receive_cids.into_iter().flatten() {
             removed_all &= self.router.remove_endpoint(cid, &id);
@@ -4459,6 +4514,63 @@ where
         self.write_stream_chunk(stream, bytes, false)
     }
 
+    /// Transfer an already pool-backed body packet into reliable stream
+    /// retransmission history without copying its bytes into a heap Vec.
+    /// The packet must fit one QUIC stream payload and current peer credit; on
+    /// a retryable failure, the unchanged packet is returned to the caller.
+    /// Once accepted, QUIC owns the source lease until its stream range is
+    /// acknowledged or the association is retired.
+    pub fn write_stream_owned_packet(
+        &mut self,
+        stream: &mut QuicStream,
+        source: OwnedPacket<crate::ErasedPacketBuffer>,
+        fin: bool,
+    ) -> Result<usize, (QuicNodeEgressError, OwnedPacket<crate::ErasedPacketBuffer>)>
+    where
+        P::Buffer: Send,
+    {
+        if stream.send_finished {
+            return Err((QuicNodeEgressError::Transport(Error::Invalid), source));
+        }
+        let Some(association) = stream.association() else {
+            return Err((QuicNodeEgressError::Transport(Error::Invalid), source));
+        };
+        let length = source.bytes().len();
+        if length == 0 || length > crate::DEFAULT_MAX_STREAM_PAYLOAD {
+            return Err((QuicNodeEgressError::Transport(Error::Blocked), source));
+        }
+        let window = match self.stream_send_window(stream) {
+            Ok(window) => window,
+            Err(error) => return Err((error, source)),
+        };
+        if window < length as u64 {
+            return Err((QuicNodeEgressError::Transport(Error::Blocked), source));
+        }
+        self.drain_bearer_events();
+        let old_offset = stream.send_offset;
+        let Some(next_offset) = old_offset.checked_add(length as u64) else {
+            return Err((QuicNodeEgressError::Transport(Error::Invalid), source));
+        };
+        let packet = match self.send_stream_with_owned_packet(
+            association,
+            stream.id,
+            old_offset,
+            fin,
+            source,
+        ) {
+            Ok(packet) => packet,
+            Err(error) => return Err(error),
+        };
+        stream.send_offset = next_offset;
+        stream.send_finished = fin;
+        // After encoding, the source lease is QUIC-owned. Submission failure
+        // is recorded in packet history and is repaired by the ordinary loss
+        // path; returning the source here would duplicate an already-retained
+        // stream range.
+        let _ = self.submit_node_packet(packet);
+        Ok(length)
+    }
+
     /// Send the largest prefix of non-empty `bytes` that fits one packet and
     /// the send window. FIN is set only when `finish` and the whole slice fit.
     fn write_stream_chunk(
@@ -4677,9 +4789,7 @@ where
                 let Some(path) = endpoint.path_state(path_id) else {
                     continue;
                 };
-                if !path.is_usable_for_data()
-                    || slot.close_code.is_some()
-                {
+                if !path.is_usable_for_data() || slot.close_code.is_some() {
                     continue;
                 }
                 let Some((bearer, _)) = path
@@ -4711,7 +4821,11 @@ where
                     // There is no ranking decision with one circuit. Avoid
                     // RTT/probability divisions whose result cannot affect
                     // the chosen path; retain full scoring for multipath.
-                    if count == 1 { 0 } else { path.measured_send_cost_us() },
+                    if count == 1 {
+                        0
+                    } else {
+                        path.measured_send_cost_us()
+                    },
                     (path_id + count - rotation) % count.max(1),
                     path_id,
                 );
@@ -4756,6 +4870,109 @@ where
         Err(QuicNodeEgressError::Transport(Error::Blocked))
     }
 
+    fn send_stream_with_owned_packet(
+        &mut self,
+        association: QuicAssociation,
+        stream_id: u64,
+        offset: u64,
+        fin: bool,
+        source: OwnedPacket<crate::ErasedPacketBuffer>,
+    ) -> Result<NodeEgress<P::Buffer>, (QuicNodeEgressError, OwnedPacket<crate::ErasedPacketBuffer>)>
+    where
+        P::Buffer: Send,
+    {
+        let (candidates, candidate_count, saw_address, saw_ready_bearer) = {
+            let Some(slot) = self.slot(association) else {
+                return Err((QuicNodeError::MissingAssociation.into(), source));
+            };
+            let endpoint = match &slot.state {
+                Association::Client(client) => client.connection().endpoint(),
+                Association::Server(server) => Some(&server.mux.endpoint),
+            };
+            let Some(endpoint) = endpoint else {
+                return Err((QuicNodeEgressError::Transport(Error::Invalid), source));
+            };
+            let count = endpoint.path_count();
+            let rotation = (endpoint.next_packet_number as usize) % count.max(1);
+            let mut candidates =
+                [(u8::MAX, u8::MAX, u64::MAX, usize::MAX, 0usize); crate::MAX_PATH_STATES];
+            let mut candidate_count = 0;
+            let mut saw_address = false;
+            let mut saw_ready_bearer = false;
+            for path_id in 0..count {
+                let Some(path) = endpoint.path_state(path_id) else {
+                    continue;
+                };
+                if !path.is_usable_for_data() || slot.close_code.is_some() {
+                    continue;
+                }
+                let Some((bearer, _)) = path
+                    .active_address()
+                    .or_else(|| (path_id == 0).then_some(slot.bootstrap_address).flatten())
+                else {
+                    continue;
+                };
+                saw_address = true;
+                let ready = match self.bearers.get(bearer) {
+                    Some(bearer) => {
+                        if !bearer.can_submit() || bearer.has_pending_submission() {
+                            continue;
+                        }
+                        saw_ready_bearer = true;
+                        0
+                    }
+                    None => 1,
+                };
+                if path.congestion.bytes_in_flight >= path.congestion.congestion_window {
+                    continue;
+                }
+                let key = (
+                    ready,
+                    u8::from(path.packets_sent != 0),
+                    if count == 1 {
+                        0
+                    } else {
+                        path.measured_send_cost_us()
+                    },
+                    (path_id + count - rotation) % count.max(1),
+                    path_id,
+                );
+                let mut insert = candidate_count;
+                while insert > 0 && key < candidates[insert - 1] {
+                    candidates[insert] = candidates[insert - 1];
+                    insert -= 1;
+                }
+                candidates[insert] = key;
+                candidate_count += 1;
+            }
+            (candidates, candidate_count, saw_address, saw_ready_bearer)
+        };
+        let mut source = source;
+        for candidate in candidates.iter().take(candidate_count) {
+            match self.send_stream_owned_on_path(
+                association,
+                candidate.4,
+                stream_id,
+                offset,
+                fin,
+                source,
+            ) {
+                Ok(packet) => return Ok(packet),
+                Err((QuicNodeEgressError::Transport(Error::Blocked), returned)) => {
+                    source = returned;
+                }
+                Err((error, returned)) => return Err((error, returned)),
+            }
+        }
+        if !saw_address {
+            return Err((QuicNodeEgressError::MissingEgressAddress, source));
+        }
+        if !saw_ready_bearer {
+            return Err((QuicNodeEgressError::BearerBusy, source));
+        }
+        Err((QuicNodeEgressError::Transport(Error::Blocked), source))
+    }
+
     /// Serialize one stream range on a selected circuit path. The public
     /// circuit scheduler will choose this path; adapters still receive only
     /// a complete packet and its bearer route.
@@ -4795,6 +5012,81 @@ where
                     path_id, stream_id, offset, bytes, fin, output,
                 )
             })?,
+        };
+        Ok(NodeEgress {
+            association,
+            bearer,
+            peer_l2_address,
+            packet,
+        })
+    }
+
+    fn send_stream_owned_on_path(
+        &mut self,
+        association: QuicAssociation,
+        path_id: usize,
+        stream_id: u64,
+        offset: u64,
+        fin: bool,
+        source: OwnedPacket<crate::ErasedPacketBuffer>,
+    ) -> Result<NodeEgress<P::Buffer>, (QuicNodeEgressError, OwnedPacket<crate::ErasedPacketBuffer>)>
+    where
+        P::Buffer: Send,
+    {
+        let Some(slot) = self.slot(association) else {
+            return Err((QuicNodeError::MissingAssociation.into(), source));
+        };
+        let Some((bearer, peer_l2_address)) = Self::slot_path_state(slot, path_id)
+            .and_then(crate::PathState::active_address)
+            .or_else(|| (path_id == 0).then_some(slot.bootstrap_address).flatten())
+        else {
+            return Err((QuicNodeEgressError::MissingEgressAddress, source));
+        };
+        if slot.close_code.is_some()
+            || Self::slot_path_state(slot, path_id).is_none_or(|path| !path.is_usable_for_data())
+        {
+            return Err((QuicNodeEgressError::Transport(Error::Invalid), source));
+        }
+        if !self
+            .bearers
+            .get(bearer)
+            .is_some_and(|bearer| bearer.can_submit() && !bearer.has_pending_submission())
+        {
+            return Err((QuicNodeEgressError::BearerBusy, source));
+        }
+        let Some(mut writer) = self.pool.acquire_writer(PACKET_PREFIX_RESERVE, 0) else {
+            return Err((QuicNodeEgressError::PoolUnavailable, source));
+        };
+        let Some(output) = writer
+            .payload_mut()
+            .get_mut(..PACKET)
+            .and_then(|output| output.try_into().ok())
+        else {
+            return Err((QuicNodeEgressError::InvalidPoolLayout, source));
+        };
+        let commit_fallback = source.clone_shared();
+        let slot = self
+            .slot_mut(association)
+            .expect("association checked above");
+        let encoded = match &mut slot.state {
+            Association::Client(client) => client.encode_stream_payload_from_owned_at_on_path(
+                path_id, stream_id, offset, fin, source, output,
+            ),
+            Association::Server(server) => server.encode_stream_payload_from_owned_at_on_path(
+                path_id, stream_id, offset, fin, source, output,
+            ),
+        };
+        let used = match encoded {
+            Ok(used) => used,
+            Err((error, source)) => {
+                return Err((QuicNodeEgressError::Transport(error), source));
+            }
+        };
+        let Some(packet) = writer.commit(used) else {
+            // The encoder writes at most PACKET bytes into this writer, so a
+            // failed commit indicates a pool contract violation after QUIC
+            // has already retained the source lease.
+            return Err((QuicNodeEgressError::InvalidPoolLayout, commit_fallback));
         };
         Ok(NodeEgress {
             association,
@@ -4925,9 +5217,8 @@ where
                 Association::Client(client) => client.connection().endpoint().unwrap(),
                 Association::Server(server) => &server.mux.endpoint,
             };
-            endpoint
-                .pending_path_status(self.clock_us())
-                .and_then(|(status_path, key, sequence, status)| {
+            endpoint.pending_path_status(self.clock_us()).and_then(
+                |(status_path, key, sequence, status)| {
                     let egress_path = endpoint.status_egress_path()?;
                     let path = endpoint.path_state(egress_path)?;
                     let (bearer, peer_l2_address) = path.active_address().or_else(|| {
@@ -4946,10 +5237,19 @@ where
                         bearer,
                         peer_l2_address,
                     ))
-                })
+                },
+            )
         };
-        if let Some((status_path, egress_path, key, sequence, status, destination, bearer, peer_l2_address)) =
-            status_output
+        if let Some((
+            status_path,
+            egress_path,
+            key,
+            sequence,
+            status,
+            destination,
+            bearer,
+            peer_l2_address,
+        )) = status_output
         {
             let now = self.clock_us();
             let packet = Self::build_packet(pool, |output| {
@@ -4971,13 +5271,22 @@ where
                 )
             });
             match packet {
-                Ok(packet) => return Ok(Some(NodeEgress {
-                    association, bearer, peer_l2_address, packet,
-                })),
+                Ok(packet) => {
+                    return Ok(Some(NodeEgress {
+                        association,
+                        bearer,
+                        peer_l2_address,
+                        packet,
+                    }));
+                }
                 Err(QuicNodeEgressError::Transport(Error::Blocked | Error::HistoryFull)) => {
-                    let slot = self.slot_mut(association).ok_or(QuicNodeError::MissingAssociation)?;
+                    let slot = self
+                        .slot_mut(association)
+                        .ok_or(QuicNodeError::MissingAssociation)?;
                     let endpoint = match &mut slot.state {
-                        Association::Client(client) => client.connection_mut().endpoint_mut()
+                        Association::Client(client) => client
+                            .connection_mut()
+                            .endpoint_mut()
                             .map_err(QuicNodeEgressError::Transport)?,
                         Association::Server(server) => &mut server.mux.endpoint,
                     };
@@ -5112,7 +5421,11 @@ where
         // submission refuses a second lease. Wait before preparing it when
         // this bearer already retains an unsubmitted packet.
         #[cfg(feature = "tokio")]
-        if self.bearers.get_mut(bearer).is_some_and(|bearer| !bearer.can_submit()) {
+        if self
+            .bearers
+            .get_mut(bearer)
+            .is_some_and(|bearer| !bearer.can_submit())
+        {
             return Err(QuicNodeEgressError::BearerBusy);
         }
 
@@ -5174,6 +5487,10 @@ where
         now: u64,
     ) -> Result<Option<NodeTimer<P::Buffer>>, QuicNodeEgressError> {
         self.advance_clock(now);
+        // A timer snapshot can predate an ingress turn. Use the same
+        // monotonic time for selection, expiry and endpoint processing;
+        // otherwise a due pacing/recovery wake can remain perpetually armed.
+        let now = self.clock_us;
         self.router.expire_forward_leases(now);
         self.router.expire_setup_transactions(now);
         if let Some((slot_index, _)) = self
@@ -5432,12 +5749,10 @@ where
                     client.poll_timer(now, output)
                 })?
             }
-            Association::Server(server) => {
-                Self::build_optional_packet(self.pool, |output| {
-                    server.mux.endpoint.on_bearer_timeout();
-                    server.poll_timer(now, output)
-                })?
-            }
+            Association::Server(server) => Self::build_optional_packet(self.pool, |output| {
+                server.mux.endpoint.on_bearer_timeout();
+                server.poll_timer(now, output)
+            })?,
         };
         let Some(packet) = packet else {
             return Ok(None);
@@ -5492,7 +5807,8 @@ where
     ) -> Result<NodeIngress<P::Buffer, P::Buffer, ForwardNextHop>, RejectedNodePacket<P::Buffer>>
     where
         Admit: FnMut(crate::BootstrapOpen) -> Option<InitialAdmission>,
-        StreamEvent: FnMut(ApplicationStreamSource, u64, u64, bool, &[u8]) -> Result<usize, crate::Error>,
+        StreamEvent:
+            FnMut(ApplicationStreamSource, u64, u64, bool, &[u8]) -> Result<usize, crate::Error>,
     {
         self.advance_clock(meta.received_at_us);
         let classified = classify_server_packet(packet.bytes());
@@ -5504,9 +5820,18 @@ where
             Ok(RouterTarget::Forward(rule)) => *rule,
             Ok(RouterTarget::Endpoint(association)) => {
                 let association = *association;
-                if let Some(path_id) = self.slot(association)
-                    .and_then(|slot| Self::slot_path_id_for_cid(slot, destination)) {
-                    return self.receive_owned_endpoint(association, path_id, meta, packet, admit_initial, on_stream);
+                if let Some(path_id) = self
+                    .slot(association)
+                    .and_then(|slot| Self::slot_path_id_for_cid(slot, destination))
+                {
+                    return self.receive_owned_endpoint(
+                        association,
+                        path_id,
+                        meta,
+                        packet,
+                        admit_initial,
+                        on_stream,
+                    );
                 }
                 return self.receive_packet(meta, packet, admit_initial, on_stream);
             }
@@ -5529,7 +5854,10 @@ where
         {
             return self.receive_packet(meta, packet, admit_initial, on_stream);
         }
-        let active = match self.router.forward_lease_active(packet.bytes(), self.clock_us) {
+        let active = match self
+            .router
+            .forward_lease_active(packet.bytes(), self.clock_us)
+        {
             Ok(active) => active,
             Err(error) => {
                 return Err(RejectedNodePacket {
@@ -5539,20 +5867,40 @@ where
             }
         };
         if !active {
-            return Ok(NodeIngress::Unknown { destination, packet });
+            return Ok(NodeIngress::Unknown {
+                destination,
+                packet,
+            });
         }
         let control = crate::is_control_only_packet(packet.bytes());
         // No second slot is allocated: equality leaves the configured reserve
         // intact. With reserve zero a full pool can still forward its RX lease.
         if !control && self.pool.available() < self.node_limits.relay_control_packet_reserve {
-            return Ok(NodeIngress::Unknown { destination, packet });
+            return Ok(NodeIngress::Unknown {
+                destination,
+                packet,
+            });
         }
-        if !self.router.consume_forward_quota(destination, control, self.clock_us) {
-            return Ok(NodeIngress::Unknown { destination, packet });
+        if !self
+            .router
+            .consume_forward_quota(destination, control, self.clock_us)
+        {
+            return Ok(NodeIngress::Unknown {
+                destination,
+                packet,
+            });
         }
-        match self.router.refresh_forward_lease(packet.bytes(), self.clock_us) {
+        match self
+            .router
+            .refresh_forward_lease(packet.bytes(), self.clock_us)
+        {
             Ok(true) => {}
-            Ok(false) => return Ok(NodeIngress::Unknown { destination, packet }),
+            Ok(false) => {
+                return Ok(NodeIngress::Unknown {
+                    destination,
+                    packet,
+                });
+            }
             Err(error) => {
                 return Err(RejectedNodePacket {
                     reason: QuicNodePacketRejection::Egress(QuicNodeEgressError::Transport(error)),
@@ -5574,6 +5922,44 @@ where
     /// Generic ingress and serializer fallback for packets that cannot reuse a
     /// node-pool lease. Runtime adapters use `receive_owned_packet` instead.
     pub(crate) fn receive_packet<B, Admit, StreamEvent>(
+        &mut self,
+        meta: PacketMeta,
+        packet: OwnedPacket<B>,
+        admit_initial: Admit,
+        mut on_stream: StreamEvent,
+    ) -> Result<NodeIngress<B, P::Buffer, ForwardNextHop>, RejectedNodePacket<B>>
+    where
+        B: AsRef<[u8]>,
+        Admit: FnMut(crate::BootstrapOpen) -> Option<InitialAdmission>,
+        StreamEvent:
+            FnMut(ApplicationStreamSource, u64, u64, bool, &[u8]) -> Result<usize, crate::Error>,
+    {
+        // Ordinary endpoint traffic must not pull Initial/PATH_OPEN setup,
+        // forwarding, and stateless-reset handling into its instruction cache.
+        // Keep classification/association validation identical to the fallback.
+        if let Ok(
+            ServerPacket::Established { destination } | ServerPacket::BootstrapAck { destination },
+        ) = classify_server_packet(packet.bytes())
+        {
+            if let Ok(RouterTarget::Endpoint(id)) = self.router.target(packet.bytes()) {
+                let id = *id;
+                if let Some(path_id) = self
+                    .slot(id)
+                    .and_then(|slot| Self::slot_path_id_for_cid(slot, destination))
+                {
+                    self.advance_clock(meta.received_at_us);
+                    return self.receive_endpoint_packet(id, path_id, meta, packet, &mut on_stream);
+                }
+            }
+        }
+        self.receive_packet_slow(meta, packet, admit_initial, on_stream)
+    }
+
+    // This path retains the full setup/forward/reset semantics. Mark only the
+    // uncommon dispatcher cold, not receive_packet or established delivery.
+    #[cold]
+    #[inline(never)]
+    fn receive_packet_slow<B, Admit, StreamEvent>(
         &mut self,
         meta: PacketMeta,
         packet: OwnedPacket<B>,
@@ -7383,22 +7769,14 @@ where
                     packet,
                 })
             }
-            Ok(None) => match self.receive_association_bytes(
-                id,
-                path_id,
-                meta,
-                bytes,
-                on_stream,
-            ) {
+            Ok(None) => match self.receive_association_bytes(id, path_id, meta, bytes, on_stream) {
                 Ok(association) => Ok(NodeIngress::Association {
                     association,
                     packet,
                 }),
                 Err(QuicNodePacketRejection::Packet(Error::PeerRestarted)) => {
                     let _ = self.remove(id);
-                    self.push_association_event(AssociationEvent::Reset {
-                        association: id,
-                    });
+                    self.push_association_event(AssociationEvent::Reset { association: id });
                     Ok(NodeIngress::PeerReset {
                         association: id,
                         packet,
@@ -7421,7 +7799,6 @@ where
         }
     }
 
-
     fn receive_path_control(
         &mut self,
         association: QuicAssociation,
@@ -7434,6 +7811,19 @@ where
         else {
             return Ok(None);
         };
+        self.apply_received_path_control(association, ingress_path, meta, input, control)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn apply_received_path_control(
+        &mut self,
+        association: QuicAssociation,
+        ingress_path: usize,
+        meta: PacketMeta,
+        input: &[u8],
+        control: crate::Frame<'_>,
+    ) -> Result<Option<Option<NodeEgress<P::Buffer>>>, QuicNodePacketRejection> {
         let local_role = match &self
             .slot(association)
             .ok_or(QuicNodePacketRejection::Packet(Error::WrongConnectionId))?
@@ -7446,18 +7836,25 @@ where
             let slot = self
                 .slot_mut(association)
                 .ok_or(QuicNodePacketRejection::Packet(Error::WrongConnectionId))?;
-            match &mut slot.state {
+            let endpoint = match &mut slot.state {
                 Association::Client(client) => client
                     .connection_mut()
                     .endpoint_mut()
-                    .map_err(QuicNodePacketRejection::Packet)?
-                    .receive_packet_batch_on_path(input, ingress_path),
-                Association::Server(server) => server
-                    .mux
-                    .endpoint
-                    .receive_packet_batch_on_path(input, ingress_path),
+                    .map_err(QuicNodePacketRejection::Packet)?,
+                Association::Server(server) => &mut server.mux.endpoint,
+            };
+            let previous = endpoint
+                .path_state(ingress_path)
+                .and_then(crate::PathState::largest_received_packet);
+            endpoint
+                .receive_packet_batch_on_path(input, ingress_path)
+                .map_err(QuicNodePacketRejection::Packet)?;
+            let current = endpoint
+                .path_state(ingress_path)
+                .and_then(crate::PathState::largest_received_packet);
+            if current.is_some_and(|number| previous.is_none_or(|old| number > old)) {
+                endpoint.record_bearer_arrival(ingress_path, meta.received_at_us);
             }
-            .map_err(QuicNodePacketRejection::Packet)?;
         }
         let probe_interval_us = self
             .slot(association)
@@ -7906,39 +8303,75 @@ where
                         client
                             .receive_packet(meta, bytes, |_| Ok(()))
                             .map_err(QuicNodePacketRejection::Packet)?;
-                    } else if let Some(payload) = client
-                        .receive_stream_payload_packet_on_path(meta, ingress_path, bytes)
-                        .map_err(QuicNodePacketRejection::Packet)?
-                    {
-                        if !payload.delivery_complete_before_packet {
-                            let mut sink = OrderedNodeSink {
-                                association: id,
-                                handler: on_stream,
-                                consumed: 0,
-                            };
-                            slot.client_delivery
-                                .receive_copying_borrowed(
-                                    payload.stream_id,
+                    } else {
+                        let admitted = client
+                            .receive_packet_on_path(
+                                meta,
+                                bytes,
+                                ingress_path,
+                                |connection, path_id| {
+                                    connection
+                                        .endpoint_mut()?
+                                        .receive_packet_before_stream_delivery(bytes, path_id)
+                                },
+                            )
+                            .map_err(QuicNodePacketRejection::Packet)?;
+                        for payload in admitted.streams() {
+                            if !slot.client_delivery.delivery_finished(payload.id) {
+                                let mut sink = OrderedNodeSink {
+                                    association: id,
+                                    handler: on_stream,
+                                    consumed: 0,
+                                };
+                                let delivery = slot.client_delivery.try_receive_copying_borrowed(
+                                    payload.id,
                                     payload.data,
                                     payload.offset,
                                     payload.fin,
-                                    || Arc::new(payload.data.to_vec()),
+                                    || crate::mux::retain_stream_bytes(payload.data),
                                     &mut sink,
-                                )
-                                .map_err(|error| match error {
-                                    crate::callback::CopyingError::Transport(_) => {
-                                        QuicNodePacketRejection::Packet(Error::Invalid)
+                                );
+                                if sink.consumed != 0 {
+                                    client
+                                        .connection_mut()
+                                        .endpoint_mut()
+                                        .and_then(|endpoint| {
+                                            endpoint.stream_consumed_before_packet_ack(
+                                                payload.id,
+                                                sink.consumed,
+                                            )
+                                        })
+                                        .map_err(QuicNodePacketRejection::Packet)?;
+                                }
+                                match delivery {
+                                    Ok(()) => {}
+                                    Err(crate::callback::CopyingError::Transport(
+                                        crate::callback::CallbackError::Capacity,
+                                    )) => {
+                                        return Ok(AssociationIngress::Client(id));
                                     }
-                                    crate::callback::CopyingError::Callback(error) => {
-                                        QuicNodePacketRejection::Application(error)
+                                    Err(crate::callback::CopyingError::Transport(_)) => {
+                                        return Err(QuicNodePacketRejection::Packet(
+                                            Error::Invalid,
+                                        ));
                                     }
-                                })?;
-                            if sink.consumed != 0 {
-                                client
-                                    // Match server delivery: consumption releases credit,
-                                    // but does not override the negotiated ACK policy.
-                                    .stream_consumed(payload.stream_id, sink.consumed, true)
-                                    .map_err(QuicNodePacketRejection::Packet)?;
+                                    Err(crate::callback::CopyingError::Callback(error)) => {
+                                        return Err(QuicNodePacketRejection::Application(error));
+                                    }
+                                }
+                            }
+                        }
+                        let endpoint = client
+                            .connection_mut()
+                            .endpoint_mut()
+                            .map_err(QuicNodePacketRejection::Packet)?;
+                        if !admitted.duplicate && admitted.stream_count != 0 {
+                            endpoint.commit_stream_packet_receive(
+                                admitted.header.packet_number,
+                                ingress_path,
+                            );
+                            if admitted.streams().any(|frame| frame.fin) {
+                                endpoint.request_stream_reack();
                             }
                         }
                     }
@@ -8052,6 +8485,17 @@ where
         });
         let new_largest = current_path_largest
             .is_some_and(|current| previous_path_largest.is_none_or(|previous| current > previous));
+        if new_largest {
+            let slot = self.slot_mut(id).unwrap();
+            let endpoint = match &mut slot.state {
+                Association::Client(client) => client
+                    .connection_mut()
+                    .endpoint_mut()
+                    .map_err(QuicNodePacketRejection::Packet)?,
+                Association::Server(server) => &mut server.mux.endpoint,
+            };
+            endpoint.record_bearer_arrival(ingress_path, meta.received_at_us);
+        }
         self.remember_ingress_path_address(id, ingress_path, meta, new_largest);
         Ok(ingress)
     }
@@ -8210,27 +8654,209 @@ mod tests {
     }
 
     #[test]
+    fn unspecified_bearer_arrival_uses_dispatch_time_for_ack_delay() {
+        type Pool = crate::packet_pool::PacketPool<4, DEFAULT_PACKET_POOL_SLOT_SIZE>;
+        static POOL: Pool = Pool::new();
+        let mut node = QuicNode::<Pool>::new(&POOL);
+        let mut bytes = [0u8; crate::DEFAULT_MAX_PACKET_SIZE];
+        let len = crate::encode_bootstrap_open_packet(cid(0x91), 0, &mut bytes).unwrap();
+        let initial = node
+            .accept_initial(
+                ingress_meta(),
+                &bytes[..len],
+                cid(0x92),
+                ConnectionLimits::default(),
+            )
+            .unwrap();
+        let association = initial.association;
+        drop(initial);
+        let mut len = ShortHeader {
+            flags: FLAG_FIXED,
+            dcid: cid(0x92),
+            packet_number: 1,
+            packet_number_len: 4,
+        }
+        .encode(&mut bytes)
+        .unwrap();
+        len += Frame::Stream(crate::StreamFrame {
+            id: 4,
+            offset: 0,
+            fin: false,
+            data: b"body",
+        })
+        .encode(&mut bytes[len..])
+        .unwrap();
+        node.advance_clock(1_000_000);
+        let mut meta = ingress_meta();
+        meta.received_at_us = 0; // Attached host bearers have no owner-clock epoch.
+        node.receive_packet(
+            meta,
+            OwnedPacket::new(bytes, 0..len).unwrap(),
+            |_| None,
+            |_, _, _, _, data| Ok(data.len()),
+        )
+        .unwrap();
+        node.advance_clock(1_000_500);
+        let Association::Server(server) = &mut node.slot_mut(association).unwrap().state else {
+            panic!("server association");
+        };
+        server.mux.endpoint.paths[0].ack_immediate = true;
+        let mut ack = [0u8; crate::DEFAULT_MAX_PACKET_SIZE];
+        let used = server
+            .mux
+            .endpoint
+            .poll_transmit(&mut ack)
+            .unwrap()
+            .unwrap();
+        let (_, offset) = ShortHeader::decode(&ack[..used]).unwrap();
+        let (frame, _) = crate::decode_frame(&ack[offset..used]).unwrap();
+        assert!(
+            matches!(
+                frame,
+                Frame::AckRanges { delay: 500, .. } | Frame::Ack { delay: 500, .. }
+            ),
+            "unknown arrival must not be interpreted as the clock epoch: {frame:?}"
+        );
+    }
+
+    #[test]
+    fn queued_receive_preserves_arrival_time_for_ack_delay() {
+        type Pool = crate::packet_pool::PacketPool<4, DEFAULT_PACKET_POOL_SLOT_SIZE>;
+        static POOL: Pool = Pool::new();
+        let mut node = QuicNode::<Pool>::new(&POOL);
+        let mut bytes = [0u8; crate::DEFAULT_MAX_PACKET_SIZE];
+        let len = crate::encode_bootstrap_open_packet(cid(0x91), 0, &mut bytes).unwrap();
+        let initial = node
+            .accept_initial(
+                ingress_meta(),
+                &bytes[..len],
+                cid(0x92),
+                ConnectionLimits::default(),
+            )
+            .unwrap();
+        let association = initial.association;
+        drop(initial);
+        let mut len = ShortHeader {
+            flags: FLAG_FIXED,
+            dcid: cid(0x92),
+            packet_number: 1,
+            packet_number_len: 4,
+        }
+        .encode(&mut bytes)
+        .unwrap();
+        len += Frame::Stream(crate::StreamFrame {
+            id: 4,
+            offset: 0,
+            fin: false,
+            data: b"body",
+        })
+        .encode(&mut bytes[len..])
+        .unwrap();
+        // Physical arrival precedes the owner turn. Advancing the send/timer
+        // clock must not replace the timestamp used to report ACK delay.
+        node.advance_clock(10_000);
+        let mut meta = ingress_meta();
+        meta.received_at_us = 1_000;
+        node.receive_packet(
+            meta,
+            OwnedPacket::new(bytes, 0..len).unwrap(),
+            |_| None,
+            |_, _, _, _, data| Ok(data.len()),
+        )
+        .unwrap();
+        let Association::Server(server) = &mut node.slot_mut(association).unwrap().state else {
+            panic!("server association");
+        };
+        assert_eq!(
+            server.mux.endpoint.paths[0].largest_received_at, 1_000,
+            "ACK timestamp must reflect bearer arrival, not queued dispatch"
+        );
+        assert_eq!(server.mux.endpoint.paths[0].send_clock, 10_000);
+        // Correct ACK-delay reporting without also changing the coalescing
+        // timer policy; those are independent pieces of state.
+        assert_eq!(server.mux.endpoint.paths[0].ack_started_at, 10_000);
+        server.mux.endpoint.paths[0].ack_immediate = true;
+        let mut ack = [0u8; crate::DEFAULT_MAX_PACKET_SIZE];
+        let used = server
+            .mux
+            .endpoint
+            .poll_transmit(&mut ack)
+            .unwrap()
+            .unwrap();
+        let (_, offset) = ShortHeader::decode(&ack[..used]).unwrap();
+        let (frame, _) = crate::decode_frame(&ack[offset..used]).unwrap();
+        assert!(
+            matches!(
+                frame,
+                Frame::AckRanges { delay: 9_000, .. } | Frame::Ack { delay: 9_000, .. }
+            ),
+            "encoded ACK must include the receive queue delay: {frame:?}"
+        );
+        // Replayed packets must not replace the largest packet's arrival.
+        node.advance_clock(20_000);
+        meta.received_at_us = 12_000;
+        node.receive_packet(
+            meta,
+            OwnedPacket::new(bytes, 0..len).unwrap(),
+            |_| None,
+            |_, _, _, _, data| Ok(data.len()),
+        )
+        .unwrap();
+        let Association::Server(server) = &node.slot(association).unwrap().state else {
+            panic!("server association");
+        };
+        assert_eq!(server.mux.endpoint.paths[0].largest_received_at, 1_000);
+    }
+
+    #[test]
     fn single_path_control_does_not_prepare_an_impossible_alternate_copy() {
         type Pool = crate::packet_pool::PacketPool<2, DEFAULT_PACKET_POOL_SLOT_SIZE>;
         static POOL: Pool = Pool::new();
         let mut node = QuicNode::<Pool>::new(&POOL);
         let mut bytes = [0; crate::DEFAULT_MAX_PACKET_SIZE];
         let len = crate::encode_bootstrap_open_packet(cid(0x91), 0, &mut bytes).unwrap();
-        let initial = node.accept_initial(ingress_meta(), &bytes[..len], cid(0x92), ConnectionLimits::default()).unwrap();
-        let acceptance = PacketAcceptance { association: initial.association, packet_number: 20 };
+        let initial = node
+            .accept_initial(
+                ingress_meta(),
+                &bytes[..len],
+                cid(0x92),
+                ConnectionLimits::default(),
+            )
+            .unwrap();
+        let acceptance = PacketAcceptance {
+            association: initial.association,
+            packet_number: 20,
+        };
         let mut used = ShortHeader {
-            flags: FLAG_FIXED, dcid: cid(0x91), packet_number: 20, packet_number_len: 4,
-        }.encode(&mut bytes).unwrap();
-        used += Frame::Ack { largest: 1, delay: 0 }.encode(&mut bytes[used..]).unwrap();
+            flags: FLAG_FIXED,
+            dcid: cid(0x91),
+            packet_number: 20,
+            packet_number_len: 4,
+        }
+        .encode(&mut bytes)
+        .unwrap();
+        used += Frame::Ack {
+            largest: 1,
+            delay: 0,
+        }
+        .encode(&mut bytes[used..])
+        .unwrap();
         used += Frame::MaxData(4096).encode(&mut bytes[used..]).unwrap();
-        assert!(node.control_duplication_candidate(acceptance, &bytes[..used]).is_none());
-        let Association::Server(server) = &mut node.slot_mut(initial.association).unwrap().state else {
+        assert!(
+            node.control_duplication_candidate(acceptance, &bytes[..used])
+                .is_none()
+        );
+        let Association::Server(server) = &mut node.slot_mut(initial.association).unwrap().state
+        else {
             panic!("server association");
         };
         server.mux.endpoint.add_path_state().unwrap();
         // Do not suppress normal multipath candidate discovery. Readiness,
         // budget and per-path eligibility remain the scheduler's decisions.
-        assert!(node.control_duplication_candidate(acceptance, &bytes[..used]).is_some());
+        assert!(
+            node.control_duplication_candidate(acceptance, &bytes[..used])
+                .is_some()
+        );
     }
 
     #[cfg(feature = "tokio")]
@@ -8240,39 +8866,75 @@ mod tests {
         type Pool = crate::packet_pool::PacketPool<4, DEFAULT_PACKET_POOL_SLOT_SIZE>;
         static POOL: Pool = Pool::new();
         let mut client = QuicNode::<Pool>::new(&POOL);
-        let bearer = client.add_bearer(FakePacketBearer::<Pool>::new(
-            BearerName::new("silent-peer-test").unwrap(),
-        )).unwrap();
+        let bearer = client
+            .add_bearer(FakePacketBearer::<Pool>::new(
+                BearerName::new("silent-peer-test").unwrap(),
+            ))
+            .unwrap();
         let meta = PacketMeta {
-            bearer, peer_l2_address: PeerL2Address::new(11).unwrap(), received_at_us: 1,
+            bearer,
+            peer_l2_address: PeerL2Address::new(11).unwrap(),
+            received_at_us: 1,
         };
         let open = client.start_association(cid(0x75), meta, 0).unwrap();
         let association = open.association;
         let receive_cid = client.receive_cid(association).unwrap();
         let mut server = QuicNode::<Pool>::new(&POOL);
-        let NodeIngress::Initial { response, .. } = server.receive_packet(
-            meta, open.packet,
-            |_| Some(InitialAdmission { local_limits: ConnectionLimits::default() }),
-            |_, _, _, _, bytes| Ok(bytes.len()),
-        ).unwrap() else { panic!("initial admission"); };
-        client.receive_packet(meta, response.packet, |_| None,
-            |_, _, _, _, bytes| Ok(bytes.len())).unwrap();
+        let NodeIngress::Initial { response, .. } = server
+            .receive_packet(
+                meta,
+                open.packet,
+                |_| {
+                    Some(InitialAdmission {
+                        local_limits: ConnectionLimits::default(),
+                    })
+                },
+                |_, _, _, _, bytes| Ok(bytes.len()),
+            )
+            .unwrap()
+        else {
+            panic!("initial admission");
+        };
+        client
+            .receive_packet(
+                meta,
+                response.packet,
+                |_| None,
+                |_, _, _, _, bytes| Ok(bytes.len()),
+            )
+            .unwrap();
         while client.next_association_event().is_some() {}
         client.set_idle_timeout_us(5_000_000);
         let before = client.slot(association).unwrap().last_activity_us;
         // A packet without a retained ack-eliciting record (e.g. a pure
         // ACK) must not consume the first-send idle extension.
-        client.record_packet_acceptance(PacketAcceptance {
-            association, packet_number: u32::MAX,
-        }, 50);
+        client.record_packet_acceptance(
+            PacketAcceptance {
+                association,
+                packet_number: u32::MAX,
+            },
+            50,
+        );
         assert_eq!(client.slot(association).unwrap().last_activity_us, before);
-        assert!(!client.slot(association).unwrap().ack_eliciting_sent_since_receive);
+        assert!(
+            !client
+                .slot(association)
+                .unwrap()
+                .ack_eliciting_sent_since_receive
+        );
         client.advance_clock(100);
         let stream = client.allocate_stream(association).unwrap();
-        let packet = client.send_stream(association, stream, 0, true, b"retained body").unwrap();
+        let packet = client
+            .send_stream(association, stream, 0, true, b"retained body")
+            .unwrap();
         client.submit_node_packet(packet).unwrap();
         assert_eq!(client.slot(association).unwrap().last_activity_us, 100);
-        assert!(client.slot(association).unwrap().ack_eliciting_sent_since_receive);
+        assert!(
+            client
+                .slot(association)
+                .unwrap()
+                .ack_eliciting_sent_since_receive
+        );
         // The bearer accepts sends, but nothing is delivered back from the
         // peer. Drive ordinary PTOs and submit the retained replacements.
         let mut retransmissions = 0;
@@ -8283,19 +8945,31 @@ mod tests {
                     client.submit_node_packet(packet).unwrap();
                     retransmissions += 1;
                 }
-                Some(NodeTimer::IdleTimedOut { association: expired }) => {
+                Some(NodeTimer::IdleTimedOut {
+                    association: expired,
+                }) => {
                     assert_eq!(expired, association);
                     break;
                 }
                 _ => {}
             }
         }
-        assert!(retransmissions > 0, "exercise actual submitted PTO replacements");
-        assert_eq!(client.association_count(), 0, "local retries must not refresh idle forever");
+        assert!(
+            retransmissions > 0,
+            "exercise actual submitted PTO replacements"
+        );
+        assert_eq!(
+            client.association_count(),
+            0,
+            "local retries must not refresh idle forever"
+        );
         assert!(!client.router.contains(receive_cid));
         client.drain_bearer_events();
         assert_eq!(POOL.available(), POOL.capacity());
-        assert_eq!(client.next_association_event(), Some(AssociationEvent::IdleTimeout { association }));
+        assert_eq!(
+            client.next_association_event(),
+            Some(AssociationEvent::IdleTimeout { association })
+        );
     }
 
     #[cfg(feature = "tokio")]
@@ -8322,7 +8996,11 @@ mod tests {
             .receive_packet(
                 meta,
                 open.packet,
-                |_| Some(InitialAdmission { local_limits: ConnectionLimits::default() }),
+                |_| {
+                    Some(InitialAdmission {
+                        local_limits: ConnectionLimits::default(),
+                    })
+                },
                 |_, _, _, _, bytes| Ok(bytes.len()),
             )
             .unwrap()
@@ -8330,7 +9008,12 @@ mod tests {
             panic!("initial admission");
         };
         client
-            .receive_packet(meta, response.packet, |_| None, |_, _, _, _, bytes| Ok(bytes.len()))
+            .receive_packet(
+                meta,
+                response.packet,
+                |_| None,
+                |_, _, _, _, bytes| Ok(bytes.len()),
+            )
             .unwrap();
         let stream = client.allocate_stream(association).unwrap();
         let Association::Client(state) = &mut client.slot_mut(association).unwrap().state else {
@@ -8355,7 +9038,9 @@ mod tests {
         };
         let endpoint = state.connection_mut().endpoint_mut().unwrap();
         endpoint.set_base_circuit_key();
-        endpoint.queue_path_status(0, crate::PathStatusKind::Available).unwrap();
+        endpoint
+            .queue_path_status(0, crate::PathStatusKind::Available)
+            .unwrap();
         let now = client.clock_us();
         assert!(matches!(client.timer_expired(now), Ok(None)));
         let status_retry = client.next_deadline().unwrap();
@@ -8370,14 +9055,21 @@ mod tests {
         // Model ACK progress releasing congestion capacity. Retry the same
         // bytes and FIN; the failed attempt must not advance the stream.
         endpoint.paths[0].congestion.bytes_in_flight = 0;
-        let sent = client.send_stream(association, stream, 0, true, b"body").unwrap();
+        let sent = client
+            .send_stream(association, stream, 0, true, b"body")
+            .unwrap();
         assert_eq!(
             (sent.bearer, sent.peer_l2_address),
             (meta.bearer, meta.peer_l2_address)
         );
         drop(sent);
         client.advance_clock(status_retry);
-        assert!(client.poll_association_control(association).unwrap().is_some());
+        assert!(
+            client
+                .poll_association_control(association)
+                .unwrap()
+                .is_some()
+        );
         // Genuine route loss must retain its non-retryable classification.
         assert!(client.remove_bearer(bearer));
         let next_stream = client.allocate_stream(association).unwrap();
@@ -9659,37 +10351,65 @@ mod tests {
     fn credit_acceptance_restarts_idle_once_and_peer_receive_rearms_it() {
         let mut node: QuicNode<TestPool> = QuicNode::new(&TEST_POOL);
         let local = cid(0x76);
-        let association = node.add_client(local, ClientAssociation::new(local)).unwrap();
+        let association = node
+            .add_client(local, ClientAssociation::new(local))
+            .unwrap();
         let mut open = [0; crate::DEFAULT_MAX_PACKET_SIZE];
         let mut response = [0; 16];
         let len = ShortHeader {
-            flags: FLAG_FIXED, dcid: local, packet_number: 0, packet_number_len: 1,
-        }.encode(&mut response).unwrap();
+            flags: FLAG_FIXED,
+            dcid: local,
+            packet_number: 0,
+            packet_number_len: 1,
+        }
+        .encode(&mut response)
+        .unwrap();
         let Association::Client(client) = &mut node.slot_mut(association).unwrap().state else {
             panic!("client");
         };
         client.connection_mut().start(&mut open).unwrap();
-        client.connection_mut().receive_initial_short_header(&response[..len], 0).unwrap();
-        client.connection_mut().endpoint_mut().unwrap().credit_packet_number = Some(7);
-        let acceptance = PacketAcceptance { association, packet_number: 7 };
+        client
+            .connection_mut()
+            .receive_initial_short_header(&response[..len], 0)
+            .unwrap();
+        client
+            .connection_mut()
+            .endpoint_mut()
+            .unwrap()
+            .credit_packet_number = Some(7);
+        let acceptance = PacketAcceptance {
+            association,
+            packet_number: 7,
+        };
         node.record_packet_acceptance(acceptance, 100);
         assert_eq!(node.slot(association).unwrap().last_activity_us, 100);
         node.record_packet_acceptance(acceptance, 200);
         assert_eq!(node.slot(association).unwrap().last_activity_us, 100);
         let meta = PacketMeta {
             bearer: BearerId::new(1).unwrap(),
-            peer_l2_address: PeerL2Address::new(11).unwrap(), received_at_us: 300,
+            peer_l2_address: PeerL2Address::new(11).unwrap(),
+            received_at_us: 300,
         };
         node.advance_clock(300);
         node.remember_address(association, meta);
-        assert!(!node.slot(association).unwrap().ack_eliciting_sent_since_receive);
+        assert!(
+            !node
+                .slot(association)
+                .unwrap()
+                .ack_eliciting_sent_since_receive
+        );
         node.record_packet_acceptance(acceptance, 400);
         assert_eq!(node.slot(association).unwrap().last_activity_us, 400);
         node.record_packet_acceptance(acceptance, 500);
         assert_eq!(node.slot(association).unwrap().last_activity_us, 400);
         node.advance_clock(600);
         node.remember_ingress_path_address(association, 0, meta, false);
-        assert!(!node.slot(association).unwrap().ack_eliciting_sent_since_receive);
+        assert!(
+            !node
+                .slot(association)
+                .unwrap()
+                .ack_eliciting_sent_since_receive
+        );
         assert_eq!(node.slot(association).unwrap().last_activity_us, 600);
     }
 
@@ -10049,6 +10769,60 @@ mod tests {
                 ConnectionId::new(first_server_cid + u64::from(client_cid == cid(0x32))).unwrap();
             assert_eq!(node.receive_cid(association), Some(expected));
             drop(response);
+        }
+    }
+
+    #[test]
+    fn established_fast_dispatch_matches_full_dispatch() {
+        type Pool = crate::packet_pool::PacketPool<4, DEFAULT_PACKET_POOL_SLOT_SIZE>;
+        static FAST_POOL: Pool = Pool::new();
+        static SLOW_POOL: Pool = Pool::new();
+        let mut fast = QuicNode::<Pool>::new(&FAST_POOL);
+        let mut slow = QuicNode::<Pool>::new(&SLOW_POOL);
+        let mut bytes = [0u8; crate::DEFAULT_MAX_PACKET_SIZE];
+        let len = crate::encode_bootstrap_open_packet(cid(0x91), 0, &mut bytes).unwrap();
+        for node in [&mut fast, &mut slow] {
+            drop(
+                node.accept_initial(
+                    ingress_meta(),
+                    &bytes[..len],
+                    cid(0x92),
+                    ConnectionLimits::default(),
+                )
+                .unwrap(),
+            );
+        }
+        for packet_number in [0, 1, 1, 2] {
+            let mut len = ShortHeader {
+                flags: FLAG_FIXED,
+                dcid: cid(0x92),
+                packet_number,
+                packet_number_len: 2,
+            }
+            .encode(&mut bytes)
+            .unwrap();
+            len += crate::Frame::Ping.encode(&mut bytes[len..]).unwrap();
+            let packet = || OwnedPacket::new(bytes, 0..len).unwrap();
+            let a = fast
+                .receive_packet(
+                    ingress_meta(),
+                    packet(),
+                    |_| None,
+                    |_, _, _, _, data| Ok(data.len()),
+                )
+                .unwrap();
+            let b = slow
+                .receive_packet_slow(
+                    ingress_meta(),
+                    packet(),
+                    |_| None,
+                    |_, _, _, _, data| Ok(data.len()),
+                )
+                .unwrap();
+            assert!(matches!(a, NodeIngress::Association { .. }));
+            assert!(matches!(b, NodeIngress::Association { .. }));
+            assert_eq!(fast.clock_us, slow.clock_us);
+            assert_eq!(fast.next_local_cid, slow.next_local_cid);
         }
     }
 
@@ -10898,6 +11672,13 @@ mod tests {
         let slow_packet = client_node
             .send_stream_on_path(client, client_path, stream, 8, true, b"two")
             .unwrap();
+        // Check refusal while stream data is actually outstanding. Once
+        // ACKed, close_circuit starts abandonment (and still returns Busy
+        // until that exchange completes), so it is not a read-only probe.
+        assert!(matches!(
+            client_node.close_circuit(client_circuit),
+            Err(QuicNodeEgressError::CircuitBusy)
+        ));
         let sent_bytes = slow_packet.packet.bytes().to_vec();
         assert_ne!(
             ShortHeader::decode(fast_packet.packet.bytes())
@@ -11106,10 +11887,6 @@ mod tests {
                 |_, _, _, _, bytes| Ok(bytes.len()),
             )
             .unwrap();
-        assert!(matches!(
-            client_node.close_circuit(client_circuit),
-            Err(QuicNodeEgressError::CircuitBusy)
-        ));
         assert_eq!(
             Node::slot_path_state(client_node.slot(client).unwrap(), client_path)
                 .unwrap()
@@ -11672,22 +12449,103 @@ mod tests {
         let response = server_node
             .send_stream(server_id, request_stream.unwrap(), 0, true, b"response")
             .unwrap();
+        // Retention pressure after an accepted prefix must neither ACK the
+        // packet nor replay that prefix on retransmission.
+        let response_number = {
+            let endpoint = client_node
+                .client(client_id)
+                .unwrap()
+                .connection()
+                .endpoint()
+                .unwrap();
+            crate::ShortHeader::decode_with_expected(
+                response.packet.bytes(),
+                endpoint.expected_packet_number(),
+            )
+            .unwrap()
+            .0
+            .packet_number
+        };
+        let (response_header, _) =
+            crate::ShortHeader::decode_with_expected(response.packet.bytes(), response_number)
+                .unwrap();
+        let mut coalesced = [0u8; PACKET];
+        let mut coalesced_len = response_header.encode(&mut coalesced).unwrap();
+        for (offset, fin, data) in [(0, false, &b"resp"[..]), (4, true, &b"onse"[..])] {
+            coalesced_len += Frame::Stream(crate::StreamFrame {
+                id: request_stream.unwrap(),
+                offset,
+                fin,
+                data,
+            })
+            .encode(&mut coalesced[coalesced_len..])
+            .unwrap();
+        }
+        let old_limits = client_node
+            .slot(client_id)
+            .unwrap()
+            .client_delivery
+            .limits();
+        client_node
+            .slot_mut(client_id)
+            .unwrap()
+            .client_delivery
+            .set_limits(old_limits.0, 0);
+        let mut accepted_prefix = Vec::new();
+        client_node
+            .receive_packet(
+                client_meta,
+                OwnedPacket::from_buffer(&coalesced[..coalesced_len]),
+                |_| None,
+                |_, _, offset, _, bytes| {
+                    assert_eq!(offset, 0);
+                    accepted_prefix.extend_from_slice(&bytes[..2]);
+                    Ok(2)
+                },
+            )
+            .unwrap();
+        assert_eq!(accepted_prefix, b"re");
+        assert!(
+            !client_node
+                .client(client_id)
+                .unwrap()
+                .connection()
+                .endpoint()
+                .unwrap()
+                .has_received_packet(response_number)
+        );
+        client_node
+            .slot_mut(client_id)
+            .unwrap()
+            .client_delivery
+            .set_limits(old_limits.0, old_limits.1);
         let mut response_body = None;
         client_node
-            .receive_owned_packet(
+            .receive_packet(
                 client_meta,
-                response.packet,
+                OwnedPacket::from_buffer(&coalesced[..coalesced_len]),
                 |_| None,
                 |source, _stream, offset, fin, bytes| {
                     assert_eq!(source, ApplicationStreamSource::Association(client_id));
-                    assert_eq!(offset, 0);
-                    assert!(fin);
-                    response_body = Some(bytes.to_vec());
+                    assert_eq!(offset as usize, accepted_prefix.len());
+                    assert_eq!(fin, offset == 4);
+                    accepted_prefix.extend_from_slice(bytes);
+                    response_body = Some(accepted_prefix.clone());
                     Ok(bytes.len())
                 },
             )
             .unwrap();
         assert_eq!(response_body.as_deref(), Some(b"response".as_slice()));
+        assert!(
+            client_node
+                .client(client_id)
+                .unwrap()
+                .connection()
+                .endpoint()
+                .unwrap()
+                .has_received_packet(response_number)
+        );
+        drop(response);
 
         let client_stream = client_node.allocate_stream(client_id).unwrap();
         assert_eq!(
@@ -11785,6 +12643,10 @@ mod tests {
             ]
         );
 
+        // A Tokio/RTOS owner may have queued this ACK intent before the
+        // application finishes. CLOSE must retire that scheduling state too.
+        client_node.defer_control(client_id).unwrap();
+        assert!(client_node.pending_controls.contains(&client_id));
         let terminal_ack = match client_node.close_association(client_id, 0x77).unwrap() {
             NodeClose::Control(egress) => egress,
             NodeClose::Closed(_) => panic!("terminal response ACK must precede CLOSE"),
@@ -11806,6 +12668,7 @@ mod tests {
         };
         assert!(client_node.client(client_id).is_none());
         assert_eq!(client_node.receive_cid(client_id), None);
+        assert!(!client_node.retry_one_pending_control().unwrap());
         server_node
             .receive_packet(
                 server_meta,
@@ -11816,6 +12679,10 @@ mod tests {
             .unwrap();
         assert!(server_node.server(server_id).is_none());
         assert_eq!(server_node.receive_cid(server_id), None);
+        // Graceful CLOSE must release association storage immediately, not
+        // leave completed endpoints allocated until the idle timeout.
+        assert_eq!(client_node.association_count(), 0);
+        assert_eq!(server_node.association_count(), 0);
     }
 
     #[test]

@@ -333,7 +333,9 @@ impl<const MAX_SLOTS: usize, const MTU: usize> HeapPacketPool<MAX_SLOTS, MTU> {
         // Completion/RX can preempt the resizing owner on a single-core MCU.
         // Never spin here: a contended retired slot is reclaimed by the next
         // owner resize/maintenance pass, including resize to the same capacity.
-        let Some(_guard) = self.try_guard() else { return; };
+        let Some(_guard) = self.try_guard() else {
+            return;
+        };
         if slot >= self.capacity() && self.references[slot].load(Ordering::Acquire) == 0 {
             self.retire_locked(slot);
         }

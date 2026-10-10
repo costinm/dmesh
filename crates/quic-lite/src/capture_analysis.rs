@@ -85,7 +85,11 @@ fn analyze_stream_capture() {
                     _ => unresolved_submissions += 1,
                 }
                 if packet[12] != 1 {
-                    std::println!("SUBMISSION time_us={time} outcome={} bytes={}", packet[12], packet.len() - 20);
+                    std::println!(
+                        "SUBMISSION time_us={time} outcome={} bytes={}",
+                        packet[12],
+                        packet.len() - 20
+                    );
                     continue; // Busy/unresolved attempts are not transmitted packets.
                 }
             } else {
@@ -107,7 +111,11 @@ fn analyze_stream_capture() {
         state.expected = state.expected.max(header.packet_number + 1);
         state.packets += 1;
         state.bytes += payload.len();
-        std::println!("PACKET,{time},{direction},{},{}", header.packet_number, payload.len());
+        std::println!(
+            "PACKET,{time},{direction},{},{}",
+            header.packet_number,
+            payload.len()
+        );
         let mut frame_offset = p;
         let mut ack_eliciting = false;
         while frame_offset < payload.len() {
@@ -169,7 +177,10 @@ fn analyze_stream_capture() {
                     if std::env::var_os("QUIC_ANALYZE_STREAM_PREFIX").is_some()
                         && stream.offset == 0
                     {
-                        let prefix: std::string::String = stream.data.iter().take(96)
+                        let prefix: std::string::String = stream
+                            .data
+                            .iter()
+                            .take(96)
                             .map(|byte| std::format!("{byte:02x}"))
                             .collect();
                         std::println!("STREAM_PREFIX,{time},{direction},{},{prefix}", stream.id);
@@ -205,7 +216,9 @@ fn analyze_stream_capture() {
             }
         }
     }
-    std::println!("CAPTURE accepted_submissions={accepted_submissions} blocked_submissions={blocked_submissions} unresolved_submissions={unresolved_submissions} legacy_submissions={legacy_submissions}");
+    std::println!(
+        "CAPTURE accepted_submissions={accepted_submissions} blocked_submissions={blocked_submissions} unresolved_submissions={unresolved_submissions} legacy_submissions={legacy_submissions}"
+    );
     for (direction, mut state) in directions.into_iter().enumerate() {
         state.ack_elapsed.sort_unstable();
         let percentile = |p: usize| {

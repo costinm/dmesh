@@ -10,6 +10,59 @@ type Pool = PacketPool<16, { quic_lite::DEFAULT_PACKET_POOL_SLOT_SIZE }>;
 type Node = QuicNode<Pool>;
 
 #[tokio::test]
+async fn association_finish_waits_for_retained_close_submission() {
+    use quic_lite::fake::{FakeLinkProfile, FakeNetworkConfig};
+    use std::{sync::{Arc, Mutex}, time::Duration};
+    let client_pool = Box::leak(Box::new(Pool::new()));
+    let server_pool = Box::leak(Box::new(Pool::new()));
+    let (first, second, network) = FakePacketBearer::<Pool>::pair_with_network(
+        BearerName::new("close-client").unwrap(),
+        BearerName::new("close-server").unwrap(),
+        FakeNetworkConfig::default(),
+    );
+    let network = Arc::new(Mutex::new(network));
+    let mut client_node = Node::new(client_pool);
+    let mut server_node = Node::new(server_pool);
+    let bearer = client_node.add_bearer(first).unwrap();
+    server_node.add_bearer(second).unwrap();
+    let (client, client_driver) = TokioNodeDriver::new(client_node, ConnectionLimits::default());
+    let (_server, server_driver) = TokioNodeDriver::new(server_node, ConnectionLimits::default());
+    let scenario = async {
+        let association = client.associate(PacketMeta {
+            bearer, peer_l2_address: PeerL2Address::new(1).unwrap(), received_at_us: 0,
+        }, 0).await.unwrap();
+        association.wait_established().await.unwrap();
+        // Drain handshake control before making the final close unwritable.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        network.lock().unwrap().set_first_to_second_profile(FakeLinkProfile {
+            would_block_every: 1, readiness_delay_us: 1_000,
+            ..FakeLinkProfile::default()
+        });
+        let finish = association.finish();
+        tokio::pin!(finish);
+        assert!(tokio::time::timeout(Duration::from_millis(30), &mut finish).await.is_err(),
+            "finish must not return while its close packet remains unsubmitted");
+        network.lock().unwrap().set_first_to_second_profile(FakeLinkProfile::default());
+        tokio::time::timeout(Duration::from_secs(1), finish).await.unwrap().unwrap();
+    };
+    let pump = async {
+        let started = tokio::time::Instant::now();
+        loop {
+            network.lock().unwrap().advance_to(started.elapsed().as_micros() as u64);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::select! {
+            result = client_driver.run() => panic!("client stopped: {result:?}"),
+            result = server_driver.run() => panic!("server stopped: {result:?}"),
+            () = pump => unreachable!(),
+            () = scenario => {},
+        }
+    }).await.unwrap();
+}
+
+#[tokio::test]
 async fn upload_resumes_after_three_second_peer_pause_and_dropped_replacements() {
     use quic_lite::fake::{FakeLinkProfile, FakeNetworkConfig};
     use std::sync::{Arc, atomic::{AtomicBool, Ordering}};

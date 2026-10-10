@@ -195,7 +195,8 @@ impl<const PACKET: usize> ServerStreamConnection<PACKET> {
             open.max_stream_data,
             open.max_in_flight_packets,
         )?;
-        mux.endpoint.set_peer_datagram_limit(open.max_datagram_frame_size);
+        mux.endpoint
+            .set_peer_datagram_limit(open.max_datagram_frame_size);
         mux.endpoint
             .continue_packet_numbers_from(bootstrap_packet_number.saturating_add(1))
     }
@@ -272,9 +273,9 @@ impl<const PACKET: usize> ServerStreamConnection<PACKET> {
     /// this role-specific operation remains hidden behind that facade.
     pub(crate) fn open_response_stream(&mut self) -> Result<u64, crate::Error> {
         let stream = self.reserve_response_stream();
-        self.mux
-            .endpoint
-            .open_send_stream(stream, crate::INITIAL_MAX_STREAM_DATA)?;
+        // SendFlowControl clamps this to the peer's negotiated stream credit.
+        // The generic default must not cap a larger negotiated window.
+        self.mux.endpoint.open_send_stream(stream, u64::MAX)?;
         Ok(stream)
     }
 
@@ -288,9 +289,7 @@ impl<const PACKET: usize> ServerStreamConnection<PACKET> {
         &mut self,
         stream_id: u64,
     ) -> Result<(), crate::Error> {
-        self.mux
-            .endpoint
-            .open_send_stream(stream_id, crate::INITIAL_MAX_STREAM_DATA)
+        self.mux.endpoint.open_send_stream(stream_id, u64::MAX)
     }
 
     pub(crate) fn receive_stream_events<F>(
@@ -355,6 +354,20 @@ impl<const PACKET: usize> ServerStreamConnection<PACKET> {
     ) -> Result<usize, crate::Error> {
         self.mux
             .encode_response_at_on_path(path_id, stream_id, offset, data, fin, out)
+            .map(|(used, _)| used)
+    }
+
+    pub(crate) fn encode_stream_payload_from_owned_at_on_path(
+        &mut self,
+        path_id: usize,
+        stream_id: u64,
+        offset: u64,
+        fin: bool,
+        packet: crate::OwnedPacket<crate::ErasedPacketBuffer>,
+        out: &mut [u8],
+    ) -> Result<usize, (crate::Error, crate::OwnedPacket<crate::ErasedPacketBuffer>)> {
+        self.mux
+            .encode_response_from_owned_at_on_path(path_id, stream_id, offset, fin, packet, out)
             .map(|(used, _)| used)
     }
 
@@ -1055,7 +1068,7 @@ impl<const PACKET: usize> ClientAssociation<PACKET> {
         stream_id: u64,
     ) -> Result<(), crate::Error> {
         let endpoint = self.connection_mut().endpoint_mut()?;
-        endpoint.open_send_stream(stream_id, crate::INITIAL_MAX_STREAM_DATA)?;
+        endpoint.open_send_stream(stream_id, u64::MAX)?;
         endpoint.prepare_local_bidi_receive(stream_id)
     }
 
@@ -1145,7 +1158,7 @@ impl<const PACKET: usize> ClientAssociation<PACKET> {
         let destination = endpoint
             .peer_connection_id_on_path(path_id)
             .unwrap_or(fallback_destination);
-        endpoint.open_send_stream(stream_id, crate::INITIAL_MAX_STREAM_DATA)?;
+        endpoint.open_send_stream(stream_id, u64::MAX)?;
         let (used, _) = endpoint.encode_stream_packet_on_path(
             path_id,
             destination,
@@ -1156,6 +1169,42 @@ impl<const PACKET: usize> ClientAssociation<PACKET> {
             output,
         )?;
         Ok(used)
+    }
+
+    pub(crate) fn encode_stream_payload_from_owned_at_on_path(
+        &mut self,
+        path_id: usize,
+        stream_id: u64,
+        offset: u64,
+        fin: bool,
+        packet: crate::OwnedPacket<crate::ErasedPacketBuffer>,
+        output: &mut [u8; PACKET],
+    ) -> Result<usize, (crate::Error, crate::OwnedPacket<crate::ErasedPacketBuffer>)> {
+        let connection = self.connection_mut();
+        let fallback_destination = connection
+            .peer_cid()
+            .unwrap_or_else(|| connection.local_cid());
+        let endpoint = match connection.endpoint_mut() {
+            Ok(endpoint) => endpoint,
+            Err(error) => return Err((error, packet)),
+        };
+        let destination = endpoint
+            .peer_connection_id_on_path(path_id)
+            .unwrap_or(fallback_destination);
+        if let Err(error) = endpoint.open_send_stream(stream_id, u64::MAX) {
+            return Err((error, packet));
+        }
+        endpoint
+            .encode_stream_packet_from_owned_on_path(
+                path_id,
+                destination,
+                stream_id,
+                offset,
+                fin,
+                packet,
+                output,
+            )
+            .map(|(used, _)| used)
     }
 
     /// Admit one packet through the bearer-aware association boundary and

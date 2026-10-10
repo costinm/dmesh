@@ -248,6 +248,7 @@ impl<const P: usize> crate::EndpointState<P> {
         let packet_number = self.next_packet_number;
         self.next_packet_number += 1;
         self.sent_packets[slot] = Some(crate::SentPacket {
+            ack_largest_received: None,
             packet_number,
             path_id,
             send_order,

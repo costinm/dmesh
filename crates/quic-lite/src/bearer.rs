@@ -94,7 +94,7 @@
 //! bearer.
 
 use alloc::{boxed::Box, sync::Arc};
-use core::{fmt, ops::Range};
+use core::{fmt, mem::MaybeUninit, ops::Range};
 
 /// Exclusive construction access to one slot owned by a QUIC node's packet pool.
 ///
@@ -354,7 +354,8 @@ pub struct PacketMeta {
     pub bearer: BearerId,
     /// Bearer-assigned peer endpoint handle.
     pub peer_l2_address: PeerL2Address,
-    /// Monotonic receive time in microseconds.
+    /// Monotonic receive time in microseconds in the node's clock domain.
+    /// Zero means unavailable; the node uses its dispatch time instead.
     pub received_at_us: u64,
 }
 
@@ -608,6 +609,128 @@ pub struct OwnedPacket<B> {
     range: Range<usize>,
 }
 
+impl<B: AsRef<[u8]> + Clone> Clone for OwnedPacket<B> {
+    fn clone(&self) -> Self {
+        self.clone_shared()
+    }
+}
+
+/// Small, allocation-free type-erased packet storage used by reliable stream
+/// history when the packet pool's concrete lease type is not known to the
+/// connection state. `OwnedPacket::try_erase` rejects lease types that do not
+/// fit this inline owner; callers can then use the ordinary copying stream
+/// path. This is storage for one lease handle, not for packet bytes.
+#[repr(align(16))]
+pub struct ErasedPacketBuffer {
+    storage: MaybeUninit<[usize; 4]>,
+    vtable: ErasedPacketBufferVTable,
+}
+
+#[derive(Clone, Copy)]
+struct ErasedPacketBufferVTable {
+    drop: unsafe fn(*mut u8),
+    as_ref: unsafe fn(*const u8) -> *const [u8],
+    as_mut: unsafe fn(*mut u8) -> Option<(*mut u8, usize)>,
+    clone: unsafe fn(*const u8, *mut u8),
+}
+
+impl ErasedPacketBuffer {
+    fn can_hold<B>() -> bool {
+        core::mem::size_of::<B>() <= core::mem::size_of::<[usize; 4]>()
+            && core::mem::align_of::<B>() <= core::mem::align_of::<Self>()
+    }
+
+    unsafe fn drop_buffer<B>(storage: *mut u8) {
+        unsafe { storage.cast::<B>().drop_in_place() };
+    }
+
+    unsafe fn buffer_as_ref<B: AsRef<[u8]>>(storage: *const u8) -> *const [u8] {
+        unsafe { &*storage.cast::<B>() }.as_ref()
+    }
+
+    unsafe fn buffer_as_mut<B: PacketBuffer>(storage: *mut u8) -> Option<(*mut u8, usize)> {
+        unsafe { &mut *storage.cast::<B>() }
+            .as_mut_unique()
+            .map(|bytes| (bytes.as_mut_ptr(), bytes.len()))
+    }
+
+    unsafe fn clone_buffer<B: Clone>(source: *const u8, destination: *mut u8) {
+        unsafe {
+            destination
+                .cast::<B>()
+                .write((&*source.cast::<B>()).clone())
+        };
+    }
+
+    unsafe fn new<B: PacketBuffer + Send + Clone + 'static>(buffer: B) -> Self {
+        debug_assert!(Self::can_hold::<B>());
+        let vtable = ErasedPacketBufferVTable {
+            drop: Self::drop_buffer::<B>,
+            as_ref: Self::buffer_as_ref::<B>,
+            as_mut: Self::buffer_as_mut::<B>,
+            clone: Self::clone_buffer::<B>,
+        };
+        let mut erased = Self {
+            storage: MaybeUninit::uninit(),
+            vtable,
+        };
+        unsafe { erased.storage.as_mut_ptr().cast::<B>().write(buffer) };
+        erased
+    }
+
+    fn storage_ptr(&self) -> *const u8 {
+        self.storage.as_ptr().cast()
+    }
+
+    fn storage_mut_ptr(&mut self) -> *mut u8 {
+        self.storage.as_mut_ptr().cast()
+    }
+}
+
+impl Clone for ErasedPacketBuffer {
+    fn clone(&self) -> Self {
+        let mut cloned = Self {
+            storage: MaybeUninit::uninit(),
+            vtable: self.vtable,
+        };
+        unsafe {
+            (self.vtable.clone)(self.storage_ptr(), cloned.storage_mut_ptr());
+        }
+        cloned
+    }
+}
+
+impl fmt::Debug for ErasedPacketBuffer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ErasedPacketBuffer")
+            .field("bytes", &self.as_ref().len())
+            .finish()
+    }
+}
+
+impl Drop for ErasedPacketBuffer {
+    fn drop(&mut self) {
+        unsafe { (self.vtable.drop)(self.storage_mut_ptr()) };
+    }
+}
+
+impl AsRef<[u8]> for ErasedPacketBuffer {
+    fn as_ref(&self) -> &[u8] {
+        unsafe { &*(self.vtable.as_ref)(self.storage_ptr()) }
+    }
+}
+
+impl PacketBuffer for ErasedPacketBuffer {
+    fn as_mut_unique(&mut self) -> Option<&mut [u8]> {
+        let (bytes, len) = unsafe { (self.vtable.as_mut)(self.storage_mut_ptr()) }?;
+        Some(unsafe { core::slice::from_raw_parts_mut(bytes, len) })
+    }
+}
+
+// Erasure is only constructed for `B: Send`; the inline owner moves with its
+// single packet lease and never exposes a second reference to that lease.
+unsafe impl Send for ErasedPacketBuffer {}
+
 impl<B: AsRef<[u8]>> OwnedPacket<B> {
     /// Wrap a pool slot and select the exact QUIC packet within it.
     ///
@@ -618,6 +741,19 @@ impl<B: AsRef<[u8]>> OwnedPacket<B> {
             Ok(Self { buffer, range })
         } else {
             Err(buffer)
+        }
+    }
+
+    /// Share this lease's immutable backing storage while preserving its
+    /// packet range. The returned packet cannot be mutated through
+    /// [`Self::bytes_mut_unique`] until every shared lease is dropped.
+    pub fn clone_shared(&self) -> Self
+    where
+        B: Clone,
+    {
+        Self {
+            buffer: self.buffer.clone(),
+            range: self.range.clone(),
         }
     }
 
@@ -681,6 +817,19 @@ impl<B: PacketBuffer> OwnedPacket<B> {
     }
 }
 
+impl<B: PacketBuffer + Send + Clone + 'static> OwnedPacket<B> {
+    /// Erase a small packet-pool lease without allocating. On failure the
+    /// unchanged packet is returned so a caller may fall back to byte writes.
+    pub fn try_erase(self) -> Result<OwnedPacket<ErasedPacketBuffer>, Self> {
+        if !ErasedPacketBuffer::can_hold::<B>() {
+            return Err(self);
+        }
+        let (buffer, range) = self.into_parts();
+        let erased = unsafe { ErasedPacketBuffer::new(buffer) };
+        Ok(OwnedPacket::new(erased, range).expect("erasure preserves packet range"))
+    }
+}
+
 impl<B: AsRef<[u8]>> AsRef<[u8]> for OwnedPacket<B> {
     fn as_ref(&self) -> &[u8] {
         self.bytes()
@@ -734,10 +883,12 @@ struct CallbackSlots<T> {
 impl<T> CallbackSlots<T> {
     fn new(capacity: usize) -> Self {
         Self {
-            slots: (0..capacity).map(|_| CallbackSlot {
-                state: core::sync::atomic::AtomicU8::new(SLOT_EMPTY),
-                value: core::cell::UnsafeCell::new(core::mem::MaybeUninit::uninit()),
-            }).collect(),
+            slots: (0..capacity)
+                .map(|_| CallbackSlot {
+                    state: core::sync::atomic::AtomicU8::new(SLOT_EMPTY),
+                    value: core::cell::UnsafeCell::new(core::mem::MaybeUninit::uninit()),
+                })
+                .collect(),
             cursor: core::sync::atomic::AtomicUsize::new(0),
         }
     }
@@ -745,9 +896,20 @@ impl<T> CallbackSlots<T> {
     fn push(&self, value: T) -> Result<(), T> {
         use core::sync::atomic::Ordering;
         for slot in &self.slots {
-            if slot.state.compare_exchange(SLOT_EMPTY, SLOT_WRITING, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            if slot
+                .state
+                .compare_exchange(
+                    SLOT_EMPTY,
+                    SLOT_WRITING,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
                 // This producer exclusively owns the uninitialized storage.
-                unsafe { (*slot.value.get()).write(value); }
+                unsafe {
+                    (*slot.value.get()).write(value);
+                }
                 slot.state.store(SLOT_READY, Ordering::Release);
                 return Ok(());
             }
@@ -761,11 +923,21 @@ impl<T> CallbackSlots<T> {
         for offset in 0..self.slots.len() {
             let index = (start + offset) % self.slots.len();
             let slot = &self.slots[index];
-            if slot.state.compare_exchange(SLOT_READY, SLOT_READING, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            if slot
+                .state
+                .compare_exchange(
+                    SLOT_READY,
+                    SLOT_READING,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
                 // This consumer exclusively owns the initialized value.
                 let value = unsafe { (*slot.value.get()).assume_init_read() };
                 slot.state.store(SLOT_EMPTY, Ordering::Release);
-                self.cursor.store((index + 1) % self.slots.len(), Ordering::Relaxed);
+                self.cursor
+                    .store((index + 1) % self.slots.len(), Ordering::Relaxed);
                 return Some(value);
             }
         }
@@ -787,7 +959,9 @@ impl<B> CompletionQueue<B> {
         assert!(capacity != 0, "completion queue capacity must be nonzero");
         Self {
             completions: CallbackSlots::new(capacity),
-            ready: (0..capacity).map(|_| core::sync::atomic::AtomicU16::new(0)).collect(),
+            ready: (0..capacity)
+                .map(|_| core::sync::atomic::AtomicU16::new(0))
+                .collect(),
             #[cfg(feature = "tokio")]
             changed: ::tokio::sync::Notify::new(),
             #[cfg(feature = "tokio")]
@@ -799,9 +973,23 @@ impl<B> CompletionQueue<B> {
         self.completions.pop()
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_events_for_test(&self) -> bool {
+        use core::sync::atomic::Ordering;
+        self.ready
+            .iter()
+            .any(|slot| slot.load(Ordering::Acquire) != 0)
+            || self
+                .completions
+                .slots
+                .iter()
+                .any(|slot| slot.state.load(Ordering::Acquire) == SLOT_READY)
+    }
+
     pub(crate) fn pop_ready(&self) -> Option<BearerId> {
         for slot in &self.ready {
-            if let Some(bearer) = BearerId::new(slot.swap(0, core::sync::atomic::Ordering::AcqRel)) {
+            if let Some(bearer) = BearerId::new(slot.swap(0, core::sync::atomic::Ordering::AcqRel))
+            {
                 return Some(bearer);
             }
         }
@@ -844,11 +1032,17 @@ impl<B: Send> PacketEgressEvents<B> for CompletionQueue<B> {
         let mut published = false;
         for slot in &self.ready {
             match slot.compare_exchange(0, bearer.value(), Ordering::Release, Ordering::Relaxed) {
-                Ok(_) => { published = true; break; }
+                Ok(_) => {
+                    published = true;
+                    break;
+                }
                 // Readiness is a level, not an ownership-bearing packet event.
                 // Coalesce repeats so callbacks cannot fill the mailbox with
                 // duplicates while the owner is preempted.
-                Err(known) if known == bearer.value() => { published = true; break; }
+                Err(known) if known == bearer.value() => {
+                    published = true;
+                    break;
+                }
                 Err(_) => {}
             }
         }
@@ -969,7 +1163,9 @@ impl<B: AsRef<[u8]>> RegisteredBearer<B> {
 
     #[cfg(feature = "tokio")]
     pub(crate) fn pending_packet_bytes(&self) -> Option<&[u8]> {
-        self.pending.as_ref().map(|(_, submission, _)| submission.packet().bytes())
+        self.pending
+            .as_ref()
+            .map(|(_, submission, _)| submission.packet().bytes())
     }
 
     /// Enable or disable this bearer without disturbing the QUIC owner.
@@ -1402,8 +1598,8 @@ mod tests {
 
     #[test]
     fn completion_callback_can_preempt_the_consumer_without_waiting_or_losing_lease() {
-        use core::sync::atomic::Ordering;
         use crate::{PacketPool as _, PacketWriter as _};
+        use core::sync::atomic::Ordering;
         type Pool = crate::packet_pool::PacketPool<2, 128>;
         let pool = Box::leak(Box::new(Pool::new()));
         let events = Arc::new(CompletionQueue::new(2));
@@ -1416,12 +1612,18 @@ mod tests {
         // Freeze a lower-priority consumer in its critical section. Invoking
         // the higher-priority callback synchronously models a single CPU:
         // the consumer cannot resume until the callback has returned.
-        events.completions.slots[0].state.store(SLOT_READING, Ordering::Release);
+        events.completions.slots[0]
+            .state
+            .store(SLOT_READING, Ordering::Release);
         events.send_ready(bearer);
         let suspended_ready = events.pop_ready().unwrap();
         EgressSubmission::new(bearer, packet, events.clone()).complete(PacketSendOutcome::Sent, 17);
         events.send_ready(bearer);
-        assert_eq!(pool.available(), 1, "callback retains the original pool lease");
+        assert_eq!(
+            pool.available(),
+            1,
+            "callback retains the original pool lease"
+        );
         let completion = events.pop_completion().unwrap();
         assert_eq!(completion.packet.bytes().as_ptr(), address);
         assert_eq!(completion.packet.bytes(), &[1, 2, 3]);
@@ -1431,14 +1633,18 @@ mod tests {
         assert!(events.pop_completion().is_none());
         drop(completion);
         assert_eq!(pool.available(), 2);
-        events.completions.slots[0].state.store(SLOT_EMPTY, Ordering::Release);
+        events.completions.slots[0]
+            .state
+            .store(SLOT_EMPTY, Ordering::Release);
     }
 
     #[test]
     fn repeated_readiness_coalesces_without_losing_a_post_consume_notification() {
         let events = CompletionQueue::<[u8; 1]>::new(1);
         let bearer = BearerId::new(1).unwrap();
-        for _ in 0..100 { events.send_ready(bearer); }
+        for _ in 0..100 {
+            events.send_ready(bearer);
+        }
         assert_eq!(events.pop_ready(), Some(bearer));
         // The owner may be preempted after atomically taking the old event.
         events.send_ready(bearer);
@@ -1453,7 +1659,9 @@ mod tests {
         let second = BearerId::new(2).unwrap();
         events.send_ready(first);
         events.send_ready(second);
-        for _ in 0..100 { events.send_ready(second); }
+        for _ in 0..100 {
+            events.send_ready(second);
+        }
         assert_eq!(events.pop_ready(), Some(first));
         assert_eq!(events.pop_ready(), Some(second));
         assert_eq!(events.pop_ready(), None);
@@ -1470,7 +1678,9 @@ mod tests {
         assert_eq!(slots.push(47), Err(47));
         assert_eq!(slots.pop(), Some(31));
         assert_eq!(slots.pop(), None);
-        unsafe { (*slots.slots[0].value.get()).write(19); }
+        unsafe {
+            (*slots.slots[0].value.get()).write(19);
+        }
         slots.slots[0].state.store(SLOT_READY, Ordering::Release);
         assert_eq!(slots.pop(), Some(19));
         assert_eq!(slots.push(47), Ok(()));
@@ -1481,7 +1691,9 @@ mod tests {
     fn callback_slots_drop_queued_values_once() {
         struct CountDrop(Arc<core::sync::atomic::AtomicUsize>);
         impl Drop for CountDrop {
-            fn drop(&mut self) { self.0.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
+            fn drop(&mut self) {
+                self.0.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
         }
         let dropped = Arc::new(core::sync::atomic::AtomicUsize::new(0));
         let slots = CallbackSlots::new(2);
@@ -1497,30 +1709,39 @@ mod tests {
     #[test]
     fn callback_slots_concurrent_producers_return_every_value_once() {
         let slots = Arc::new(CallbackSlots::new(8));
-        let threads: alloc::vec::Vec<_> = (0..4).map(|producer| {
-            let slots = slots.clone();
-            std::thread::spawn(move || {
-                for index in 0..1024 {
-                    let mut value = producer * 1024 + index;
-                    loop {
-                        match slots.push(value) {
-                            Ok(()) => break,
-                            Err(retained) => { value = retained; std::thread::yield_now(); }
+        let threads: alloc::vec::Vec<_> = (0..4)
+            .map(|producer| {
+                let slots = slots.clone();
+                std::thread::spawn(move || {
+                    for index in 0..1024 {
+                        let mut value = producer * 1024 + index;
+                        loop {
+                            match slots.push(value) {
+                                Ok(()) => break,
+                                Err(retained) => {
+                                    value = retained;
+                                    std::thread::yield_now();
+                                }
+                            }
                         }
                     }
-                }
+                })
             })
-        }).collect();
+            .collect();
         let mut seen = [false; 4096];
         for _ in 0..seen.len() {
             let value = loop {
-                if let Some(value) = slots.pop() { break value; }
+                if let Some(value) = slots.pop() {
+                    break value;
+                }
                 std::thread::yield_now();
             };
             assert!(!seen[value], "duplicate completion");
             seen[value] = true;
         }
-        for thread in threads { thread.join().unwrap(); }
+        for thread in threads {
+            thread.join().unwrap();
+        }
         assert!(seen.iter().all(|seen| *seen));
         assert!(slots.pop().is_none());
     }
@@ -1534,6 +1755,35 @@ mod tests {
             .copy_from_slice(&[7, 8, 9]);
         assert_eq!(packet.bytes(), &[7, 8, 9]);
         assert_eq!(packet.into_buffer(), [1, 7, 8, 9, 5]);
+    }
+
+    #[test]
+    fn shared_packet_clone_preserves_the_exact_range() {
+        let packet = OwnedPacket::new(vec![1, 2, 3, 4, 5], 1..4).unwrap();
+        let shared = packet.clone_shared();
+        assert_eq!(shared.packet_range(), 1..4);
+        assert_eq!(shared.bytes(), &[2, 3, 4]);
+        assert_eq!(packet.bytes(), shared.bytes());
+    }
+
+    #[test]
+    fn packet_lease_erasure_preserves_bytes_range_and_mutability_without_copy() {
+        let packet = OwnedPacket::new(vec![9, 1, 2, 3, 8], 1..4).unwrap();
+        let mut erased = packet
+            .try_erase()
+            .ok()
+            .expect("Vec lease fits inline owner");
+        assert_eq!(erased.packet_range(), 1..4);
+        assert_eq!(erased.bytes(), &[1, 2, 3]);
+        erased.bytes_mut_unique().unwrap()[1] = 7;
+        assert_eq!(erased.bytes(), &[1, 7, 3]);
+        assert_eq!(erased.into_buffer().as_ref(), &[9, 1, 7, 3, 8]);
+
+        let packet = OwnedPacket::new([0u8; 64], 0..64).unwrap();
+        match packet.try_erase() {
+            Err(packet) => assert_eq!(packet.bytes().len(), 64),
+            Ok(_) => panic!("large lease should fall back to borrowed writes"),
+        }
     }
 
     #[test]

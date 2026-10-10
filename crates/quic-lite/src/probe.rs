@@ -259,7 +259,11 @@ impl PayloadPattern {
     }
 
     fn next_byte(&mut self) -> u8 {
-        let byte = if self.within < 4 { self.header[self.within] } else { self.byte };
+        let byte = if self.within < 4 {
+            self.header[self.within]
+        } else {
+            self.byte
+        };
         self.byte = self.byte.wrapping_add(1);
         self.within += 1;
         if self.within == self.packet_size {
@@ -303,8 +307,33 @@ impl ProbePayload {
             .unwrap_or(usize::MAX)
             .min(out.len());
         let mut pattern = PayloadPattern::new(self.offset, self.packet_size);
-        for byte in &mut out[..count] {
-            *byte = pattern.next_byte();
+        let mut remaining = &mut out[..count];
+        while !remaining.is_empty() {
+            // Split at header and packet boundaries once per run, rather
+            // than testing both conditions for every ordinary payload byte.
+            let limit = if pattern.within < 4 {
+                4
+            } else {
+                pattern.packet_size
+            };
+            let run = remaining.len().min(limit - pattern.within);
+            let (part, rest) = remaining.split_at_mut(run);
+            if pattern.within < 4 {
+                part.copy_from_slice(&pattern.header[pattern.within..pattern.within + run]);
+                pattern.byte = pattern.byte.wrapping_add(run as u8);
+            } else {
+                for byte in part {
+                    *byte = pattern.byte;
+                    pattern.byte = pattern.byte.wrapping_add(1);
+                }
+            }
+            pattern.within += run;
+            if pattern.within == pattern.packet_size {
+                pattern.within = 0;
+                pattern.packet = pattern.packet.saturating_add(1);
+                pattern.header = pattern.packet.to_be_bytes();
+            }
+            remaining = rest;
         }
         self.offset += count as u64;
         count
@@ -312,13 +341,21 @@ impl ProbePayload {
 
     /// Check the next received payload bytes against the pattern.
     pub fn check(&mut self, bytes: &[u8]) -> Result<(), ProbeError> {
+        self.consume(bytes, true)
+    }
+
+    /// Count received bytes, optionally checking the deterministic pattern.
+    /// Range checks remain enabled regardless of payload verification.
+    pub fn consume(&mut self, bytes: &[u8], verify: bool) -> Result<(), ProbeError> {
         if bytes.len() as u64 > self.total - self.offset {
             return Err(ProbeError::UnexpectedRange);
         }
-        let mut pattern = PayloadPattern::new(self.offset, self.packet_size);
-        for byte in bytes {
-            if *byte != pattern.next_byte() {
-                return Err(ProbeError::InvalidPayload);
+        if verify {
+            let mut pattern = PayloadPattern::new(self.offset, self.packet_size);
+            for byte in bytes {
+                if *byte != pattern.next_byte() {
+                    return Err(ProbeError::InvalidPayload);
+                }
             }
         }
         self.offset += bytes.len() as u64;
@@ -623,14 +660,16 @@ mod tests {
     fn payload_pattern_matches_bytewise_reference_at_packet_and_chunk_boundaries() {
         const TOTAL: usize = 8193;
         for packet_size in [4usize, 5, 127, 1024, 1036, 16384] {
-            let reference: std::vec::Vec<u8> = (0..TOTAL).map(|position| {
-                let within = position % packet_size;
-                if within < 4 {
-                    ((position / packet_size) as u32).to_be_bytes()[within]
-                } else {
-                    position as u8
-                }
-            }).collect();
+            let reference: std::vec::Vec<u8> = (0..TOTAL)
+                .map(|position| {
+                    let within = position % packet_size;
+                    if within < 4 {
+                        ((position / packet_size) as u32).to_be_bytes()[within]
+                    } else {
+                        position as u8
+                    }
+                })
+                .collect();
             for chunk_size in [1usize, 3, 4, 7, 1023, 1024, 1036, 2049] {
                 let mut sender = ProbePayload::new(TOTAL as u64, packet_size).unwrap();
                 let mut generated = [0; TOTAL];
@@ -651,6 +690,25 @@ mod tests {
                 assert_eq!(receiver.offset(), 5);
                 receiver.check(&reference[5..13]).unwrap();
             }
+        }
+    }
+
+    #[test]
+    fn payload_fill_preserves_unused_output_and_empty_read_position() {
+        for packet_size in [4, 5, 256, 1024] {
+            let mut payload = ProbePayload::new(259, packet_size).unwrap();
+            assert_eq!(payload.fill(&mut []), 0);
+            assert_eq!(payload.offset(), 0);
+            let mut output = [0xAA; 300];
+            assert_eq!(payload.fill(&mut output), 259);
+            assert!(payload.is_complete());
+            assert_eq!(&output[259..], &[0xAA; 41]);
+            let before = output;
+            assert_eq!(payload.fill(&mut output), 0);
+            assert_eq!(output, before);
+            let mut receiver = ProbePayload::new(259, packet_size).unwrap();
+            receiver.check(&output[..259]).unwrap();
+            assert!(receiver.is_complete());
         }
     }
 

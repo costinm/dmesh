@@ -615,8 +615,13 @@ impl AsyncRead for TokioStream {
             match self.incoming.poll_recv(context) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(None) => {
-                    self.read_finished = true;
-                    return Poll::Ready(Ok(()));
+                    // Dropping a route on reset/idle timeout is not a peer FIN.
+                    // Returning EOF here would make a truncated response look
+                    // like a successfully completed ordinary byte stream.
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "QUIC stream ended without peer FIN",
+                    )));
                 }
                 Poll::Ready(Some(chunk)) => {
                     self.read_bytes = chunk.bytes;
@@ -716,6 +721,7 @@ struct StreamRoute {
 struct PendingWrite {
     stream: Arc<Mutex<QuicStream>>,
     bytes: Vec<u8>,
+    sent: usize,
     fin: bool,
     partial: bool,
     reply: oneshot::Sender<Result<usize, QuicNodeEgressError>>,
@@ -748,6 +754,10 @@ pub struct TokioNodeDriver<
     pending_opens: Vec<PendingOpen>,
     finish_waiters: Vec<(
         QuicAssociation,
+        oneshot::Sender<Result<(), QuicNodeEgressError>>,
+    )>,
+    close_submission_waiters: Vec<(
+        crate::BearerId,
         oneshot::Sender<Result<(), QuicNodeEgressError>>,
     )>,
     closing_associations: Vec<QuicAssociation>,
@@ -786,6 +796,7 @@ where
                 pending_writes: Vec::new(),
                 pending_opens: Vec::new(),
                 finish_waiters: Vec::new(),
+                close_submission_waiters: Vec::new(),
                 closing_associations: Vec::new(),
             },
         )
@@ -804,7 +815,9 @@ where
             self.retry_pending_writes();
             self.retry_finishes();
             // An already queued normal/high command precedes low output.
-            if self.commands.is_empty() { self.dispatch_datagrams(false); }
+            if self.commands.is_empty() {
+                self.dispatch_datagrams(false);
+            }
             // The driver owns every node timer (pacing, loss, ACK delay, PTO,
             // idle). Without one, a send that pacing defers after the initial
             // burst would never be retried while the driver waits for packets
@@ -844,7 +857,7 @@ where
                     self.handle_command(command)?;
                 }
                 event = core::future::poll_fn(|context| {
-                    self.node.poll_one_event(context, Some(self.limits))
+                    self.node.poll_one_event_at(context, Some(self.limits), fresh_now())
                 }) => {
                     if let Err(error) = event {
                         // A socket or pool that is momentarily full is not a
@@ -857,7 +870,11 @@ where
                     }
                 }
                 () = &mut timer => {
-                    let now = deadline.unwrap_or(now);
+                    // Polling ingress can advance the node beyond the deadline
+                    // captured above. Dispatch with the current clock, otherwise
+                    // an immediate recovery deadline keeps moving ahead of the
+                    // stale timestamp passed to timer_expired and never runs.
+                    let now = fresh_now().max(self.node.clock_us());
                     self.node.advance_clock(now);
                     match self.node.timer_expired(now) {
                         Ok(Some(crate::node::NodeTimer::Egress(packet))) => {
@@ -972,7 +989,9 @@ where
                 if let Ok(request) = request.downcast::<datagram::DatagramCommand<P::Buffer>>() {
                     if request.priority == crate::DatagramPriority::High {
                         self.high_datagrams.push_back(*request);
-                    } else { self.low_datagrams.push_back(*request); }
+                    } else {
+                        self.low_datagrams.push_back(*request);
+                    }
                 }
             }
             DriverCommand::DatagramHandler { register, reply } => {
@@ -1042,7 +1061,11 @@ where
                 now_us,
                 reply,
             } => {
-                let _ = reply.send(self.node.add_direct_circuit(association, next_hop, now_us.max(clock)));
+                let _ = reply.send(self.node.add_direct_circuit(
+                    association,
+                    next_hop,
+                    now_us.max(clock),
+                ));
             }
             DriverCommand::RetryDirectCircuit { circuit, reply } => {
                 let _ = reply.send(self.node.retry_direct_circuit(circuit));
@@ -1056,7 +1079,10 @@ where
                 now_us,
                 reply,
             } => {
-                let _ = reply.send(self.node.resume_circuit(circuit, next_hop, now_us.max(clock)));
+                let _ = reply.send(
+                    self.node
+                        .resume_circuit(circuit, next_hop, now_us.max(clock)),
+                );
             }
             DriverCommand::CloseCircuit { circuit, reply } => {
                 let _ = reply.send(self.node.close_circuit(circuit));
@@ -1084,6 +1110,7 @@ where
                 self.try_write(PendingWrite {
                     stream,
                     bytes,
+                    sent: 0,
                     fin,
                     partial,
                     reply,
@@ -1108,28 +1135,34 @@ where
         self.establishment_waiters = pending;
     }
 
-    fn try_write(&mut self, pending: PendingWrite) {
+    fn try_write(&mut self, mut pending: PendingWrite) {
         let result = {
             let mut stream = pending
                 .stream
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            if pending.fin && !pending.bytes.is_empty() {
-                self.node
-                    .write_stream_packet(&mut stream, &pending.bytes, true)
-                    .map(|()| pending.bytes.len())
+            let bytes = &pending.bytes[pending.sent..];
+            if pending.fin && !bytes.is_empty() {
+                self.node.write_stream_and_finish(&mut stream, bytes)
             } else if pending.fin {
                 self.node.finish_stream(&mut stream).map(|()| 0)
-            } else if pending.partial {
-                self.node.write_stream(&mut stream, &pending.bytes)
+            } else if !bytes.is_empty() {
+                self.node.write_stream(&mut stream, bytes)
             } else {
-                self.node
-                    .write_stream_packet(&mut stream, &pending.bytes, false)
-                    .map(|()| pending.bytes.len())
+                Ok(0)
             }
         };
         if matches!(&result, Err(error) if error.is_retryable()) {
             self.pending_writes.push(pending);
+        } else if let Ok(count) = result {
+            pending.sent += count;
+            if !pending.partial && pending.sent < pending.bytes.len() {
+                // Keep ownership of the original allocation; a cursor avoids
+                // copying or reallocating the suffix after a partial send.
+                self.pending_writes.push(pending);
+            } else {
+                let _ = pending.reply.send(Ok(pending.sent));
+            }
         } else {
             let _ = pending.reply.send(result);
         }
@@ -1163,6 +1196,19 @@ where
     }
 
     fn retry_finishes(&mut self) {
+        for (bearer, reply) in core::mem::take(&mut self.close_submission_waiters) {
+            match self.node.bearers.get_mut(bearer) {
+                Some(entry) if entry.has_pending_submission() => {
+                    self.close_submission_waiters.push((bearer, reply));
+                }
+                Some(_) => {
+                    let _ = reply.send(Ok(()));
+                }
+                None => {
+                    let _ = reply.send(Err(QuicNodeEgressError::MissingBearer));
+                }
+            }
+        }
         for (association, reply) in core::mem::take(&mut self.finish_waiters) {
             match self.node.close_association(association, 0) {
                 Ok(crate::node::NodeClose::Control(packet)) => {
@@ -1177,7 +1223,22 @@ where
                     }
                 }
                 Ok(crate::node::NodeClose::Closed(packet)) => {
-                    let _ = reply.send(self.node.submit_node_packet(packet));
+                    let bearer = packet.bearer;
+                    let result = self.node.submit_node_packet(packet);
+                    // CLOSE has retired the association, but WouldBlock may
+                    // still leave its exact packet in the bearer retry slot.
+                    // Do not let a one-shot client cancel its driver yet.
+                    if result.is_ok()
+                        && self
+                            .node
+                            .bearers
+                            .get_mut(bearer)
+                            .is_some_and(|entry| entry.has_pending_submission())
+                    {
+                        self.close_submission_waiters.push((bearer, reply));
+                    } else {
+                        let _ = reply.send(result);
+                    }
                 }
                 Err(error) if error.is_retryable() => {
                     self.finish_waiters.push((association, reply));
@@ -1357,7 +1418,11 @@ impl PacketCapture {
     }
 
     pub(crate) fn from_env() -> Option<Self> {
-        let path = std::env::var_os(PACKET_CAPTURE_ENV)?;
+        Self::from_env_named(PACKET_CAPTURE_ENV)
+    }
+
+    pub(crate) fn from_env_named(name: &str) -> Option<Self> {
+        let path = std::env::var_os(name)?;
         match File::create(&path).and_then(|mut file| {
             file.write_all(&0xa1b2_c3d4_u32.to_le_bytes())?;
             file.write_all(&2_u16.to_le_bytes())?;
@@ -1388,13 +1453,41 @@ impl PacketCapture {
     }
 
     fn write_record(&self, ingress: bool, bearer: BearerId, packet: &[u8]) -> io::Result<()> {
-        self.write_record_with_outcome(ingress, bearer, packet, 0).map(|_| ())
+        self.write_record_with_outcome(ingress, bearer, packet, 0)
+            .map(|_| ())
     }
 
-    fn write_record_with_outcome(&self, ingress: bool, bearer: BearerId, packet: &[u8], outcome: u8) -> io::Result<u64> {
+    fn write_record_with_outcome(
+        &self,
+        ingress: bool,
+        bearer: BearerId,
+        packet: &[u8],
+        outcome: u8,
+    ) -> io::Result<u64> {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
+        self.write_record_at(ingress, bearer, packet, outcome, timestamp)
+    }
+
+    pub(crate) fn record_kernel_receive(
+        &self,
+        bearer: BearerId,
+        packet: &[u8],
+        timestamp: std::time::Duration,
+    ) {
+        // Supplemental diagnostics must never change packet admission.
+        let _ = self.write_record_at(true, bearer, packet, 0, timestamp);
+    }
+
+    fn write_record_at(
+        &self,
+        ingress: bool,
+        bearer: BearerId,
+        packet: &[u8],
+        outcome: u8,
+        timestamp: std::time::Duration,
+    ) -> io::Result<u64> {
         let packet_len = SLL2_HEADER_LEN
             .checked_add(packet.len())
             .and_then(|len| u32::try_from(len).ok())
@@ -1423,16 +1516,267 @@ impl PacketCapture {
 mod packet_loss_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn driver_loss_without_peer_fin_is_not_clean_eof() {
+        ::tokio::task::LocalSet::new()
+            .run_until(async {
+                use crate::{BearerName, PacketMeta, PeerL2Address, fake::FakePacketBearer};
+                use ::tokio::io::{AsyncReadExt, AsyncWriteExt};
+                type Pool =
+                    crate::packet_pool::PacketPool<16, { crate::DEFAULT_PACKET_POOL_SLOT_SIZE }>;
+                let ap = Box::leak(Box::new(Pool::new()));
+                let bp = Box::leak(Box::new(Pool::new()));
+                let (first, second) = FakePacketBearer::<Pool>::pair(
+                    BearerName::new("client").unwrap(),
+                    BearerName::new("server").unwrap(),
+                );
+                let mut an = QuicNode::<Pool>::new(ap);
+                let mut bn = QuicNode::<Pool>::new(bp);
+                let bearer = an.add_bearer(first).unwrap();
+                bn.add_bearer(second).unwrap();
+                let limits = crate::ConnectionLimits::default();
+                let (a, ad) = TokioNodeDriver::new(an, limits);
+                let (b, bd) = TokioNodeDriver::new(bn, limits);
+                let at = ::tokio::task::spawn_local(ad.run());
+                let bt = ::tokio::task::spawn_local(bd.run());
+                let association = a
+                    .associate(
+                        PacketMeta {
+                            bearer,
+                            peer_l2_address: PeerL2Address::new(1).unwrap(),
+                            received_at_us: 0,
+                        },
+                        0,
+                    )
+                    .await
+                    .unwrap();
+                association.wait_established().await.unwrap();
+                let mut stream = association.open_stream().await.unwrap();
+                stream.write_all(b"request").await.unwrap();
+                stream.shutdown().await.unwrap();
+                let mut server = b.accept_stream().await.unwrap();
+                server.write_all(b"partial").await.unwrap();
+                server.flush().await.unwrap();
+                let mut prefix = [0; 7];
+                stream.read_exact(&mut prefix).await.unwrap();
+                assert_eq!(&prefix, b"partial");
+                // Simulate terminal driver/route loss after response bytes but before
+                // FIN. Buffered bytes remain readable; termination must be an error.
+                at.abort();
+                let _ = at.await;
+                let error = stream.read_to_end(&mut Vec::new()).await.unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+                bt.abort();
+                let _ = bt.await;
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn buffered_async_write_crosses_a_sub_packet_receive_window() {
+        sub_packet_window_transfer(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn buffered_duplex_writes_cross_sub_packet_receive_windows() {
+        sub_packet_window_transfer(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn buffered_duplex_small_windows_recover_delay_and_burst_loss() {
+        sub_packet_window_transfer(true, true).await;
+    }
+
+    async fn sub_packet_window_transfer(duplex: bool, impaired: bool) {
+        use crate::{
+            AssociationLimits, BearerName, PacketMeta, PeerL2Address, fake::FakePacketBearer,
+        };
+        use ::tokio::io::{AsyncReadExt, AsyncWriteExt};
+        type Pool = crate::packet_pool::PacketPool<16, { crate::DEFAULT_PACKET_POOL_SLOT_SIZE }>;
+        let ap = Box::leak(Box::new(Pool::new()));
+        let bp = Box::leak(Box::new(Pool::new()));
+        let (first, second, mut network) = if impaired {
+            use crate::fake::{FakeLinkProfile, FakeNetworkConfig};
+            let profile = FakeLinkProfile {
+                latency_us: 20_000,
+                jitter_us: 5_000,
+                loss_burst_start_packet: 4,
+                loss_burst_packets: 2,
+                seed: 1234,
+                ..FakeLinkProfile::default()
+            };
+            let (first, second, network) = FakePacketBearer::<Pool>::pair_with_network(
+                BearerName::new("client").unwrap(),
+                BearerName::new("server").unwrap(),
+                FakeNetworkConfig {
+                    first_to_second: profile,
+                    second_to_first: profile,
+                    ..FakeNetworkConfig::default()
+                },
+            );
+            (first, second, Some(network))
+        } else {
+            let (first, second) = FakePacketBearer::<Pool>::pair(
+                BearerName::new("client").unwrap(),
+                BearerName::new("server").unwrap(),
+            );
+            (first, second, None)
+        };
+        let limits = crate::ConnectionLimits::with_receive_profile(1688, 844, 4);
+        let captures = [first.sent_packets(), second.sent_packets()];
+        let mut a = QuicNode::<Pool>::new(ap);
+        let mut b = QuicNode::<Pool>::new(bp);
+        for node in [&mut a, &mut b] {
+            let mut policy = AssociationLimits::host();
+            policy.connection = limits;
+            node.set_default_association_limits(policy).unwrap();
+        }
+        let bearer = a.add_bearer(first).unwrap();
+        b.add_bearer(second).unwrap();
+        let (a, ad) = TokioNodeDriver::new(a, limits);
+        let (b, bd) = TokioNodeDriver::new(b, limits);
+        let bytes: Vec<u8> = (0..4097).map(|index| (index % 251) as u8).collect();
+        let client = async {
+            let association = a
+                .associate(
+                    PacketMeta {
+                        bearer,
+                        peer_l2_address: PeerL2Address::new(1).unwrap(),
+                        received_at_us: 0,
+                    },
+                    0,
+                )
+                .await
+                .unwrap();
+            association.wait_established().await.unwrap();
+            let mut stream = association.open_stream().await.unwrap();
+            let (mut read, mut write) = ::tokio::io::split(&mut stream);
+            let send = async {
+                write.write_all(&bytes).await.unwrap();
+                if impaired {
+                    std::eprintln!("client body written");
+                }
+                write.shutdown().await.unwrap();
+                if impaired {
+                    std::eprintln!("client FIN submitted");
+                }
+            };
+            let receive = async {
+                if duplex {
+                    let mut received = Vec::new();
+                    read.read_to_end(&mut received).await.unwrap();
+                    assert_eq!(received, bytes);
+                    if impaired {
+                        std::eprintln!("client response FIN received");
+                    }
+                }
+            };
+            ::tokio::join!(send, receive);
+        };
+        let server = async {
+            let mut stream = b.accept_stream().await.unwrap();
+            let (mut read, mut write) = ::tokio::io::split(&mut stream);
+            let receive = async {
+                let mut received = Vec::new();
+                read.read_to_end(&mut received).await.unwrap();
+                assert_eq!(received, bytes);
+                if impaired {
+                    std::eprintln!("server request FIN received");
+                }
+            };
+            let send = async {
+                if duplex {
+                    write.write_all(&bytes).await.unwrap();
+                    write.shutdown().await.unwrap();
+                    if impaired {
+                        std::eprintln!("server response FIN submitted");
+                    }
+                }
+            };
+            ::tokio::join!(receive, send);
+        };
+        let started = ::tokio::time::Instant::now();
+        let pump = async {
+            let Some(network) = network.as_mut() else {
+                core::future::pending::<()>().await;
+                return;
+            };
+            loop {
+                network.advance_to(started.elapsed().as_micros() as u64);
+                ::tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        };
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::select! {
+                _ = async { tokio::join!(client, server); } => {},
+                _ = pump => panic!("network pump stopped"),
+                result = ad.run() => panic!("client driver stopped: {result:?}"),
+                result = bd.run() => panic!("server driver stopped: {result:?}"),
+            }
+        })
+        .await;
+        if let Some(network) = network {
+            std::eprintln!(
+                "small-window network elapsed={:?} stats={:?}",
+                started.elapsed(),
+                network.stats()
+            );
+            assert!(
+                network.stats().loss_drops >= 4,
+                "fixture must exercise burst loss"
+            );
+        }
+        if outcome.is_err() {
+            for (side, capture) in captures.iter().enumerate() {
+                for packet in capture.lock().unwrap().iter() {
+                    if let Ok((header, mut offset)) = crate::ShortHeader::decode(packet) {
+                        while offset < packet.len() {
+                            let (frame, used) = crate::decode_frame(&packet[offset..]).unwrap();
+                            match frame {
+                                crate::Frame::Stream(frame) => std::eprintln!(
+                                    "side={side} pn={} stream={} offset={} bytes={} fin={}",
+                                    header.packet_number,
+                                    frame.id,
+                                    frame.offset,
+                                    frame.data.len(),
+                                    frame.fin,
+                                ),
+                                crate::Frame::MaxStreamData { id, max } => std::eprintln!(
+                                    "side={side} pn={} credit_stream={id} max={max}",
+                                    header.packet_number,
+                                ),
+                                _ => {}
+                            }
+                            offset += used;
+                        }
+                    }
+                }
+            }
+        }
+        outcome.unwrap();
+    }
+
     #[test]
     fn capture_classifies_blocked_and_accepted_retry_without_changing_payload() {
-        let path = std::env::temp_dir().join(format!("quic-capture-{}-{}.pcap", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
-        let capture = PacketCapture { file: Mutex::new(File::create(&path).unwrap()) };
+        let path = std::env::temp_dir().join(format!(
+            "quic-capture-{}-{}.pcap",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let capture = PacketCapture {
+            file: Mutex::new(File::create(&path).unwrap()),
+        };
         let bearer = BearerId::new(1).unwrap();
         let blocked = capture.stage_egress(bearer, b"unchanged").unwrap();
         capture.record(true, bearer, b"incoming");
         capture.finish_egress(blocked, false);
         let retry = capture.stage_egress(bearer, b"unchanged").unwrap();
         capture.finish_egress(retry, true);
+        let kernel_offset = capture.file.lock().unwrap().stream_position().unwrap() as usize;
+        capture.record_kernel_receive(bearer, b"kernel", std::time::Duration::new(7, 2_500_000));
         drop(capture);
         let bytes = std::fs::read(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
@@ -1443,41 +1787,99 @@ mod packet_loss_tests {
             assert_eq!(&bytes[offset + 36..offset + 45], b"unchanged");
         }
         assert_eq!(&bytes[81..89], b"incoming");
+        assert_eq!(
+            u32::from_le_bytes(bytes[kernel_offset..kernel_offset + 4].try_into().unwrap()),
+            7
+        );
+        assert_eq!(
+            u32::from_le_bytes(
+                bytes[kernel_offset + 4..kernel_offset + 8]
+                    .try_into()
+                    .unwrap()
+            ),
+            2500
+        );
+        assert_eq!(bytes[kernel_offset + 26], 0);
+        assert_eq!(&bytes[kernel_offset + 36..], b"kernel");
     }
 
     #[test]
     fn truncated_stream_packet_does_not_stop_node_or_ack_missing_bytes() {
-        use crate::{BearerName, ConnectionId, OwnedPacket, PeerL2Address, fake::FakePacketBearer};
         use crate::node::{InitialAdmission, NodeIngress};
+        use crate::{BearerName, ConnectionId, OwnedPacket, PeerL2Address, fake::FakePacketBearer};
         type Pool = crate::packet_pool::PacketPool<8, { crate::DEFAULT_PACKET_POOL_SLOT_SIZE }>;
         let pool = Box::leak(Box::new(Pool::new()));
         let mut client = QuicNode::<Pool>::new(pool);
         let mut server = QuicNode::<Pool>::new(pool);
-        let bearer = server.add_bearer(FakePacketBearer::<Pool>::new(BearerName::new("corruptible").unwrap())).unwrap();
-        let meta = crate::PacketMeta { bearer, peer_l2_address: PeerL2Address::new(1).unwrap(), received_at_us: 0 };
-        let initial = client.start_association(ConnectionId::new(71).unwrap(), meta, 0).unwrap();
+        let bearer = server
+            .add_bearer(FakePacketBearer::<Pool>::new(
+                BearerName::new("corruptible").unwrap(),
+            ))
+            .unwrap();
+        let meta = crate::PacketMeta {
+            bearer,
+            peer_l2_address: PeerL2Address::new(1).unwrap(),
+            received_at_us: 0,
+        };
+        let initial = client
+            .start_association(ConnectionId::new(71).unwrap(), meta, 0)
+            .unwrap();
         let client_association = initial.association;
-        let NodeIngress::Initial { association, response } = server.receive_packet(
-            meta, initial.packet,
-            |_| Some(InitialAdmission { local_limits: crate::ConnectionLimits::default() }),
-            |_, _, _, _, bytes| Ok(bytes.len()),
-        ).unwrap() else { panic!("server initial") };
-        client.receive_packet(meta, response.packet, |_| None, |_, _, _, _, bytes| Ok(bytes.len())).unwrap();
+        let NodeIngress::Initial {
+            association,
+            response,
+        } = server
+            .receive_packet(
+                meta,
+                initial.packet,
+                |_| {
+                    Some(InitialAdmission {
+                        local_limits: crate::ConnectionLimits::default(),
+                    })
+                },
+                |_, _, _, _, bytes| Ok(bytes.len()),
+            )
+            .unwrap()
+        else {
+            panic!("server initial")
+        };
+        client
+            .receive_packet(
+                meta,
+                response.packet,
+                |_| None,
+                |_, _, _, _, bytes| Ok(bytes.len()),
+            )
+            .unwrap();
         let stream = client.allocate_stream(client_association).unwrap();
-        let packet = client.send_stream(client_association, stream, 0, true, &[0x5a; 100]).unwrap().packet;
+        let packet = client
+            .send_stream(client_association, stream, 0, true, &[0x5a; 100])
+            .unwrap()
+            .packet;
         let (buffer, range) = packet.into_parts();
-        let mut writer = crate::PacketPool::acquire_writer(pool, crate::PACKET_PREFIX_RESERVE, 0).unwrap();
+        let mut writer =
+            crate::PacketPool::acquire_writer(pool, crate::PACKET_PREFIX_RESERVE, 0).unwrap();
         let damaged = &buffer.as_ref()[range.start..range.end - 1];
         crate::PacketWriter::payload_mut(&mut writer)[..damaged.len()].copy_from_slice(damaged);
         let truncated = crate::PacketWriter::commit(writer, damaged.len()).unwrap();
         let before = server.association_telemetry(association).unwrap();
-        server.process_received_packet(ReceivedPacket { meta, packet: truncated }, None).unwrap();
+        server
+            .process_received_packet(
+                ReceivedPacket {
+                    meta,
+                    packet: truncated,
+                },
+                None,
+            )
+            .unwrap();
         assert!(server.stream_chunks.is_empty());
         assert_eq!(server.association_telemetry(association).unwrap(), before);
         // The identical packet number and full body must still be accepted,
         // proving that the corrupted packet was not ACKed as delivered.
         let packet = OwnedPacket::new(buffer, range).unwrap();
-        server.process_received_packet(ReceivedPacket { meta, packet }, None).unwrap();
+        server
+            .process_received_packet(ReceivedPacket { meta, packet }, None)
+            .unwrap();
         assert_eq!(server.stream_chunks.len(), 1);
         let chunk = server.stream_chunks.pop_front().unwrap();
         assert!(chunk.fin);
@@ -1661,39 +2063,41 @@ where
             self.stream_chunk_limit,
             self.association_chunk_limits(),
         );
-        let ingress = match self
-            .receive_owned_packet(
-                received.meta,
-                received.packet,
-                |_| {
-                    let local_limits = local_limits?;
-                    Some(crate::node::InitialAdmission { local_limits })
-                },
-                |source, stream, offset, fin, bytes| {
-                    admission.offer(source, stream, offset, fin, bytes)
-                },
-            ) {
+        let ingress = match self.receive_owned_packet(
+            received.meta,
+            received.packet,
+            |_| {
+                let local_limits = local_limits?;
+                Some(crate::node::InitialAdmission { local_limits })
+            },
+            |source, stream, offset, fin, bytes| {
+                admission.offer(source, stream, offset, fin, bytes)
+            },
+        ) {
             Ok(ingress) => ingress,
             Err(rejected) => {
                 // An incomplete wire packet is a packet loss, not a failure
                 // of the entire node/driver. Endpoint decoding is transactional:
                 // it validates all frames before recording ACK/stream state.
                 // Leave reliable repair to the sender's ordinary loss recovery.
-                if matches!(rejected.reason,
+                if matches!(
+                    rejected.reason,
                     crate::node::QuicNodePacketRejection::Packet(crate::Error::Truncated)
-                    | crate::node::QuicNodePacketRejection::Egress(
-                        QuicNodeEgressError::Transport(crate::Error::Truncated))) {
+                        | crate::node::QuicNodePacketRejection::Egress(
+                            QuicNodeEgressError::Transport(crate::Error::Truncated)
+                        )
+                ) {
                     return Ok(());
                 }
                 return Err(match rejected.reason {
-                crate::node::QuicNodePacketRejection::Egress(error) => error,
-                crate::node::QuicNodePacketRejection::Packet(error)
-                | crate::node::QuicNodePacketRejection::Application(error) => {
-                    QuicNodeEgressError::Transport(error)
-                }
-                crate::node::QuicNodePacketRejection::PeerClosed(_) => {
-                    unreachable!("peer close is converted to NodeIngress::PeerClosed")
-                }
+                    crate::node::QuicNodePacketRejection::Egress(error) => error,
+                    crate::node::QuicNodePacketRejection::Packet(error)
+                    | crate::node::QuicNodePacketRejection::Application(error) => {
+                        QuicNodeEgressError::Transport(error)
+                    }
+                    crate::node::QuicNodePacketRejection::PeerClosed(_) => {
+                        unreachable!("peer close is converted to NodeIngress::PeerClosed")
+                    }
                 });
             }
         };
@@ -1751,6 +2155,19 @@ where
         Poll::Ready(self.process_received_packet(received, local_limits))
     }
 
+    /// Refresh the owner clock on each poll, including a poll after an idle
+    /// wait. Bearers without a shared clock provide timestamp zero, so the
+    /// timestamp from before that wait cannot be used for RTT/ACK processing.
+    fn poll_one_event_at(
+        &mut self,
+        context: &mut Context<'_>,
+        local_limits: Option<crate::ConnectionLimits>,
+        now_us: u64,
+    ) -> Poll<Result<(), QuicNodeEgressError>> {
+        self.advance_clock(now_us);
+        self.poll_one_event(context, local_limits)
+    }
+
     /// Take one packet from the node-owned ingress queue and run the common
     /// bearer-independent QUIC receive state machine.
     ///
@@ -1786,6 +2203,9 @@ where
             tokio::pin!(timer);
             tokio::select! {
                 received = self.ingress.receive() => {
+                    self.advance_clock(clock_base_us.saturating_add(
+                        u64::try_from(clock_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                    ));
                     return self.process_received_packet(received, local_limits);
                 }
                 () = self.completions.changed() => {}
@@ -1885,7 +2305,16 @@ where
                     self.submit_node_packet(packet)?;
                 }
                 Ok(crate::node::NodeClose::Closed(packet)) => {
+                    let bearer = packet.bearer;
                     self.submit_node_packet(packet)?;
+                    while self
+                        .bearers
+                        .get_mut(bearer)
+                        .is_some_and(|entry| entry.has_pending_submission())
+                    {
+                        core::future::poll_fn(|context| self.poll_one_event(context, None)).await?;
+                        self.drain_bearer_events();
+                    }
                     return Ok(());
                 }
                 Err(error) if error.is_retryable() => {
@@ -1920,6 +2349,46 @@ mod tests {
 
     type Pool = PacketPool<4, { crate::DEFAULT_PACKET_POOL_SLOT_SIZE }>;
     type Node = QuicNode<Pool>;
+
+    #[test]
+    fn bearer_event_poll_refreshes_clock_after_idle_wait() {
+        static POOL: Pool = Pool::new();
+        let mut node = Node::new(&POOL);
+        let bearer = node
+            .add_bearer(FakePacketBearer::<Pool>::new(
+                BearerName::new("clock-test").unwrap(),
+            ))
+            .unwrap();
+        let mut context = Context::from_waker(std::task::Waker::noop());
+        assert!(node.poll_one_event_at(&mut context, None, 100).is_pending());
+        // Model an attached UDP bearer: it cannot translate its clock into
+        // the owner's epoch and supplies timestamp zero. The owner has been
+        // asleep since the earlier poll. A non-QUIC packet is ignored, but
+        // still exercises the actual ingress and clock update boundary.
+        let mut writer = node
+            .acquire_packet_writer(crate::PACKET_PREFIX_RESERVE)
+            .unwrap();
+        writer.payload_mut()[0] = 0;
+        node.ingress_sender.enqueue_packet(
+            PacketMeta {
+                bearer,
+                peer_l2_address: PeerL2Address::new(1).unwrap(),
+                received_at_us: 0,
+            },
+            PacketWriter::commit(writer, 1).unwrap(),
+        );
+        assert!(matches!(
+            node.poll_one_event_at(&mut context, None, 1_000_000),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(node.clock_us(), 1_000_000);
+        // A late caller/arrival timestamp must never rewind the owner.
+        assert!(
+            node.poll_one_event_at(&mut context, None, 500_000)
+                .is_pending()
+        );
+        assert_eq!(node.clock_us(), 1_000_000);
+    }
 
     #[test]
     fn per_stream_chunk_limit_does_not_scale_with_node_size() {
@@ -2039,7 +2508,8 @@ mod tests {
     fn bearer_rows_list_each_registered_bearer_and_an_unestablished_association_is_not_live() {
         type RowsPool = PacketPool<8, { crate::DEFAULT_PACKET_POOL_SLOT_SIZE }>;
         static ROWS_POOL: RowsPool = RowsPool::new();
-        let bearer_impl = FakePacketBearer::<RowsPool>::new(BearerName::new("rows-bearer").unwrap());
+        let bearer_impl =
+            FakePacketBearer::<RowsPool>::new(BearerName::new("rows-bearer").unwrap());
         let mut node = QuicNode::<RowsPool>::new(&ROWS_POOL);
         let bearer = node.add_bearer(bearer_impl).unwrap();
         let bearers = node.bearer_rows();

@@ -247,6 +247,29 @@ struct TokioUdpShared<const PEERS: usize> {
     peers: Mutex<PeerL2Table<SocketAddr, PEERS>>,
     write_blocked: AtomicBool,
     write_blocked_notify: Notify,
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    kernel_capture: Option<crate::tokio::PacketCapture>,
+}
+
+/// Native x86_64 Linux ioctl layout only. Other platforms need their own
+/// reviewed timestamp ABI. Querying once before receive enables kernel
+/// timestamp collection; ENOENT on an empty socket is expected at that point.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn kernel_receive_timestamp(socket: &impl std::os::fd::AsRawFd) -> io::Result<std::time::Duration> {
+    let mut stamp: libc::timespec = unsafe { core::mem::zeroed() };
+    if unsafe { libc::ioctl(socket.as_raw_fd(), 0x8907 as _, &mut stamp) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if stamp.tv_sec < 0 || !(0..1_000_000_000).contains(&stamp.tv_nsec) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid socket timestamp",
+        ));
+    }
+    Ok(std::time::Duration::new(
+        stamp.tv_sec as u64,
+        stamp.tv_nsec as u32,
+    ))
 }
 
 /// Cloneable handle to one Tokio UDP socket and bearer-scoped peer table.
@@ -263,12 +286,25 @@ pub struct TokioUdpBearer<const PEERS: usize> {
 
 impl<const PEERS: usize> TokioUdpBearer<PEERS> {
     fn new(socket: UdpSocket) -> Self {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        let kernel_capture = {
+            let path = std::env::var_os("QUIC_LITE_UDP_RX_PCAP");
+            // Never truncate the normal node capture with this extra sink.
+            if path.is_some() && path != std::env::var_os("QUIC_LITE_PCAP") {
+                let _ = kernel_receive_timestamp(&socket);
+                crate::tokio::PacketCapture::from_env_named("QUIC_LITE_UDP_RX_PCAP")
+            } else {
+                None
+            }
+        };
         Self {
             shared: Arc::new(TokioUdpShared {
                 socket,
                 peers: Mutex::new(PeerL2Table::new()),
                 write_blocked: AtomicBool::new(false),
                 write_blocked_notify: Notify::new(),
+                #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+                kernel_capture,
             }),
             info: BearerInfo {
                 name: BearerName::new("udp").unwrap(),
@@ -418,6 +454,12 @@ impl<const PEERS: usize> TokioUdpBearer<PEERS> {
             .recv_from(&mut output[..payload_capacity])
             .await
             .map_err(UdpReceiveError::Io)?;
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        if let Some(capture) = &self.shared.kernel_capture {
+            if let Ok(timestamp) = kernel_receive_timestamp(&self.shared.socket) {
+                capture.record_kernel_receive(bearer, &output[..len], timestamp);
+            }
+        }
         let peer_l2_address = self
             .register_peer(peer)
             .map_err(|_| UdpReceiveError::PeerTableFull)?;
@@ -526,6 +568,31 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn kernel_timestamp_precedes_delayed_userspace_receive() {
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        // Prime BEFORE traffic: the first query after receive can otherwise
+        // synthesize a userspace-time timestamp rather than arrival time.
+        let _ = kernel_receive_timestamp(&receiver);
+        sender
+            .send_to(b"timestamp", receiver.local_addr().unwrap())
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        let before_receive = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        let mut data = [0; 32];
+        let (used, _) = receiver.recv_from(&mut data).unwrap();
+        assert_eq!(&data[..used], b"timestamp");
+        let stamp = kernel_receive_timestamp(&receiver).unwrap();
+        assert!(before_receive.saturating_sub(stamp) >= std::time::Duration::from_millis(10));
+    }
 
     #[test]
     fn peer_names_apply_defaults_and_scopes() {

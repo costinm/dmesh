@@ -156,7 +156,8 @@ impl<P: PacketLease> OrderedStream<P> {
         offset: u64,
         range: Range<usize>,
         fin: bool,
-    ) -> Result<(), CallbackError> {
+        max_new_bytes: usize,
+    ) -> Result<usize, CallbackError> {
         if range.start > range.end || range.end > packet.bytes().len() {
             return Err(CallbackError::InvalidOverlap);
         }
@@ -166,15 +167,16 @@ impl<P: PacketLease> OrderedStream<P> {
             if end > final_size || (fin && end != final_size) {
                 return Err(CallbackError::InvalidFin);
             }
-        } else if fin {
-            self.final_size = Some(end);
         }
         if end <= self.consumed && !(len == 0 && fin && offset == self.consumed) {
             // Packet-number retransmissions intentionally carry a fresh
             // number, so duplicate suppression cannot stop a stream range
             // that was already delivered and released. It is harmless here:
             // all of its bytes precede the ordered application cursor.
-            return Ok(());
+            if fin {
+                self.final_size = Some(end);
+            }
+            return Ok(0);
         }
         let trim = self.consumed.saturating_sub(offset) as usize;
         let range = (range.start + trim)..range.end;
@@ -183,7 +185,7 @@ impl<P: PacketLease> OrderedStream<P> {
             .checked_add(range.len() as u64)
             .ok_or(CallbackError::InvalidFin)?;
         if range.start == range.end && !fin {
-            return Ok(());
+            return Ok(0);
         }
         for existing in &self.retained {
             let a0 = existing.offset;
@@ -214,7 +216,13 @@ impl<P: PacketLease> OrderedStream<P> {
                 && existing.range.len() == range.len()
                 && existing.packet.bytes()[existing.range.clone()] == packet.bytes()[range.clone()]
         }) {
-            return Ok(());
+            if fin {
+                self.final_size = Some(end);
+            }
+            return Ok(0);
+        }
+        if range.len() > max_new_bytes {
+            return Err(CallbackError::Capacity);
         }
         // This is the bounded receive ledger shared by every bearer. Firmware
         // must turn heap pressure into normal transport backpressure, never a
@@ -222,14 +230,21 @@ impl<P: PacketLease> OrderedStream<P> {
         self.retained
             .try_reserve(1)
             .map_err(|_| CallbackError::Capacity)?;
-        self.retained.push(Retained {
-            offset,
-            packet,
-            range,
-            end: fin,
-        });
-        self.retained.sort_by_key(|item| item.offset);
-        Ok(())
+        let bytes = range.len();
+        let position = self.retained.partition_point(|item| item.offset <= offset);
+        self.retained.insert(
+            position,
+            Retained {
+                offset,
+                packet,
+                range,
+                end: fin,
+            },
+        );
+        if fin {
+            self.final_size = Some(end);
+        }
+        Ok(bytes)
     }
 
     fn next_chunk(&mut self) -> Option<StreamChunk<P>> {
@@ -313,6 +328,11 @@ pub struct CallbackStreams<P: PacketLease> {
 }
 
 impl<P: PacketLease> CallbackStreams<P> {
+    pub(crate) fn delivery_finished(&self, stream: u64) -> bool {
+        self.streams
+            .iter()
+            .any(|state| state.id == stream && state.finished)
+    }
     /// Create ordered delivery state with explicit stream and retained-byte limits.
     pub fn new(max_streams: usize, max_retained_bytes: usize) -> Self {
         Self {
@@ -395,6 +415,33 @@ impl<P: PacketLease> CallbackStreams<P> {
         Ok(self.streams.last_mut().unwrap())
     }
 
+    fn insert_range(
+        &mut self,
+        stream: u64,
+        packet: P,
+        offset: u64,
+        range: Range<usize>,
+        fin: bool,
+        available: usize,
+    ) -> Result<usize, CallbackError> {
+        self.streams.retain(|state| !state.finished);
+        if let Some(state) = self.streams.iter_mut().find(|state| state.id == stream) {
+            return state.insert(packet, offset, range, fin, available);
+        }
+        if self.streams.len() >= self.max_streams {
+            return Err(CallbackError::Capacity);
+        }
+        // Refusal must not consume a stream slot. Build its state locally,
+        // then publish it only after both payload and metadata admission.
+        let mut state = OrderedStream::new(stream);
+        let bytes = state.insert(packet, offset, range, fin, available)?;
+        self.streams
+            .try_reserve(1)
+            .map_err(|_| CallbackError::Capacity)?;
+        self.streams.push(state);
+        Ok(bytes)
+    }
+
     /// Insert one retained packet range and emit the next ordered leased chunk.
     pub fn receive_leased<E: StreamEvents<P>>(
         &mut self,
@@ -405,28 +452,12 @@ impl<P: PacketLease> CallbackStreams<P> {
         fin: bool,
         events: &mut E,
     ) -> Result<(), CallbackError> {
-        let bytes = range.len();
-        // A retransmission can arrive after the retained window is full. Do
-        // not reject it before OrderedStream has identified it as an exact
-        // duplicate; packet-number retransmission must not consume callback
-        // storage a second time. Keep a cheap lease-only checkpoint only in
-        // the near-capacity case so a genuinely new range can be rolled back.
-        let checkpoint = (self.retained_bytes.saturating_add(bytes) > self.max_retained_bytes)
-            .then(|| self.clone());
-        let (chunk, added) = {
-            let state = self.stream_mut(stream)?;
-            let before = state.retained.len();
-            state.insert(packet, offset, range, fin)?;
-            let added = state.retained.len() != before;
-            (state.next_chunk(), added)
-        };
-        if added {
-            if self.retained_bytes.saturating_add(bytes) > self.max_retained_bytes {
-                *self = checkpoint.expect("checkpoint exists above callback capacity");
-                return Err(CallbackError::Capacity);
-            }
-            self.retained_bytes = self.retained_bytes.saturating_add(bytes);
-        }
+        // Insertion identifies duplicates before checking new storage. No
+        // deep delivery-state checkpoint is needed to refuse a new range.
+        let available = self.max_retained_bytes.saturating_sub(self.retained_bytes);
+        let bytes = self.insert_range(stream, packet, offset, range, fin, available)?;
+        let chunk = self.stream_mut(stream)?.next_chunk();
+        self.retained_bytes = self.retained_bytes.saturating_add(bytes);
         if let Some(chunk) = chunk {
             events.stream_chunk(chunk);
         }
@@ -443,34 +474,40 @@ impl<P: PacketLease> CallbackStreams<P> {
         fin: bool,
         events: &mut E,
     ) -> Result<(), CopyingError<E::Error>> {
-        let bytes = range.len();
-        // A range at the consumer cursor drains synchronously and therefore
-        // does not compete with retained out-of-order storage.
-        let directly_consumable = self
-            .streams
-            .iter()
-            .find(|state| state.id == stream)
-            .map_or(offset == 0, |state| {
-                !state.finished && state.outstanding.is_none() && offset == state.consumed
-            });
-        let checkpoint = self.clone();
-        let added = {
-            let state = self.stream_mut(stream).map_err(CopyingError::Transport)?;
-            let before = state.retained.len();
-            state
-                .insert(packet, offset, range, fin)
-                .map_err(CopyingError::Transport)?;
-            state.retained.len() != before
-        };
-        if added {
-            if !directly_consumable
-                && self.retained_bytes.saturating_add(bytes) > self.max_retained_bytes
-            {
-                *self = checkpoint;
-                return Err(CopyingError::Transport(CallbackError::Capacity));
-            }
-            self.retained_bytes = self.retained_bytes.saturating_add(bytes);
+        if range.start > range.end || range.end > packet.bytes().len() {
+            return Err(CopyingError::Transport(CallbackError::InvalidOverlap));
         }
+        // Immediate consumption needs no retained-byte reservation. An unread
+        // suffix must pass the same admission as borrowed ingress.
+        let directly_consumable =
+            self.streams
+                .iter()
+                .find(|state| state.id == stream)
+                .map_or(offset == 0, |state| {
+                    !state.finished
+                        && state.outstanding.is_none()
+                        && offset == state.consumed
+                        && !state
+                            .retained
+                            .iter()
+                            .any(|item| item.offset == state.consumed)
+                });
+        if directly_consumable {
+            return self.try_receive_copying_range(
+                stream,
+                &packet.bytes()[range.clone()],
+                offset,
+                fin,
+                range.start,
+                || Ok(packet.clone()),
+                events,
+            );
+        }
+        let available = self.max_retained_bytes.saturating_sub(self.retained_bytes);
+        let bytes = self
+            .insert_range(stream, packet, offset, range, fin, available)
+            .map_err(CopyingError::Transport)?;
+        self.retained_bytes = self.retained_bytes.saturating_add(bytes);
         self.resume_copying(stream, events)?;
         Ok(())
     }
@@ -493,15 +530,61 @@ impl<P: PacketLease> CallbackStreams<P> {
         E: CopyingStreamEvents,
         F: FnOnce() -> P,
     {
+        self.try_receive_copying_borrowed(stream, bytes, offset, fin, || Ok(retain()), events)
+    }
+
+    /// Fallible retention for owners which can refuse packet storage under
+    /// memory pressure. Already consumed prefixes remain consumed on failure;
+    /// the owner must leave newly received packets unacknowledged until all
+    /// unread bytes have been retained or delivered.
+    pub(crate) fn try_receive_copying_borrowed<E, F>(
+        &mut self,
+        stream: u64,
+        bytes: &[u8],
+        offset: u64,
+        fin: bool,
+        retain: F,
+        events: &mut E,
+    ) -> Result<(), CopyingError<E::Error>>
+    where
+        E: CopyingStreamEvents,
+        F: FnOnce() -> Result<P, CallbackError>,
+    {
+        self.try_receive_copying_range(stream, bytes, offset, fin, 0, retain, events)
+    }
+
+    fn try_receive_copying_range<E, F>(
+        &mut self,
+        stream: u64,
+        bytes: &[u8],
+        offset: u64,
+        fin: bool,
+        storage_offset: usize,
+        retain: F,
+        events: &mut E,
+    ) -> Result<(), CopyingError<E::Error>>
+    where
+        E: CopyingStreamEvents,
+        F: FnOnce() -> Result<P, CallbackError>,
+    {
         let len = bytes.len() as u64;
         let end = offset
             .checked_add(len)
             .ok_or(CopyingError::Transport(CallbackError::InvalidFin))?;
+        let retained_before = self.retained_bytes;
+        let retention_limit = self.max_retained_bytes;
         let state = self.stream_mut(stream).map_err(CopyingError::Transport)?;
 
         // Only a packet exactly at the application cursor can be borrowed:
         // retained ranges must remain owned until their preceding gap closes.
-        if !state.finished && state.outstanding.is_none() && offset == state.consumed {
+        if !state.finished
+            && state.outstanding.is_none()
+            && offset == state.consumed
+            && !state
+                .retained
+                .iter()
+                .any(|item| item.offset == state.consumed)
+        {
             if let Some(final_size) = state.final_size {
                 if end > final_size || (fin && end != final_size) {
                     return Err(CopyingError::Transport(CallbackError::InvalidFin));
@@ -519,12 +602,21 @@ impl<P: PacketLease> CallbackStreams<P> {
                 // The handler may stop exactly at a storage boundary. Keep
                 // only the unread suffix under QUIC-lite ordering ownership;
                 // never materialize a dispatcher-private fragment queue.
-                let packet = retain();
-                state
-                    .insert(packet, offset + consumed as u64, consumed..bytes.len(), fin)
-                    .map_err(CopyingError::Transport)?;
                 state.consumed = offset + consumed as u64;
                 let retained = bytes.len().saturating_sub(consumed);
+                if retained_before.saturating_add(retained) > retention_limit {
+                    return Err(CopyingError::Transport(CallbackError::Capacity));
+                }
+                let packet = retain().map_err(CopyingError::Transport)?;
+                let retained = state
+                    .insert(
+                        packet,
+                        offset + consumed as u64,
+                        (storage_offset + consumed)..(storage_offset + bytes.len()),
+                        fin,
+                        retention_limit.saturating_sub(retained_before),
+                    )
+                    .map_err(CopyingError::Transport)?;
                 self.retained_bytes = self.retained_bytes.saturating_add(retained);
                 return Ok(());
             }
@@ -541,11 +633,22 @@ impl<P: PacketLease> CallbackStreams<P> {
             // A borrowed prefix may close a gap in already retained ranges.
             // Drain those ordinary ordered ranges now when the consumer took
             // the full prefix, preserving the historical copying behaviour.
-            self.resume_copying(stream, events)?;
+            // Established in-order traffic has no retained fragments. Avoid
+            // another stream lookup and the reorder-drain path per packet.
+            if !state.retained.is_empty() {
+                self.resume_copying(stream, events)?;
+            }
             return Ok(());
         }
 
-        self.receive_copying(stream, retain(), offset, 0..bytes.len(), fin, events)
+        self.receive_copying(
+            stream,
+            retain().map_err(CopyingError::Transport)?,
+            offset,
+            storage_offset..(storage_offset + bytes.len()),
+            fin,
+            events,
+        )
     }
 
     /// Resume an ordered copying consumer after application storage becomes
@@ -573,7 +676,7 @@ impl<P: PacketLease> CallbackStreams<P> {
             else {
                 return Ok(total);
             };
-            let item = state.retained[item_index].clone();
+            let item = &state.retained[item_index];
             let bytes = &item.packet.bytes()[item.range.clone()];
             let consumed = match events.stream_chunk(stream, item.offset, item.end, bytes) {
                 Ok(consumed) if consumed <= bytes.len() => consumed,
@@ -688,6 +791,105 @@ impl<P: PacketLease> CallbackStreams<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owned_in_order_suffix_obeys_budget_and_preserves_packet_headroom() {
+        for budget in [0, 4] {
+            let mut streams = CallbackStreams::new(1, budget);
+            let packet = Arc::new(b"XXabcdefZZ".to_vec());
+            let mut prefix = PartialSink {
+                data: Vec::new(),
+                limit: 2,
+                finished: Vec::new(),
+            };
+            let result = streams.receive_copying(7, packet.clone(), 0, 2..8, true, &mut prefix);
+            assert_eq!(prefix.data, b"ab");
+            assert!(prefix.finished.is_empty());
+            if budget == 0 {
+                assert!(matches!(
+                    result,
+                    Err(CopyingError::Transport(CallbackError::Capacity))
+                ));
+                assert_eq!(streams.retained_bytes(), 0);
+            } else {
+                result.unwrap();
+                assert_eq!(streams.retained_bytes(), 4);
+                let mut stopped = PartialSink {
+                    data: Vec::new(),
+                    limit: 0,
+                    finished: Vec::new(),
+                };
+                streams
+                    .receive_copying(7, packet.clone(), 0, 2..8, true, &mut stopped)
+                    .unwrap();
+                assert_eq!(
+                    streams.retained_bytes(),
+                    4,
+                    "duplicate suffix counted twice"
+                );
+            }
+            streams.set_limits(1, 4);
+            let mut suffix = CopySink::default();
+            streams
+                .receive_copying(7, packet, 0, 2..8, true, &mut suffix)
+                .unwrap();
+            assert_eq!(suffix.data, b"cdef");
+            assert_eq!(suffix.finished, vec![7]);
+            assert_eq!(streams.retained_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn retained_insertion_needs_no_lease_checkpoint_and_refusal_is_atomic() {
+        struct NoCheckpoint(&'static [u8]);
+        impl Clone for NoCheckpoint {
+            fn clone(&self) -> Self {
+                panic!("retained insertion cloned a lease checkpoint")
+            }
+        }
+        impl PacketLease for NoCheckpoint {
+            fn bytes(&self) -> &[u8] {
+                self.0
+            }
+        }
+        let mut streams = CallbackStreams::new(1, 8);
+        let mut sink = CopySink::default();
+        for (offset, data) in [(4, &b"abcd"[..]), (8, &b"efgh"[..])] {
+            streams
+                .receive_copying(1, NoCheckpoint(data), offset, 0..4, false, &mut sink)
+                .unwrap();
+        }
+        assert_eq!(streams.retained_bytes(), 8);
+        // Exact duplicates fit even when no new byte may be retained.
+        streams
+            .receive_copying(1, NoCheckpoint(b"abcd"), 4, 0..4, false, &mut sink)
+            .unwrap();
+        assert!(matches!(
+            streams.receive_copying(1, NoCheckpoint(b"ijkl"), 12, 0..4, true, &mut sink),
+            Err(CopyingError::Transport(CallbackError::Capacity))
+        ));
+        assert_eq!(streams.retained_bytes(), 8);
+        assert_eq!(streams.streams[0].final_size, None);
+        assert_eq!(streams.streams[0].retained.len(), 2);
+        assert!(sink.data.is_empty());
+        // Closing the gap drains synchronous callbacks without cloning the
+        // retained leases, even when their byte budget is completely full.
+        streams
+            .receive_copying(1, NoCheckpoint(b"head"), 0, 0..4, false, &mut sink)
+            .unwrap();
+        assert_eq!(sink.data, b"headabcdefgh");
+        assert_eq!(streams.retained_bytes(), 0);
+
+        let mut empty = CallbackStreams::new(1, 0);
+        assert!(matches!(
+            empty.receive_copying(2, NoCheckpoint(b"a"), 1, 0..1, true, &mut sink),
+            Err(CopyingError::Transport(CallbackError::Capacity))
+        ));
+        assert!(
+            empty.streams.is_empty(),
+            "refused range consumed a stream slot"
+        );
+    }
     use alloc::{sync::Arc, vec};
 
     #[derive(Default)]
@@ -807,6 +1009,88 @@ mod tests {
     }
 
     #[test]
+    fn failed_retention_keeps_consumed_prefix_and_retries_only_suffix() {
+        let mut streams = CallbackStreams::<Arc<Vec<u8>>>::new(2, 16);
+        let mut sink = PartialSink {
+            data: Vec::new(),
+            limit: 2,
+            finished: Vec::new(),
+        };
+        assert!(matches!(
+            streams.try_receive_copying_borrowed(
+                4,
+                b"abcdef",
+                0,
+                true,
+                || Err(CallbackError::Capacity),
+                &mut sink,
+            ),
+            Err(CopyingError::Transport(CallbackError::Capacity))
+        ));
+        assert_eq!(sink.data, b"ab");
+        assert_eq!(streams.retained_bytes(), 0);
+        assert!(sink.finished.is_empty());
+        sink.limit = usize::MAX;
+        streams
+            .try_receive_copying_borrowed(
+                4,
+                b"abcdef",
+                0,
+                true,
+                || Ok(Arc::new(b"abcdef".to_vec())),
+                &mut sink,
+            )
+            .unwrap();
+        assert_eq!(
+            sink.data, b"abcdef",
+            "accepted prefix must not be delivered twice"
+        );
+        assert_eq!(sink.finished, vec![4]);
+        assert_eq!(streams.retained_bytes(), 0);
+    }
+
+    #[test]
+    fn failed_out_of_order_retention_is_retryable_and_in_order_needs_no_storage() {
+        let mut streams = CallbackStreams::<Arc<Vec<u8>>>::new(2, 16);
+        let mut sink = CopySink::default();
+        assert!(matches!(
+            streams.try_receive_copying_borrowed(
+                4,
+                b"def",
+                3,
+                true,
+                || Err(CallbackError::Capacity),
+                &mut sink,
+            ),
+            Err(CopyingError::Transport(CallbackError::Capacity))
+        ));
+        assert!(sink.data.is_empty());
+        assert_eq!(streams.retained_bytes(), 0);
+        streams
+            .try_receive_copying_borrowed(
+                4,
+                b"abc",
+                0,
+                false,
+                || panic!("in-order delivery requested allocation"),
+                &mut sink,
+            )
+            .unwrap();
+        streams
+            .try_receive_copying_borrowed(
+                4,
+                b"def",
+                3,
+                true,
+                || panic!("retry at cursor requested allocation"),
+                &mut sink,
+            )
+            .unwrap();
+        assert_eq!(sink.data, b"abcdef");
+        assert_eq!(sink.finished, vec![4]);
+    }
+
+    #[test]
     fn borrowed_copying_delivery_does_not_acquire_a_packet_lease_in_order() {
         let mut streams = CallbackStreams::<Arc<Vec<u8>>>::new(2, 16);
         let mut sink = CopySink::default();
@@ -920,6 +1204,38 @@ mod tests {
     }
 
     #[test]
+    fn established_in_order_borrowed_delivery_has_no_retained_work() {
+        let mut streams = CallbackStreams::<Arc<Vec<u8>>>::new(2, 16);
+        let mut sink = CopySink::default();
+        for index in 0..128_u64 {
+            streams
+                .receive_copying_borrowed(
+                    4,
+                    b"data",
+                    index * 4,
+                    false,
+                    || panic!("ordinary in-order delivery must remain borrowed"),
+                    &mut sink,
+                )
+                .unwrap();
+            assert_eq!(streams.retained_bytes(), 0);
+            assert_eq!(sink.data.len(), (index as usize + 1) * 4);
+        }
+        streams
+            .receive_copying_borrowed(
+                4,
+                b"",
+                512,
+                true,
+                || panic!("bare in-order FIN must remain borrowed"),
+                &mut sink,
+            )
+            .unwrap();
+        assert_eq!(sink.finished, vec![4]);
+        assert!(sink.reset.is_empty());
+    }
+
+    #[test]
     fn borrowed_copying_delivery_acquires_a_lease_only_for_reordering() {
         let mut streams = CallbackStreams::<Arc<Vec<u8>>>::new(2, 16);
         let mut sink = CopySink::default();
@@ -944,13 +1260,14 @@ mod tests {
                 b"head",
                 0,
                 false,
-                // A retained tail exists, so this gap-closing packet joins
-                // the bounded queue and drains both ranges in order.
-                || Arc::new(b"head".to_vec()),
+                // Borrow the prefix, then drain the already-owned tail.
+                || panic!("gap-closing prefix must remain borrowed"),
                 &mut sink,
             )
             .unwrap();
         assert_eq!(sink.data, b"headtail");
+        assert_eq!(sink.finished, vec![4]);
+        assert_eq!(streams.retained_bytes(), 0);
     }
 
     #[test]
@@ -1170,7 +1487,7 @@ mod tests {
     fn invalid_fin_does_not_drop_outstanding_chunk() {
         let mut state = OrderedStream::<Arc<Vec<u8>>>::new(11);
         state
-            .insert(Arc::new(b"ab".to_vec()), 0, 0..2, true)
+            .insert(Arc::new(b"ab".to_vec()), 0, 0..2, true, usize::MAX)
             .unwrap();
         let chunk = state.next_chunk().unwrap();
         assert_eq!(chunk.bytes(), b"ab");
