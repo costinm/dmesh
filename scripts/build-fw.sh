@@ -24,11 +24,11 @@ esac
 FIRMWARE_DIR="${DMESH_MAIN_FIRMWARE_DIR:-$DMESH_REPO/fw/main}"
 BUILD_MODE="${DMESH_FW_PROFILE:-release}"
 REQUESTED_TARGET="${1:-all}"
-# Flash clock for every image (Stage2 and Recovery2 use the same default);
+# Flash clock for every image (Stage2 and the loader use the same default);
 # 80 MHz is tested on all boards. Main's own flash driver is always DIO:
 # Stage2 selects QIO code reads per boot (NVS stg2:flash) and configures the
 # quad pins only then, so a QIO driver reads garbage after a DIO boot and can
-# damage NVS. See fw/boot/README.md "Flash read mode".
+# damage NVS. See docs/dmesh-stage2-lessons.md and boot.md "QIO autodetect" in the esp-wifi-loader repository.
 FLASH_MODE=dio
 FLASH_MHZ="${DMESH_FLASH_MHZ:-80}"
 if [[ -n "${DMESH_FLASH_MODE:-}" && "$DMESH_FLASH_MODE" != dio ]]; then
@@ -117,7 +117,7 @@ build_one() {
     # Keep the packaged app at the same offset declared by the shared
     # Stage2 partition table.  Recovery transfers the extracted raw app,
     # while provisioning tools use this offset for a direct Main write.
-    local app_offset=0x110000
+    local app_offset=0xf0000
 
     case "$BUILD_MODE" in
         release) args+=(--release) ;;
@@ -217,7 +217,7 @@ build_one() {
         "$DMESH_REPO/fw/ble/native/dmesh_nimble/CMakeLists.txt" \
         "$DMESH_REPO/fw/ble/native/dmesh_nimble/dmesh_nimble.c" \
         "$DMESH_REPO/fw/ble/native/dmesh_nimble/include/dmesh_nimble.h" \
-        $(find -L "$DMESH_REPO/fw/esp-wifi-loader/components/esp_wifi_loader" -type f 2>/dev/null | sort) \
+        "$DMESH_REPO/fw/main/partitions.csv" \
         | sha256sum | awk '{print $1}')"
     local sdk_id="cache-v3:${IDF_PATH}:$(git -C "$IDF_PATH" describe --tags --always 2>/dev/null || true):${sdk_defaults_digest}"
     if [[ ! -f "$sdk_stamp" || "$(cat "$sdk_stamp")" != "$sdk_id" ]]; then
@@ -243,7 +243,7 @@ build_one() {
     printf '=== Merged image: %s ===\n' "$image_path"
     # Recovery/DRS2 always transfers the raw Main app, never the padded merged
     # image.  All current provisioned layouts use the named `main` partition
-    # at 0x110000.  The old classic single-factory image at 0x10000 is retained
+    # at 0xf0000.  The old classic single-factory image at 0x10000 is retained
     # only in historical flash evidence and must not be regenerated here.
     "$DMESH_PYTHON" "$DMESH_REPO/scripts/extract-esp-app.py" "$image_path" \
         "$image_dir/main-app.bin" --offset "$app_offset"
@@ -252,18 +252,18 @@ build_one() {
 
 case "$REQUESTED_TARGET" in
     all)
-        build_one esp32 xtensa-esp32-espidf sdkconfig.defaults "$DMESH_REPO/fw/boot/partitions.csv" esp32 4mb
-        build_one esp32s3 xtensa-esp32s3-espidf sdkconfig.esp32s3.defaults "$DMESH_REPO/fw/boot/partitions.csv" esp32s3 4mb
-        build_one esp32c6 riscv32imac-esp-espidf sdkconfig.esp32c6.defaults "$DMESH_REPO/fw/boot/partitions.csv" esp32c6 4mb
+        build_one esp32 xtensa-esp32-espidf sdkconfig.defaults "$DMESH_REPO/fw/main/partitions.csv" esp32 4mb
+        build_one esp32s3 xtensa-esp32s3-espidf sdkconfig.esp32s3.defaults "$DMESH_REPO/fw/main/partitions.csv" esp32s3 4mb
+        build_one esp32c6 riscv32imac-esp-espidf sdkconfig.esp32c6.defaults "$DMESH_REPO/fw/main/partitions.csv" esp32c6 4mb
         ;;
-    esp32) build_one esp32 xtensa-esp32-espidf sdkconfig.defaults "$DMESH_REPO/fw/boot/partitions.csv" esp32 4mb ;;
+    esp32) build_one esp32 xtensa-esp32-espidf sdkconfig.defaults "$DMESH_REPO/fw/main/partitions.csv" esp32 4mb ;;
     # E5 is a board name, not a separate CPU image family.  Keep its artifact
     # in target/flash/esp32 so the unified server cannot accidentally serve a
     # stale generic ESP32 image after an E5 build.
-    e5) build_one esp32 xtensa-esp32-espidf sdkconfig.defaults "$DMESH_REPO/fw/boot/partitions.csv" esp32 4mb ;;
-    recovery-s3) build_one esp32s3 xtensa-esp32s3-espidf sdkconfig.esp32s3.defaults "$DMESH_REPO/fw/boot/partitions.csv" esp32s3 4mb ;;
-    esp32s3|esp32-s3) build_one esp32s3 xtensa-esp32s3-espidf sdkconfig.esp32s3.defaults "$DMESH_REPO/fw/boot/partitions.csv" esp32s3 4mb ;;
-    esp32c6|c6|e6) build_one esp32c6 riscv32imac-esp-espidf sdkconfig.esp32c6.defaults "$DMESH_REPO/fw/boot/partitions.csv" esp32c6 4mb ;;
+    e5) build_one esp32 xtensa-esp32-espidf sdkconfig.defaults "$DMESH_REPO/fw/main/partitions.csv" esp32 4mb ;;
+    recovery-s3) build_one esp32s3 xtensa-esp32s3-espidf sdkconfig.esp32s3.defaults "$DMESH_REPO/fw/main/partitions.csv" esp32s3 4mb ;;
+    esp32s3|esp32-s3) build_one esp32s3 xtensa-esp32s3-espidf sdkconfig.esp32s3.defaults "$DMESH_REPO/fw/main/partitions.csv" esp32s3 4mb ;;
+    esp32c6|c6|e6) build_one esp32c6 riscv32imac-esp-espidf sdkconfig.esp32c6.defaults "$DMESH_REPO/fw/main/partitions.csv" esp32c6 4mb ;;
     *) usage >&2; exit 2 ;;
 esac
 

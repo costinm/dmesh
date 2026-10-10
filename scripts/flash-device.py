@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Managed serial provisioning and repair for ESP images.
 
-Routine updates use dmesh-cli flash over Wi-Fi: Recovery writes Main, while
-running Main writes Recovery, Stage2, and modules. This wrapper is the serial
+Routine updates use the signed Wi-Fi protocol of the esp-wifi-loader repository
+(docs/flashing.md). This wrapper is the serial
 fallback after a failed remote gate, or initial provisioning. It opens only
 the selected physical port through the repository's verified espflash wrapper
 and never starts, stops, or restores a managed serial forward.
@@ -451,7 +451,7 @@ def artifacts(device: object, target: str, module: str,
                 ("0x8000", cpu_root / "partition-table.bin"),
             ]
         return family, [
-            ("0x110000" if target == "main" else "0x10000",
+            ("0xf0000" if target == "main" else "0x10000",
              cpu_root / ("main-app.bin" if target == "main" else "recovery.bin")),
         ]
     stage2 = ROOT / "target" / "stage2" / family / f"{flash_size_mb}mb"
@@ -463,11 +463,11 @@ def artifacts(device: object, target: str, module: str,
             ("0x8000", stage2 / "partition-table.bin"),
         ]
     if target in ("main", "oldmain"):
-        # Must mirror fw/boot/partitions.csv.  The Stage2 update moves Main
-        # after the 1 MiB Recovery partition, so a stale 0xe0000 write would
-        # leave the selector with no valid Main image at its declared offset.
+        # Must mirror fw/main/partitions.csv (and the esp-wifi-loader repository's boot/partitions/*.csv).  The Stage2 update
+        # moves Main after the 896 KiB loader partition, so a stale 0x110000 write
+        # would leave the selector with no valid Main image at its declared offset.
         image_root = flash if target == "main" else ROOT / "target" / "oldmain" / "flash" / family
-        return family, [("0x110000", image_root / "main-app.bin")]
+        return family, [("0xf0000", image_root / "main-app.bin")]
     if target == "recovery":
         return family, [(
             "0x10000",
@@ -778,7 +778,7 @@ def main() -> int:
         _, pairs = artifacts(DirectDevice("esp32c6"), args.target, args.module)
         # This authority accepts exactly one checked app partition; retain the
         # partition-table offsets here so JTAG cannot overwrite Stage2 or NVS.
-        expected_offset = {"recovery": "0x10000", "main": "0x110000"}[args.target]
+        expected_offset = {"recovery": "0x10000", "main": "0xf0000"}[args.target]
         if len(pairs) != 1 or pairs[0][0] != expected_offset:
             raise RuntimeError(f"unexpected {args.role} {args.target} JTAG artifact: {pairs}")
         print(f"{args.role}: JTAG {args.target} write {pairs[0][1]}", flush=True)

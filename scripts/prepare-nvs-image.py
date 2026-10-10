@@ -39,7 +39,7 @@ TYPE_MAP = {
 }
 TRANSIENT_RECOVERY_KEYS = {"request_magic", "request_version", "flags"}
 STAGE2_NAMESPACE = "stg2"
-# stg2:flash values understood by fw/boot (Main code read mode).
+# stg2:flash values understood by Stage2 (esp-wifi-loader/boot; Main code read mode).
 STAGE2_FLASH_MODES = {"dio": 1, "qio": 2, "auto": 3}
 STA_PROFILE_KEYS = {
     "sta_ssid",
