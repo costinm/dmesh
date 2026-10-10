@@ -7,7 +7,7 @@
 //! writes, as a body sink that knows its own block size.
 
 use alloc::{boxed::Box, vec, vec::Vec};
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 use dmesh_server::cbor::FieldValue::{self, Unsigned as U, Text as T, Null};
 use dmesh_server::object_transfer::{FlashStartError, ImageSink, ImageWriter};
 
@@ -349,20 +349,12 @@ fn log_receiver_error(
 }
 
 fn emit_event(kind: &str, fields: &[(u64, FieldValue<'_>)]) {
-    static SEQUENCE: AtomicU32 = AtomicU32::new(0);
-    let mut out = [0u8; 512];
-    let Some(used) = dmesh_server::cbor::encode_fields(&mut out, fields) else { return; };
-    let record = dmesh_server::log_watch::LogRecord {
-        seq: u64::from(SEQUENCE.fetch_add(1, Ordering::Relaxed)) + 1,
-        time_ms: now_ms(),
-        level: if kind == "object_flash.receiver_rejected" {
-            dmesh_server::log_watch::LEVEL_ERROR
-        } else { dmesh_server::log_watch::LEVEL_INFO },
-        source: "flash".into(),
-        kind: Some(kind.into()), text: alloc::string::String::new(),
-        fields: Some(out[..used].to_vec()),
+    let level = if kind == "object_flash.receiver_rejected" {
+        dmesh_server::log_watch::LEVEL_ERROR
+    } else {
+        dmesh_server::log_watch::LEVEL_INFO
     };
-    let _ = crate::uart_esp::send_log_record(&record.encode());
+    let _ = crate::log_history::push_event(level, "flash", kind, fields);
 }
 
 /// Admit a request: the image must be for this CPU, name a writable destination, and fit it.

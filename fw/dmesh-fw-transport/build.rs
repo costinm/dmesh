@@ -1,4 +1,10 @@
 fn main() {
+    // Shared adapters must follow the consuming image's SDK capabilities.
+    // Recovery deliberately omits Main-only sleep callback instrumentation.
+    if let Some(cfg) = embuild::espidf::sysenv::cfg_args() {
+        cfg.output();
+    }
+    println!("cargo:rustc-check-cfg=cfg(esp_idf_pm_light_sleep_callbacks)");
     // A physical UART rate is a firmware image property: host and device must
     // be switched together.  Keep the accepted set explicit so a typo cannot
     // produce a silently unusable console image.

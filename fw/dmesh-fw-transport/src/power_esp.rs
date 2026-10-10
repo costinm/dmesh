@@ -50,6 +50,7 @@ static AUTO_CALLBACK_REGISTERED: core::sync::atomic::AtomicBool = core::sync::at
 // IDF also invokes this after a rejected attempt; ignore short returns, which
 // cannot demonstrate the inter-window sleep interval. These are long-return
 // observations, not an exact count of every successful sleep entry.
+#[cfg(esp_idf_pm_light_sleep_callbacks)]
 unsafe extern "C" fn automatic_sleep_exit(duration_us: i64, _arg: *mut core::ffi::c_void) -> i32 {
     if duration_us >= 10_000 {
         let duration = duration_us.min(i64::from(u32::MAX)) as u32;
@@ -70,6 +71,7 @@ pub(crate) fn automatic_sleep_metrics() -> (u32, u32, u32, bool) {
 /// It is never called by packet ingress or a radio callback.  USB-JTAG and
 /// the explicit DW8 sleep effect remain separate from this CPU-idle policy.
 pub fn configure(sleepy: bool) -> bool {
+    #[cfg(esp_idf_pm_light_sleep_callbacks)]
     if !AUTO_CALLBACK_REGISTERED.load(Ordering::Relaxed) {
         let mut callbacks = esp_idf_sys::esp_pm_sleep_cbs_register_config_t::default();
         callbacks.exit_cb = Some(automatic_sleep_exit);

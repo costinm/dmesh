@@ -2,18 +2,41 @@
 //! provenance; the request's own `kind` field is never authorization.
 
 use alloc::vec::Vec;
-use dmesh_server::{provision, tagged::{self, Name, Record}};
 use dmesh_server::registry::CallContext;
+use dmesh_server::{
+    provision,
+    tagged::{self, Name, Record},
+};
 
 /// The request's association runs over the wired UART, by the node's own record of its bearer;
 /// the request's `kind` field is never consulted.
 fn over_uart(context: CallContext) -> bool {
-    context.bearer.is_some_and(|bearer| bearer.as_str() == "uart0")
+    context
+        .bearer
+        .is_some_and(|bearer| bearer.as_str() == "uart0")
 }
 
 /// The request's association runs over the BLE L2CAP channel.
+#[cfg(feature = "ble-stack")]
 fn over_ble_coc(context: CallContext) -> bool {
-    context.bearer.is_some_and(|bearer| bearer.as_str() == "ble")
+    context
+        .bearer
+        .is_some_and(|bearer| bearer.as_str() == "ble")
+}
+
+#[cfg(not(feature = "ble-stack"))]
+fn over_ble_coc(_context: CallContext) -> bool {
+    false
+}
+
+#[cfg(feature = "ble-stack")]
+fn clear_ble_bonds() -> bool {
+    dmesh_ble::clear_bonds()
+}
+
+#[cfg(not(feature = "ble-stack"))]
+fn clear_ble_bonds() -> bool {
+    true
 }
 
 pub fn register() {
@@ -32,22 +55,29 @@ pub fn register() {
 /// it needs no proof of the current secret. Never over a radio bearer, whatever
 /// the request claims.
 fn handle_unpair(record: Record<'_>, context: CallContext) -> Option<Vec<u8>> {
-    if record.component != Some(Name::Tag(provision::COMPONENT)) { return None; }
+    if record.component != Some(Name::Tag(provision::COMPONENT)) {
+        return None;
+    }
     let id = record.id?;
     let unpaired = over_uart(context)
         && provision::is_unpair(record)
         && dmesh_fw_transport::main_runtime::clear_pairing()
-        && dmesh_ble::clear_bonds();
+        && clear_ble_bonds();
     let mut wire = [0; 64];
     let len = tagged::encode_numeric_response(
-        provision::COMPONENT, provision::UNPAIR, id,
-        if unpaired { &[0xf5] } else { &[0xf4] }, &mut wire,
+        provision::COMPONENT,
+        provision::UNPAIR,
+        id,
+        if unpaired { &[0xf5] } else { &[0xf4] },
+        &mut wire,
     )?;
     Some(Vec::from(&wire[..len]))
 }
 
 fn handle(record: Record<'_>, context: CallContext) -> Option<Vec<u8>> {
-    if record.component != Some(Name::Tag(provision::COMPONENT)) { return None; }
+    if record.component != Some(Name::Tag(provision::COMPONENT)) {
+        return None;
+    }
     let id = record.id?;
     // Wired UART/USB may set or replace the secret. BLE may only pair a device
     // that has none (install_pairing enforces that and the open pairing
@@ -64,14 +94,20 @@ fn handle(record: Record<'_>, context: CallContext) -> Option<Vec<u8>> {
     let installed = replace.is_some_and(|replace| {
         provision::decode_install(record).is_some_and(|request| {
             dmesh_fw_transport::main_runtime::install_pairing(
-                request.name, request.root_public_key, request.secret, replace,
+                request.name,
+                request.root_public_key,
+                request.secret,
+                replace,
             )
         })
     });
     let mut wire = [0; 64];
     let len = tagged::encode_numeric_response(
-        provision::COMPONENT, provision::INSTALL, id,
-        if installed { &[0xf5] } else { &[0xf4] }, &mut wire,
+        provision::COMPONENT,
+        provision::INSTALL,
+        id,
+        if installed { &[0xf5] } else { &[0xf4] },
+        &mut wire,
     )?;
     Some(Vec::from(&wire[..len]))
 }

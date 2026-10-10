@@ -401,14 +401,8 @@ pub fn stop() {
     if !STARTED.swap(false, Ordering::AcqRel) {
         return;
     }
-    let _ =
-        crate::wifi_esp::register_ethernet_rx_callback(crate::wifi_esp::RadioInterface::Sta, None);
-    if AP_RX_CALLBACK_REGISTERED.swap(false, Ordering::AcqRel) {
-        let _ = crate::wifi_esp::register_ethernet_rx_callback(
-            crate::wifi_esp::RadioInterface::Ap,
-            None,
-        );
-    }
+    // Leave the classifier installed: stopped QUIC must not disable TCP/IP.
+    // Its inactive branch forwards ownership to lwIP unchanged.
     HANDLER.store(0, Ordering::Release);
     crate::shared_ingress_esp::stop(crate::shared_ingress_esp::IngressKind::RawUdp6);
     START_STATUS.store(0, Ordering::Release);
@@ -521,6 +515,10 @@ pub fn last_tx_result() -> u32 {
     LAST_TX_RESULT.load(Ordering::Relaxed)
 }
 
+static NATIVE_TX_FAILURES: AtomicU32 = AtomicU32::new(0);
+static NATIVE_TX_ERROR: AtomicU32 = AtomicU32::new(0);
+static NATIVE_TX_ERROR_MS: AtomicU32 = AtomicU32::new(0);
+
 unsafe extern "C" fn rx_callback_sta(buffer: *mut c_void, len: u16, eb: *mut c_void) -> i32 {
     unsafe {
         rx_callback(
@@ -549,7 +547,10 @@ unsafe fn rx_callback(
     len: u16,
     eb: *mut c_void,
 ) -> i32 {
-    if buffer.is_null() || len as usize > FRAME_CAPACITY {
+    if !STARTED.load(Ordering::Acquire) {
+        return crate::wifi_esp::forward_ethernet_to_lwip(link, buffer, len, eb);
+    }
+    if buffer.is_null() {
         if !eb.is_null() {
             crate::wifi_esp::release_ethernet_rx_buffer(eb);
         }
@@ -565,17 +566,19 @@ unsafe fn rx_callback(
     }
     unsafe {
         let frame = core::slice::from_raw_parts(buffer.cast::<u8>(), len as usize);
-        // ESP-IDF delivers the whole associated Ethernet feed to this raw
-        // callback.  The shared eight-slot packet pool is for the UDP6
-        // bearer, not a general STA sniffer: copying ARP, IPv4, and unrelated
-        // L2 traffic can otherwise evict the IPv6 Neighbor Solicitation that
-        // establishes the return path for an incoming QUIC-lite association.
-        // Keep the callback's decision to the common raw-UDP6 frame classes;
-        // detailed NDP and UDP validation remains in the worker below.
-        if !crate::raw_udp6::is_icmpv6_frame(frame) && !crate::raw_udp6::is_udp6_frame(frame) {
-            if !eb.is_null() {
-                crate::wifi_esp::release_ethernet_rx_buffer(eb);
-            }
+        // Divert only our plain IPv6 UDP destinations. TCP, ARP, DHCP, NDP
+        // and other traffic remain with the normal SDK network stack.
+        // Full UDP validation follows in dispatch_ingress.
+        let local_ip = link_local_from_mac(local_mac_for(link));
+        if !crate::raw_udp6::is_udp6_for_destination(frame, local_ip, RAW_UDP6_PORT)
+            && !crate::raw_udp6::is_udp6_for_destination(frame, ANNOUNCE_IPV6, ANNOUNCE_UDP6_PORT)
+        {
+            // Do not free here: lwIP takes the original driver allocation.
+            return crate::wifi_esp::forward_ethernet_to_lwip(link, buffer, len, eb);
+        }
+        if len as usize > FRAME_CAPACITY {
+            if !eb.is_null() { crate::wifi_esp::release_ethernet_rx_buffer(eb); }
+            RX_QUEUE_DROPS.fetch_add(1, Ordering::Relaxed);
             return esp_idf_sys::ESP_OK;
         }
         let queued = crate::shared_ingress_esp::enqueue_on_link(
@@ -584,8 +587,8 @@ unsafe fn rx_callback(
             [0; 6],
             frame,
         );
-        // `buffer` is owned by the Wi-Fi driver. This adapter has copied it
-        // into its static queue, so it must return the opaque RX allocation
+        // `buffer` is owned by the Wi-Fi driver. The handler has transferred
+        // its payload into the node pool, so return the opaque RX allocation
         // immediately; retaining it would exhaust the driver's RX pool.
         if !eb.is_null() {
             crate::wifi_esp::release_ethernet_rx_buffer(eb);
@@ -757,38 +760,22 @@ fn dispatch_ingress(item: crate::shared_ingress_esp::IngressPacket, frame: &[u8]
     if handler == 0 {
         return;
     }
-    let handler: RawUdp6Handler = unsafe { core::mem::transmute(handler) };
     // Preserve the complete UDP return tuple behind a stable opaque path.
     // MAC alone is insufficient: independent host processes can use the same
     // L2 peer with different source ports and associations.
-    let Some(path) = bind_udp_peer(peer) else {
+    let Some(mut writer) = crate::quic_node_esp::acquire_udp_receive_writer() else {
         RX_QUEUE_DROPS.fetch_add(1, Ordering::Relaxed);
         return;
     };
-    let immediate = handler(path, peer, packet.payload, response);
-    let submitted = immediate
-        .filter(|&used| {
-            let sent = transmit_udp6(peer.link, peer, RAW_UDP6_PORT, &response[..used]);
-            if sent {
-                UDP_DELIVERED.fetch_add(1, Ordering::Relaxed);
-                TX_FRAMES.fetch_add(1, Ordering::Relaxed);
-            } else {
-                TX_FAILURES.fetch_add(1, Ordering::Relaxed);
-            }
-            sent
-        })
-        .map_or(0, |_| 1);
-    if submitted != 0 {
-        // Keep a small physical-path breadcrumb for the host->STA direct
-        // responder. A client timeout alone cannot distinguish a handler
-        // that produced nothing from a Wi-Fi submit or AP-forwarding loss.
-        if UDP_DELIVERED.load(Ordering::Relaxed) <= 2 {
-            crate::commands::send_stat(b"raw udp6 egress sent=", 1);
-            crate::commands::send_stat(
-                b"raw udp6 egress tx result=",
-                LAST_TX_RESULT.load(Ordering::Relaxed) as u64,
-            );
-        }
+    use quic_lite::PacketWriter;
+    if packet.payload.len() > writer.payload_mut().len() {
+        RX_QUEUE_DROPS.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    writer.payload_mut()[..packet.payload.len()].copy_from_slice(packet.payload);
+    let Some(owned) = writer.commit(packet.payload.len()) else { return };
+    if !crate::quic_node_esp::defer_udp_packet(peer, owned) {
+        RX_QUEUE_DROPS.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -906,6 +893,11 @@ fn bind_udp_peer(peer: RawUdp6Peer) -> Option<quic_lite::PeerL2Address> {
     }
 }
 
+// Compatibility entry point used by the owner for either UDP backend.
+pub(crate) fn bind_udp_peer_for_socket(peer: RawUdp6Peer) -> Option<quic_lite::PeerL2Address> {
+    bind_udp_peer(peer)
+}
+
 pub(crate) fn peer_for_path(path: quic_lite::PeerL2Address) -> Option<RawUdp6Peer> {
     unsafe { (*core::ptr::addr_of!(UDP_PATH_BINDINGS)).get(path) }
 }
@@ -969,7 +961,7 @@ pub(crate) fn transmit_udp6_owned(
     peer: RawUdp6Peer,
     source_port: u16,
     packet: crate::quic_node_esp::FirmwarePacket,
-) -> (crate::quic_node_esp::FirmwarePacket, bool) {
+) -> (crate::quic_node_esp::FirmwarePacket, UdpTransmitResult) {
     use quic_lite::PacketBuffer;
     let local_mac = local_mac_for(peer.link);
     let local_ip = link_local_from_mac(local_mac);
@@ -977,7 +969,7 @@ pub(crate) fn transmit_udp6_owned(
         && !sta_driver_tx_enabled();
     let prefix_len = if raw_station { STATION_UDP6_HEADROOM } else { ETHERNET_UDP6_HEADROOM };
     let (mut buffer, range) = packet.into_parts();
-    let sent = range.start.checked_sub(prefix_len).and_then(|start| {
+    let submitted = range.start.checked_sub(prefix_len).and_then(|start| {
         let storage = buffer.as_mut_unique()?;
         let frame = &mut storage[start..range.end];
         if raw_station {
@@ -994,10 +986,28 @@ pub(crate) fn transmit_udp6_owned(
             };
             Some(transmit_ethernet(interface, &frame[..len]))
         }
-    }).unwrap_or(false);
+    });
+    let sent = submitted.unwrap_or(false);
     let packet = quic_lite::OwnedPacket::new(buffer, range).ok().expect("original QUIC range");
-    (packet, sent)
+    let outcome = if sent {
+        UdpTransmitResult::Accepted
+    } else if submitted == Some(false) && LAST_TX_RESULT.load(Ordering::Relaxed) == esp_idf_sys::ESP_ERR_NO_MEM as u32 {
+        UdpTransmitResult::Busy
+    } else {
+        UdpTransmitResult::Failed
+    };
+    (packet, outcome)
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UdpTransmitResult { Accepted, Busy, Failed }
+
+// The restored backend has only the public raw-TX completion observer.
+pub fn ethernet_tx_done_diagnostics() -> [u32; 4] { [0; 4] }
+pub(crate) fn tx_submit_failure_details() -> (u32, u32, u32) {
+    (NATIVE_TX_FAILURES.load(Ordering::Relaxed), NATIVE_TX_ERROR.load(Ordering::Relaxed), NATIVE_TX_ERROR_MS.load(Ordering::Relaxed))
+}
+pub(crate) fn tx_failure_memory() -> [u32; 4] { [0; 4] }
 
 /// Send one bounded unsigned presence record over every live UDP6 Wi-Fi link.
 /// STA and AP have distinct ESP-IDF Ethernet egress, so APSTA must submit one
@@ -1071,6 +1081,11 @@ fn transmit_ethernet(interface: crate::wifi_esp::RadioInterface, ethernet: &[u8]
     let elapsed = (unsafe { esp_idf_sys::esp_timer_get_time() } - started).max(0) as u32;
     record_tx_submit(elapsed);
     LAST_TX_RESULT.store(result as u32, Ordering::Relaxed);
+    if result != esp_idf_sys::ESP_OK {
+        NATIVE_TX_FAILURES.fetch_add(1, Ordering::Relaxed);
+        NATIVE_TX_ERROR.store(result as u32, Ordering::Relaxed);
+        NATIVE_TX_ERROR_MS.store((started.max(0) as u64 / 1000) as u32, Ordering::Relaxed);
+    }
     result == esp_idf_sys::ESP_OK
 }
 

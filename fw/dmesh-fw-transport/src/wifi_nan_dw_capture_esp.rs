@@ -1099,6 +1099,8 @@ fn drain_pending_sdfs() {
         if valid {
             PENDING_SDF_TX_ATTEMPTED.fetch_add(1, Ordering::Relaxed);
         }
+        let tx_started_us = now_us();
+        let (_, tx_anchor_us, _) = sync_diagnostics();
         let sent = if valid {
             let interface =
                 if crate::wifi_esp::sta_associated() || !crate::wifi_esp::lab_open_ap_active() {
@@ -1129,6 +1131,23 @@ fn drain_pending_sdfs() {
                 (b"nan SDF tx frame_bytes", len as u64),
                 (b"nan SDF tx remaining", u64::from(remaining)),
                 (b"nan SDF tx accepted", u64::from(sent)),
+            ]);
+            // CAPTURING can also mean continuous NOW reception. Record the
+            // actual cluster phase of first/last SDF attempts so submission
+            // acceptance is not mistaken for transmission during a peer DW.
+            use dmesh_server::cbor::FieldValue::Unsigned as U;
+            crate::wifi_esp::sta_diagnostic("nan.sdf_tx", &[
+                (1, U(tx_started_us)),
+                (2, U(tx_anchor_us)),
+                (3, U(tx_started_us.saturating_sub(tx_anchor_us)
+                    % dmesh_rawnan::NAN_DISCOVERY_PERIOD_US)),
+                (4, U(u64::from(NOW_ACTIVE_RECEIVE.load(Ordering::Acquire)))),
+                (5, U(u64::from(CAPTURING.load(Ordering::Acquire)))),
+                (6, U(u64::from(remaining))),
+                (7, U(u64::from(sent))),
+                (8, U(u64::from(NAN_DW_DURATION_US))),
+                (9, U(len as u64)),
+                (10, U(u64::from(sync_received_us() != 0))),
             ]);
         }
         if slot.count_active_discovery.load(Ordering::Relaxed) {
@@ -2641,6 +2660,18 @@ pub fn service_deadline() {
             {
                 let memory = crate::shared_ingress_esp::memory_stats();
                 let (sleep_exits, sleep_total_us, sleep_last_us, sleep_callback) = crate::power_esp::automatic_sleep_metrics();
+                // A UART event may be missing while the driver still holds
+                // bytes. Observe at the existing sparse task-context sleep
+                // checkpoint, independently of QUIC ingress notifications.
+                let uart = crate::uart_esp::receive_diagnostics();
+                use dmesh_server::cbor::FieldValue::Unsigned as U;
+                crate::wifi_esp::sta_diagnostic("uart.rx_idle", &[
+                    (1, U(u64::from(uart[0]))), (2, U(u64::from(uart[1]))),
+                    (3, U(u64::from(uart[2]))), (4, U(u64::from(uart[3]))),
+                    (5, U(u64::from(uart[4]))), (6, U(u64::from(uart[5]))),
+                    (7, U(u64::from(uart[6]))),
+                    (8, U(u64::from(crate::uart_esp::buffered_receive_bytes().unwrap_or(u32::MAX)))),
+                ]);
                 crate::commands::send_stats(&[
                     (b"nan auto sleep callback", u64::from(sleep_callback)),
                     (b"nan auto sleep long_returns", u64::from(sleep_exits)),

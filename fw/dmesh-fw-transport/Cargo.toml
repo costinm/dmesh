@@ -22,6 +22,12 @@ uart-transport = []
 # Main-only bearer and application capabilities. Recovery leaves these off.
 espnow-transport = []
 probe = []
+# Private diagnostic snapshots; the build script also enables SDK accounting.
+rtos-stats = []
+# Host-controlled A/B only; normal firmware intercepts UDP before lwIP.
+udp6-socket = []
+# Main TCP byte-stream comparison using the same registry, no QUIC changes.
+tcp-stream = []
 
 [dependencies]
 quic-lite = { path = "../../crates/quic-lite" }
@@ -29,3 +35,6 @@ dmesh-server = { path = "../../crates/dmesh-server", default-features = false }
 dmesh-rawnan = { path = "../../crates/rawnan", default-features = false }
 uart-codec = { path = "../../crates/uart-codec" }
 esp-idf-sys = { version = "0.37", default-features = false, features = ["alloc_handler"] }
+
+[build-dependencies]
+embuild = "0.33.3"

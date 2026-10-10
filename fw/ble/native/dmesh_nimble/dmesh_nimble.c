@@ -11,6 +11,7 @@
 #include "soc/gpio_struct.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#if CONFIG_BT_ENABLED && CONFIG_BT_NIMBLE_ENABLED
 #include "host/ble_gap.h"
 #include "host/ble_hs.h"
 #include "host/ble_hs_id.h"
@@ -25,6 +26,7 @@
 #include "syscfg/syscfg.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
+#endif
 
 static const char *TAG = "dmesh_nimble";
 
@@ -98,6 +100,7 @@ void IRAM_ATTR dmesh_lora_gpio_isr(void *arg) {
     notify_task_from_gpio_isr(&s_lora_irq_task, &s_lora_irq_pending);
 }
 
+#if CONFIG_BT_ENABLED && CONFIG_BT_NIMBLE_ENABLED
 static uint8_t s_addr_type;
 static uint8_t s_addr[6];
 static bool s_started;
@@ -974,3 +977,4 @@ int32_t dmesh_nimble_stop_advertising(void) {
     ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_adv_stop_event);
     return 0;
 }
+#endif

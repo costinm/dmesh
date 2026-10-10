@@ -136,6 +136,13 @@ pub fn is_icmpv6_frame(frame: &[u8]) -> bool {
 /// ICMPv6, and non-IPv6 traffic as malformed DMesh UDP.  Validation of the
 /// IPv6 and UDP lengths, destination, and checksum remains in
 /// [`parse_udp6_for_destination`].
+/// Cheap RX routing only. Full length/checksum validation follows on the owner.
+/// Unsupported extension headers/fragments stay with lwIP.
+pub fn is_udp6_for_destination(frame: &[u8], ip: [u8; 16], port: u16) -> bool {
+    frame.len() >= ETHERNET_UDP6_HEADROOM && is_udp6_frame(frame)
+        && frame[38..54] == ip && frame[56..58] == port.to_be_bytes()
+}
+
 pub fn is_udp6_frame(frame: &[u8]) -> bool {
     frame.len() >= ETHERNET_HEADER_LEN + IPV6_HEADER_LEN
         && read_u16(&frame[12..14]) == ETHERTYPE_IPV6
@@ -734,6 +741,25 @@ mod tests {
 
     const LOCAL_MAC: [u8; 6] = [0x14, 0xc1, 0x9f, 0xe5, 0x98, 0];
     const PEER_MAC: [u8; 6] = [2, 0, 0, 0, 0, 1];
+
+    #[test]
+    fn intercept_only_selected_plain_udp6_destination() {
+        let local = link_local_from_mac(LOCAL_MAC);
+        let peer = link_local_from_mac(PEER_MAC);
+        let mut frame = [0u8; 128];
+        let n = encode_udp6(&mut frame, LOCAL_MAC, PEER_MAC, local, peer, 3339, 4444, b"payload").unwrap();
+        assert!(is_udp6_for_destination(&frame[..n], local, 3339));
+        assert!(!is_udp6_for_destination(&frame[..n], peer, 3339));
+        assert!(!is_udp6_for_destination(&frame[..n], local, 3340));
+        for len in 0..ETHERNET_UDP6_HEADROOM {
+            assert!(!is_udp6_for_destination(&frame[..len], local, 3339));
+        }
+        // TCP, ICMPv6, fragments and extension headers stay with lwIP.
+        for protocol in [6, 58, 44, 0, 43, 60] {
+            frame[20] = protocol;
+            assert!(!is_udp6_for_destination(&frame[..n], local, 3339));
+        }
+    }
 
     #[test]
     fn ethernet_udp6_prefix_preserves_payload_address_and_suffix() {

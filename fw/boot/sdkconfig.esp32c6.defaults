@@ -1,9 +1,8 @@
 CONFIG_IDF_TARGET="esp32c6"
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
-# The C6 test board is reliable at 40 MHz; keep the bootloader and app image
-# contract below the marginal 80 MHz setting seen during early flash reads.
-CONFIG_ESPTOOLPY_FLASHFREQ_40M=y
-CONFIG_ESPTOOLPY_FLASHFREQ="40m"
+# 80 MHz is tested on all boards; build-stage2.sh applies the same default.
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_ESPTOOLPY_FLASHFREQ="80m"
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_BOOTLOADER_RESERVE_RTC_MEM=y
 CONFIG_BOOTLOADER_RESERVE_RTC_SIZE=0x20

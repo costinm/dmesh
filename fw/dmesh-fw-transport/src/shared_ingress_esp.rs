@@ -5,11 +5,11 @@
 //! call sites while each radio is converted to `PacketBearer`.
 
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use quic_lite::{OwnedPacket, packet_pool::PoolBufferLease};
+use quic_lite::OwnedPacket;
 
 pub const FRAME_CAPACITY: usize = crate::TRANSPORT_MTU + 96;
 pub const ESP_CALLBACK_PACKET_SLOTS: usize = 8;
-pub const ESP_MAX_PACKET_SLOTS: usize = 8;
+pub const ESP_MAX_PACKET_SLOTS: usize = crate::quic_node_esp::PACKETS;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -51,8 +51,7 @@ impl IngressPacket {
 }
 
 pub type IngressHandler = fn(IngressPacket, &[u8]);
-pub type SharedPacketLease =
-    PoolBufferLease<'static, 8, { quic_lite::DEFAULT_PACKET_POOL_SLOT_SIZE }>;
+pub type SharedPacketLease = <crate::quic_node_esp::FirmwarePool as quic_lite::PacketPool>::Buffer;
 pub type OwnedIngressPacket = OwnedPacket<SharedPacketLease>;
 
 static RAW_UDP6: AtomicUsize = AtomicUsize::new(0);
@@ -127,12 +126,19 @@ pub fn schedule_ble_coc_egress_ready(handler: fn()) -> bool {
     handler();
     true
 }
-pub fn set_packet_capacity_limit(_slots: usize) {}
+pub fn set_packet_capacity_limit(slots: usize) {
+    crate::quic_node_esp::set_packet_capacity_limit(slots);
+}
 pub fn available() -> usize {
     0
 }
 pub fn drops() -> u32 {
     DROPS.load(Ordering::Relaxed)
+}
+
+/// Record a receive frame discarded because the shared packet pool refused it.
+pub(crate) fn record_pool_drop() -> bool {
+    DROPS.fetch_add(1, Ordering::Relaxed) == 0
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

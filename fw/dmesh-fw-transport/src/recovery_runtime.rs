@@ -1,6 +1,6 @@
-//! Minimal Recovery STA/raw-UDP6 flash server.
+//! Minimal Recovery STA/UDP6 flash server.
 //!
-//! Main and Recovery use the same raw Ethernet UDP6 adapter, shared ingress
+//! Main and Recovery use the same lwIP UDP6 adapter, shared ingress
 //! worker, QUIC-lite dispatcher, stream handlers, and flash sink. Recovery
 //! owns only STA startup, periodic presence, deadline wakeups, and the final
 //! Stage2 handoff. UART is console output only, never a QUIC bearer.
@@ -9,12 +9,19 @@ const START_TIMEOUT_MS: u64 = 75_000;
 const ANNOUNCE_INTERVAL_MS: u64 = 2_000;
 static DEADLINE_OWNER_TASK: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
+static RECOVERY_RUNNING: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 pub(crate) fn active() -> bool {
     DEADLINE_OWNER_TASK.load(core::sync::atomic::Ordering::Acquire) != 0
 }
 
+pub(crate) fn is_recovery() -> bool {
+    RECOVERY_RUNNING.load(core::sync::atomic::Ordering::Acquire)
+}
+
 pub fn run() {
+    RECOVERY_RUNNING.store(true, core::sync::atomic::Ordering::Release);
     esp_idf_sys::link_patches();
     // Console output also carries structured log records. Disable newline
     // translation once at startup: binary 0x0a must remain a single byte.
@@ -25,7 +32,8 @@ pub fn run() {
         );
         #[cfg(not(target_arch = "riscv32"))]
         esp_idf_sys::uart_vfs_dev_port_set_tx_line_endings(
-            0, esp_idf_sys::esp_line_endings_t_ESP_LINE_ENDINGS_LF,
+            0,
+            esp_idf_sys::esp_line_endings_t_ESP_LINE_ENDINGS_LF,
         );
     }
     // Recovery shares Main's packet-memory capability and therefore reads the
@@ -38,6 +46,16 @@ pub fn run() {
     let _ = registry::register(
         methods::TELEMETRY_DEVICE,
         SyncFn(crate::device_telemetry::receive),
+    );
+    let dispatch: dmesh_server::log_watch::Dispatch = alloc::sync::Arc::new(|request| {
+        registry::dispatch_now(request, dmesh_server::registry::CallContext::local())
+    });
+    let _ = registry::register_stream(
+        methods::LOG_WATCH_RECORDS,
+        dmesh_server::log_watch::LogWatchHandler::new(
+            alloc::sync::Arc::new(crate::log_history::Source),
+            Some(dispatch),
+        ),
     );
     let _ = registry::register_stream_at(
         methods::HTTP_POST,
@@ -185,19 +203,20 @@ fn serve_upload(started_us: u64) -> ! {
 
 fn log_raw_stats() {
     let (rx, drops, invalid, udp_tx, frames_tx, tx_failures) = crate::wifi_raw_udp6_esp::stats();
-    unsafe {
-        esp_idf_sys::esp_rom_printf(
-            b"DMESH recovery: raw stats rx=%u drops=%u invalid=%u udp_tx=%u frames_tx=%u tx_fail=%u\n\0"
-                .as_ptr()
-                .cast(),
-            rx,
-            drops,
-            invalid,
-            udp_tx,
-            frames_tx,
-            tx_failures,
-        );
-    }
+    use dmesh_server::cbor::FieldValue::Unsigned as U;
+    let _ = crate::log_history::push_event(
+        dmesh_server::log_watch::LEVEL_INFO,
+        "bearer.udp6",
+        "bearer.counters",
+        &[
+            (1, U(u64::from(rx))),
+            (2, U(u64::from(drops))),
+            (3, U(u64::from(invalid))),
+            (4, U(u64::from(udp_tx))),
+            (5, U(u64::from(frames_tx))),
+            (6, U(u64::from(tx_failures))),
+        ],
+    );
     log_stack_stats();
 }
 
@@ -216,6 +235,24 @@ fn log_stack_stats() {
     } else {
         0
     };
+    if active() {
+        use dmesh_server::cbor::FieldValue::Unsigned as U;
+        let _ = crate::log_history::push_event(
+            dmesh_server::log_watch::LEVEL_INFO,
+            "runtime",
+            "runtime.stack",
+            &[
+                (1, U(configured as u64)),
+                (2, U(u64::from(min_free))),
+                (3, U(u64::from(configured.saturating_sub(min_free)))),
+                (4, U(if ingress.worker_running { 1 } else { 0 })),
+                (5, U(u64::from(ingress.worker_stack_bytes))),
+                (6, U(u64::from(ingress.worker_stack_min_free_words))),
+                (7, U(u64::from(ingress_peak_used))),
+            ],
+        );
+        return;
+    }
     unsafe {
         esp_idf_sys::esp_rom_printf(
             b"DMESH recovery: stack configured=%u min_free=%u peak_used=%u ingress_running=%u ingress_configured=%u ingress_min_free=%u ingress_peak_used=%u\n\0"
@@ -274,7 +311,12 @@ fn wait_for_deadline_or_ingress(ms: u32) {
 }
 
 pub(crate) fn log(message: &'static [u8]) {
-    unsafe { esp_idf_sys::esp_rom_printf(message.as_ptr().cast()) };
+    if active() {
+        let message = message.strip_suffix(b"\0").unwrap_or(message);
+        crate::log_history::push(message);
+    } else {
+        unsafe { esp_idf_sys::esp_rom_printf(message.as_ptr().cast()) };
+    }
 }
 
 fn return_to_main() -> ! {

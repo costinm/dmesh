@@ -1,6 +1,8 @@
 extern crate alloc;
 
+#[cfg(feature = "ble-stack")]
 mod ble;
+mod loader_flash;
 mod pairing;
 
 fn receive_boot_control(record: dmesh_server::tagged::Record<'_>) -> Option<alloc::vec::Vec<u8>> {
@@ -33,17 +35,26 @@ fn receive_boot_control(record: dmesh_server::tagged::Record<'_>) -> Option<allo
 struct BootRecoveryHandler;
 
 impl dmesh_server::stream::StreamHandler for BootRecoveryHandler {
-    fn open<'a>(&'a self, request: dmesh_server::stream::Request<'a>)
-        -> dmesh_server::stream::OpenFuture<'a>
-    {
+    fn open<'a>(
+        &'a self,
+        request: dmesh_server::stream::Request<'a>,
+    ) -> dmesh_server::stream::OpenFuture<'a> {
         use dmesh_server::stream::{Outcome, Response};
         let response = match receive_boot_control(request.record) {
             Some(header) => Response::header(header).after_finish(|| {
-                unsafe { esp_idf_sys::esp_rom_printf(b"DMESH main: recovery response finished\n\0".as_ptr().cast()) };
+                unsafe {
+                    esp_idf_sys::esp_rom_printf(
+                        b"DMESH main: recovery response finished\n\0"
+                            .as_ptr()
+                            .cast(),
+                    )
+                };
                 let _ = dmesh_fw_transport::rtc::request_recovery_boot();
             }),
             None => Response::header(dmesh_server::stream::error_header(
-                request.record.id, b"invalid boot.recovery request")),
+                request.record.id,
+                b"invalid boot.recovery request",
+            )),
         };
         alloc::boxed::Box::pin(core::future::ready(Some(Outcome::Respond(response))))
     }
@@ -57,6 +68,7 @@ fn main() {
 /// Starting it after the radio-ready edge prevents the classic ESP32
 /// coexistence allocator from racing the first WPA authentication while still
 /// restoring BLE automatically for both associated and NAN/NOW boots.
+#[cfg(feature = "ble-stack")]
 fn start_ble_after_radio_ready() {
     if !dmesh_ble::boot_enabled() {
         return;
@@ -96,32 +108,39 @@ pub extern "C" fn app_main() {
         dmesh_server::registry::methods::BOOT_RECOVERY,
         BootRecoveryHandler,
     ));
+    #[cfg(feature = "ble-stack")]
     ble::register();
     pairing::register();
+    loader_flash::start();
     unsafe { esp_idf_sys::esp_rom_printf(b"DMESH main: health-start\n\0".as_ptr().cast()) };
     #[cfg(feature = "modules")]
     dmesh_fw_modules::register_tagged_handlers();
-    // Route ESP-IDF logs through the UART writer queue. Direct console writes
-    // would splice text into PPP-framed tagged responses.
+    // Capture formatted ESP-IDF output as CBOR LogRecord entries in Main's
+    // shared packet-pool history. Do not write routine logs onto framed UART.
     unsafe {
         esp_idf_sys::esp_log_set_vprintf(Some(dmesh_uart_log_vprintf));
     }
-    let ble_auto = dmesh_fw_transport::main_runtime::boot_ble_auto();
-    dmesh_ble::configure_boot(ble_auto);
-    ble::install();
-    if !ble_auto {
-        unsafe {
-            esp_idf_sys::esp_rom_printf(b"DMESH main: BLE auto disabled\n\0".as_ptr().cast())
-        };
+    #[cfg(feature = "ble-stack")]
+    {
+        let ble_auto = dmesh_fw_transport::main_runtime::boot_ble_auto();
+        dmesh_ble::configure_boot(ble_auto);
+        ble::install();
+        if !ble_auto {
+            unsafe {
+                esp_idf_sys::esp_rom_printf(b"DMESH main: BLE auto disabled\n\0".as_ptr().cast())
+            };
+        }
+        if ble_auto {
+            dmesh_fw_transport::main_runtime::run_with_boot_radio_ready(
+                dmesh_fw_transport::rtc::mark_main_healthy,
+                start_ble_after_radio_ready,
+            );
+        } else {
+            dmesh_fw_transport::main_runtime::run(dmesh_fw_transport::rtc::mark_main_healthy);
+        }
     }
-    if ble_auto {
-        dmesh_fw_transport::main_runtime::run_with_boot_radio_ready(
-            dmesh_fw_transport::rtc::mark_main_healthy,
-            start_ble_after_radio_ready,
-        );
-    } else {
-        dmesh_fw_transport::main_runtime::run(dmesh_fw_transport::rtc::mark_main_healthy);
-    }
+    #[cfg(not(feature = "ble-stack"))]
+    dmesh_fw_transport::main_runtime::run(dmesh_fw_transport::rtc::mark_main_healthy);
 }
 
 extern "C" {

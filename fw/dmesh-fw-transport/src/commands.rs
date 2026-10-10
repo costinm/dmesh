@@ -1,14 +1,12 @@
 // IMPORTANT: This is shared no-std ESP firmware code. Host-testable CBOR
 // decoding and schemas belong in dmesh-server; this module only applies the
-// result to firmware state and uses the ESP UART adapter for exceptions.
+// result to firmware state and uses the shared CBOR log history for diagnostics.
 //!
 //! CBOR decoding is shared in `dmesh-server`; this module applies the decoded
 //! request to the Recovery-owned parameter image. UART, UDP, and future L2
 //! bearers call this handler without inheriting USB, PPP, or FreeRTOS code.
 
 extern crate alloc;
-
-use core::fmt::{self, Write};
 
 use dmesh_server::{
     control::{self, Handler, TransportConfig, TransportKind},
@@ -17,55 +15,66 @@ use dmesh_server::{
 
 use crate::TransportProfile;
 
-/// Emit human-readable diagnostics on UART's reserved debug channel. These
-/// records are local diagnostics, not QUIC application packets.
+/// Record one diagnostic message as a structured log-watch event. Recovery's
+/// boot console remains available until its QUIC owner is running.
 pub fn send_response(message: &[u8]) {
-    let _ = crate::uart_esp::send_debug_text(message);
+    if crate::recovery_runtime::is_recovery() && !crate::recovery_runtime::active() {
+        let _ = crate::uart_esp::send_debug_text(message);
+        return;
+    }
+    let Ok(message) = core::str::from_utf8(message) else {
+        return;
+    };
+    let _ = crate::log_history::push_event(
+        dmesh_server::log_watch::LEVEL_INFO,
+        "firmware",
+        "diagnostic.message",
+        &[(1, dmesh_server::cbor::FieldValue::Text(message))],
+    );
 }
 
 pub fn send_stat(prefix: &[u8], value: u64) {
-    let mut line = DiagnosticLine::new();
-    line.extend(prefix);
-    let _ = write!(line, "{value}");
-    let _ = crate::uart_esp::send_debug_text(line.bytes());
+    if crate::recovery_runtime::is_recovery() && !crate::recovery_runtime::active() {
+        let mut line = [0u8; 192];
+        let count = prefix.len().min(line.len().saturating_sub(20));
+        line[..count].copy_from_slice(&prefix[..count]);
+        let mut digits = [0u8; 20];
+        let mut digit_count = 0;
+        let mut remaining = value;
+        loop {
+            digits[digit_count] = b'0' + (remaining % 10) as u8;
+            digit_count += 1;
+            remaining /= 10;
+            if remaining == 0 {
+                break;
+            }
+        }
+        let mut output_len = count;
+        for digit in digits[..digit_count].iter().rev() {
+            line[output_len] = *digit;
+            output_len += 1;
+        }
+        let _ = crate::uart_esp::send_debug_text(&line[..output_len]);
+        return;
+    }
+    let Ok(prefix) = core::str::from_utf8(prefix) else {
+        return;
+    };
+    let _ = crate::log_history::push_event(
+        dmesh_server::log_watch::LEVEL_INFO,
+        "firmware",
+        "diagnostic.counter",
+        &[
+            (1, dmesh_server::cbor::FieldValue::Text(prefix)),
+            (2, dmesh_server::cbor::FieldValue::Unsigned(value)),
+        ],
+    );
 }
 
-/// Emit a group of related values on the UART debug channel.
+/// Emit a group of related numeric diagnostic fields.
 pub fn send_stats(entries: &[(&[u8], u64)]) {
     for &(prefix, value) in entries {
         send_stat(prefix, value);
-    }
-}
-
-struct DiagnosticLine {
-    bytes: [u8; 192],
-    len: usize,
-}
-
-impl DiagnosticLine {
-    const fn new() -> Self {
-        Self {
-            bytes: [0; 192],
-            len: 0,
-        }
-    }
-
-    fn extend(&mut self, value: &[u8]) {
-        let available = self.bytes.len().saturating_sub(self.len);
-        let copied = core::cmp::min(available, value.len());
-        self.bytes[self.len..self.len + copied].copy_from_slice(&value[..copied]);
-        self.len += copied;
-    }
-
-    fn bytes(&self) -> &[u8] {
-        &self.bytes[..self.len]
-    }
-}
-
-impl Write for DiagnosticLine {
-    fn write_str(&mut self, value: &str) -> fmt::Result {
-        self.extend(value.as_bytes());
-        Ok(())
     }
 }
 

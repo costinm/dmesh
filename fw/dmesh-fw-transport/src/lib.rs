@@ -18,6 +18,8 @@ pub mod profile;
 /// Main desired-profile publication. This is separate from the Main applied
 /// radio state so bearer ingress cannot mutate a live driver epoch directly.
 pub mod profile_store;
+mod ipv6;
+#[cfg(not(feature = "udp6-socket"))]
 mod raw_udp6;
 
 // These modules are the shared ESP-IDF runtime.  The crate is built only by
@@ -63,7 +65,12 @@ pub mod wifi_nan_dw_capture_esp;
 pub mod wifi_nonpromisc_probe_esp;
 pub mod wifi_radio_control_esp;
 pub mod wifi_radio_inject_esp;
+#[cfg_attr(feature = "udp6-socket", path = "wifi_udp6_socket_facade_esp.rs")]
 pub mod wifi_raw_udp6_esp;
+#[cfg(feature = "udp6-socket")]
+mod wifi_udp6_socket_esp;
+#[cfg(feature = "tcp-stream")]
+mod tcp_stream_esp;
 
 /// The one packet payload limit used by every bearer. A bearer that cannot
 /// carry this must reject it at bring-up; it must not fragment at this layer.
