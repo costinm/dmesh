@@ -920,14 +920,12 @@ pub(crate) fn connection_delay_us() -> Option<u64> {
             .saturating_sub(now_us)
             .min(u64::from(u32::MAX).saturating_mul(1_000))
     });
-    let flash_delay = crate::flash::next_report_delay_ms(now_ms);
     let body_delay = body_poll_pending().then_some(BODY_POLL_MS);
     let pool_delay = unsafe { (&*core::ptr::addr_of!(POOL_POLICY)).shrink_deadline() }
         .map(|deadline| deadline.saturating_sub(now_ms).min(u64::from(u32::MAX)) as u32);
     let delay_ms = transport_delay
         .into_iter()
         .chain(unsafe { UDP6_RETRY_AT_US }.map(|deadline| deadline.saturating_sub(now_us)))
-        .chain(flash_delay.map(|delay| u64::from(delay) * 1_000))
         .chain(body_delay.map(|delay| u64::from(delay) * 1_000))
         .chain(pool_delay.map(|delay| u64::from(delay) * 1_000))
         .min();
@@ -1129,19 +1127,6 @@ pub(crate) fn node_telemetry() -> quic_lite::NodeTelemetry {
     unsafe { runtime() }.telemetry()
 }
 
-fn report_flash_progress(runtime: &FirmwareRuntime, now_ms: u64) {
-    if crate::flash::report_progress(now_ms, |association| {
-        runtime.association_telemetry(association)
-    }) {
-        let deadline_ms = runtime.next_deadline().map(|deadline| {
-            deadline
-                .saturating_sub(now_ms.saturating_mul(1000))
-                .div_ceil(1000)
-        });
-        crate::flash::report_owner_progress(now_ms, deadline_ms, POOL.available());
-    }
-}
-
 pub(crate) fn schedule_connection_timer() {
     if !READY.load(Ordering::Acquire) {
         return;
@@ -1172,7 +1157,6 @@ pub(crate) fn schedule_connection_timer() {
         // Ask the ingress loop to poll the streaming bodies again.
         crate::main_runtime::request_quic_ingress();
     }
-    report_flash_progress(runtime, now_us / 1_000);
     crate::main_runtime::request_connection_deadline_recheck();
 }
 
@@ -1412,7 +1396,6 @@ pub(crate) fn progress() {
     let now_ms = (unsafe { esp_idf_sys::esp_timer_get_time().max(0) as u64 }) / 1_000;
     report_uart_receive_progress(runtime, now_ms);
     sweep_handler_streams(now_ms);
-    report_flash_progress(runtime, now_ms);
     #[cfg(feature = "probe")]
     progress_directed_probe(runtime);
     INGRESS_DROPS_TOTAL.fetch_add(runtime.take_ingress_drops(), Ordering::Relaxed);

@@ -722,34 +722,13 @@ fn notify_egress_ready() {
     }
 }
 
-/// Record one diagnostic in the QUIC log history. Recovery keeps its physical
-/// console for boot output until its QUIC owner is running. Hardware ROM and
-/// panic output bypass this function and remain visible after a crash.
+/// Record one diagnostic in the QUIC log history. Hardware ROM and panic output
+/// bypass this function and remain visible after a crash.
 pub fn send_debug_text(text: &[u8]) -> bool {
     if text.is_empty() || text.len().saturating_add(2) > UART_MAX_PACKET || !text.is_ascii() {
         return false;
     }
-    // Preserve early Recovery boot diagnostics until the UDP QUIC service is
-    // ready. Once active, routine diagnostics use the same watcher as Main.
-    if crate::recovery_runtime::is_recovery() && !crate::recovery_runtime::active() {
-        return send_recovery_debug_text(text);
-    }
     crate::log_history::push(text)
-}
-
-// Keep the console's NUL-terminated scratch array out of Main's sys_evt
-// callback stack. At speed optimization this branch otherwise shares a
-// frame with the Main egress record and can exceed the small IDF event stack.
-#[cold]
-#[inline(never)]
-fn send_recovery_debug_text(text: &[u8]) -> bool {
-    // ROM printf does not implement precision/width string formats.
-    let mut line = [0u8; UART_MAX_PACKET];
-    line[..text.len()].copy_from_slice(text);
-    unsafe {
-        esp_idf_sys::esp_rom_printf(b"%s\n\0".as_ptr().cast(), line.as_ptr().cast::<i8>());
-    }
-    true
 }
 
 /// C/ESP-IDF log bridge. Normal records go to retained `log.watch` history;

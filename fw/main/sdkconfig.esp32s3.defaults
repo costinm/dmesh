@@ -74,6 +74,3 @@ CONFIG_LWIP_TCP_OOSEQ_MAX_PBUFS=0
 CONFIG_LWIP_TCP_TMR_INTERVAL=50
 CONFIG_LWIP_TCPIP_TASK_PRIO=23
 CONFIG_LWIP_IRAM_OPTIMIZATION=y
-# esp-wifi-loader component, library mode: Main serves signed loader/Stage2 uploads on TCP
-# 5227 (src/loader_flash.rs). Writing the bootloader region needs the DANGEROUS_WRITE option above.
-CONFIG_WL_MODE_LIBRARY=y

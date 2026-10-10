@@ -33,6 +33,8 @@ pub mod crypto_esp;
 mod firmware_identity;
 mod device_telemetry;
 pub mod flash;
+/// Shared lwIP readiness and TCP listener ownership for firmware adapters.
+pub mod lwip_io_esp;
 /// Main-only retained firmware log lines used by the remote `log-watch`
 /// diagnostic stream.
 pub mod log_history;
@@ -44,7 +46,6 @@ pub mod main_runtime;
 pub mod power_esp;
 /// Recovery-specific policy entry point. This remains a thin compatibility
 /// shell until Recovery is reduced to open-STA UDP6 flashing.
-pub mod recovery_runtime;
 /// Main-only bounded DCID forwarding state. Recovery intentionally does not
 /// register this handler or accept transit rules.
 /// Shared Stage2 retained-memory handoff/health contract for Main and

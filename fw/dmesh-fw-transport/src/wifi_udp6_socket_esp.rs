@@ -5,10 +5,7 @@
 //! QUIC payloads from the same pool lease; it does not build Ethernet or
 //! 802.11 frames or retain a bearer-private packet buffer.
 
-use core::{
-    ffi::c_void,
-    sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, Ordering},
-};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use quic_lite::PacketWriter;
 
 use crate::wifi_raw_udp6_esp::{
@@ -18,7 +15,8 @@ use crate::wifi_raw_udp6_esp::{
 static DATA_SOCKET: AtomicI32 = AtomicI32::new(-1);
 static ANNOUNCE_SOCKET: AtomicI32 = AtomicI32::new(-1);
 static ACTIVE: AtomicBool = AtomicBool::new(false);
-static RX_TASK: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
+static DATA_REGISTERED: AtomicBool = AtomicBool::new(false);
+static ANNOUNCE_REGISTERED: AtomicBool = AtomicBool::new(false);
 static RX_DATAGRAMS: AtomicU32 = AtomicU32::new(0);
 static RX_QUEUE_DROPS: AtomicU32 = AtomicU32::new(0);
 static RX_INVALID: AtomicU32 = AtomicU32::new(0);
@@ -116,13 +114,29 @@ pub(crate) fn start() -> bool {
     if !ensure_sockets() {
         return false;
     }
-    // The higher-priority RX task can run before xTaskCreate returns. Publish
-    // readiness first so a queued datagram cannot trap startup in poll.
+    // The shared lwIP poll task may run callbacks as soon as a socket is
+    // registered. Publish the receive state before registration.
     ACTIVE.store(true, Ordering::Release);
-    if !ensure_rx_task() {
+    if !ANNOUNCE_REGISTERED.load(Ordering::Acquire) {
+        if crate::lwip_io_esp::register_socket(
+            ANNOUNCE_SOCKET.load(Ordering::Acquire),
+            esp_idf_sys::POLLIN as i16,
+            announce_ready,
+        ).is_none() {
+            ACTIVE.store(false, Ordering::Release);
+            return false;
+        }
+        ANNOUNCE_REGISTERED.store(true, Ordering::Release);
+    }
+    if !DATA_REGISTERED.load(Ordering::Acquire) && crate::lwip_io_esp::register_socket(
+        DATA_SOCKET.load(Ordering::Acquire),
+        esp_idf_sys::POLLIN as i16,
+        data_ready,
+    ).is_none() {
         ACTIVE.store(false, Ordering::Release);
         return false;
     }
+    DATA_REGISTERED.store(true, Ordering::Release);
     true
 }
 
@@ -133,7 +147,7 @@ pub(crate) fn refresh_interfaces() {
 }
 
 pub(crate) fn stop() {
-    // Keep the two lwIP sockets and the one blocking receiver task reusable
+    // Keep the two lwIP sockets and their shared poll registrations reusable
     // across STA/AP transitions. With no Wi-Fi netif up, lwIP poll sleeps and
     // this costs no packet buffer or periodic owner wake.
     ACTIVE.store(false, Ordering::Release);
@@ -269,52 +283,18 @@ pub(crate) fn poll() {
     }
 }
 
-fn ensure_rx_task() -> bool {
-    if !RX_TASK.load(Ordering::Acquire).is_null() {
-        return true;
+fn announce_ready(_: crate::lwip_io_esp::Registration, fd: i32, events: i16) {
+    if events & esp_idf_sys::POLLIN as i16 != 0 {
+        for _ in 0..8 {
+            if !receive_one(fd, true) { break; }
+        }
     }
-    let mut task = core::ptr::null_mut();
-    let created = unsafe {
-        esp_idf_sys::xTaskCreatePinnedToCore(
-            Some(rx_task_entry),
-            b"dmesh_udp6_rx\0".as_ptr().cast(),
-            3_072,
-            core::ptr::null_mut(),
-            4,
-            &mut task,
-            // IDF 6 uses INT_MAX, not -1, for an unpinned task. Passing -1
-            // asserts on the single-core C6 before Main becomes reachable.
-            esp_idf_sys::CONFIG_FREERTOS_NO_AFFINITY as i32,
-        )
-    } == 1 && !task.is_null();
-    if created {
-        RX_TASK.store(task.cast(), Ordering::Release);
-    }
-    created
 }
 
-unsafe extern "C" fn rx_task_entry(_argument: *mut c_void) {
-    unsafe { esp_idf_sys::lwip_socket_thread_init() };
-    loop {
-        let data = DATA_SOCKET.load(Ordering::Acquire);
-        let announce = ANNOUNCE_SOCKET.load(Ordering::Acquire);
-        if data < 0 || announce < 0 {
-            unsafe { esp_idf_sys::vTaskDelay(100) };
-            continue;
-        }
-        let mut descriptors = [
-            esp_idf_sys::pollfd { fd: announce, events: esp_idf_sys::POLLIN as i16, revents: 0 },
-            esp_idf_sys::pollfd { fd: data, events: esp_idf_sys::POLLIN as i16, revents: 0 },
-        ];
-        let ready = unsafe { esp_idf_sys::lwip_poll(descriptors.as_mut_ptr(), descriptors.len() as u32, 1_000) };
-        if ready <= 0 {
-            continue;
-        }
-        if descriptors[0].revents & esp_idf_sys::POLLIN as i16 != 0 {
-            while receive_one(announce, true) {}
-        }
-        if descriptors[1].revents & esp_idf_sys::POLLIN as i16 != 0 {
-            while receive_one(data, false) {}
+fn data_ready(_: crate::lwip_io_esp::Registration, fd: i32, events: i16) {
+    if events & esp_idf_sys::POLLIN as i16 != 0 {
+        for _ in 0..8 {
+            if !receive_one(fd, false) { break; }
         }
     }
 }

@@ -21,6 +21,6 @@ pub(crate) fn receive(record: dmesh_server::tagged::Record<'_>) -> Option<alloc:
     let version = core::str::from_utf8(&version_bytes[..end]).ok()?;
     dmesh_server::telemetry::device_response(record, dmesh_server::telemetry::TelemetryDeviceResponse {
         version, cpu_type, total_ram_bytes, flash_bytes,
-        role: if crate::recovery_runtime::active() { "recovery" } else { "main" },
+        role: "main",
     })
 }

@@ -15,13 +15,8 @@ use dmesh_server::{
 
 use crate::TransportProfile;
 
-/// Record one diagnostic message as a structured log-watch event. Recovery's
-/// boot console remains available until its QUIC owner is running.
+/// Record one diagnostic message as a structured log-watch event.
 pub fn send_response(message: &[u8]) {
-    if crate::recovery_runtime::is_recovery() && !crate::recovery_runtime::active() {
-        let _ = crate::uart_esp::send_debug_text(message);
-        return;
-    }
     let Ok(message) = core::str::from_utf8(message) else {
         return;
     };
@@ -34,29 +29,6 @@ pub fn send_response(message: &[u8]) {
 }
 
 pub fn send_stat(prefix: &[u8], value: u64) {
-    if crate::recovery_runtime::is_recovery() && !crate::recovery_runtime::active() {
-        let mut line = [0u8; 192];
-        let count = prefix.len().min(line.len().saturating_sub(20));
-        line[..count].copy_from_slice(&prefix[..count]);
-        let mut digits = [0u8; 20];
-        let mut digit_count = 0;
-        let mut remaining = value;
-        loop {
-            digits[digit_count] = b'0' + (remaining % 10) as u8;
-            digit_count += 1;
-            remaining /= 10;
-            if remaining == 0 {
-                break;
-            }
-        }
-        let mut output_len = count;
-        for digit in digits[..digit_count].iter().rev() {
-            line[output_len] = *digit;
-            output_len += 1;
-        }
-        let _ = crate::uart_esp::send_debug_text(&line[..output_len]);
-        return;
-    }
     let Ok(prefix) = core::str::from_utf8(prefix) else {
         return;
     };

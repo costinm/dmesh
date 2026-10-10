@@ -1,0 +1,8 @@
+# Main's partition table (4 MiB layout). Stage2 is built for the board's flash size from the esp-wifi-loader
+# repository (boot/partitions/4mb.csv and 8mb.csv there); keep the offsets of loader and main in sync.
+# Name,     Type, SubType, Offset,   Size,      Flags
+nvs,        data, nvs,     0x9000,   0x6000,
+phy_init,   data, phy,     0xf000,   0x1000,
+loader,     app,  factory, 0x10000,  0xe0000,
+main,       app,  ota_0,   0xf0000,  0x2d0000,
+data,       data, fat,     0x3c0000, 0x40000,

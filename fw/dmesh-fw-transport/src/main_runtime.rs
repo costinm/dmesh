@@ -1504,10 +1504,6 @@ fn apply_sta_live_settings(profile: &crate::TransportProfile, state: &mut MainRa
         &mut state.sta_extensions_enabled,
         &mut state.applied_nan_dw_interval,
     );
-    // Flash keeps the ordinary STA/NAN/NOW personality intact. Only optional
-    // NAN public actions are deferred while ESP flash needs scarce action-TX
-    // frames; raw UDP6 remains the upload path.
-    crate::wifi_nan_dw_capture_esp::set_nan_action_tx_suppressed(crate::flash::transfer_active());
     false
 }
 
@@ -3847,11 +3843,6 @@ pub(crate) fn run_main_service(service: MainRuntimeService) {
     assert!(registry::register(
         methods::TELEMETRY_DEVICE,
         SyncFn(crate::device_telemetry::receive),
-    ));
-    assert!(registry::register_stream_at(
-        methods::HTTP_POST,
-        dmesh_server::object_transfer::FLASH_PATH,
-        dmesh_server::object_transfer::FlashHandler(crate::flash::EspFlashPlatform),
     ));
     crate::quic_node_esp::register_probe_handlers();
     for method in [

@@ -1,11 +1,6 @@
 mod iram_link_test;
 
 fn main() {
-    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR");
-    let partition = std::path::Path::new("../boot/partitions.csv");
-    std::fs::copy(partition, format!("{out_dir}/partitions.csv"))
-        .expect("copy Main partition table");
-    println!("cargo:rerun-if-changed={}", partition.display());
     println!("cargo:rerun-if-changed=sdkconfig.defaults");
     println!("cargo:rerun-if-changed=sdkconfig.esp32s3.defaults");
     println!("cargo:rerun-if-changed=sdkconfig.esp32c6.defaults");
@@ -19,16 +14,11 @@ fn main() {
     );
     println!("cargo:rerun-if-changed=../modules/native/dmesh_module_loader/CMakeLists.txt");
     println!("cargo:rerun-if-changed=native/dmesh_uart_log/CMakeLists.txt");
-    // esp-wifi-loader component (library mode): rebuild the SDK when it changes.
-    for f in ["CMakeLists.txt", "Kconfig", "include/esp_wifi_loader.h",
-              "src/serve.c", "src/upload.c", "src/state.c", "src/state_core.c",
-              "src/crypto_psa.c", "src/rtc.c", "src/internal.h"] {
-        println!("cargo:rerun-if-changed=../esp-wifi-loader/components/esp_wifi_loader/{f}");
-    }
     println!("cargo:rerun-if-changed=native/dmesh_uart_log/dmesh_uart_log.c");
     println!("cargo:rerun-if-env-changed=DMESH_QUIC_IRAM_TEST");
     println!("cargo:rerun-if-changed=iram_link_test.rs");
     if std::env::var("DMESH_QUIC_IRAM_TEST").as_deref() == Ok("1") {
+        let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR");
         assert_eq!(std::env::var("TARGET").as_deref(), Ok("riscv32imac-esp-espidf"),
             "the private QUIC IRAM experiment is for the RISC-V canary only");
         if let Some(cfg) = embuild::espidf::sysenv::cfg_args() { cfg.output(); }
