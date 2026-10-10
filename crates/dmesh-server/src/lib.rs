@@ -10,6 +10,8 @@ extern crate alloc;
 /// NAN Service Discovery.
 pub mod announce;
 pub mod cbor;
+/// Independent-tick validation for platform clock rollback repair.
+pub mod clock_guard;
 /// Explicit connectionless application-message allowlist and replay support.
 pub mod connectionless;
 /// Tagged-CBOR control handlers shared by direct records and streams.

@@ -97,11 +97,15 @@ mod progress_tests {
     fn blocking_handler_uses_completion_time_and_continued_upload_survives() {
         let clock = Cell::new(1_000u64);
         let mut last = clock.get();
-        let consumed = track_progress(&mut last, || clock.get(), || {
-            // Partition erase blocks longer than the firmware's 15s idle limit.
-            clock.set(clock.get() + 32_000);
-            (512, true)
-        });
+        let consumed = track_progress(
+            &mut last,
+            || clock.get(),
+            || {
+                // Partition erase blocks longer than the firmware's 15s idle limit.
+                clock.set(clock.get() + 32_000);
+                (512, true)
+            },
+        );
         assert_eq!(consumed, 512);
         assert_eq!(last, 33_000);
         assert!(clock.get().saturating_sub(last) < 15_000);
@@ -272,6 +276,54 @@ pub trait BodySource: Send {
     /// available yet; the transport asks again when it can send. `done` ends
     /// the body, and FIN follows the last byte.
     fn read(&mut self, out: &mut [u8]) -> (usize, bool);
+
+    /// Stream borrowed bytes directly to a transport when the body already
+    /// owns suitable storage. Returning `None` selects the caller-buffer
+    /// [`Self::read`] path.
+    fn write_chunk(&mut self, _writer: &mut dyn BodyChunkWriter) -> Option<BodyChunkProgress> {
+        None
+    }
+}
+
+/// Result of offering a borrowed response range to a transport.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BodyChunkProgress {
+    Accepted(usize),
+    Waiting,
+    Retryable,
+    Failed,
+    Done,
+}
+
+/// Transport sink for a borrowed response-body range.
+pub trait BodyChunkWriter {
+    fn write(&mut self, bytes: &[u8]) -> Result<usize, BodyChunkWriteError>;
+
+    /// Offer a pool-backed packet to a transport that can transfer its lease
+    /// into reliable stream history. The default asks the body source to use
+    /// the borrowed-byte path instead.
+    fn write_owned(
+        &mut self,
+        _packet: quic_lite::OwnedPacket<quic_lite::ErasedPacketBuffer>,
+    ) -> OwnedBodyChunkProgress {
+        OwnedBodyChunkProgress::Unsupported
+    }
+}
+
+/// Result of offering an owned pool lease to a transport stream writer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OwnedBodyChunkProgress {
+    Accepted(usize),
+    Unsupported,
+    Retryable,
+    Failed,
+}
+
+/// Transport-independent body-write failure classification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BodyChunkWriteError {
+    Retryable,
+    Failed,
 }
 
 /// A response: its header, then an optional body, then FIN.
@@ -286,7 +338,11 @@ pub struct Response {
 impl Response {
     /// A header-only response.
     pub fn header(header: Vec<u8>) -> Self {
-        Self { header, body: None, after_finish: None }
+        Self {
+            header,
+            body: None,
+            after_finish: None,
+        }
     }
 
     /// A response whose body is produced by `body`.
@@ -330,6 +386,29 @@ impl ResponseReader {
     pub fn finish_response(&mut self) {
         if let Some(action) = self.after_finish.take() {
             action();
+        }
+    }
+
+    /// Offer the next header/body bytes directly to a transport sink.
+    /// Headers are borrowed from the envelope, and pool-backed sources may
+    /// lend their record bytes without an intermediate caller buffer.
+    pub fn write_direct(&mut self, writer: &mut dyn BodyChunkWriter) -> Option<BodyChunkProgress> {
+        if self.position < self.header.len() {
+            let bytes = &self.header[self.position..];
+            return Some(match writer.write(bytes) {
+                Ok(0) => BodyChunkProgress::Waiting,
+                Ok(count) if count <= bytes.len() => {
+                    self.position += count;
+                    BodyChunkProgress::Accepted(count)
+                }
+                Ok(_) => BodyChunkProgress::Failed,
+                Err(BodyChunkWriteError::Retryable) => BodyChunkProgress::Retryable,
+                Err(BodyChunkWriteError::Failed) => BodyChunkProgress::Failed,
+            });
+        }
+        match self.body.as_mut() {
+            Some(body) => body.write_chunk(writer),
+            None => Some(BodyChunkProgress::Done),
         }
     }
     /// Fill `out` with the next response bytes. The second value is true when
@@ -434,13 +513,7 @@ impl ServerStream {
 
     /// Offer the next ordered request bytes. `offset` is the stream offset of
     /// `chunk`; `fin` is set when `chunk` ends the request direction.
-    pub fn push(
-        &mut self,
-        registry: &Registry,
-        offset: u64,
-        fin: bool,
-        chunk: &[u8],
-    ) -> Pushed {
+    pub fn push(&mut self, registry: &Registry, offset: u64, fin: bool, chunk: &[u8]) -> Pushed {
         if offset != self.received {
             return self.fail(chunk.len(), b"stream offset rejected");
         }
@@ -512,13 +585,11 @@ impl ServerStream {
                 let outcome = {
                     let record = crate::tagged::decode(&self.header);
                     record.and_then(|record| {
-                        registry.open_now(
-                            Request {
-                                record,
-                                header: &self.header,
-                                context: self.context,
-                            },
-                        )
+                        registry.open_now(Request {
+                            record,
+                            header: &self.header,
+                            context: self.context,
+                        })
                     })
                 };
                 match outcome {
@@ -685,14 +756,20 @@ mod tests {
         assert_eq!(scan_header(&wire), Header::Complete(header.len()));
         // Any strict prefix is incomplete, never invalid.
         for end in 0..header.len() {
-            assert_eq!(scan_header(&header[..end]), Header::NeedMore, "prefix {end}");
+            assert_eq!(
+                scan_header(&header[..end]),
+                Header::NeedMore,
+                "prefix {end}"
+            );
         }
     }
 
     #[test]
     fn indefinite_length_items_end_at_their_break() {
         // {_ 1: "a", 2: [_ 1, 2]} followed by body
-        let wire = [0xbf, 0x01, 0x61, b'a', 0x02, 0x9f, 0x01, 0x02, 0xff, 0xff, 0xde, 0xad];
+        let wire = [
+            0xbf, 0x01, 0x61, b'a', 0x02, 0x9f, 0x01, 0x02, 0xff, 0xff, 0xde, 0xad,
+        ];
         assert_eq!(scan_header(&wire), Header::Complete(10));
         assert_eq!(scan_header(&wire[..9]), Header::NeedMore);
         // Indefinite byte string chunks.
@@ -710,18 +787,16 @@ mod tests {
         long.extend_from_slice(&[0u8; 0x2000]);
         assert_eq!(scan_header(&long), Header::Invalid);
         // A tag wraps one item.
-        assert_eq!(scan_header(&[0xc1, 0x1a, 1, 2, 3, 4, 9]), Header::Complete(6));
+        assert_eq!(
+            scan_header(&[0xc1, 0x1a, 1, 2, 3, 4, 9]),
+            Header::Complete(6)
+        );
     }
 
     fn respond(record: Record<'_>) -> Option<Vec<u8>> {
         let mut out = [0u8; 32];
-        let used = crate::tagged::encode_numeric_response(
-            0x7ffe,
-            1,
-            record.id?,
-            &[0xa0],
-            &mut out,
-        )?;
+        let used =
+            crate::tagged::encode_numeric_response(0x7ffe, 1, record.id?, &[0xa0], &mut out)?;
         Some(out[..used].to_vec())
     }
 
@@ -758,12 +833,14 @@ mod tests {
 
     impl StreamHandler for Upload {
         fn open<'a>(&'a self, request: Request<'a>) -> OpenFuture<'a> {
-            Box::pin(core::future::ready(Some(Outcome::Receive(Box::new(Collect {
-                bytes: Vec::new(),
-                take: 3,
-                id: request.record.id.unwrap_or(0),
-                ended: false,
-            })))))
+            Box::pin(core::future::ready(Some(Outcome::Receive(Box::new(
+                Collect {
+                    bytes: Vec::new(),
+                    take: 3,
+                    id: request.record.id.unwrap_or(0),
+                    ended: false,
+                },
+            )))))
         }
     }
 
@@ -807,7 +884,10 @@ mod tests {
         impl StreamHandler for ErasingUpload {
             fn open<'a>(&'a self, _: Request<'a>) -> OpenFuture<'a> {
                 Box::pin(core::future::ready(Some(Outcome::Receive(Box::new(
-                    ErasingSink { clock: self.0.clone(), bytes: 0 },
+                    ErasingSink {
+                        clock: self.0.clone(),
+                        bytes: 0,
+                    },
                 )))))
             }
         }
@@ -822,24 +902,35 @@ mod tests {
         let mut first = request(2, 42);
         first.extend_from_slice(b"abc");
         let mut last = 1_000;
-        let pushed = track_progress(&mut last, || clock.load(Ordering::Relaxed), || {
-            let pushed = stream.push(&registry, 0, false, &first);
-            let progressed = pushed.accepted != 0;
-            (pushed, progressed)
-        });
+        let pushed = track_progress(
+            &mut last,
+            || clock.load(Ordering::Relaxed),
+            || {
+                let pushed = stream.push(&registry, 0, false, &first);
+                let progressed = pushed.accepted != 0;
+                (pushed, progressed)
+            },
+        );
         assert_eq!(pushed.accepted, first.len());
         assert!(pushed.response.is_none());
         assert_eq!(last, 33_000);
         assert!(clock.load(Ordering::Relaxed).saturating_sub(last) < 15_000);
         clock.fetch_add(1_000, Ordering::Relaxed);
-        let pushed = track_progress(&mut last, || clock.load(Ordering::Relaxed), || {
-            let pushed = stream.push(&registry, first.len() as u64, true, b"def");
-            let progressed = pushed.accepted != 0;
-            (pushed, progressed)
-        });
+        let pushed = track_progress(
+            &mut last,
+            || clock.load(Ordering::Relaxed),
+            || {
+                let pushed = stream.push(&registry, first.len() as u64, true, b"def");
+                let progressed = pushed.accepted != 0;
+                (pushed, progressed)
+            },
+        );
         assert_eq!(pushed.accepted, 3);
         assert_eq!(last, 34_000);
-        assert_eq!(read_all(pushed.response.expect("terminal response")), [0xa0]);
+        assert_eq!(
+            read_all(pushed.response.expect("terminal response")),
+            [0xa0]
+        );
     }
 
     fn read_all(response: Response) -> Vec<u8> {
@@ -924,7 +1015,12 @@ mod tests {
         let header = request(2, 4);
         let pushed = stream.push(&registry, 0, true, &header);
         let response = pushed.response.or_else(|| stream.poll()).expect("finished");
-        assert!(crate::tagged::decode(&read_all(response)).unwrap().result.is_some());
+        assert!(
+            crate::tagged::decode(&read_all(response))
+                .unwrap()
+                .result
+                .is_some()
+        );
     }
 
     #[test]
@@ -961,5 +1057,54 @@ mod tests {
         let bytes = read_all(response);
         assert_eq!(bytes[0], 0xa0);
         assert!(bytes.len() > 5);
+    }
+
+    #[test]
+    fn response_reader_directly_offers_header_and_borrowed_body() {
+        struct DirectBody(bool);
+        impl BodySource for DirectBody {
+            fn read(&mut self, _out: &mut [u8]) -> (usize, bool) {
+                panic!("direct body must bypass the caller buffer")
+            }
+
+            fn write_chunk(
+                &mut self,
+                writer: &mut dyn BodyChunkWriter,
+            ) -> Option<BodyChunkProgress> {
+                if self.0 {
+                    return Some(BodyChunkProgress::Done);
+                }
+                self.0 = true;
+                Some(match writer.write(b"body") {
+                    Ok(count) => BodyChunkProgress::Accepted(count),
+                    Err(BodyChunkWriteError::Retryable) => BodyChunkProgress::Retryable,
+                    Err(BodyChunkWriteError::Failed) => BodyChunkProgress::Failed,
+                })
+            }
+        }
+        struct Sink(Vec<u8>);
+        impl BodyChunkWriter for Sink {
+            fn write(&mut self, bytes: &[u8]) -> Result<usize, BodyChunkWriteError> {
+                self.0.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+        }
+
+        let mut reader =
+            Response::with_body(alloc::vec![b'h', b'd', b'r'], DirectBody(false)).into_reader();
+        let mut sink = Sink(Vec::new());
+        assert_eq!(
+            reader.write_direct(&mut sink),
+            Some(BodyChunkProgress::Accepted(3))
+        );
+        assert_eq!(
+            reader.write_direct(&mut sink),
+            Some(BodyChunkProgress::Accepted(4))
+        );
+        assert_eq!(
+            reader.write_direct(&mut sink),
+            Some(BodyChunkProgress::Done)
+        );
+        assert_eq!(sink.0, b"hdrbody");
     }
 }

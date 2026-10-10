@@ -67,14 +67,24 @@ pub const UART_115200: u8 = 1;
 /// Explicitly stop a real UART bearer. USB-Serial/JTAG deliberately ignores
 /// this selector: it is a debug/JTAG path, not a controllable UART peripheral.
 pub const UART_OFF: u8 = 8;
+pub const UART_921600: u8 = 9;
 
-/// Normalize a public UART selector before storing it in a profile.
-/// `0` requests the 115200 default; malformed selectors are rejected by the
-/// wire decoder before they reach this helper.
+/// Parse the persistent physical UART rate. Native USB ignores this setting.
+pub fn parse_uart_baud(value: &[u8]) -> Option<i32> {
+    match value {
+        b"115200" => Some(115_200),
+        b"230400" => Some(230_400),
+        b"460800" => Some(460_800),
+        b"921600" => Some(921_600),
+        _ => None,
+    }
+}
+
+/// Normalize the transport profile's legacy on/off/speed selector.
 pub const fn normalize_uart_selector(selector: u8) -> Option<u8> {
     match selector {
         UART_DEFAULT => Some(UART_115200),
-        UART_115200..=7 | UART_OFF => Some(selector),
+        UART_115200..=7 | UART_OFF | UART_921600 => Some(selector),
         _ => None,
     }
 }
@@ -123,7 +133,7 @@ pub struct TransportProfile {
     /// to false: absent credentials retain the fixed DMesh WPA2 policy.
     pub open: bool,
     /// UART selector: `0` is the default 115200 setting, `1` explicitly means
-    /// 115200, `2..=7` select other common rates, and `8` is explicitly off.
+    /// 115200, `2..=7` select other common rates, `8` is off, and `9` is921600.
     /// USB packet mode ignores this selector.
     pub uart: u8,
     pub ble: u8,
@@ -354,6 +364,16 @@ fn control_method(request: control::Request<'_>) -> u64 {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn persistent_uart_rates_reject_unsupported_or_malformed_values() {
+        for (text, rate) in [(b"115200".as_slice(), 115200), (b"230400", 230400),
+            (b"460800", 460800), (b"921600", 921600)] {
+            assert_eq!(super::parse_uart_baud(text), Some(rate));
+        }
+        for text in [b"0".as_slice(), b"128000", b"115200\0", b"", b"-1"] {
+            assert_eq!(super::parse_uart_baud(text), None);
+        }
+    }
+    #[test]
     fn nan_only_sleep_policy_ignores_stored_credentials_and_uart() {
         let mut profile = super::TransportProfile::new();
         profile.requested_transport = Some(super::TransportKind::Nan);
@@ -434,7 +454,10 @@ mod tests {
             &mut profile,
         );
         assert_eq!(profile.uart, UART_OFF);
-        assert_eq!(normalize_uart_selector(9), None);
+        assert_eq!(normalize_uart_selector(UART_921600), Some(UART_921600));
+        apply_transport_config(TransportConfig { uart: Some(UART_921600), ..Default::default() }, &mut profile);
+        assert_eq!(profile.uart, UART_921600);
+        assert_eq!(normalize_uart_selector(10), None);
     }
 
     #[test]

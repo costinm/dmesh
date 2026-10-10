@@ -6,7 +6,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from dmesh_api import TIERS, check_additional_device_methods, extract, section_tiers
+from dmesh_api import TIERS, check_additional_device_methods, extract, private_methods, section_platforms, section_tiers
 
 root = Path(__file__).resolve().parent.parent
 path = root / 'crates/lmesh/resources/tools.json'
@@ -53,12 +53,31 @@ for tool in device:
     schema = source.get('outputSchema', {})
     if schema.get('properties'):
         tool['outputSchema'] = schema
-    # A request schema is taken only where the entry has none of its own, so
-    # the hand-checked request tables of the older methods stay authoritative.
+    # Probe's portable API tables own both schemas. Older device methods keep
+    # their hand-checked request tables until migrated to the same model.
     request = source.get('inputSchema', {})
-    if request.get('properties') and not tool['inputSchema'].get('properties'):
+    if request.get('properties') and (
+        tool['name'] in ('probe.start', 'probe.handler')
+        or not tool['inputSchema'].get('properties')
+    ):
         tool['inputSchema'] = request
 catalog['tools'] = device + [tool for tool in local if tool['name'] not in seen]
+# A section method that firmware (E) registers is addressable by the CLI: it is a device method
+# whether or not its entry was written by hand, so the catalog flag follows the Platforms line.
+by_name = {tool['name']: tool for tool in catalog['tools']}
+for name, platforms in section_platforms().items():
+    if 'E' not in platforms or name in private_methods():
+        continue
+    tool = by_name.get(name) or dict(generated.get(name) or {})
+    if not tool:
+        raise SystemExit(f'{name} is an E method with no generated schema')
+    if name not in by_name:
+        catalog['tools'].append(tool)
+        by_name[name] = tool
+    tool['x-dmesh-device'] = True
+    tool.setdefault('x-ui-visibility', 'advanced')
+    tool.setdefault('x-check-all', None)
+    tool.setdefault('x-check-all-platforms', None)
 # The tier of a section method is its `**Tier:**` line in the formal API document; a table-only
 # device method keeps the tier of its hand-written entry (check_additional_device_methods compares
 # it with the API.md table). Every tool must end up with one.

@@ -1,11 +1,14 @@
 # DMesh API
 
-This is the sole human-readable DMesh service contract. Requests and responses use
-tagged CBOR with the numeric component, method, and field tags shown below.
+This is the sole field-level DMesh service contract and the source of the generated schemas. Start with
+[`docs/api/README.md`](docs/api/README.md) (concepts and the public calls with examples) and
+[`docs/api/reference.md`](docs/api/reference.md) (every method by tier, generated). Requests and responses are
+records identified by the numeric component, method, and field tags shown below. The API is neutral:
+the same records travel over several transports and encodings (binary, JSON over HTTP, text), which
+are defined once in the ssh-mesh [`mesh-api/PROTOCOLS.md`](https://github.com/costinm/ssh-mesh/blob/main/crates/mesh-api/PROTOCOLS.md),
+and a gateway translates between them at the boundary.
 `lmesh` is the Linux service name; its daemon integrates the Linux radio handlers
-with the shared DMesh handlers. HTTP endpoints accept and return JSON, translating
-at the boundary to the same tagged records. Android platform plumbing may still
-use JSON internally. The installed command catalog is
+with the shared DMesh handlers. The installed command catalog is
 [`crates/lmesh/resources/tools.json`](crates/lmesh/resources/tools.json).
 
 Examples use a catalogued device name and the managed Linux service:
@@ -17,13 +20,13 @@ dmesh-cli DEVICE transport.set --1=6 --14=1 --15=1
 ```
 
 `DEVICE` is a node name (or FQDN, or VIP6) found in the node records (`DMESH_NODES_DIR`; `dmesh-cli devices sync` records the nodes it can see). Use `--field=value` or the numeric
-`--tag=value` form for declared request fields. The corresponding HTTP JSON
-endpoint uses the method name and field names from this document; see
+`--tag=value` form for declared request fields. A gateway that addresses methods by name
+(for example an HTTP edge) uses the method name and field names from this document; see
 [`crates/dmesh-cli/README.md`](crates/dmesh-cli/README.md) for transport,
 flash, reset, logs, and NAN wake examples.
 
 Each method carries a **Platforms:** marker listing the platforms that
-register a CBOR handler for it: `A` = Android (`crates/dmesh-android`),
+register a handler for it: `A` = Android (`crates/dmesh-android`),
 `L` = Linux (`lmesh`), `E` = Embedded (`fw/main`). Every handler is
 registered through the one `dmesh_server::registry` (component and method
 numbers plus names); a platform registers only methods it implements. A
@@ -55,9 +58,8 @@ where a method has one, what its body contains.
 
 ### Response
 
-The binary QUIC response contains a result map whose field `1` is an array of
-observer-local device rows. HTTP returns the same information as
-`{"devices":[...]}`. A stable `device_id` is the merge key; `peer` is an
+The response result has field `1`, an array of
+observer-local device rows. A stable `device_id` is the merge key; `peer` is an
 optional bearer-local correlation address and is never a device identity.
 
 | Tag | Field | Type | Description |
@@ -85,7 +87,7 @@ optional bearer-local correlation address and is never a device identity.
 | 21 | `probe_capabilities` | `u16` | Announced probe capability set. |
 | 22 | `authenticated` | `bool` | The announce carried a public key whose signature verified. |
 | 23 | `uptime_secs` | `u32` | Producer-relative uptime from its announce. |
-| 24 | `udp_endpoint` | `string` | Where the device accepts QUIC over UDP (advertised address and port, with this receiver's interface scope); absent when it has no UDP path, such as a device seen only over NAN or BLE. |
+| 24 | `udp_endpoint` | `string` | Where the device accepts mesh requests over UDP (advertised address and port, with this receiver's interface scope); absent when it has no UDP path, such as a device seen only over NAN or BLE. |
 | 25 | `network_name` | `string` | Shared network label from its announce. |
 
 Fields 1 to 15 are the compact form every platform sends. Fields 16 and up come from
@@ -123,7 +125,7 @@ device; receivers must not infer common ownership from the fixed ULA bits.
 
 The handler fans out locally to all currently owned discovery adapters (for
 example UDP multicast, NAN, BLE, or UART). It is not a path-selection hint for
-QUIC and does not queue application traffic behind a busy bearer. Each adapter
+the mesh transport and does not queue application traffic behind a busy bearer. Each adapter
 only reports observations it actually received; callers subsequently read the
 merged `discovery.nodes` inventory.
 
@@ -140,7 +142,7 @@ NOW and NAN. `to` selects one peer: a `udp://` endpoint, or on Linux a MAC addre
 (the request is addressed to that peer on NOW and on NAN, with the same repeats), whose
 reply is awaited. A `nan.wakeup` is a NAN service-discovery request too and is sent the
 same way, on NAN and on NOW, so a Linux host and firmware that sync on NOW fake-beacons
-(no Android device running NAN) can wake each other. A directed check of a path (does a QUIC association
+(no Android device running NAN) can wake each other. A directed check of a path (does an association
 work over this bearer) is a different thing: it is `probe`.
 
 ### Request
@@ -386,7 +388,7 @@ adapter; `idle_ms` and `charging_ms` describe the current interval, while
 
 **Tier:** internal
 
-**Rust CBOR:** generated
+**Rust codec:** generated
 
 These are QUIC-core counters summed over associations with an active QUIC
 endpoint on the node. They reset when an association is removed or the node
@@ -428,7 +430,7 @@ not filled yet.
 
 One row per live association; the same counters as `quic`, per association,
 plus send-credit state. Round-trip time and congestion window are not listed
-because `quic-lite` does not expose them yet.
+because the transport does not expose them yet.
 
 ### Response
 
@@ -462,7 +464,7 @@ because `quic-lite` does not expose them yet.
 **Tier:** internal
 
 Target platforms: A L E. E reports a row for `now` and `udp6` (the bearers that keep
-these counters); A and L report a row for every bearer registered on the QUIC node,
+these counters); A and L report a row for every bearer registered on the node,
 from the node's own per-bearer counters. Fields a bearer does not count are omitted
 (`rx_rejected` is not kept by the node).
 
@@ -584,7 +586,7 @@ Tags start at 1; the older snapshot method used 0-based tags.
 
 **Tier:** internal
 
-**Rust CBOR:** generated
+**Rust codec:** generated
 
 Static platform information, independent of radio state. Main and Recovery
 register the same handler. Values unavailable on a platform are omitted, not
@@ -623,17 +625,17 @@ protocol prerequisite.
 | 3 | `bssid` | `string` | Optional directed STA BSSID. |
 | 4 | `channel` | `u8` | Selected channel. |
 | 5 | `raw_tx_rate` | `u8` | Raw injection diagnostic rate. |
-| 6 | `sta_driver_tx` | `bool` | Use the associated ESP driver TX path. |
+| 6 | `sta_driver_tx` | `bool` | Legacy setting; UDP6 always sends through the ESP-IDF/lwIP socket path. |
 | 7 | `sta_bssid_check_disabled` | `bool` | Disable BSSID filtering in raw RX. |
 | 8 | `sta_ampdu_enabled` | `bool` | Enable STA A-MPDU. |
 | 9 | `sta_11b_rates_disabled` | `bool` | Disable legacy 802.11b rates. |
-| 10 | `sta_raw_rx_enabled` | `bool` | Enable the raw UDP6 receive adapter. |
+| 10 | `sta_raw_rx_enabled` | `bool` | Enable the UDP6 socket receive adapter. |
 | 13 | `espnow_capture` | `bool` | Legacy diagnostic capture setting. |
 | 14 | `nan_dw_interval` | `u8` | NAN discovery-window interval. |
 | 15 | `now` | `u8` | ESP-NOW policy. |
 | 16 | `ap` | `u8` | AP policy. |
 | 17 | `passphrase` | `string` | Volatile WPA2 override. |
-| 18 | `uart` | `u8` | UART speed or off selector. |
+| 18 | `uart` | `u8` | Physical UART selector: 0/default or 1=115200, 2=9600, 3=19200, 4=38400, 5=57600, 6=230400, 7=460800, 8=off, 9=921600. ESP applies the volatile rate after the response finishes; native USB-JTAG ignores it. Persist boot rate separately with settings key `uart.baud`. |
 | 19 | `ndp` | `u8` | NAN Data Path policy. |
 | 24 | `open` | `bool` | Open-mode policy. |
 | 25 | `wake_target` | `string` | MAC address allowed to apply NAN wake. |
@@ -655,7 +657,7 @@ re-pair), writes it to the device, and durably stores the
 secret with the device MAC and public key in the device's record (a private file).
 The signed `device_id` is stable across bearers.
 
-Bearers add no cryptography of their own. The shared secret is what QUIC-lite
+Bearers add no cryptography of their own. The shared secret is what the transport
 uses to authenticate and encrypt once it is on the device. Over the wired UART
 (trusted physical access) the host may set or replace the secret, even on a
 device that has one and with no pairing window: that host could reflash the
@@ -697,7 +699,7 @@ identity and shared-secret proof remain required.
 `vip6` is optional. The device is identified by its bearer (the serial port or
 BLE address) and by its signed discovery reply, whose VIP6 the owned record is
 keyed on. When `vip6` is given it must match that reply, and the host refuses a
-device that proves a different identity. UART and BLE use the same exchange over an ordinary QUIC
+device that proves a different identity. UART and BLE use the same exchange over an ordinary
 association on the host's running node (BLE over a plain CoC): discover, `provision.install`, then
 save the device record. Refusal or a lost response does not create a new host
 record or remove an existing one. A re-pair over the wire atomically replaces
@@ -815,9 +817,9 @@ permits reflashing the device. The request has no fields.
 
 **Visibility:** private
 
-This tagged message has no request ID or response. A host UART adapter wraps
-unframed boot and crash text in this message after receiving it; normal QUIC
-frames remain unchanged. `log.watch` is the interface that reads retained records.
+This message has no request ID or response. A host UART adapter wraps
+unframed boot and crash text in this message after receiving it; normal
+mesh traffic on the same link remains unchanged. `log.watch` is the interface that reads retained records.
 
 ### Request
 
@@ -827,38 +829,33 @@ frames remain unchanged. `log.watch` is the interface that reads retained record
 | 2 | `source` | `string` | Observer-local bearer path or name. |
 | 3 | `timestamp_ms` | `u64` | Observer receipt time. |
 
-## 2. `watch` — Read retained log and event records, optionally streaming them with periodic metric snapshots
+## 2. `watch` — Read recent structured records, optionally streaming new records and periodic metrics
 
 **Platforms:** A L E
 
 **Tier:** debug
 
-Target platforms: A L E; registered on E, which keeps the last 32 ESP-IDF log
-lines (`E (1234) tag: text` becomes level, source `tag` and text), and on L,
-which serves its `tracing` history (`mesh::local_trace`): warnings, errors and
-events whose `event_type` is watched or retained, with `target` as `source`
-and `event_type` as `kind`, and on A, which serves the same history plus NAN
-follow-ups and events (`nan.followup`, `nan.event`) and BLE scan results
-(`ble.scan_result`). Replaces `log-watch` (9/5) and `events` (9/4), which no
-platform registers any more. An event is a record whose `kind` is set; a plain
-log line has none.
+Platforms: A L E. This method exposes structured log records, events and
+metrics independently of transport or wire encoding. A log record has no
+`kind`; events and metric snapshots use `kind` to identify what they describe.
 
-Every node keeps one retained history of recent records. `watch` returns
-records with `seq` greater than `since_seq`, oldest first, and a `cursor` to
-pass as the next `since_seq`. `dropped` counts records that left the history
-before they were read.
+Each node keeps a small rolling buffer of recent records. Without `stream`,
+`watch` returns matching records from that buffer, oldest first, along with a
+`cursor` for the next request. `dropped` reports records that left the buffer
+before they were read. The buffer is volatile and intended for recent history,
+not durable storage.
 
-With `stream` set, the response header is the same, and the response body then
-continues as a sequence of CBOR records, each one a `LogRecord` map as below,
-until the request's `timeout` ends (60 s when absent, at most one hour) or the
-caller closes the stream. No length
-or count is declared; each record is a self-delimiting CBOR item.
+With `stream` set, the initial response provides the current cursor and drop
+count, then matching records are delivered as they are produced until the
+request deadline expires or the caller closes the stream. Low-end nodes support
+one active streaming watcher; opening a new watcher closes the old one.
 
-Periodic snapshots use the same record: for each name in `snapshots` (a
-telemetry method such as `telemetry.quic`), every `interval_ms` the node emits
-a `LogRecord` whose `kind` is that method name and whose `fields` is exactly the
-response that method returns. A snapshot is not retained, so its `seq` is 0. A snapshot of a method the node does not
-register is skipped, and a `log` record with `source` `log.watch` says so once.
+For each name in `snapshots` (a telemetry method such as `telemetry.quic`), the
+node periodically emits a metric record whose `kind` is that method name and
+whose `fields` contain the method's response values. The period is
+`interval_ms`. A snapshot is not retained, so its `seq` is 0. An unavailable
+snapshot method is skipped and reported once as a `log` record from
+`log.watch`.
 
 ### Request
 
@@ -891,7 +888,7 @@ register is skipped, and a `log` record with `source` `log.watch` says so once.
 | 4 | `source` | `string` | yes | Producing module, dotted (`quic`, `nan`, `bearer.ble`). |
 | 5 | `kind` | `string` | no | Event type, or a telemetry method name for a snapshot; absent for a plain log line. |
 | 6 | `text` | `string` | yes | Message; a device may shorten it to fit its slot. |
-| 7 | `fields` | `cbor` | no | One CBOR map of structured values of an event, or a snapshot's response. |
+| 7 | `fields` | `object` | no | Structured values for an event or metric snapshot. |
 
 # `probe` API (8)
 
@@ -904,14 +901,20 @@ other combination. Two methods are involved, on two different nodes:
   that receives it) to run a probe against `peer`. It has no body in either
   direction; its response header is the outcome.
 - `probe.handler` is the handler on the node that is probed (the `peer`). It is
-  an ordinary registered method with the usual CBOR header in front, and its
-  response body streams the probe payload. More probe handlers (sink, echo,
-  error injection, chat-like exchanges, delays) will be added beside it as tests
-  need them, each its own method.
+  an ordinary registered method with the usual request header in front, and its
+  request/response bodies carry the selected upload/download workload. All
+  throughput tests use this method, independent of the bearer.
 
-`quic-lite` itself has no CBOR and no registry: its probe workload
-(`quic_lite::probe`) is wrapped by these handlers, and its own tests attach it
-directly.
+`direction` is relative to the client: `download` (default), `upload`, or `both`.
+`bytes` is the length per enabled direction. `both` runs upload and download
+simultaneously on two ordinary streams in the same association, each invoking
+the same handler with its individual direction. Success requires both response envelopes,
+exact payload byte counts and response FIN. Aggregate throughput counts both directions.
+Pattern verification is opt-in (`verify=true`, default false); use it periodically
+and compare otherwise identical runs to measure its CPU cost.
+
+The transport library has no registry: its probe workload is wrapped by these
+handlers, and its own tests attach it directly.
 
 ## 1. `start` — Ask a node to run a probe against a peer
 
@@ -922,7 +925,7 @@ directly.
 **UI:** advanced
 
 The envelope's destination `to` (a request field named `to`, tag 15 in this
-catalog) selects the node that runs the probe as the QUIC client; it is not part
+catalog) selects the node that runs the probe as the client; it is not part
 of the request's `fields` map. `peer` names the probed node: `espnow://MAC`,
 `udp://HOST:PORT`, `usb://`, `ble://`, or `mesh://VIP`, which is resolved through
 discovery to the current address and path. Bearer names select explicit
@@ -952,7 +955,9 @@ decoder rejects them.
 | 11 | `initial_consume_delay_ms` | `u32` | Delay before the first read. |
 | 12 | `consume_delay_ms` | `u32` | Delay between reads. |
 | 13 | `peer` | `string` | The probed node (destination URI). |
+| 14 | `direction` | `string` | `download` (default), `upload`, or simultaneous `both`. |
 | 15 | `to` | `string` | Node that runs the probe (envelope destination). |
+| 16 | `verify` | `bool` | Default false. Check deterministic payload bytes on both receivers; byte counts and FIN are always required. |
 
 ### Response
 
@@ -961,7 +966,7 @@ decoder rejects them.
 | 1 | `status` | `string` | `ok` or `error`. |
 | 2 | `peer` | `string` | The probed node. |
 | 3 | `requested_bytes` | `u64` | Requested payload length. |
-| 4 | `received_bytes` | `u64` | Validated payload bytes received. |
+| 4 | `received_bytes` | `u64` | Total received payload bytes, including peer-confirmed upload; pattern-checked only when `verify=true`. |
 | 5 | `elapsed_us` | `u64` | Elapsed time. |
 
 ## 2. `handler` — Answer a probe with a header and then the probe payload
@@ -972,16 +977,16 @@ decoder rejects them.
 
 **UI:** advanced
 
-**Request body:** none
+**Request body:** `bytes` pattern octets for `upload`; otherwise none.
 
-**Response body:** the probe payload, `bytes` octets long.
+**Response body:** `bytes` pattern octets for `download`; otherwise none.
 
 Packet `k` of the payload starts with `k` as a big-endian `u32`, and every other
 byte is its stream offset modulo 256, so a caller can validate it however the
 transport chunks it. A request the node does not support (a `peer`, more than one
 stream, priority streams, ACK tuning, more than the probe limit) is answered with
 an error header and no body. The generator and the validator are
-`quic_lite::probe::ProbePayload`.
+the transport library's `ProbePayload`.
 
 ### Request
 
@@ -996,6 +1001,8 @@ an error header and no body. The generator and the validator are
 | 10 | `parallel_streams` | `u8` | Concurrent streams. |
 | 11 | `initial_consume_delay_ms` | `u32` | Delay before the first read. |
 | 12 | `consume_delay_ms` | `u32` | Delay between reads. |
+| 14 | `direction` | `string` | `download` (default) or `upload`; the client implements `both` with one of each concurrently. |
+| 16 | `verify` | `bool` | Default false. Enable deterministic payload validation; length and FIN checks are always enabled. |
 
 ### Response
 
@@ -1003,6 +1010,7 @@ an error header and no body. The generator and the validator are
 |---:|---|---|---|
 | 1 | `bytes` | `u64` | Length of the payload that follows. |
 | 2 | `packet_size` | `u64` | Packet size the payload is built from. |
+| 3 | `uploaded_bytes` | `u64` | Validated request-body bytes after request FIN; omitted for download-only. |
 
 <!-- dmesh-api:end -->
 
@@ -1010,6 +1018,12 @@ an error header and no body. The generator and the validator are
 
 Device settings requests use component `1`. `settings.set` writes the named
 setting; use `settings.get` to verify its value.
+
+ESP Main accepts persistent `uart.baud` values `115200` (default), `230400`,
+`460800`, and `921600`. The setting applies on reboot, so its write and response
+use the old rate. Update the host device record's `uart_baud` to the same value
+before reconnecting. Native USB-JTAG is unaffected; ROM/Stage2/Recovery consoles
+retain their own rate. Missing or invalid stored values use the image default.
 
 ```sh
 dmesh-cli DEVICE settings.get --key=name
@@ -1106,7 +1120,7 @@ crate and are documented in [`crates/lmesh-wifi/API.md`](crates/lmesh-wifi/API.m
 
 # `ble` API (201)
 
-Android BLE adapter operations. The service uses tagged CBOR; the Android framework remains behind the Rust backend.
+Android BLE adapter operations. The Android framework remains behind the Rust backend.
 
 ## 1. `status` — Report local BLE adapter and bearer state
 
@@ -1202,9 +1216,9 @@ companion API so the same method applies to BLE, UART, and Wi-Fi.
 
 | Tag | Field | Type | Description |
 |---:|---|---|---|
-| 1 | `events` | `cbor[]` | Retained NAN receipt events, newest first; each one CBOR map. |
-| 2 | `followups` | `cbor[]` | Retained NAN follow-up receipts, newest first; each one CBOR map. |
-| 3 | `ble_scan_results` | `cbor` | Matching retained BLE scan results (`results`, `count`), one CBOR map. |
+| 1 | `events` | `encoded[]` | Retained NAN receipt events, newest first; each one an encoded map. |
+| 2 | `followups` | `encoded[]` | Retained NAN follow-up receipts, newest first; each one an encoded map. |
+| 3 | `ble_scan_results` | `encoded` | Matching retained BLE scan results (`results`, `count`), one encoded map. |
 | 4 | `count` | `u64` | Total rows across the three lists. |
 
 # `usb` API (204)
@@ -1255,7 +1269,7 @@ companion API so the same method applies to BLE, UART, and Wi-Fi.
 
 **Tier:** internal
 
-Sends a tagged discovery request over the open USB QUIC bearer. The response
+Sends a discovery request over the open USB bearer. The response
 must carry a valid device signature. This is a read-only identity check and
 does not pair or claim the device.
 
@@ -1303,9 +1317,9 @@ network peer is declined.
 
 ## Additional device methods
 
-These are active tagged-CBOR methods whose implementations live in the device
+These are active methods whose implementations live in the device
 or shared service handlers. Their wire names are retained for existing clients.
-The component and method columns are the numeric CBOR tags. `Tier` is `core` (the public control-plane
+The component and method columns are the numeric tags. `Tier` is `core` (the public control-plane
 surface), `debug` or `internal`; every method in this document has one.
 
 | Component | Method | Wire name | Purpose | Platforms | Tier |
@@ -1339,7 +1353,7 @@ Platform registration notes:
   layout or its radio lifecycle, so a request receives the numeric error.
 - `object.flash` (`POST /flash`): registered by Main and Recovery firmware at the key
   `[http (2002), post (2), 10]`. Android and Linux do not register the device flash
-  operation. The request header and the raw image body share one QUIC stream.
+  operation. The request header and the raw image body share one stream.
 - Stubs are not registered. Android answers `status`, `services`,
   `telemetry.nan_status`, `battery`, `quic`, `quic_associations`, `bearers`, `memory`
   and `log.watch`; Linux
@@ -1357,7 +1371,7 @@ Platform registration notes:
   reachable from the local control surface and HTTP gateway, declined for a
   network peer.
 - `log.record` (208/1): one-way message produced only by the Linux UART
-  adapter; no platform registers a handler. It is intended to become a QUIC
+  adapter; no platform registers a handler. It is intended to become a one-way
   datagram with its own registration.
 - `nan.pair_wakeup` (6/12): not registered on Android; the invitation is
   sent by the Linux controller.
@@ -1373,18 +1387,18 @@ Platform registration notes:
   gateway surface; it is not a numeric device method.
 - The ssh-mesh common methods `mesh` (2000) and `trace` (2001) have reserved
   numbers outside every service's range. Linux registers them in this registry
-  and dispatches them by number as CBOR (`mesh.lifecycle` and
+  and dispatches them by number (`mesh.lifecycle` and
   `trace.set_level` are local-only); a gateway that addresses them by text name
   is translated to the number at the edge. Android serves them only on the
   HTTP gateway.
 - `status.text` (203/1) and `radio.history` (202/1) are written against the
   typed structs generated from this document (`crates/dmesh-server/src/platform_api.rs`)
   and encode their results with the tags above. Other Android platform methods
-  still return JSON-shaped results in tagged CBOR until their response tables
+  still return untyped results until their response tables
   are added here.
 
 The request fields below are optional unless the handler description says otherwise.
-An empty request uses an empty CBOR map. Response fields are handler-specific and
+An empty request has no fields. Response fields are handler-specific and
 are described by the method purpose above.
 
 ### `status` response fields
@@ -1402,8 +1416,7 @@ are described by the method purpose above.
 ### `object.flash` request fields
 
 `object.flash` is the CLI name of `POST /flash`. On the wire it is the generic REST request of the
-tagged-CBOR envelope (component `2002` `http`, method `2` `post`, `params` the path `[10]` or
-`["flash"]`, `fields` the headers below, see ssh-mesh `mesh-api/PROTOCOLS.md`, "HTTP component"). A
+common envelope (component `2002` `http`, method `2` `post`, `params` the path `[10]`, `fields` the headers below, see ssh-mesh `mesh-api/PROTOCOLS.md`, "HTTP component"). A
 command built by the CLI carries the same headers as its fields; the sender adds `content-length`
 (header `1`) and posts it.
 
@@ -1444,10 +1457,34 @@ releases the writer.
 The response is returned on that same stream only after the body ends and the sink has made the
 image durable. Handler acceptance, stream ACKs, and byte counts are not proof of durable completion or
 successful reboot. The response has no body and ends with FIN, like every header-only handler
-response. Recovery schedules its Stage2 handoff only after durable completion and finishing this
-ordinary response direction; Main leaves the written slot for the normal boot/update path.
+response. Main leaves the written slot for the normal boot/update path.
+Legacy QUIC Recovery schedules its Stage2 handoff after that response;
+Recovery2 uses the separate minimal TCP contract below.
 `dry_run=true` validates through the sink's dry-run behavior and does not signal durable flash
 completion.
+
+### Recovery2 TCP updater (not a Main handler)
+
+Recovery2 accepts one connection on TCP port `3340`. The 16-byte little-endian
+header is: magic `DMR2` (4 bytes), version `1` (u8), flags (u8; bit 1 dry-run,
+all other bits rejected), target (u8; `0` Main, `255` reboot), reserved zero
+(u8), image length (u32), reserved zero (u32). Main image bytes follow the
+header; the client half-closes its write direction. Length must be between
+4096 and `0x2b0000`; reboot requires zero length and flags.
+
+Responses are ASCII lines: `P <received> <written>`, `ERR <code> <reason>`,
+or `OK <length> ms=<total> erase_ms=<erase> write_ms=<write>[ dry]`, followed
+by server FIN. Reboot returns `OK 0`. The head sector is committed only after
+exact length and client FIN. `OK` reports successful flash operations, not
+authentication or additional readback verification. Final success still needs
+signed Main discovery and a fresh Main status.
+
+While waiting, Recovery2 sends an unsigned `dmesh-recovery2 v=1 ...` presence
+line from UDP `3340` to `[ff02::5227]:3340` every five seconds. Beacons stop
+during TCP connections and resume on return to accept. They are only routing
+hints, matched to the selected scoped device address. Recovery2 exits with a
+one-shot RTC Main handoff, which outranks NVS; no NVS writes occur in Recovery2.
+Wire v1 is unauthenticated and intended for controlled development networks.
 
 ### `ble.scan` request fields
 
@@ -1512,6 +1549,10 @@ The payload is the complete CoC SDU. It has no bearer-local length prefix.
 | 4 | `system_sequence` | `bool` | — |
 | 5 | `rate` | `enum` | auto=0, 6=6, 9=9, 12=12, 18=18, 24=24, 36=36, 48=48, 54=54 |
 | 6 | `disable_11b` | `bool` | — |
+
+On success, the response result is an unsigned integer containing
+the number of frame bytes accepted by the radio submission path. It does not
+claim peer reception or application delivery.
 
 ### `radio.control` request fields
 
@@ -1649,225 +1690,7 @@ The payload is the complete CoC SDU. It has no bearer-local length prefix.
 
 ## Firmware module payload contracts
 
-The following module service payloads use the tagged envelope above. Their
-inner CBOR tuples and C callback ABI are specific to the optional ESP modules.
-
-**Platforms:** E (compiled only with the firmware `modules` feature; Android
-and Linux answer component 1000 with the "device-only" error.)
-
-### Module loader
-
-`fw/modules` supplies optional flash-module handlers for any application that
-links the ESP module loader. The handler transport is a normal QUIC-lite
-stream or a direct bearer record; the stream payload begins with one complete
-tagged-CBOR envelope. There is no stream service byte.
-
-The common envelope fields are defined by `dmesh-server::tagged` (see
-`PROTOCOLS.md` in ssh-mesh for all keys, including `8: timeout` in milliseconds):
-
-```text
-{ 1: component, 2: method, 3: request_id?, 8: timeout_ms?, 10: binary_payload? }
-```
-
-Responses preserve `component`, `method`, and `request_id`, and put the result
-in field `6` as `{1: ok, 2: loader_result_abs}`.
-
-## Components
-
-| Component | Handler | Method | Meaning |
-|---:|---|---:|---|
-| 1000 | module | 1 | Refresh and return loader header/status. |
-| 1000 | module | 2 | Initialize the native module loader. |
-| 1000 | module | 3 | Request a loader stop with a deadline before flash work. |
-| 1001 | hello | 4 | Start module service tag 46. |
-| 1002 | lora | 4 | Configure and start/command module service tag 43. |
-| 1003 | hardware | 4 | Start module service tag 45. |
-
-For `RUN` (method 4), field `10` is passed unchanged as the size-limited module
-payload. The loader derives flash placement from its service tag and validates
-the DMOD header; callers never supply a flash offset.
-
-For component `1002` only, field `4` is the required one-item CBOR array
-`[operation]`. Supported operations are `probe`, `probe127`, `probe126`,
-`rx`, `tx`, `stop`, `reconfigure`, `fsk`, and `stats`. Field `10` is the
-opaque `tx`/`fsk` packet, never a command string. Optional field `5` is a
-numeric configuration map. Its IDs follow `dmesh_lora_config_v1` after the
-ABI header: `1..14` are chip/frequency/bandwidth/SF/SPI/sync/power and the
-seven board pins; `15..24` are board-power and SX126x settings; `25..30` are
-coding rate, preamble, CRC, CAD mode, CAD interval, and CAD RX duration. An
-omitted map uses the established SX127x TLORA profile (913.125 MHz, 250 kHz,
-SF10, CR5, sync word 0x2b). This makes legacy LoRa boards usable without
-reintroducing the retired text-command dispatcher; SX1262 boards must provide
-their wiring/configuration map.
-
-## Ownership and limits
-
-`dmesh-server` owns a fixed 16-entry, no-allocation component registry. Each
-component has a separate function registration, and a component may serve any
-number of concurrent QUIC streams. The bearer only owns stream ordering and
-flow control; it does not interpret a module ID.
-
-This first extraction includes the loader control/start path. Module-originated
-settings reads/writes, emitted events, and nested service calls currently fail
-with loader ABI result `-2`; they are intentionally not routed through the
-deleted Main string-command dispatcher. They will be connected to the common
-`dmesh-server` settings/event/direct-record handlers in the next migration.
-
-## Frozen Recovery build option
-
-Recovery is currently frozen and its build entry point is deliberately
-disabled. Do not use the historical commands below; Main is the active
-firmware lane. They are retained only as migration notes:
-
-The last C6 measurement (2026-08-21) produced 911,360 bytes without modules
-and 949,136 bytes with modules: +37,776 bytes. The one-MiB recovery partition
-therefore retains 99,440 bytes of headroom with module support.
-
-### Hardware module
-
-Status: experimental V3. Service tag `45`, slot `2`, one 64-KiB slot.
-
-`hw.dmod` is a replaceable, `no_std` peripheral service. Main supplies the
-host ABI; the module owns peripheral policy and emits compact telemetry. Main
-does not need to understand the event payloads.
-
-The C ABI declaration is [dmesh_hw_abi.h](../modules/include/dmesh_hw_abi.h).
-The numeric module ABI below is part of this root contract.
-Names are documentation only; firmware requests and events use integer tuples.
-
-#### Module request
-
-The module entry payload is a definite-length CBOR array of unsigned integers.
-The first item is `operation`; the remaining items depend on that operation.
-No text keys or text values are required.
-
-The array is the body of QUIC-lite stream service tag `45`. The immediate
-stream response is CBOR `[0]` when the fixed-capacity Main-owned module queue accepts
-the request; execution and samples are asynchronous module events. `[0]` is
-not a completed-operation result.
-
-##### Operation IDs
-
-| ID | Name | Purpose |
-|---:|---|---|
-| 1 | `battery` | Read the configured battery ADC and emit one event |
-| 2 | `adc_probe` | Sample one or more ADC pins |
-| 3 | `button` | Run the GPIO button interrupt task |
-
-##### Battery request
-
-```text
-[1, pin, ref_mv, divider_x100, min_mv, max_mv,
-   control_pin, control_level, enabled]
-```
-
-All fields after `1` are optional and default to the corresponding settings:
-
-| Position | Field | Default |
-|---:|---|---:|
-| 1 | ADC GPIO | `battery.pin`, 35 |
-| 2 | ADC reference in mV | `battery.ref_mv`, 3300 |
-| 3 | Battery divider ×100 | `battery.divider_x100`, or `battery.divider` parsed as decimal |
-| 4 | Empty voltage in mV | `battery.min_mv`, 3300 |
-| 5 | Full voltage in mV | `battery.max_mv`, 4200 |
-| 6 | ADC control GPIO | `battery.ctrl`, -1 disabled |
-| 7 | Control active level | `battery.ctl_lvl`, 1 |
-| 8 | Enabled | 1 |
-
-When a control GPIO is present, the module configures it as an output, sets
-the active level, waits 10 ms, samples, then sets the inactive level.
-
-##### ADC probe request
-
-```text
-[2, sample_count, interval_ms, ref_mv, pin0, pin1, ...]
-```
-
-`sample_count=0` means continuous until the module task is stopped. The count
-is bounded by the host/task lifetime; `interval_ms` is clamped to 0..60000.
-The loader permits independent service tasks to run concurrently. The radio
-service (tag 43) and hardware service (tag 45) have separate runtime state;
-flash preparation stops all active services before erasing their slots.
-If no pins are supplied, the default list is `[34, 35, 36, 39]`.
-
-##### Button request
-
-```text
-[3, gpio, enabled]
-```
-
-Defaults are `button.gpio=0` and `enabled=1`. The module registers both-edge
-interrupts, classifies releases as short, long (at least 2500 ms), or double
-(within 500 ms), and exits when the host stop callback is asserted.
-
-#### Event ABI
-
-Events use the common module event callback with `value_type=5`:
-
-```text
-ModuleEvent(event_id, value_type=5, flags, cbor_tuple)
-```
-
-The payload is a CBOR tuple of unsigned integers. `value_type=5` means Main
-must forward the bytes unchanged; it must not format or reinterpret fields.
-Module callback payloads are limited to 1024 bytes until stream-response
-segmentation is implemented. Main exposes them unchanged through service tag
-`events` as CBOR `[next_sequence, [[sequence, event_id, value_type, flags,
-payload], ...]]`; clients poll with the ASCII request `since=<sequence>`.
-
-##### Event IDs and tuples
-
-| ID | Name | Tuple |
-|---:|---|---|
-| 110 | `adc.sample` | `[pin, raw, adc_mv, 0, 255, ref_mv, unit, channel]` |
-| 111 | `battery.sample` | `[pin, raw, adc_mv, battery_mv, level, ref_mv, unit, channel]` |
-| 101 | `button.short` | `[pin, held_ms, 0]` |
-| 102 | `button.long` | `[pin, held_ms, 0]` |
-| 103 | `button.double` | `[pin, held_ms, 0]` |
-
-For `adc.sample`, battery voltage is zero and level is `255` (unknown).
-`level=255` is reserved for unknown; otherwise battery level is 0..100.
-`unit` is 1-based (`1=ADC1`); `channel` is the ESP ADC channel number.
-
-#### Host ABI
-
-The host table provides generic GPIO, ADC, I2C, SPI, RGB LED, IRQ, event
-wait, stop, sleep, and monotonic-time callbacks. `adc_read` is the original
-raw/mV operation. `adc_read_ex` is additive and returns ADC unit/channel
-metadata. Modules must check `size` before using additive fields.
-
-Callbacks return zero on success or an ESP error/result code. The host owns
-SDK objects and synchronization; modules must not link ESP-IDF or block on
-unbounded operations.
-
-#### Ownership and storage
-
-- Main owns the ABI implementation and command/service dispatch. The
-  device-facing identity is the numeric service tag; names are controller and
-  schema data only.
-- `hw.dmod` owns battery, ADC probe, button, and peripheral policy.
-- Recovery owns only the flash transport and named module-slot writing.
-- LoRa and hardware modules use fixed 64-KiB-aligned slots: physical offset is
-  `(service_tag - 43) * 0x10000`.
-- Event IDs 1..127 are reserved for core hardware events; 128..255 are
-  available for future peripheral modules.
-- Operation IDs 1..63 are reserved for this module; 64..255 are future work.
-
-### LoRa module
-
-`mod_lora` owns the module-local radio ABI. Main owns loading, placement,
-power, GPIO/SPI host primitives, and forwarding; this document owns radio
-configuration, packet semantics, and module event tuples.
-
-The module event tuple is `[event_id, value_type, flags, value]`. Current IDs
-are `1=rx_started`, `2=rx_stopped`, `3=tx_done`, `4=reconfigured`,
-`5=stats`, and `6=tx_error`. RX/TX operations are asynchronous; completion and
-errors are events, not blocking command responses.
-
-LoRa and FSK wire payloads are opaque to Main. Chip-specific IRQ, FIFO, BUSY,
-reset, and continuous-RX behavior remain module-owned.
-
-The QUIC-lite service tag is `43`. Main acknowledges an accepted stream
-request with CBOR `[0]`, then invokes the module from its serialized owner
-loop. RX/TX completion remains an asynchronous module event; bearer tasks do
-not wait for radio work.
+The optional ESP flash modules (components 1000-1003) have wire-level payloads and a C callback ABI
+that depend on the encoding and transport of the device build. They are documented in
+[`docs/firmware-modules.md`](docs/firmware-modules.md), not here: this document is the neutral method
+contract.

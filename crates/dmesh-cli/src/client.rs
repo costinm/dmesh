@@ -11,12 +11,10 @@ use crate::flash::{
 };
 use crate::uart::{DeviceSession, DeviceSessionEvent};
 use crate::{
-    device::{
-        DeviceProfile, load_device, resolve_catalog_target, resolve_udp_peer,
-    },
+    device::{DeviceProfile, load_device, resolve_catalog_target, resolve_udp_peer},
     schema::{
-        encode_stream_argv_with_id, encode_stream_command_with_id,
-        is_stream_command_name, load_tagged_schema, render_device_record,
+        encode_stream_argv_with_id, encode_stream_command_with_id, is_stream_command_name,
+        load_tagged_schema, render_device_record,
     },
 };
 use dmesh_server::announce;
@@ -189,6 +187,9 @@ pub fn run_dmesh_cli_args(args: impl IntoIterator<Item = String>) -> Result<(), 
             append_catalog_uart_baud(&mut arguments, &profile);
         }
         return run_serial_watch(&arguments);
+    }
+    if arguments.first().is_some_and(|target| target.starts_with("tcp://")) {
+        return run_tcp_service_client(&arguments);
     }
     if let Some(target) = arguments
         .first()
@@ -388,21 +389,26 @@ fn run_serial_stream_command(arguments: &[String]) -> Result<(), String> {
         // Without a `peer` the CLI is the probe's client: it calls the probed
         // node's registered `probe.handler` handler and validates the payload.
         let mut source = [0u8; dmesh_server::probe::PROBE_REQUEST_MAX];
-        let used = dmesh_server::probe::encode_probe_handler_request(probe_request, id, &mut source)
-            .ok_or("probe request does not fit a probe.handler header")?;
+        let used =
+            dmesh_server::probe::encode_probe_handler_request(probe_request, id, &mut source)
+                .ok_or("probe request does not fit a probe.handler header")?;
         let result = runtime.block_on(crate::node_client::probe_uart(
             path,
             baud,
             &source[..used],
             probe_request,
             timeout,
+            linger,
         ))?;
         println!(
-            "dmesh_cli_probe bearer=uart target={path} direction={} bytes={} elapsed_us={} mbps={:.3} callback_errors={:?}",
+            "dmesh_cli_probe bearer=uart target={path} direction={} bytes={} elapsed_us={} upload_mbps={:.3} download_mbps={:.3} upload_elapsed_us={} download_elapsed_us={} callback_errors={:?}",
             probe_request.direction.as_str(),
             result.bytes,
             result.elapsed_us,
-            result.bits_per_second() as f64 / 1_000_000.0,
+            result.upload_mbps(),
+            result.download_mbps(),
+            result.upload_elapsed_us,
+            result.download_elapsed_us,
             result.callback_errors,
         );
         return Ok(());
@@ -682,7 +688,7 @@ fn run_serial_watch(arguments: &[String]) -> Result<(), String> {
             match event {
                 DeviceSessionEvent::Diagnostic(line) => {
                     if text_filter.retain(&line) {
-                            println!("{line}");
+                        println!("{line}");
                     }
                 }
                 DeviceSessionEvent::Message(message) => {
@@ -733,8 +739,100 @@ fn parse_interactive_service_command(line: &str) -> Result<Vec<u8>, String> {
 /// Execute one service operation directly over the UDP QUIC-lite bearer.
 /// The node owns association setup, packet processing, and stream flow control;
 /// the CLI only opens a byte stream and renders the returned tagged record.
+fn run_tcp_service_client(arguments: &[String]) -> Result<(), String> {
+    let (arguments, timeout_override) = split_udp_timeout(arguments)?;
+    let peer = parse_udp_peer(arguments.first().and_then(|s| s.strip_prefix("tcp://"))
+        .ok_or("missing tcp:// endpoint")?)?;
+    let command = arguments.get(1).filter(|s| is_stream_command_name(s))
+        .ok_or("missing schema service")?;
+    if command == "object.flash" {
+        return Err("use the automated flash workflow; Main TCP flash is not enabled by this adapter".into());
+    }
+    let request = encode_stream_argv_with_id(&arguments[1..], fresh_request_id())
+        .map_err(|e| e.to_string())?;
+    let timeout = timeout_override.unwrap_or(stream_request_timeout(&request)?);
+    let probe = dmesh_server::tagged::decode(&request)
+        .and_then(dmesh_server::probe::decode_probe_start_record);
+    let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    runtime.block_on(async {
+        tokio::time::timeout(timeout, async {
+            let mut stream = tokio::net::TcpStream::connect(peer).await.map_err(|e| e.to_string())?;
+            stream.set_nodelay(true).map_err(|e| e.to_string())?;
+            if let Some((id, probe)) = probe {
+                if probe.peer.is_some() { return Err("TCP probe peer forwarding is not supported".into()); }
+                let mut header = [0; dmesh_server::probe::PROBE_REQUEST_MAX];
+                let used = dmesh_server::probe::encode_probe_handler_request(probe, id, &mut header)
+                    .ok_or("probe header does not fit")?;
+                let result = if probe.direction == dmesh_server::probe::ProbeDirection::Both {
+                    let mut down = tokio::net::TcpStream::connect(peer).await.map_err(|e| e.to_string())?;
+                    down.set_nodelay(true).map_err(|e| e.to_string())?;
+                    dmesh_server::stream_client::probe_duplex(&mut stream, &mut down, probe, id).await
+                } else {
+                    dmesh_server::stream_client::probe(&mut stream, &header[..used], probe).await
+                }.map_err(|e| e.to_string())?;
+                println!("dmesh_cli_probe bearer=tcp target={peer} direction={} bytes={} elapsed_us={} upload_mbps={:.3} download_mbps={:.3} upload_elapsed_us={} download_elapsed_us={} callback_errors={:?}",
+                    probe.direction.as_str(), result.bytes, result.elapsed_us,
+                    result.upload_mbps(), result.download_mbps(), result.upload_elapsed_us,
+                    result.download_elapsed_us, result.callback_errors);
+            } else {
+                let started = Instant::now();
+                let response = dmesh_server::stream_client::exchange(&mut stream, &[&request]).await
+                    .map_err(|e| e.to_string())?;
+                println!("dmesh_cli_stream_command target={peer} fin=true bytes={} elapsed_us={} {}",
+                    response.len(), started.elapsed().as_micros(), render_device_record(&load_tagged_schema(), &response));
+            }
+            Ok(())
+        }).await.map_err(|_| format!("TCP stream timed out after {timeout:?}"))?
+    })
+}
+
+#[cfg(test)]
+mod tcp_stream_tests {
+    #[test]
+    fn cli_tcp_probe_uses_registered_handler_for_all_directions() {
+        for direction in ["upload", "download", "both"] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let server = std::thread::spawn(move || {
+                tokio::runtime::Runtime::new().unwrap().block_on(async {
+                    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                    let registry = std::sync::Arc::new(dmesh_server::registry::Registry::new());
+                    assert!(registry.register_stream(dmesh_server::registry::methods::PROBE_HANDLER,
+                        dmesh_server::probe::ProbeHandler));
+                    let service = dmesh_server::stream_service::RegistryStreamHandler::new(registry);
+                    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                        let mut first = listener.accept().await.unwrap().0;
+                        if direction == "both" {
+                            let mut second = listener.accept().await.unwrap().0;
+                            tokio::try_join!(service.serve(&mut first), service.serve(&mut second)).unwrap();
+                        } else { service.serve(&mut first).await.unwrap(); }
+                    }).await.unwrap();
+                });
+            });
+            let arguments = vec![format!("tcp://{address}"), "probe.start".into(),
+                "bytes=65537".into(), "packet_size=1024".into(), format!("direction={direction}"),
+                "verify=true".into(), "--timeout-secs".into(), "10".into()];
+            super::run_tcp_service_client(&arguments).unwrap();
+            server.join().unwrap();
+        }
+    }
+}
+
 pub(crate) fn run_udp_service_client(arguments: &[String]) -> Result<(), String> {
-    let (arguments, object_file) = split_object_file_argument(arguments)?;
+    let audit = (arguments.get(1).map(String::as_str) == Some("object.flash"))
+        .then(|| crate::flash_log::begin(arguments.first().map_or("unknown", String::as_str),
+            arguments.iter().find_map(|a| a.trim_start_matches("--").strip_prefix("target=")).unwrap_or("unknown"),
+            arguments.iter().any(|a| a.trim_start_matches("--") == "dry_run=true"), None,
+            "response_and_fin")).flatten();
+    let result = run_udp_service_client_inner(arguments);
+    if let Some(audit) = audit { audit.finish(&result); }
+    result
+}
+
+fn run_udp_service_client_inner(arguments: &[String]) -> Result<(), String> {
+    let (arguments, timeout_override) = split_udp_timeout(arguments)?;
+    let (arguments, object_file) = split_object_file_argument(&arguments)?;
     let (arguments, uart_path, uart_baud) = split_uart_bearer_arguments(&arguments)?;
     let peer = arguments
         .first()
@@ -747,7 +845,7 @@ pub(crate) fn run_udp_service_client(arguments: &[String]) -> Result<(), String>
         .ok_or("missing schema service; use dmesh-cli DEVICE METHOD [--field=value ...]")?;
     let request = encode_stream_argv_with_id(&arguments[1..], fresh_request_id())
         .map_err(|error| error.to_string())?;
-    let timeout = stream_request_timeout(&request)?;
+    let timeout = timeout_override.unwrap_or(stream_request_timeout(&request)?);
     let probe_request = dmesh_server::probe::decode_probe_start_record(
         dmesh_server::tagged::decode(&request).ok_or("invalid tagged request")?,
     );
@@ -762,19 +860,22 @@ pub(crate) fn run_udp_service_client(arguments: &[String]) -> Result<(), String>
         let (_, flash) = dmesh_server::object_transfer::decode_flash_command(&request)
             .ok_or("invalid object.flash request")?;
         let (image, artifact) = flash_upload_object(flash.object, object_file.as_deref())?;
+        crate::flash_log::image("quic_udp", Some(&artifact), &image);
         eprintln!(
             "dmesh_cli_object_upload bearer=udp association=single stream=single artifact={}",
             artifact.display()
         );
-        runtime
+        let transfer_started = Instant::now();
+        let result = runtime
             .block_on(crate::node_client::flash_udp(
                 udp_bind_for_peer(peer),
                 peer,
                 &request,
                 &image,
                 object_upload_timeout(),
-            ))?
-            .bytes
+            ));
+        crate::flash_log::transfer(transfer_started.elapsed(), result.is_ok());
+        result?.bytes
     } else {
         if let Some((id, probe_request)) =
             probe_request.filter(|(_, request)| request.peer.is_none())
@@ -795,7 +896,7 @@ pub(crate) fn run_udp_service_client(arguments: &[String]) -> Result<(), String>
                 timeout,
             ))?;
             println!(
-                "dmesh_cli_probe bearer={} target={peer} direction={} bytes={} elapsed_us={} mbps={:.3} callback_errors={:?}",
+                "dmesh_cli_probe bearer={} target={peer} direction={} bytes={} elapsed_us={} upload_mbps={:.3} download_mbps={:.3} upload_elapsed_us={} download_elapsed_us={} callback_errors={:?}",
                 if uart_path.is_some() {
                     "udp+uart"
                 } else {
@@ -804,7 +905,10 @@ pub(crate) fn run_udp_service_client(arguments: &[String]) -> Result<(), String>
                 probe_request.direction.as_str(),
                 result.bytes,
                 result.elapsed_us,
-                result.bits_per_second() as f64 / 1_000_000.0,
+                result.upload_mbps(),
+                result.download_mbps(),
+                result.upload_elapsed_us,
+                result.download_elapsed_us,
                 result.callback_errors,
             );
             return Ok(());
@@ -830,6 +934,29 @@ pub(crate) fn run_udp_service_client(arguments: &[String]) -> Result<(), String>
         render_device_record(&load_tagged_schema(), &response),
     );
     Ok(())
+}
+
+fn split_udp_timeout(arguments: &[String]) -> Result<(Vec<String>, Option<Duration>), String> {
+    let mut retained = Vec::new();
+    let mut timeout = None;
+    let mut args = arguments.iter();
+    while let Some(argument) = args.next() {
+        let value = if argument == "--timeout-secs" {
+            Some(args.next().ok_or("missing --timeout-secs value")?.as_str())
+        } else {
+            argument.strip_prefix("--timeout-secs=")
+        };
+        if let Some(value) = value {
+            let seconds = value.parse::<u64>().map_err(|_| "invalid --timeout-secs value")?;
+            if seconds == 0 || timeout.is_some() {
+                return Err("--timeout-secs requires one positive value".into());
+            }
+            timeout = Some(Duration::from_secs(seconds));
+        } else {
+            retained.push(argument.clone());
+        }
+    }
+    Ok((retained, timeout))
 }
 
 fn split_uart_bearer_arguments(
@@ -951,7 +1078,7 @@ fn udp_bind_for_peer(peer: SocketAddr) -> SocketAddr {
 /// `[fe80::1%wlan0]:3339`. `SocketAddr` itself deliberately
 /// does not parse interface names, so resolve the Linux interface index here
 /// at the host CLI boundary rather than teaching firmware about host scopes.
-fn parse_udp_peer(value: &str) -> Result<SocketAddr, String> {
+pub(crate) fn parse_udp_peer(value: &str) -> Result<SocketAddr, String> {
     quic_lite::bearer_udp::parse_peer(value, 3339).map_err(|error| error.to_string())
 }
 
@@ -1004,7 +1131,18 @@ fn run_catalog_target_service(arguments: &[String], profile: &DeviceProfile) -> 
             .ok_or_else(|| format!("device {name:?} has no selected bearer"))?;
         command_arguments[0] = path.display().to_string();
         append_catalog_uart_baud(&mut command_arguments, profile);
-        return run_serial_stream_command(&command_arguments);
+        return run_after_catalog_uart_wake(
+            profile.sleepy,
+            || {
+                // Extend Main's CPU-awake lease without replacing its radio
+                // profile or persistent policy. Use the shared UART record,
+                // not a probe-specific transport.set workaround.
+                let mut session =
+                    DeviceSession::open(&path.display().to_string(), profile.uart_baud)?;
+                session.send_wake()
+            },
+            || run_serial_stream_command(&command_arguments),
+        );
     }
     if let Some(path) = &uart_path {
         command_arguments.push("--uart-bearer".into());
@@ -1042,6 +1180,17 @@ fn run_catalog_target_service(arguments: &[String], profile: &DeviceProfile) -> 
     let mut udp_arguments = command_arguments;
     udp_arguments[0] = format!("udp://{peer}");
     run_udp_service_client(&udp_arguments)
+}
+
+fn run_after_catalog_uart_wake(
+    sleepy: bool,
+    wake: impl FnOnce() -> Result<(), String>,
+    request: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    if sleepy {
+        wake()?;
+    }
+    request()
 }
 
 fn split_catalog_bearers(
@@ -1763,11 +1912,61 @@ pub(crate) fn exchange_udp_stream_record(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn udp_timeout_is_host_only_and_accepts_both_spellings() {
+        for suffix in [vec!["--timeout-secs", "120"], vec!["--timeout-secs=120"]] {
+            let mut args = vec!["udp://[::1]:3339".to_string(), "probe.start".to_string()];
+            args.extend(suffix.into_iter().map(str::to_string));
+            let (retained, timeout) = super::split_udp_timeout(&args).unwrap();
+            assert_eq!(retained, args[..2]);
+            assert_eq!(timeout, Some(std::time::Duration::from_secs(120)));
+        }
+        for value in ["0", "no", ""] {
+            assert!(super::split_udp_timeout(&[format!("--timeout-secs={value}")]).is_err());
+        }
+        assert!(super::split_udp_timeout(&["--timeout-secs".into()]).is_err());
+    }
     use super::{
         FlashTarget, flash_target_matches_announce, parse_serial_stream_arguments,
         probe_request_timeout, split_catalog_bearers,
     };
     use std::time::Duration;
+
+    #[test]
+    fn catalog_uart_wakes_sleepy_devices_before_request_and_propagates_failure() {
+        use std::cell::RefCell;
+        for sleepy in [false, true] {
+            let calls = RefCell::new(Vec::new());
+            super::run_after_catalog_uart_wake(
+                sleepy,
+                || {
+                    calls.borrow_mut().push("wake");
+                    Ok(())
+                },
+                || {
+                    calls.borrow_mut().push("request");
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                *calls.borrow(),
+                if sleepy {
+                    vec!["wake", "request"]
+                } else {
+                    vec!["request"]
+                }
+            );
+        }
+        assert_eq!(
+            super::run_after_catalog_uart_wake(
+                true,
+                || Err("wake failed".into()),
+                || panic!("request must not run")
+            ),
+            Err("wake failed".into())
+        );
+    }
 
     #[test]
     fn catalog_bearer_selection_accepts_udp_and_uart_together() {

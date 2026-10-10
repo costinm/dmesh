@@ -24,9 +24,44 @@ pub fn nan_idle_pm_ready(now_ms: u64, grace_until_ms: u64, wake_until_ms: u32, r
         && nan_wake_hold_remaining(now_ms as u32, wake_until_ms) == 0
 }
 
+/// Renew a command's CPU-awake grace without shortening an existing lease.
+/// Radio configuration and persistent sleep policy are unchanged.
+pub fn renew_command_grace(now_ms: u64, current_until_ms: u64, hold_ms: u32) -> u64 {
+    current_until_ms.max(now_ms.saturating_add(u64::from(hold_ms)))
+}
+
 #[cfg(test)]
 mod wake_lease_tests {
     use super::*;
+
+    #[test]
+    fn uart_command_grace_disarms_idle_sleep_and_renews_without_shortening() {
+        let until = renew_command_grace(90_000, 0, 60_000);
+        assert_eq!(until, 150_000);
+        assert!(!nan_idle_pm_ready(90_000, until, 0, true));
+        assert!(!nan_idle_pm_ready(149_999, until, 0, true));
+        assert!(nan_idle_pm_ready(150_000, until, 0, true));
+        assert_eq!(renew_command_grace(91_000, until, 60_000), 151_000);
+        assert_eq!(renew_command_grace(91_000, 200_000, 60_000), 200_000);
+        assert_eq!(renew_command_grace(u64::MAX - 1, 0, 60_000), u64::MAX);
+    }
+
+    #[test]
+    fn active_handler_extends_initial_grace_then_allows_idle_sleep() {
+        let mut until = 60_000;
+        // Active requests do not shorten the initial operator wake window.
+        until = renew_command_grace(10_000, until, 2_000);
+        assert_eq!(until, 60_000);
+        // A transfer lasting longer than that window remains awake.
+        for now in [59_000, 60_000, 61_000, 120_000, 140_000] {
+            until = renew_command_grace(now, until, 2_000);
+            assert!(!nan_idle_pm_ready(now, until, 0, true));
+            assert!(until > now);
+        }
+        // No refresh after completion: sleep resumes at the idle deadline.
+        assert!(!nan_idle_pm_ready(141_999, until, 0, true));
+        assert!(nan_idle_pm_ready(142_000, until, 0, true));
+    }
 
     #[test]
     fn wake_stays_active_for_ten_seconds_and_explicit_sleep_cancels() {

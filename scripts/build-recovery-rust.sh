@@ -56,8 +56,9 @@ fi
 export CARGO_TARGET_DIR="$TARGET_DIR"
 export CARGO_WORKSPACE_DIR="$PROJECT"
 export ESP_IDF_SDKCONFIG_DEFAULTS="$PROJECT/sdkconfig.defaults;$OVERLAY"
-# Recovery uses the shared associated-STA raw UDP6 bearer. ESP-IDF still owns
-# Wi-Fi association, but Recovery does not install an lwIP socket transport.
+# Recovery uses the shared associated-STA UDP6 socket bearer. ESP-IDF and
+# lwIP own Wi-Fi association and socket transport; Recovery adds no UART or
+# ESP-NOW bearer.
 # Console output uses the chip-selected ESP console and does not install UART
 # input or a framed UART transport.
 export ESP_IDF_COMPONENTS="main;esp_wifi;esp_event;esp_netif;esp_partition;nvs_flash"

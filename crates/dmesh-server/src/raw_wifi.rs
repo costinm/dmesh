@@ -52,6 +52,15 @@ pub const RAW_WIFI_SNAPSHOT_MAX_BYTES: usize = 1024;
 /// response below the common bearer MTU while allowing ten visible DMesh APs.
 pub const RAW_WIFI_RESPONSE_MAX_BYTES: usize = RAW_WIFI_SNAPSHOT_MAX_BYTES;
 
+/// Encode the successful `radio.tx` result as the number of bytes submitted
+/// to the radio driver. Keep the result numeric rather than formatting it as
+/// a diagnostic string.
+pub fn encode_raw_wifi_tx_result(bytes: u64, out: &mut [u8]) -> Option<usize> {
+    let mut encoder = Encoder::new(out);
+    encoder.uint(bytes)?;
+    Some(encoder.len())
+}
+
 /// Common admission result for an ESP-NOW action payload. Synchronization and
 /// tagged connectionless records stay on discovery/control handling; only an
 /// opaque payload reaches the QUIC packet bearer.
@@ -1108,7 +1117,7 @@ impl RawWifiSnapshot {
     pub fn link_metrics(&self) -> WifiLinkMetrics {
         let mut metrics = WifiLinkMetrics::new();
         metrics.peer_mac = if self.sta_associated == Some(true) {
-            self.comparator_bssid
+            self.sta_bssid
         } else {
             None
         };
@@ -1351,8 +1360,12 @@ pub fn encode_raw_wifi_snapshot(
         e.uint(u64::from(value))?;
     }
     for (tag, value) in [
-        (131, snapshot.sta_connections), (132, snapshot.sta_disconnections),
-        (133, snapshot.sta_last_event_disconnect_reason.map(u32::from)),
+        (131, snapshot.sta_connections),
+        (132, snapshot.sta_disconnections),
+        (
+            133,
+            snapshot.sta_last_event_disconnect_reason.map(u32::from),
+        ),
         (134, snapshot.sta_diagnostic_log_drops),
     ] {
         if let Some(value) = value {
@@ -1360,16 +1373,39 @@ pub fn encode_raw_wifi_snapshot(
             e.uint(u64::from(value))?;
         }
     }
-    if let Some(value) = snapshot.sta_scan_rssi_threshold_dbm { e.uint(135)?; e.int(i64::from(value))?; }
-    for (tag, value) in [(136, snapshot.sta_scan_authmode_threshold), (137, snapshot.sta_config_channel),
-        (140, snapshot.sta_scan_method), (143, snapshot.sta_sae_pwe_method)] {
-        if let Some(value) = value { e.uint(tag)?; e.uint(u64::from(value))?; }
+    if let Some(value) = snapshot.sta_scan_rssi_threshold_dbm {
+        e.uint(135)?;
+        e.int(i64::from(value))?;
     }
-    if let Some(value) = snapshot.sta_config_bssid { e.uint(138)?; e.bytes_value(&value)?; }
-    for (tag, value) in [(139, snapshot.sta_config_bssid_set), (141, snapshot.sta_pmf_capable), (142, snapshot.sta_pmf_required)] {
-        if let Some(value) = value { e.uint(tag)?; e.boolean(value)?; }
+    for (tag, value) in [
+        (136, snapshot.sta_scan_authmode_threshold),
+        (137, snapshot.sta_config_channel),
+        (140, snapshot.sta_scan_method),
+        (143, snapshot.sta_sae_pwe_method),
+    ] {
+        if let Some(value) = value {
+            e.uint(tag)?;
+            e.uint(u64::from(value))?;
+        }
     }
-    if let Some(value) = snapshot.sta_config_ssid { e.uint(144)?; e.bytes_value(&value)?; }
+    if let Some(value) = snapshot.sta_config_bssid {
+        e.uint(138)?;
+        e.bytes_value(&value)?;
+    }
+    for (tag, value) in [
+        (139, snapshot.sta_config_bssid_set),
+        (141, snapshot.sta_pmf_capable),
+        (142, snapshot.sta_pmf_required),
+    ] {
+        if let Some(value) = value {
+            e.uint(tag)?;
+            e.boolean(value)?;
+        }
+    }
+    if let Some(value) = snapshot.sta_config_ssid {
+        e.uint(144)?;
+        e.bytes_value(&value)?;
+    }
     if let Some(value) = snapshot.sta_ap_rssi_dbm {
         e.uint(86)?;
         e.int(i64::from(value))?;
@@ -1501,20 +1537,81 @@ pub fn decode_raw_wifi_snapshot(data: &[u8]) -> Result<(u64, RawWifiSnapshot), &
                 )
             }
             128 => snapshot.sta_enabled = Some(decoder.boolean().ok_or("radio STA enabled")?),
-            131 => snapshot.sta_connections = Some(u32::try_from(decoder.uint().ok_or("STA connections")?).map_err(|_| "STA connections")?),
-            132 => snapshot.sta_disconnections = Some(u32::try_from(decoder.uint().ok_or("STA disconnections")?).map_err(|_| "STA disconnections")?),
-            133 => snapshot.sta_last_event_disconnect_reason = Some(u8::try_from(decoder.uint().ok_or("STA disconnect reason")?).map_err(|_| "STA disconnect reason")?),
-            134 => snapshot.sta_diagnostic_log_drops = Some(u32::try_from(decoder.uint().ok_or("STA log drops")?).map_err(|_| "STA log drops")?),
-            135 => snapshot.sta_scan_rssi_threshold_dbm = Some(i8::try_from(decoder.int().ok_or("STA RSSI threshold")?).map_err(|_| "STA RSSI threshold")?),
-            136 => snapshot.sta_scan_authmode_threshold = Some(u8::try_from(decoder.uint().ok_or("STA auth threshold")?).map_err(|_| "STA auth threshold")?),
-            137 => snapshot.sta_config_channel = Some(u8::try_from(decoder.uint().ok_or("STA configured channel")?).map_err(|_| "STA configured channel")?),
-            138 => snapshot.sta_config_bssid = Some(decoder.bytes_ref().and_then(|v| v.try_into().ok()).ok_or("STA configured BSSID")?),
-            139 => snapshot.sta_config_bssid_set = Some(decoder.boolean().ok_or("STA BSSID pinned")?),
-            140 => snapshot.sta_scan_method = Some(u8::try_from(decoder.uint().ok_or("STA scan method")?).map_err(|_| "STA scan method")?),
+            131 => {
+                snapshot.sta_connections = Some(
+                    u32::try_from(decoder.uint().ok_or("STA connections")?)
+                        .map_err(|_| "STA connections")?,
+                )
+            }
+            132 => {
+                snapshot.sta_disconnections = Some(
+                    u32::try_from(decoder.uint().ok_or("STA disconnections")?)
+                        .map_err(|_| "STA disconnections")?,
+                )
+            }
+            133 => {
+                snapshot.sta_last_event_disconnect_reason = Some(
+                    u8::try_from(decoder.uint().ok_or("STA disconnect reason")?)
+                        .map_err(|_| "STA disconnect reason")?,
+                )
+            }
+            134 => {
+                snapshot.sta_diagnostic_log_drops = Some(
+                    u32::try_from(decoder.uint().ok_or("STA log drops")?)
+                        .map_err(|_| "STA log drops")?,
+                )
+            }
+            135 => {
+                snapshot.sta_scan_rssi_threshold_dbm = Some(
+                    i8::try_from(decoder.int().ok_or("STA RSSI threshold")?)
+                        .map_err(|_| "STA RSSI threshold")?,
+                )
+            }
+            136 => {
+                snapshot.sta_scan_authmode_threshold = Some(
+                    u8::try_from(decoder.uint().ok_or("STA auth threshold")?)
+                        .map_err(|_| "STA auth threshold")?,
+                )
+            }
+            137 => {
+                snapshot.sta_config_channel = Some(
+                    u8::try_from(decoder.uint().ok_or("STA configured channel")?)
+                        .map_err(|_| "STA configured channel")?,
+                )
+            }
+            138 => {
+                snapshot.sta_config_bssid = Some(
+                    decoder
+                        .bytes_ref()
+                        .and_then(|v| v.try_into().ok())
+                        .ok_or("STA configured BSSID")?,
+                )
+            }
+            139 => {
+                snapshot.sta_config_bssid_set = Some(decoder.boolean().ok_or("STA BSSID pinned")?)
+            }
+            140 => {
+                snapshot.sta_scan_method = Some(
+                    u8::try_from(decoder.uint().ok_or("STA scan method")?)
+                        .map_err(|_| "STA scan method")?,
+                )
+            }
             141 => snapshot.sta_pmf_capable = Some(decoder.boolean().ok_or("STA PMF capable")?),
             142 => snapshot.sta_pmf_required = Some(decoder.boolean().ok_or("STA PMF required")?),
-            143 => snapshot.sta_sae_pwe_method = Some(u8::try_from(decoder.uint().ok_or("STA SAE method")?).map_err(|_| "STA SAE method")?),
-            144 => snapshot.sta_config_ssid = Some(decoder.bytes_ref().and_then(|v| v.try_into().ok()).ok_or("STA configured SSID")?),
+            143 => {
+                snapshot.sta_sae_pwe_method = Some(
+                    u8::try_from(decoder.uint().ok_or("STA SAE method")?)
+                        .map_err(|_| "STA SAE method")?,
+                )
+            }
+            144 => {
+                snapshot.sta_config_ssid = Some(
+                    decoder
+                        .bytes_ref()
+                        .and_then(|v| v.try_into().ok())
+                        .ok_or("STA configured SSID")?,
+                )
+            }
             22 => snapshot.sta_associated = Some(decoder.boolean().ok_or("radio STA")?),
             129 => {
                 snapshot.sta_bssid = Some(
@@ -2372,6 +2469,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn radio_tx_success_result_is_a_numeric_cbor_value() {
+        let mut out = [0u8; 16];
+        let used = encode_raw_wifi_tx_result(1_234, &mut out).unwrap();
+        let mut decoder = Decoder::new(&out[..used]);
+        assert_eq!(decoder.uint(), Some(1_234));
+        assert!(decoder.is_finished());
+    }
+
+    #[test]
     fn espnow_admission_separates_sync_control_and_opaque_quic() {
         let sync = dmesh_rawnan::build_now_sync_body([1; 6], [2; 6], 3, 512, 0, &[]).unwrap();
         let tagged_control = [0xa3, 1, 6, 2, 1, 3, 1];
@@ -2655,6 +2761,7 @@ mod tests {
         let snapshot = RawWifiSnapshot {
             sta_associated: Some(true),
             comparator_bssid: Some([1, 2, 3, 4, 5, 6]),
+            sta_bssid: Some([6, 5, 4, 3, 2, 1]),
             sta_ap_rssi_dbm: Some(-41),
             counters: RawWifiCounters {
                 udp6_rx_frames: 9,
@@ -2666,13 +2773,30 @@ mod tests {
         };
         let metrics = snapshot.link_metrics();
         assert_eq!(metrics.schema_version, WIFI_LINK_METRICS_SCHEMA_VERSION);
-        assert_eq!(metrics.peer_mac, Some([1, 2, 3, 4, 5, 6]));
+        assert_eq!(metrics.peer_mac, Some([6, 5, 4, 3, 2, 1]));
         assert_eq!(metrics.signal_dbm, Some(-41));
         assert_eq!(metrics.bearer_rx_frames, Some(9));
         assert_eq!(metrics.bearer_tx_failures, Some(2));
         assert_eq!(metrics.raw_tx_completion_failures, Some(3));
         assert_eq!(metrics.mac_tx_retries, None);
         assert_eq!(metrics.mac_tx_failed, None);
+        for (associated, sta_bssid) in [
+            (Some(true), None),
+            (Some(false), snapshot.sta_bssid),
+            (None, snapshot.sta_bssid),
+        ] {
+            let unknown_peer = RawWifiSnapshot {
+                sta_associated: associated,
+                sta_bssid,
+                comparator_bssid: snapshot.comparator_bssid,
+                ..RawWifiSnapshot::default()
+            }
+            .link_metrics();
+            assert_eq!(
+                unknown_peer.peer_mac, None,
+                "NAN comparator is not a STA peer"
+            );
+        }
     }
 
     #[test]
@@ -3002,8 +3126,13 @@ mod tests {
         let mut out = [0; RAW_WIFI_RESPONSE_MAX_BYTES];
         let used = encode_raw_wifi_snapshot(RAW_WIFI_METHOD_SNAPSHOT, snapshot, &mut out).unwrap();
         assert!(used <= RAW_WIFI_SNAPSHOT_MAX_BYTES);
-        assert_eq!(decode_raw_wifi_snapshot(&out[..used]), Ok((RAW_WIFI_METHOD_SNAPSHOT, snapshot)));
-        assert!(encode_raw_wifi_snapshot(RAW_WIFI_METHOD_SNAPSHOT, snapshot, &mut [0; 448]).is_none());
+        assert_eq!(
+            decode_raw_wifi_snapshot(&out[..used]),
+            Ok((RAW_WIFI_METHOD_SNAPSHOT, snapshot))
+        );
+        assert!(
+            encode_raw_wifi_snapshot(RAW_WIFI_METHOD_SNAPSHOT, snapshot, &mut [0; 448]).is_none()
+        );
     }
 
     #[test]
@@ -3011,7 +3140,10 @@ mod tests {
         // {1: radio, 2: method, 3: id} and the same with `5: {}` are one request.
         for (method, expected) in [
             (RAW_WIFI_METHOD_SNAPSHOT, RawWifiLabRequest::Snapshot),
-            (RAW_WIFI_METHOD_RESET_COUNTERS, RawWifiLabRequest::ResetCounters),
+            (
+                RAW_WIFI_METHOD_RESET_COUNTERS,
+                RawWifiLabRequest::ResetCounters,
+            ),
         ] {
             for with_fields in [false, true] {
                 let mut wire = [0u8; 32];

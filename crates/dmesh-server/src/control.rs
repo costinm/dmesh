@@ -57,7 +57,7 @@ const FIELD_STA_PASSPHRASE: u64 = 17;
 /// existing passphrase field while keeping this addition backward-compatible.
 /// `0` selects the default 115200 UART rate, `1` explicitly means 115200,
 /// `2..=7` select other common rates, and `8` explicitly turns off a real
-/// UART bearer. USB packet mode ignores the selector.
+/// UART bearer; `9` selects 921600. USB packet mode ignores the selector.
 const FIELD_UART: u64 = 18;
 /// Enable the NAN Data Path (NDP) bearer for this immutable radio epoch.
 /// NDP is meaningful only to adapters that implement it today (Android), but
@@ -342,7 +342,7 @@ fn decode_transport_config(encoded: &[u8]) -> Option<TransportConfig<'_>> {
             }
             FIELD_UART => {
                 let speed = u8::try_from(d.uint()?).ok()?;
-                if speed > 8 {
+                if crate::firmware_profile::normalize_uart_selector(speed).is_none() {
                     return None;
                 }
                 config.uart = Some(speed);
@@ -778,5 +778,21 @@ mod tests {
         };
         let used = encode_request(request, Some(10), &mut wire).unwrap();
         assert_eq!(decode_request(&wire[..used]), Some(request));
+    }
+
+    #[test]
+    fn transport_set_round_trips_921600_uart_selector() {
+        let request = Request::TransportSet {
+            kind: TransportKind::Uart,
+            config: TransportConfig { uart: Some(9), ..Default::default() },
+        };
+        let mut wire = [0; 96];
+        let used = encode_request(request, Some(10), &mut wire).unwrap();
+        assert_eq!(decode_request(&wire[..used]), Some(request));
+        let invalid = Request::TransportSet {
+            kind: TransportKind::Uart,
+            config: TransportConfig { uart: Some(10), ..Default::default() },
+        };
+        assert!(encode_request(invalid, None, &mut wire).is_none());
     }
 }

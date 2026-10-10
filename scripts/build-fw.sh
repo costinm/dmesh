@@ -6,6 +6,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 usage() {
     echo "Usage: scripts/build-fw.sh [all|esp32|e5|recovery-s3|esp32s3|esp32c6|e6]"
     echo "Default: all (build every Main CPU family)"
+    echo "BLE defaults on for C6, off for ESP32/S3. To build Main without BLE:"
+    echo "  DMESH_FW_NO_DEFAULT_FEATURES=1 DMESH_FW_FEATURES=modules scripts/build-fw.sh esp32c6"
+    echo "Opt-in driver queue experiment (does not change normal defaults):"
+    echo "  DMESH_WIFI_DYNAMIC_TX_BUFFERS=4 scripts/build-fw.sh esp32"
+    echo "  DMESH_WIFI_DYNAMIC_RX_BUFFERS=10 scripts/build-fw.sh esp32"
+    echo "  DMESH_WIFI_STATIC_RX_BUFFERS=6 DMESH_WIFI_DYNAMIC_RX_BUFFERS=6 DMESH_WIFI_DYNAMIC_TX_BUFFERS=8 scripts/build-fw.sh esp32"
+    echo "  Static RX must cover the selected SDK RX BA window; verify generated sdkconfig."
 }
 case "${1:-}" in
     -h|--help|help) usage; exit 0 ;;
@@ -17,6 +24,38 @@ esac
 FIRMWARE_DIR="${DMESH_MAIN_FIRMWARE_DIR:-$DMESH_REPO/fw/main}"
 BUILD_MODE="${DMESH_FW_PROFILE:-release}"
 REQUESTED_TARGET="${1:-all}"
+# Flash clock for every image (Stage2 and Recovery2 use the same default);
+# 80 MHz is tested on all boards. Main's own flash driver is always DIO:
+# Stage2 selects QIO code reads per boot (NVS stg2:flash) and configures the
+# quad pins only then, so a QIO driver reads garbage after a DIO boot and can
+# damage NVS. See fw/boot/README.md "Flash read mode".
+FLASH_MODE=dio
+FLASH_MHZ="${DMESH_FLASH_MHZ:-80}"
+if [[ -n "${DMESH_FLASH_MODE:-}" && "$DMESH_FLASH_MODE" != dio ]]; then
+    echo 'DMESH_FLASH_MODE: Main is always DIO; set QIO with NVS stg2:flash for Stage2' >&2
+    exit 2
+fi
+case "$FLASH_MHZ" in 40|80) ;; *) echo 'DMESH_FLASH_MHZ must be 40 or 80' >&2; exit 2 ;; esac
+if [[ -n "${DMESH_WIFI_DYNAMIC_TX_BUFFERS:-}" ]] &&
+   [[ ! "$DMESH_WIFI_DYNAMIC_TX_BUFFERS" =~ ^([1-9]|[1-9][0-9]|1[01][0-9]|12[0-8])$ ]]; then
+    echo 'DMESH_WIFI_DYNAMIC_TX_BUFFERS must be an integer from 1 to 128' >&2
+    exit 2
+fi
+if [[ -n "${DMESH_WIFI_STATIC_RX_BUFFERS:-}" ]] &&
+   [[ ! "$DMESH_WIFI_STATIC_RX_BUFFERS" =~ ^([6-9]|1[0-9]|2[0-5])$ ]]; then
+    echo 'DMESH_WIFI_STATIC_RX_BUFFERS must be an integer from 6 to 25 (and at least the selected SDK RX BA window)' >&2
+    exit 2
+fi
+if [[ -n "${DMESH_WIFI_DYNAMIC_RX_BUFFERS:-}" ]] &&
+   [[ ! "$DMESH_WIFI_DYNAMIC_RX_BUFFERS" =~ ^([2-9]|[1-9][0-9]|1[01][0-9]|12[0-8])$ ]]; then
+    echo 'DMESH_WIFI_DYNAMIC_RX_BUFFERS must be an integer from 2 to 128' >&2
+    exit 2
+fi
+if [[ -n "${DMESH_WIFI_DYNAMIC_RX_BUFFERS:-}" ]] &&
+   (( DMESH_WIFI_DYNAMIC_RX_BUFFERS < ${DMESH_WIFI_STATIC_RX_BUFFERS:-10} )); then
+    echo 'Dynamic RX must be at least static RX (default floor 10 unless explicitly overridden)' >&2
+    exit 2
+fi
 now_ms() { "$DMESH_PYTHON" -c 'import time; print(time.time_ns() // 1_000_000)'; }
 build_started_ms="$(now_ms)"
 
@@ -33,7 +72,10 @@ FLASH_ROOT="${DMESH_MAIN_FLASH_ROOT:-$CARGO_TARGET_DIR/flash}"
 # Keep the normal default composition implicit, but clean only the two local
 # firmware packages when an explicit diagnostic feature set changes.
 FEATURE_STAMP="$CARGO_TARGET_DIR/.dmesh-main-feature-set"
-FEATURE_SET="default,${DMESH_FW_FEATURES:-}"
+NO_DEFAULT_FEATURES="${DMESH_FW_NO_DEFAULT_FEATURES:-0}"
+case "$NO_DEFAULT_FEATURES" in 0|1) ;; *) echo 'DMESH_FW_NO_DEFAULT_FEATURES must be 0 or 1' >&2; exit 2 ;; esac
+FEATURE_SET="no-defaults=${NO_DEFAULT_FEATURES},${DMESH_FW_FEATURES:-}"
+mkdir -p "$CARGO_TARGET_DIR"
 if [ ! -f "$FEATURE_STAMP" ] || [ "$(cat "$FEATURE_STAMP")" != "$FEATURE_SET" ]; then
     (
         cd "$FIRMWARE_DIR"
@@ -53,6 +95,13 @@ fi
 mkdir -p "$CARGO_TARGET_DIR"
 build_one() {
     local name="$1" target="$2" sdkconfig="$3" partition_file="$4" chip="$5" flash_size="$6"
+    local no_defaults="$NO_DEFAULT_FEATURES" fw_features="${DMESH_FW_FEATURES:-}"
+    # Normal Xtensa images omit BLE; C6 keeps the default BLE feature.
+    # An explicit feature selection remains available for diagnostic builds.
+    if [[ "$chip" != esp32c6 && -z "${DMESH_FW_NO_DEFAULT_FEATURES+x}" && -z "${DMESH_FW_FEATURES+x}" ]]; then
+        no_defaults=1
+        fw_features=modules
+    fi
     local args=(build --target "$target")
     local config_dir="$CARGO_TARGET_DIR/sdkconfig"
     local partition_overlay="$config_dir/${name}-partition.defaults"
@@ -77,8 +126,11 @@ build_one() {
     esac
     # Normal firmware uses raw IPv6/UDP and raw ESP-NOW by default. This
     # remains available only for narrowly scoped diagnostic features.
-    if [ -n "${DMESH_FW_FEATURES:-}" ]; then
-        args+=(--features "$DMESH_FW_FEATURES")
+    if [[ "$no_defaults" == "1" ]]; then
+        args+=(--no-default-features)
+    fi
+    if [ -n "$fw_features" ]; then
+        args+=(--features "$fw_features")
     fi
 
     echo "=== Building $name ($target, $BUILD_MODE) ==="
@@ -97,6 +149,26 @@ build_one() {
     partition_overlay_tmp="$(mktemp "${partition_overlay}.tmp.XXXXXX")"
     printf 'CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="%s"\n' \
         "$partition_path" > "$partition_overlay_tmp"
+    if [[ -n "${DMESH_WIFI_DYNAMIC_TX_BUFFERS:-}" ]]; then
+        # Explicit canary overlay only. Driver queue capacity is independent
+        # of QUIC packet-pool slots, stream credit and retransmission limits.
+        printf 'CONFIG_ESP_WIFI_STATIC_TX_BUFFER=n\nCONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER=y\nCONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=%s\n' \
+            "$DMESH_WIFI_DYNAMIC_TX_BUFFERS" >> "$partition_overlay_tmp"
+    fi
+    if [[ -n "${DMESH_WIFI_STATIC_RX_BUFFERS:-}" ]]; then
+        printf 'CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=%s\n' \
+            "$DMESH_WIFI_STATIC_RX_BUFFERS" >> "$partition_overlay_tmp"
+    fi
+    if [[ -n "${DMESH_WIFI_DYNAMIC_RX_BUFFERS:-}" ]]; then
+        printf 'CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=%s\n' \
+            "$DMESH_WIFI_DYNAMIC_RX_BUFFERS" >> "$partition_overlay_tmp"
+    fi
+    # Keep the app driver settings identical to the espflash image header.
+    printf 'CONFIG_ESPTOOLPY_FLASHMODE_DIO=%s\nCONFIG_ESPTOOLPY_FLASHMODE_QIO=%s\nCONFIG_ESPTOOLPY_FLASHMODE="%s"\nCONFIG_ESPTOOLPY_FLASHFREQ_40M=%s\nCONFIG_ESPTOOLPY_FLASHFREQ_80M=%s\nCONFIG_ESPTOOLPY_FLASHFREQ="%sm"\n' \
+        "$([[ "$FLASH_MODE" == dio ]] && echo y || echo n)" \
+        "$([[ "$FLASH_MODE" == qio ]] && echo y || echo n)" "$FLASH_MODE" \
+        "$([[ "$FLASH_MHZ" == 40 ]] && echo y || echo n)" \
+        "$([[ "$FLASH_MHZ" == 80 ]] && echo y || echo n)" "$FLASH_MHZ" >> "$partition_overlay_tmp"
     # Diagnostic-only raw-bearer profile. NAN beacon synchronization and
     # power policy remain Main-owned; this overlay lets a C6 canary measure
     # whether either ESP-IDF service prevents the shared raw transport from
@@ -110,6 +182,14 @@ build_one() {
             printf 'CONFIG_PM_ENABLE=n\n'
             printf 'CONFIG_FREERTOS_USE_TICKLESS_IDLE=n\n'
         } >> "$partition_overlay_tmp"
+    fi
+    if [[ ",${DMESH_FW_FEATURES:-}," == *",rtos-stats,"* ]]; then
+        printf 'CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y\nCONFIG_FREERTOS_USE_TRACE_FACILITY=y\nCONFIG_FREERTOS_RUN_TIME_STATS_USING_ESP_TIMER=y\n' >> "$partition_overlay_tmp"
+    fi
+    if [[ "$no_defaults" == "1" && ",$fw_features," != *",ble-stack,"* ]]; then
+        # Cargo feature and ESP-IDF component selection must agree: omitting
+        # the Rust adapter alone leaves NimBLE's SDK RAM allocation enabled.
+        printf 'CONFIG_BT_ENABLED=n\nCONFIG_BT_NIMBLE_ENABLED=n\n' >> "$partition_overlay_tmp"
     fi
     if cmp -s "$partition_overlay_tmp" "$partition_overlay"; then
         rm -f "$partition_overlay_tmp"
@@ -125,7 +205,7 @@ build_one() {
     # Include their source/ABI inputs in the target cache key so a module
     # loader fix cannot silently package the prior C object file.
     sdk_defaults_digest="$(sha256sum \
-        "$sdk_defaults_path" "$partition_overlay" \
+        "$sdk_defaults_path" "$partition_overlay" "$FIRMWARE_DIR/Cargo.toml" \
         "$DMESH_REPO/fw/modules/native/dmesh_module_loader/CMakeLists.txt" \
         "$DMESH_REPO/fw/modules/native/dmesh_module_loader/dmesh_module_loader.c" \
         "$DMESH_REPO/fw/modules/native/dmesh_module_loader/dmesh_hw_host.c" \
@@ -137,6 +217,7 @@ build_one() {
         "$DMESH_REPO/fw/ble/native/dmesh_nimble/CMakeLists.txt" \
         "$DMESH_REPO/fw/ble/native/dmesh_nimble/dmesh_nimble.c" \
         "$DMESH_REPO/fw/ble/native/dmesh_nimble/include/dmesh_nimble.h" \
+        $(find -L "$DMESH_REPO/fw/esp-wifi-loader/components/esp_wifi_loader" -type f 2>/dev/null | sort) \
         | sha256sum | awk '{print $1}')"
     local sdk_id="cache-v3:${IDF_PATH}:$(git -C "$IDF_PATH" describe --tags --always 2>/dev/null || true):${sdk_defaults_digest}"
     if [[ ! -f "$sdk_stamp" || "$(cat "$sdk_stamp")" != "$sdk_id" ]]; then
@@ -154,7 +235,7 @@ build_one() {
         # espflash packages the ELF without opening a serial port. Keep the
         # partition offsets selected by the shared Stage2 table.
         espflash --skip-update-check save-image --chip "$chip" \
-            --flash-mode dio --flash-freq 40mhz --flash-size "$image_flash_size" \
+            --flash-mode "$FLASH_MODE" --flash-freq "${FLASH_MHZ}mhz" --flash-size "$image_flash_size" \
             --target-app-partition main --partition-table "$partition_file" \
             --bootloader "$boot_path" --merge --skip-padding \
             "$elf_path" "$image_path"

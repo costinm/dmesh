@@ -250,7 +250,7 @@ pub(crate) async fn probe_udp(
     payload: &[u8],
     request: dmesh_server::probe::ProbeServiceRequest,
     timeout: Duration,
-) -> Result<quic_lite::probe::ProbeResult, String> {
+) -> Result<dmesh_server::stream_client::ProbeResult, String> {
     probe_udp_with_uart(bind, peer, None, None, payload, request, timeout).await
 }
 
@@ -262,7 +262,7 @@ pub(crate) async fn probe_udp_with_uart(
     payload: &[u8],
     request: dmesh_server::probe::ProbeServiceRequest,
     timeout: Duration,
-) -> Result<quic_lite::probe::ProbeResult, String> {
+) -> Result<dmesh_server::stream_client::ProbeResult, String> {
     let future = async {
         let mut node = new_node();
         let primary = attach_udp(&mut node, bind, peer).await?;
@@ -291,19 +291,33 @@ pub(crate) async fn probe_uart(
     payload: &[u8],
     request: dmesh_server::probe::ProbeServiceRequest,
     timeout: Duration,
-) -> Result<quic_lite::probe::ProbeResult, String> {
-    let future = async {
-        let mut node = new_node();
-        let primary = attach_uart(&mut node, path, baud)?;
-        run_node(node, |client| async move {
+    linger: Duration,
+) -> Result<dmesh_server::stream_client::ProbeResult, String> {
+    let mut node = new_node();
+    let primary = attach_uart(&mut node, path, baud)?;
+    run_node(node, |client| async move {
+        let attempt = async {
             let association = associate_paths(&client, primary, &[]).await?;
             exchange_probe(association, payload, request).await
-        })
+        };
+        monitor_uart_probe(attempt, timeout, linger).await
+    })
+    .await
+}
+
+/// The caller keeps the UART driver alive while this operation is pending.
+/// Log collection follows both completion and timeout, outside the deadline.
+async fn monitor_uart_probe<T>(
+    attempt: impl core::future::Future<Output = Result<T, String>>,
+    timeout: Duration,
+    linger: Duration,
+) -> Result<T, String> {
+    let result = tokio::time::timeout(timeout, attempt)
         .await
-    };
-    tokio::time::timeout(timeout, future)
-        .await
-        .map_err(|_| format!("UART QUIC probe timed out after {timeout:?}"))?
+        .map_err(|_| format!("UART QUIC probe timed out after {timeout:?}"))
+        .and_then(|result| result);
+    tokio::time::sleep(linger).await;
+    result
 }
 
 /// Run a probe as the client of the peer's `probe.handler` handler: send the
@@ -313,7 +327,7 @@ async fn exchange_probe(
     association: TokioAssociation,
     payload: &[u8],
     request: dmesh_server::probe::ProbeServiceRequest,
-) -> Result<quic_lite::probe::ProbeResult, String> {
+) -> Result<dmesh_server::stream_client::ProbeResult, String> {
     let result = dmesh_server::stream_client::probe_quic(&association, payload, request)
         .await
         .map_err(|error| format!("probe stream exchange: {error}"))?;
@@ -433,6 +447,30 @@ mod tests {
 
     type TestPool = PacketPool<16, { quic_lite::DEFAULT_PACKET_POOL_SLOT_SIZE }>;
     type TestNode = QuicNode<TestPool>;
+
+    #[tokio::test]
+    async fn uart_probe_linger_is_outside_success_deadline() {
+        let start = std::time::Instant::now();
+        let result = super::monitor_uart_probe(
+            async { Ok::<_, String>(42) },
+            Duration::from_millis(5),
+            Duration::from_millis(20),
+        ).await;
+        assert_eq!(result.unwrap(), 42);
+        assert!(start.elapsed() >= Duration::from_millis(20));
+    }
+
+    #[tokio::test]
+    async fn uart_probe_timeout_still_collects_logs_during_linger() {
+        let start = std::time::Instant::now();
+        let result = super::monitor_uart_probe(
+            core::future::pending::<Result<(), String>>(),
+            Duration::from_millis(5),
+            Duration::from_millis(20),
+        ).await;
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(start.elapsed() >= Duration::from_millis(25));
+    }
 
     #[test]
     fn udp_client_completes_a_quic_stream_request_and_response() {

@@ -119,6 +119,8 @@ impl ProbeDestination {
 /// Existing `probe` workload plus an optional device-directed peer route.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProbeServiceRequest {
+    /// Opt-in deterministic payload validation; length and FIN are always checked.
+    pub verify: bool,
     pub direction: ProbeDirection,
     pub bytes: u64,
     pub packet_size: u16,
@@ -136,6 +138,7 @@ pub struct ProbeServiceRequest {
 impl ProbeServiceRequest {
     pub const fn new(bytes: u64, packet_size: u16) -> Self {
         Self {
+            verify: false,
             direction: ProbeDirection::Download,
             bytes,
             packet_size,
@@ -242,7 +245,8 @@ fn encode_probe_request(
         + usize::from(request.initial_consume_delay_ms.is_some())
         + usize::from(request.consume_delay_ms.is_some())
         + usize::from(request.peer.is_some())
-        + usize::from(request.direction != ProbeDirection::Download);
+        + usize::from(request.direction != ProbeDirection::Download)
+        + usize::from(request.verify);
     let mut e = Encoder::new(output);
     e.map(4)?;
     e.uint(1)?;
@@ -294,6 +298,10 @@ fn encode_probe_request(
         e.uint(14)?;
         e.text_value(request.direction.as_str().as_bytes())?;
     }
+    if request.verify {
+        e.uint(16)?;
+        e.bool(true)?;
+    }
     Some(e.len())
 }
 
@@ -323,14 +331,14 @@ fn decode_probe_record(record: Record<'_>, method: u64) -> Option<(u64, ProbeSer
     }
     let mut d = Decoder::new(record.fields?);
     let (major, count) = d.head()?;
-    if major != 5 || count == u64::MAX || count > 14 {
+    if major != 5 || count == u64::MAX || count > 16 {
         return None;
     }
     let mut seen = 0u16;
     let mut request = ProbeServiceRequest::new(0, 0);
     for _ in 0..count {
         let field = d.uint()?;
-        if !(1..=14).contains(&field) || matches!(field, 3..=5) {
+        if !(1..=16).contains(&field) || matches!(field, 3..=5 | 15) {
             return None;
         }
         let bit = 1u16.checked_shl((field - 1) as u32)?;
@@ -339,6 +347,7 @@ fn decode_probe_record(record: Record<'_>, method: u64) -> Option<(u64, ProbeSer
         }
         seen |= bit;
         match field {
+            16 => request.verify = d.boolean()?,
             14 => request.direction = ProbeDirection::parse(d.text_ref()?)?,
             FIELD_PEER => {
                 request.peer = ProbeDestination::parse(core::str::from_utf8(d.text_ref()?).ok()?)
@@ -467,7 +476,9 @@ impl ProbeUpload {
 
 impl crate::stream::BodySink for ProbeUpload {
     fn write(&mut self, chunk: &[u8], fin: bool) -> Result<usize, Vec<u8>> {
-        if self.payload.check(chunk).is_err() || (fin && !self.payload.is_complete()) {
+        if self.payload.consume(chunk, self.request.verify).is_err()
+            || (fin && !self.payload.is_complete())
+        {
             return Err(self.rejected());
         }
         Ok(chunk.len())
@@ -593,6 +604,7 @@ pub enum ProbeClientError {
 /// The caller's end of a probe: feeds the bytes of the response stream (header,
 /// then payload) and validates the payload, however the transport chunks it.
 pub struct ProbeResponseReader {
+    verify: bool,
     buffer: alloc::vec::Vec<u8>,
     payload: Option<quic_lite::probe::ProbePayload>,
     expected: u64,
@@ -605,6 +617,7 @@ impl ProbeResponseReader {
     /// `expected` is the byte count that was requested.
     pub fn new(expected: u64) -> Self {
         Self {
+            verify: true,
             buffer: alloc::vec::Vec::new(),
             payload: None,
             expected,
@@ -617,6 +630,7 @@ impl ProbeResponseReader {
     /// Validate download bytes and the peer's terminal upload receipt.
     pub fn for_request(request: ProbeServiceRequest) -> Self {
         Self {
+            verify: request.verify,
             expected_upload: request.upload_bytes(),
             ..Self::new(request.download_bytes())
         }
@@ -701,7 +715,9 @@ impl ProbeResponseReader {
 
     fn check(&mut self, bytes: &[u8]) -> Result<(), ProbeClientError> {
         match self.payload.as_mut() {
-            Some(payload) => payload.check(bytes).map_err(|_| ProbeClientError::Payload),
+            Some(payload) => payload
+                .consume(bytes, self.verify)
+                .map_err(|_| ProbeClientError::Payload),
             None if bytes.is_empty() => Ok(()),
             None => Err(ProbeClientError::Payload),
         }
@@ -783,15 +799,49 @@ mod tests {
     }
 
     #[test]
+    fn optional_verification_preserves_length_checks_and_wire_default() {
+        for verify in [false, true] {
+            let mut request = ProbeServiceRequest::new(100, 32);
+            request.verify = verify;
+            let mut wire = [0; 160];
+            let len = super::encode_probe_handler_request(request, 1, &mut wire).unwrap();
+            assert_eq!(
+                super::decode_probe_handler_record(crate::tagged::decode(&wire[..len]).unwrap()),
+                Some((1, request))
+            );
+            let response = super::probe_response(1, request, 32).unwrap();
+            let mut reader = super::ProbeResponseReader::for_request(request);
+            reader.push(&response.header).unwrap();
+            let mut body = [0; 100];
+            quic_lite::probe::ProbePayload::new(100, 32)
+                .unwrap()
+                .fill(&mut body);
+            body[20] ^= 1;
+            if verify {
+                assert_eq!(reader.push(&body), Err(super::ProbeClientError::Payload));
+                assert_eq!(reader.bytes(), 0);
+            } else {
+                reader.push(&body[..99]).unwrap();
+                assert!(!reader.is_complete());
+                reader.push(&body[99..]).unwrap();
+                assert!(reader.is_complete());
+                assert_eq!(reader.push(&[0]), Err(super::ProbeClientError::Payload));
+            }
+        }
+        assert!(!ProbeServiceRequest::new(100, 32).verify);
+    }
+
+    #[test]
     fn upload_waits_for_fin_and_rejects_corruption_truncation_and_overrun() {
         use crate::registry::{CallContext, Registry, methods};
         use crate::stream::ServerStream;
-        for direction in [super::ProbeDirection::Upload] {
+        for verify in [false, true] {
             for fault in 0..4 {
                 let registry = Registry::new();
                 assert!(registry.register_stream(methods::PROBE_HANDLER, super::ProbeHandler));
                 let mut request = ProbeServiceRequest::new(100, 32);
-                request.direction = direction;
+                request.verify = verify;
+                request.direction = super::ProbeDirection::Upload;
                 let mut wire = [0; 160];
                 let len = super::encode_probe_handler_request(request, 9, &mut wire).unwrap();
                 let mut server = ServerStream::new(CallContext::default());
@@ -838,7 +888,7 @@ mod tests {
                         break;
                     }
                 }
-                if fault == 0 {
+                if fault == 0 || (fault == 1 && !verify) {
                     reader.push(&collected).unwrap();
                     assert!(reader.is_complete());
                     assert_eq!(reader.uploaded_bytes(), 100);
@@ -869,6 +919,7 @@ mod tests {
     #[test]
     fn tagged_probe_run_round_trips_with_a_uri_destination() {
         let request = ProbeServiceRequest {
+            verify: true,
             direction: super::ProbeDirection::Both,
             bytes: 65_536,
             packet_size: 1200,
@@ -902,6 +953,7 @@ mod tests {
     #[test]
     fn plan_has_one_shared_bounded_stream_and_ack_shape() {
         let request = ProbeServiceRequest {
+            verify: false,
             direction: super::ProbeDirection::Download,
             bytes: 10,
             packet_size: 65_535,

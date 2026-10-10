@@ -874,7 +874,7 @@
     "x-tier": "core"
   },
   {
-    "description": "Read retained log and event records, optionally streaming them with periodic metric snapshots",
+    "description": "Read recent structured records, optionally streaming new records and periodic metrics",
     "inputSchema": {
       "properties": {
         "interval_ms": {
@@ -1021,6 +1021,11 @@
           "type": "string",
           "x-protobuf-index": 15,
           "x-protobuf-type": "string"
+        },
+        "verify": {
+          "type": "boolean",
+          "x-protobuf-index": 16,
+          "x-protobuf-type": "bool"
         }
       },
       "required": [],
@@ -1127,6 +1132,11 @@
           "type": "integer",
           "x-protobuf-index": 10,
           "x-protobuf-type": "u8"
+        },
+        "verify": {
+          "type": "boolean",
+          "x-protobuf-index": 16,
+          "x-protobuf-type": "bool"
         }
       },
       "required": [],
@@ -1350,7 +1360,7 @@
         "ble_scan_results": {
           "type": "object",
           "x-protobuf-index": 3,
-          "x-protobuf-type": "cbor"
+          "x-protobuf-type": "encoded"
         },
         "count": {
           "type": "integer",
@@ -1360,12 +1370,12 @@
         "events": {
           "type": "array",
           "x-protobuf-index": 1,
-          "x-protobuf-type": "cbor[]"
+          "x-protobuf-type": "encoded[]"
         },
         "followups": {
           "type": "array",
           "x-protobuf-index": 2,
-          "x-protobuf-type": "cbor[]"
+          "x-protobuf-type": "encoded[]"
         }
       },
       "required": [],

@@ -1045,7 +1045,7 @@ async fn stream_exchange(
 ) -> Result<StreamReply> {
     Ok(match probe {
         Some(request) => StreamReply::Probe(
-            dmesh_server::stream_client::probe_quic(association, payload, request).await?,
+            dmesh_server::stream_client::probe_quic(association, payload, request).await?.transfer,
         ),
         None => {
             let mut stream = association.open_stream().await

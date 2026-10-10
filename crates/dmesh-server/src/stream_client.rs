@@ -5,6 +5,40 @@
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+/// Completed application probe, with independent directional response/FIN timings.
+#[derive(Clone, Copy, Debug)]
+pub struct ProbeResult {
+    pub transfer: quic_lite::probe::ProbeResult,
+    pub upload_bytes: u64,
+    pub download_bytes: u64,
+    pub upload_elapsed_us: u64,
+    pub download_elapsed_us: u64,
+}
+
+impl core::ops::Deref for ProbeResult {
+    type Target = quic_lite::probe::ProbeResult;
+    fn deref(&self) -> &Self::Target {
+        &self.transfer
+    }
+}
+
+impl ProbeResult {
+    pub fn upload_mbps(&self) -> f64 {
+        directional_mbps(self.upload_bytes, self.upload_elapsed_us)
+    }
+    pub fn download_mbps(&self) -> f64 {
+        directional_mbps(self.download_bytes, self.download_elapsed_us)
+    }
+}
+
+fn directional_mbps(bytes: u64, elapsed_us: u64) -> f64 {
+    if elapsed_us == 0 {
+        0.0
+    } else {
+        bytes as f64 * 8.0 / elapsed_us as f64
+    }
+}
+
 /// Run simultaneous upload/download over two ordinary streams. Each direction
 /// has its own terminal response and FIN; neither waits for the other to start.
 pub async fn probe_duplex<U, D>(
@@ -12,7 +46,7 @@ pub async fn probe_duplex<U, D>(
     download: &mut D,
     request: crate::probe::ProbeServiceRequest,
     id: u64,
-) -> std::io::Result<quic_lite::probe::ProbeResult>
+) -> std::io::Result<ProbeResult>
 where
     U: AsyncRead + AsyncWrite + Unpin,
     D: AsyncRead + AsyncWrite + Unpin,
@@ -35,15 +69,21 @@ where
         probe(upload, &up_header[..up_len], up),
         probe(download, &down_header[..down_len], down),
     )?;
-    Ok(quic_lite::probe::ProbeResult {
-        bytes: up_result.bytes + down_result.bytes,
-        normal_bytes: up_result.bytes + down_result.bytes,
-        high_bytes: 0,
-        low_bytes: 0,
-        elapsed_us: started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
-        callback_errors: core::array::from_fn(|index| {
-            up_result.callback_errors[index].saturating_add(down_result.callback_errors[index])
-        }),
+    Ok(ProbeResult {
+        upload_bytes: up_result.upload_bytes,
+        download_bytes: down_result.download_bytes,
+        upload_elapsed_us: up_result.upload_elapsed_us,
+        download_elapsed_us: down_result.download_elapsed_us,
+        transfer: quic_lite::probe::ProbeResult {
+            bytes: up_result.bytes + down_result.bytes,
+            normal_bytes: up_result.bytes + down_result.bytes,
+            high_bytes: 0,
+            low_bytes: 0,
+            elapsed_us: started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+            callback_errors: core::array::from_fn(|index| {
+                up_result.callback_errors[index].saturating_add(down_result.callback_errors[index])
+            }),
+        },
     })
 }
 
@@ -53,7 +93,7 @@ pub async fn probe_quic(
     association: &quic_lite::tokio::TokioAssociation,
     payload: &[u8],
     request: crate::probe::ProbeServiceRequest,
-) -> std::io::Result<quic_lite::probe::ProbeResult> {
+) -> std::io::Result<ProbeResult> {
     let error = |error| std::io::Error::other(format!("open probe stream: {error:?}"));
     let mut stream = association.open_stream().await.map_err(error)?;
     if request.direction == crate::probe::ProbeDirection::Both {
@@ -119,7 +159,7 @@ pub async fn probe<S>(
     stream: &mut S,
     payload: &[u8],
     request: crate::probe::ProbeServiceRequest,
-) -> std::io::Result<quic_lite::probe::ProbeResult>
+) -> std::io::Result<ProbeResult>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -184,19 +224,67 @@ where
         Ok::<_, std::io::Error>(reader.bytes() + reader.uploaded_bytes())
     };
     let (_, bytes) = tokio::try_join!(send, receive)?;
-    Ok(quic_lite::probe::ProbeResult {
-        bytes,
-        normal_bytes: bytes,
-        high_bytes: 0,
-        low_bytes: 0,
-        elapsed_us: started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
-        callback_errors: [0; 6],
+    let elapsed_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+    Ok(ProbeResult {
+        upload_bytes: request.upload_bytes(),
+        download_bytes: request.download_bytes(),
+        upload_elapsed_us: if request.upload_bytes() == 0 {
+            0
+        } else {
+            elapsed_us
+        },
+        download_elapsed_us: if request.download_bytes() == 0 {
+            0
+        } else {
+            elapsed_us
+        },
+        transfer: quic_lite::probe::ProbeResult {
+            bytes,
+            normal_bytes: bytes,
+            high_bytes: 0,
+            low_bytes: 0,
+            elapsed_us,
+            callback_errors: [0; 6],
+        },
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directional_rates_use_independent_timings() {
+        assert_eq!(directional_mbps(1_000_000, 1_000_000), 8.0);
+        assert_eq!(directional_mbps(1_000_000, 2_000_000), 4.0);
+        assert_eq!(directional_mbps(0, 0), 0.0);
+    }
+
+    #[tokio::test]
+    async fn duplex_reports_fast_upload_without_waiting_for_slow_download() {
+        let registry = std::sync::Arc::new(crate::registry::Registry::new());
+        registry.register_stream(
+            crate::registry::methods::PROBE_HANDLER,
+            crate::probe::ProbeHandler,
+        );
+        let service = crate::stream_service::RegistryStreamHandler::new(registry);
+        let (mut upload, mut up_server) = tokio::io::duplex(128);
+        let (mut download, mut down_server) = tokio::io::duplex(128);
+        let request = crate::probe::ProbeServiceRequest::new(1024, 128);
+        let delayed_download = async {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            service.serve(&mut down_server).await
+        };
+        let (result, (), ()) = tokio::try_join!(
+            probe_duplex(&mut upload, &mut download, request, 42),
+            service.serve(&mut up_server),
+            delayed_download,
+        )
+        .unwrap();
+        assert!(result.download_elapsed_us >= 100_000);
+        assert!(result.upload_elapsed_us < result.download_elapsed_us);
+        assert!(result.upload_mbps() > result.download_mbps());
+    }
 
     #[tokio::test]
     async fn duplex_directions_start_before_either_can_finish() {
@@ -294,6 +382,12 @@ mod tests {
             )
             .unwrap();
             assert_eq!(result.bytes, request.bytes * 2);
+            assert_eq!(result.upload_bytes, request.bytes);
+            assert_eq!(result.download_bytes, request.bytes);
+            assert!(result.upload_elapsed_us > 0);
+            assert!(result.download_elapsed_us > 0);
+            assert!(result.upload_elapsed_us <= result.elapsed_us);
+            assert!(result.download_elapsed_us <= result.elapsed_us);
         })
         .await
         .unwrap();
@@ -468,19 +562,15 @@ mod tests {
                 .unwrap();
         }
         let (bearer, peer) = if udp {
-            let first = quic_lite::bearer_udp::TokioUdpBearer::<16>::bind(
-                "[::1]:0".parse().unwrap(),
-            )
-            .await
-            .unwrap();
-            let second = quic_lite::bearer_udp::TokioUdpBearer::<16>::bind(
-                "[::1]:0".parse().unwrap(),
-            )
-            .await
-            .unwrap();
-            let peer = first
-                .register_peer(second.local_addr().unwrap())
-                .unwrap();
+            let first =
+                quic_lite::bearer_udp::TokioUdpBearer::<16>::bind("[::1]:0".parse().unwrap())
+                    .await
+                    .unwrap();
+            let second =
+                quic_lite::bearer_udp::TokioUdpBearer::<16>::bind("[::1]:0".parse().unwrap())
+                    .await
+                    .unwrap();
+            let peer = first.register_peer(second.local_addr().unwrap()).unwrap();
             b.add_bearer(second).unwrap();
             (a.add_bearer(first).unwrap(), peer)
         } else {
@@ -519,12 +609,22 @@ mod tests {
                 request.direction = direction;
                 let mut header = [0; 160];
                 let len = encode_probe_handler_request(request, 42, &mut header).unwrap();
-                let result = probe_quic(&association, &header[..len], request).await.unwrap();
+                let result = probe_quic(&association, &header[..len], request)
+                    .await
+                    .unwrap();
                 assert_eq!(result.bytes, request.total_bytes());
-                println!("transport={} run={} direction={} bytes={} verified=true fin=true elapsed_us={} mbps={:.3}",
-                    if udp { "udp-loopback" } else { "in-memory" }, index / 3 + 1,
-                    direction.as_str(), result.bytes, result.elapsed_us,
-                    result.bits_per_second() as f64 / 1_000_000.0);
+                println!(
+                    "transport={} run={} direction={} bytes={} verified=true fin=true elapsed_us={} upload_mbps={:.3} download_mbps={:.3} upload_elapsed_us={} download_elapsed_us={}",
+                    if udp { "udp-loopback" } else { "in-memory" },
+                    index / 3 + 1,
+                    direction.as_str(),
+                    result.bytes,
+                    result.elapsed_us,
+                    result.upload_mbps(),
+                    result.download_mbps(),
+                    result.upload_elapsed_us,
+                    result.download_elapsed_us
+                );
             }
         };
         let server = async {

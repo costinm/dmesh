@@ -39,6 +39,8 @@ TYPE_MAP = {
 }
 TRANSIENT_RECOVERY_KEYS = {"request_magic", "request_version", "flags"}
 STAGE2_NAMESPACE = "stg2"
+# stg2:flash values understood by fw/boot (Main code read mode).
+STAGE2_FLASH_MODES = {"dio": 1, "qio": 2, "auto": 3}
 STA_PROFILE_KEYS = {
     "sta_ssid",
     "sta_server_ll",
@@ -182,6 +184,7 @@ def write_csv(
     boot_target: int | None = None, device_profile: dict[str, str] | None = None,
     clear_boot_target: bool = False, mode: str | None = None,
     clear_sta_profile: bool = False, clear_pairing: bool = False,
+    stage2_flash: int | None = None,
 ) -> int:
     # nvs_partition_gen assigns a numeric namespace id at each `namespace`
     # row. A decoded dump can revisit `phy` later for blob chunks; emitting it
@@ -192,6 +195,7 @@ def write_csv(
         namespaces.setdefault(entry["namespace"], []).append(entry)
     removed = 0
     saw_boot_target = False
+    saw_stage2_flash = False
     saw_dmesh = False
     saw_secret_namespace = False
     saw_secret_keys: set[str] = set()
@@ -229,6 +233,11 @@ def write_csv(
                         continue
                     if boot_target is not None:
                         writer.writerow(("boot_target", "data", "u32", str(boot_target)))
+                        continue
+                if current == STAGE2_NAMESPACE and entry["key"] == "flash":
+                    saw_stage2_flash = True
+                    if stage2_flash is not None:
+                        writer.writerow(("flash", "data", "u32", str(stage2_flash)))
                         continue
                 # A prior generator could append a duplicate `stg2`
                 # namespace after another namespace. Its following selector
@@ -294,6 +303,9 @@ def write_csv(
                 if boot_target is not None and not saw_boot_target:
                     writer.writerow(("boot_target", "data", "u32", str(boot_target)))
                     saw_boot_target = True
+                if stage2_flash is not None and not saw_stage2_flash:
+                    writer.writerow(("flash", "data", "u32", str(stage2_flash)))
+                    saw_stage2_flash = True
             if current == "dmesh":
                 if mode is not None and not saw_mode:
                     writer.writerow(("mode", "data", "string", mode))
@@ -311,11 +323,17 @@ def write_csv(
                         writer.writerow((key, "data", "base64" if key == SHARED_SECRET_KEY else "string", device_profile[profile_key]))
                         saw_secret_keys.add(key)
         namespace = next(reversed(namespaces), None)
+        stage2_pending = []
         if boot_target is not None and not saw_boot_target:
+            stage2_pending.append(("boot_target", boot_target))
+        if stage2_flash is not None and not saw_stage2_flash:
+            stage2_pending.append(("flash", stage2_flash))
+        if stage2_pending:
             if namespace != STAGE2_NAMESPACE:
                 writer.writerow((STAGE2_NAMESPACE, "namespace", "", ""))
                 namespace = STAGE2_NAMESPACE
-            writer.writerow(("boot_target", "data", "u32", str(boot_target)))
+            for key, value in stage2_pending:
+                writer.writerow((key, "data", "u32", str(value)))
         if device_profile is not None and not saw_dmesh:
             if namespace != "dmesh":
                 writer.writerow(("dmesh", "namespace", "", ""))
@@ -358,6 +376,10 @@ def main() -> int:
         "--clear-boot-target", action="store_true",
         help="remove stg2:boot_target and use normal Stage2 selection",
     )
+    parser.add_argument(
+        "--stage2-flash", choices=tuple(STAGE2_FLASH_MODES),
+        help="set stg2:flash, Main's code read mode (dio=1, qio=2, auto=3; unset means auto)",
+    )
     parser.add_argument("--mode", choices=("active", "sleepy", "sleepy-soft"),
                         help="set dmesh:mode next-boot policy (sleepy-soft keeps the radio awake for transition tests)")
     parser.add_argument("--clear-sta-profile", action="store_true",
@@ -379,6 +401,8 @@ def main() -> int:
                         help="Recovery server UDP port when --sta-server-ll is used")
     parser.add_argument("--device-role",
                         help="name of the ESP device record whose secret and control-plane root are installed")
+    parser.add_argument("--uart-baud", type=int, choices=(115200, 230400, 460800, 921600),
+                        help="set persistent dmesh:uart.baud; preserve other NVS values")
     args = parser.parse_args()
     if args.boot_target is not None and args.clear_boot_target:
         parser.error("--boot-target and --clear-boot-target are mutually exclusive")
@@ -393,6 +417,8 @@ def main() -> int:
         "port": str(args.port) if args.port else None,
     }
     device_profile = {key: value for key, value in profile_values.items() if value}
+    if args.uart_baud is not None:
+        device_profile["uart.baud"] = str(args.uart_baud)
     if args.sta_profile is not None:
         try:
             sta_profile = load_sta_profile(
@@ -411,6 +437,7 @@ def main() -> int:
     removed = write_csv(
         entries, args.csv, args.boot_target, device_profile or None,
         args.clear_boot_target, args.mode, args.clear_sta_profile, args.clear_pairing,
+        None if args.stage2_flash is None else STAGE2_FLASH_MODES[args.stage2_flash],
     )
     size = args.size or args.source.stat().st_size
     python = os.environ.get("DMESH_PYTHON", sys.executable)
@@ -424,6 +451,8 @@ def main() -> int:
         setting += f"; stg2:boot_target={args.boot_target}"
     elif args.clear_boot_target:
         setting += "; stg2:boot_target cleared"
+    if args.stage2_flash is not None:
+        setting += f"; stg2:flash={STAGE2_FLASH_MODES[args.stage2_flash]} ({args.stage2_flash})"
     if device_profile:
         setting += "; dmesh profile updated"
     if args.mode is not None:

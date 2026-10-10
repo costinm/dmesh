@@ -4265,7 +4265,7 @@ impl crate::registry_bridge::TaggedCbor for LogRecordResponse {
     }
 }
 
-/// Read retained log and event records, optionally streaming them with periodic metric snapshots
+/// Read recent structured records, optionally streaming new records and periodic metrics
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct LogWatchRequest {
     /// API field `since_seq`.
@@ -4391,7 +4391,7 @@ impl crate::registry_bridge::TaggedCbor for LogWatchRequest {
     }
 }
 
-/// Read retained log and event records, optionally streaming them with periodic metric snapshots
+/// Read recent structured records, optionally streaming new records and periodic metrics
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct LogWatchResponse {
     /// API field `records`.
@@ -4516,10 +4516,13 @@ pub struct ProbeStartRequest {
     /// API field `to`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<String>,
+    /// API field `verify`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify: Option<bool>,
 }
 
 impl mesh::tagged::TaggedFields for ProbeStartRequest {
-    const FIELDS: &'static [(&'static str, u32)] = &[("bytes", 1), ("packet_size", 2), ("ack_frequency", 6), ("ack_delay_ms", 7), ("low_priority_bytes", 8), ("high_priority_bytes", 9), ("parallel_streams", 10), ("initial_consume_delay_ms", 11), ("consume_delay_ms", 12), ("peer", 13), ("direction", 14), ("to", 15)];
+    const FIELDS: &'static [(&'static str, u32)] = &[("bytes", 1), ("packet_size", 2), ("ack_frequency", 6), ("ack_delay_ms", 7), ("low_priority_bytes", 8), ("high_priority_bytes", 9), ("parallel_streams", 10), ("initial_consume_delay_ms", 11), ("consume_delay_ms", 12), ("peer", 13), ("direction", 14), ("to", 15), ("verify", 16)];
 }
 
 impl ProbeStartRequest {
@@ -4539,7 +4542,7 @@ impl ProbeStartRequest {
     /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
     pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
         let mut e = crate::cbor::Encoder::new(out);
-        e.map(0u64 + u64::from(self.bytes.is_some()) + u64::from(self.packet_size.is_some()) + u64::from(self.ack_frequency.is_some()) + u64::from(self.ack_delay_ms.is_some()) + u64::from(self.low_priority_bytes.is_some()) + u64::from(self.high_priority_bytes.is_some()) + u64::from(self.parallel_streams.is_some()) + u64::from(self.initial_consume_delay_ms.is_some()) + u64::from(self.consume_delay_ms.is_some()) + u64::from(self.peer.is_some()) + u64::from(self.direction.is_some()) + u64::from(self.to.is_some()))?;
+        e.map(0u64 + u64::from(self.bytes.is_some()) + u64::from(self.packet_size.is_some()) + u64::from(self.ack_frequency.is_some()) + u64::from(self.ack_delay_ms.is_some()) + u64::from(self.low_priority_bytes.is_some()) + u64::from(self.high_priority_bytes.is_some()) + u64::from(self.parallel_streams.is_some()) + u64::from(self.initial_consume_delay_ms.is_some()) + u64::from(self.consume_delay_ms.is_some()) + u64::from(self.peer.is_some()) + u64::from(self.direction.is_some()) + u64::from(self.to.is_some()) + u64::from(self.verify.is_some()))?;
         if let Some(value) = &self.bytes {
         e.uint(1)?;
         e.uint(u64::from(*value))?;
@@ -4588,6 +4591,10 @@ impl ProbeStartRequest {
         e.uint(15)?;
         e.text_value(value.as_bytes())?;
         }
+        if let Some(value) = &self.verify {
+        e.uint(16)?;
+        e.bool(*value)?;
+        }
         Some(e.len())
     }
 
@@ -4615,6 +4622,7 @@ impl ProbeStartRequest {
                 13 => out.peer = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
                 14 => out.direction = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
                 15 => out.to = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                16 => out.verify = Some(d.bool().ok_or("invalid bool")?),
                 _ => d.skip().ok_or("invalid value")?,
             }
         }
@@ -4764,10 +4772,13 @@ pub struct ProbeHandlerRequest {
     /// API field `direction`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direction: Option<String>,
+    /// API field `verify`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify: Option<bool>,
 }
 
 impl mesh::tagged::TaggedFields for ProbeHandlerRequest {
-    const FIELDS: &'static [(&'static str, u32)] = &[("bytes", 1), ("packet_size", 2), ("ack_frequency", 6), ("ack_delay_ms", 7), ("low_priority_bytes", 8), ("high_priority_bytes", 9), ("parallel_streams", 10), ("initial_consume_delay_ms", 11), ("consume_delay_ms", 12), ("direction", 14)];
+    const FIELDS: &'static [(&'static str, u32)] = &[("bytes", 1), ("packet_size", 2), ("ack_frequency", 6), ("ack_delay_ms", 7), ("low_priority_bytes", 8), ("high_priority_bytes", 9), ("parallel_streams", 10), ("initial_consume_delay_ms", 11), ("consume_delay_ms", 12), ("direction", 14), ("verify", 16)];
 }
 
 impl ProbeHandlerRequest {
@@ -4787,7 +4798,7 @@ impl ProbeHandlerRequest {
     /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
     pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
         let mut e = crate::cbor::Encoder::new(out);
-        e.map(0u64 + u64::from(self.bytes.is_some()) + u64::from(self.packet_size.is_some()) + u64::from(self.ack_frequency.is_some()) + u64::from(self.ack_delay_ms.is_some()) + u64::from(self.low_priority_bytes.is_some()) + u64::from(self.high_priority_bytes.is_some()) + u64::from(self.parallel_streams.is_some()) + u64::from(self.initial_consume_delay_ms.is_some()) + u64::from(self.consume_delay_ms.is_some()) + u64::from(self.direction.is_some()))?;
+        e.map(0u64 + u64::from(self.bytes.is_some()) + u64::from(self.packet_size.is_some()) + u64::from(self.ack_frequency.is_some()) + u64::from(self.ack_delay_ms.is_some()) + u64::from(self.low_priority_bytes.is_some()) + u64::from(self.high_priority_bytes.is_some()) + u64::from(self.parallel_streams.is_some()) + u64::from(self.initial_consume_delay_ms.is_some()) + u64::from(self.consume_delay_ms.is_some()) + u64::from(self.direction.is_some()) + u64::from(self.verify.is_some()))?;
         if let Some(value) = &self.bytes {
         e.uint(1)?;
         e.uint(u64::from(*value))?;
@@ -4828,6 +4839,10 @@ impl ProbeHandlerRequest {
         e.uint(14)?;
         e.text_value(value.as_bytes())?;
         }
+        if let Some(value) = &self.verify {
+        e.uint(16)?;
+        e.bool(*value)?;
+        }
         Some(e.len())
     }
 
@@ -4853,6 +4868,7 @@ impl ProbeHandlerRequest {
                 11 => out.initial_consume_delay_ms = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
                 12 => out.consume_delay_ms = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
                 14 => out.direction = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                16 => out.verify = Some(d.bool().ok_or("invalid bool")?),
                 _ => d.skip().ok_or("invalid value")?,
             }
         }
@@ -7554,7 +7570,7 @@ pub struct LogRecord {
     pub text: String,
     /// API field `fields`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fields: Option<Vec<u8>>,
+    pub fields: Option<serde_json::Value>,
 }
 
 impl mesh::tagged::TaggedFields for LogRecord {
@@ -7595,7 +7611,8 @@ impl LogRecord {
         e.text_value(&self.text.as_bytes())?;
         if let Some(value) = &self.fields {
         e.uint(7)?;
-        e.encoded_value(value)?;
+        let item = mesh::cbor::encode_value_bytes(&serde_json::to_value(value).ok()?).ok()?;
+        e.encoded_value(&item)?;
         }
         Some(e.len())
     }
@@ -7623,7 +7640,7 @@ impl LogRecord {
                 4 => { out.source = String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?; seen_4 = true; }
                 5 => out.kind = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
                 6 => { out.text = String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?; seen_6 = true; }
-                7 => out.fields = Some({ let start = d.position(); d.skip().ok_or("invalid value")?; input[start..d.position()].to_vec() }),
+                7 => out.fields = Some({ let start = d.position(); d.skip().ok_or("invalid value")?; serde_json::from_value(mesh::cbor::decode_value_bytes(&input[start..d.position()]).map_err(|error| error.to_string())?).map_err(|error| error.to_string())? }),
                 _ => d.skip().ok_or("invalid value")?,
             }
         }

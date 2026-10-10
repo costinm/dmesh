@@ -13,6 +13,44 @@ GROUP_FILES = {'linux': 'crates/lmesh-wifi/API.md'}
 TIERS = ('core', 'debug', 'internal')
 
 
+def section_platforms() -> dict[str, set[str]]:
+    """`component.method` -> platform letters (A, L, E) of every section method."""
+    platforms: dict[str, set[str]] = {}
+    for path in ('API.md', 'crates/lmesh-wifi/API.md'):
+        component = None
+        method = None
+        for line in (ROOT / path).read_text().split('\n'):
+            heading = re.match(r'^# `(\w+)` API', line)
+            if heading:
+                component = heading.group(1)
+            method_heading = re.match(r'^## \d+\. `([\w.]+)`', line)
+            if method_heading:
+                method = f'{component}.{method_heading.group(1)}'
+            marker = re.match(r'^\*\*Platforms:\*\*\s+(.+)$', line)
+            if marker and method:
+                platforms[method] = set(marker.group(1).split())
+                method = None
+    return platforms
+
+
+def private_methods() -> set[str]:
+    """Section methods marked `**Visibility:** private`: never in a public catalog, so never CLI-addressable."""
+    private: set[str] = set()
+    for path in ('API.md', 'crates/lmesh-wifi/API.md'):
+        component = None
+        method = None
+        for line in (ROOT / path).read_text().split('\n'):
+            heading = re.match(r'^# `(\w+)` API', line)
+            if heading:
+                component = heading.group(1)
+            method_heading = re.match(r'^## \d+\. `([\w.]+)`', line)
+            if method_heading:
+                method = f'{component}.{method_heading.group(1)}'
+            if re.match(r'^\*\*Visibility:\*\*\s+private\s*$', line) and method:
+                private.add(method)
+    return private
+
+
 def section_tiers() -> dict[str, str]:
     """`component.method` -> tier for every section method of the formal API documents."""
     tiers: dict[str, str] = {}

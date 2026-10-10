@@ -8,6 +8,8 @@
 pub mod client;
 mod device;
 mod flash;
+mod flash_log;
+mod recovery_tcp;
 mod http;
 mod node_client;
 mod schema;

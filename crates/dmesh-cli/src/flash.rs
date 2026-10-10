@@ -167,6 +167,10 @@ fn flash_target_from_profile(
 /// legacy generic ESP announce is deliberately refused for writes: it cannot
 /// select a safe CPU artifact.
 pub(crate) fn run_automated_flash(arguments: &[String]) -> Result<(), String> {
+    let options = parse_automated_flash_options(arguments);
+    let audit = options.as_ref().ok().and_then(|options| crate::flash_log::begin(
+        options.target, options.image.label(), options.dry_run, options.source,
+        "automated_flash_completion_gates"));
     let started = Instant::now();
     let result = run_automated_flash_timed(arguments, started);
     if let Err(error) = &result {
@@ -175,6 +179,7 @@ pub(crate) fn run_automated_flash(arguments: &[String]) -> Result<(), String> {
             started.elapsed().as_millis()
         );
     }
+    if let Some(audit) = audit { audit.finish(&result); }
     result
 }
 
@@ -218,24 +223,34 @@ pub(crate) struct AutomatedFlashOptions<'a> {
     pub(crate) target: &'a str,
     pub(crate) image: AutomatedFlashImage,
     pub(crate) source: Option<&'a str>,
+    pub(crate) dry_run: bool,
+    pub(crate) recovery_addr: Option<&'a str>,
 }
 
 pub(crate) fn parse_automated_flash_options(
     arguments: &[String],
 ) -> Result<AutomatedFlashOptions<'_>, String> {
     let target = arguments.first().ok_or(
-        "usage: dmesh-cli flash TARGET [--target main|recovery|stage2|MODULE] [--file IMAGE]",
+        "usage: dmesh-cli flash TARGET [--target main|recovery|stage2|MODULE] [--file IMAGE] [--dry-run] [--recovery-addr ADDRESS]",
     )?;
     let mut selected = "main";
     let mut source = None;
+    let mut dry_run = false;
+    let mut recovery_addr = None;
     let mut index = 1;
     while index < arguments.len() {
+        if arguments[index] == "--dry-run" {
+            dry_run = true;
+            index += 1;
+            continue;
+        }
         let value = arguments
             .get(index + 1)
             .ok_or_else(|| format!("missing value for {}", arguments[index]))?;
         match arguments[index].as_str() {
             "--target" => selected = value,
             "--file" => source = Some(value.as_str()),
+            "--recovery-addr" => recovery_addr = Some(value.as_str()),
             option => return Err(format!("unknown flash option {option:?}")),
         }
         index += 2;
@@ -258,6 +273,8 @@ pub(crate) fn parse_automated_flash_options(
         target,
         image,
         source,
+        dry_run,
+        recovery_addr,
     })
 }
 
@@ -265,6 +282,54 @@ fn run_automated_flash_timed(arguments: &[String], started: Instant) -> Result<(
     let options = parse_automated_flash_options(arguments)?;
     let source = options.source;
     let target = resolve_flash_target(options.target)?;
+    if options.image != AutomatedFlashImage::Main && (options.dry_run || options.recovery_addr.is_some()) {
+        return Err("--dry-run/--recovery-addr require --target main".into());
+    }
+    if let Some(addr) = options.recovery_addr {
+        let peer = crate::client::parse_udp_peer(addr)?;
+        let mut main_peer = target.known_peer.ok_or("target needs catalog UDP endpoint for post-reboot health")?;
+        let (image, cpu) = if let Some(source) = source {
+            let image = std::fs::read(source).map_err(|e|e.to_string())?;
+            let cpu = image.get(12).copied().ok_or("short image")?;
+            crate::flash_log::image("recovery2_tcp", Some(Path::new(source)), &image);
+            (image, cpu)
+        } else {
+            // An idle Recovery2 beacon supplies the CPU when selecting the
+            // normal catalog artifact. With multicast suppressed, --file
+            // still permits a direct TCP upload without waiting for a beacon.
+            let (_, cpu) = crate::recovery_tcp::wait_beacon(peer, Duration::from_secs(6))?;
+            let (image, artifact) = flash_upload_object(
+                dmesh_server::object_transfer::ObjectId { name: None, cpu, target: 6 }, None)?;
+            crate::flash_log::image("recovery2_tcp", Some(&artifact), &image);
+            (image, cpu)
+        };
+        crate::recovery_tcp::upload(peer, &image, cpu, options.dry_run)?;
+        if options.dry_run { crate::recovery_tcp::reboot(peer)?; }
+        else { println!("dmesh_flash_gate object_committed=true peer={peer}"); }
+        let deadline = Instant::now()+Duration::from_secs(75);
+        let mut wake_attempted = false;
+        loop {
+            if let Ok((_, announce)) = direct_discovery_announce(main_peer) {
+                if !announce.recovery && flash_target_matches_announce(&announce, &target) {
+                    let status=encode_stream_command_with_id("status",fresh_request_id()).map_err(|e|e.to_string())?;
+                    ensure_stream_success(exchange_udp_stream_record(main_peer,&status)?,"Main status")?;
+                    println!("dmesh_flash_gate main_healthy=true peer={main_peer}");
+                    restore_sleepy_after_flash(main_peer, target.restore_sleepy, started)?;
+                    return Ok(());
+                }
+            }
+            if target.restore_sleepy && !wake_attempted {
+                wake_attempted = true;
+                let (woken_peer, ready) = discover_and_nan_activate(&target)?;
+                if ready.recovery || !flash_target_matches_announce(&ready, &target) {
+                    return Err("post-Recovery2 wake returned a different target or Recovery".into());
+                }
+                main_peer = woken_peer;
+            }
+            if Instant::now()>=deadline {return Err("Main health timeout after Recovery2".into())}
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
     println!(
         "dmesh_flash_timing stage=start target={} image={} elapsed_ms=0",
         target.description,
@@ -287,6 +352,24 @@ fn run_automated_flash_timed(arguments: &[String], started: Instant) -> Result<(
         selected.is_some()
     );
     report_flash_step("direct_target_probe", started, direct_probe_started);
+
+    // Recovery2 does not answer Main discovery. Match only this target's
+    // scoped source before trying NAN wake; never select an arbitrary beacon.
+    if selected.is_none() && options.image == AutomatedFlashImage::Main
+        && env::var("DMESH_RECOVERY_IMPL").as_deref() != Ok("quic")
+    {
+        if let Some(peer) = target.known_peer {
+            if let Ok((recovery_peer, cpu)) = crate::recovery_tcp::wait_beacon(peer, Duration::from_secs(6)) {
+                let (_, artifact) = flash_upload_object(
+                    dmesh_server::object_transfer::ObjectId { name: None, cpu, target: 6 }, source.map(Path::new))?;
+                let mut retry = vec![options.target.to_owned(), "--file".into(), artifact.to_string_lossy().into_owned(),
+                    "--recovery-addr".into(), recovery_peer.to_string()];
+                if options.dry_run {retry.push("--dry-run".into());}
+                println!("dmesh_flash_gate already_in_recovery=true peer={recovery_peer}");
+                return run_automated_flash_timed(&retry, started);
+            }
+        }
+    }
 
     let discovery_started = Instant::now();
     let peers = if selected.is_none() {
@@ -430,6 +513,16 @@ fn run_automated_flash_timed(arguments: &[String], started: Instant) -> Result<(
         return Ok(());
     }
 
+    let recovery_tcp = env::var("DMESH_RECOVERY_IMPL").as_deref() != Ok("quic");
+    let main_upload = if recovery_tcp {
+        let (image, artifact) = flash_upload_object(dmesh_server::object_transfer::ObjectId { name: None, cpu, target: 6 }, source.map(Path::new))?;
+        crate::recovery_tcp::validate_image(&image, cpu)?;
+        crate::flash_log::image("recovery2_tcp", Some(&artifact), &image);
+        Some(image)
+    } else {
+        if options.dry_run {return Err("Recovery QUIC dry run is not supported here".into())}
+        None
+    };
     let recovery_peer = if started_in_recovery {
         // Crash-loop boot health and explicit repair can enter Recovery before
         // the operator starts this command. Its signed multicast response is
@@ -452,6 +545,12 @@ fn run_automated_flash_timed(arguments: &[String], started: Instant) -> Result<(
         // Directed discovery supports bridges that suppress multicast.
         let recovery_wait_started = Instant::now();
         let deadline = Instant::now() + Duration::from_secs(75);
+        if recovery_tcp {
+            let (recovery_peer, recovery_cpu) = crate::recovery_tcp::wait_beacon(peer, Duration::from_secs(75))?;
+            if recovery_cpu != cpu {return Err("Recovery2 chip differs from Main discovery".into())}
+            report_flash_step("recovery_wait", started, recovery_wait_started);
+            recovery_peer
+        } else {
         loop {
             if Instant::now() >= deadline {
                 return Err(
@@ -477,6 +576,7 @@ fn run_automated_flash_timed(arguments: &[String], started: Instant) -> Result<(
                 break peer;
             }
         }
+        }
     };
     println!("dmesh_flash_gate recovery_seen=true peer={recovery_peer}");
     // Durable upload completion is followed by signed Main-role discovery
@@ -492,16 +592,26 @@ fn run_automated_flash_timed(arguments: &[String], started: Instant) -> Result<(
         upload.push(source.to_owned());
     }
     println!(
-        "dmesh_flash_action write=true dry_run=false peer={recovery_peer} cpu={cpu} target=6 artifact={}",
+        "dmesh_flash_action write={} dry_run={} peer={recovery_peer} cpu={cpu} target=6 artifact={}",
+        !options.dry_run,
+        options.dry_run,
         source.unwrap_or("catalog")
     );
     let object_flash_started = Instant::now();
-    run_udp_service_client(&upload)?;
-    println!("dmesh_flash_gate object_committed=true peer={recovery_peer}");
+    if recovery_tcp {
+        crate::recovery_tcp::upload(recovery_peer, main_upload.as_ref().unwrap(), cpu, options.dry_run)?;
+        if options.dry_run {crate::recovery_tcp::reboot(recovery_peer)?;}
+    } else {
+        if options.dry_run {return Err("Recovery QUIC dry run is not supported here".into())}
+        run_udp_service_client(&upload)?;
+    }
+    if !options.dry_run {println!("dmesh_flash_gate object_committed=true peer={recovery_peer}");}
     report_flash_step("object_flash", started, object_flash_started);
 
     let main_health_started = Instant::now();
-    let deadline = Instant::now() + Duration::from_secs(75);
+    let mut deadline = Instant::now() + Duration::from_secs(75);
+    let mut main_peer_hint = peer;
+    let mut main_wake_attempted = false;
     loop {
         if Instant::now() >= deadline {
             return Err("main_healthy=false timeout waiting for Main status".into());
@@ -515,10 +625,31 @@ fn run_automated_flash_timed(arguments: &[String], started: Instant) -> Result<(
         // Require the same signed node and the Main role before checking health.
         let health_peer = multicast_peer
             .map(|candidate| candidate.peer)
-            .unwrap_or(peer);
+            .unwrap_or(main_peer_hint);
         let main_seen = direct_discovery_announce(health_peer).is_ok_and(|(_, ready)|
             ready.device_id() == announce.device_id()
                 && ready.device_class == announce.device_class && !ready.recovery);
+        if wake_main_for_health(was_sleepy, main_seen, &mut main_wake_attempted, || {
+            // Sleepy NVS boots Main in NAN-only mode even after a successful
+            // Recovery upload. Wake again; do not change durable sleep policy
+            // or mistake the pre-reboot STA address for a live interface.
+            let wake_started = Instant::now();
+            let (woken_peer, ready) = discover_and_nan_activate(&target)?;
+            if ready.device_id() != announce.device_id()
+                || ready.device_class != announce.device_class || ready.recovery
+            {
+                return Err("post-reboot wake returned a different target or Recovery".into());
+            }
+            main_peer_hint = woken_peer;
+            report_flash_step("main_nan_activation", started, wake_started);
+            Ok(())
+        })? {
+            // Activation has its own deadlines. Give the freshly reachable
+            // Main its normal health interval rather than consuming it while
+            // waiting for observer commands and STA startup.
+            deadline = Instant::now() + Duration::from_secs(75);
+            continue;
+        }
         if main_seen {
             let status = encode_stream_command_with_id("status", fresh_request_id())
                 .map_err(|error| error.to_string())?;
@@ -542,6 +673,26 @@ fn run_automated_flash_timed(arguments: &[String], started: Instant) -> Result<(
     }
 }
 
+/// One post-reboot activation, only for explicit sleepy policy and absent
+/// direct Main evidence. Queue admission alone never satisfies Main health.
+fn wake_main_for_health(
+    sleepy: bool,
+    main_seen: bool,
+    attempted: &mut bool,
+    activate: impl FnOnce() -> Result<(), String>,
+) -> Result<bool, String> {
+    if !sleepy || main_seen || *attempted {
+        return Ok(false);
+    }
+    *attempted = true;
+    activate()?;
+    Ok(true)
+}
+
+// Preserve the device's current DW cadence; flashing is not a request to
+// replace its power/latency policy with a host-selected interval.
+const SLEEPY_RESTORE_COMMAND: &str = "transport.set mode=nan now=2 ap=0";
+
 fn restore_sleepy_after_flash(
     peer: SocketAddr,
     was_sleepy: bool,
@@ -552,7 +703,7 @@ fn restore_sleepy_after_flash(
     }
     let restore_started = Instant::now();
     let restore = encode_stream_command_with_id(
-        "transport.set mode=nan now=2 nan_dw_interval=8 ap=0",
+        SLEEPY_RESTORE_COMMAND,
         fresh_request_id(),
     )
     .map_err(|error| error.to_string())?;
@@ -592,6 +743,53 @@ mod tests {
     use super::flash_target_from_profile;
     use crate::device::DeviceProfile;
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn recovery_tcp_options_accept_dry_run_without_a_value() {
+        let arguments = ["node-under-test", "--dry-run", "--file", "main.bin", "--recovery-addr", "[fe80::1%test-interface]:3340"].map(str::to_owned);
+        let options = super::parse_automated_flash_options(&arguments).unwrap();
+        assert!(options.dry_run);
+        assert_eq!(options.source, Some("main.bin"));
+        assert_eq!(options.recovery_addr, Some("[fe80::1%test-interface]:3340"));
+        assert_eq!(options.image, super::AutomatedFlashImage::Main);
+    }
+
+    #[test]
+    fn flash_sleep_restore_preserves_discovery_window_cadence() {
+        let encoded = crate::schema::encode_stream_command_with_id(super::SLEEPY_RESTORE_COMMAND, 7).unwrap();
+        let record = dmesh_server::tagged::decode(&encoded).unwrap();
+        let dmesh_server::control::Request::TransportSet { kind, config } =
+            dmesh_server::control::decode_record(record).unwrap()
+        else { panic!("expected transport profile"); };
+        assert_eq!(kind, dmesh_server::control::TransportKind::Nan);
+        assert_eq!(config.nan_dw_interval, None);
+        for interval in [1, 8, 16] {
+            let mut profile = dmesh_server::firmware_profile::TransportProfile::default();
+            profile.nan_dw_interval = interval;
+            dmesh_server::firmware_profile::apply_transport_config(config, &mut profile);
+            profile.requested_transport = Some(kind);
+            assert!(profile.is_nan_only());
+            assert_eq!(profile.nan_dw_interval, interval);
+        }
+    }
+
+    #[test]
+    fn sleepy_main_health_wakes_once_without_claiming_health() {
+        let mut attempted = false;
+        assert!(!super::wake_main_for_health(false, false, &mut attempted, || panic!("active target" )).unwrap());
+        assert!(!super::wake_main_for_health(true, true, &mut attempted, || panic!("already reachable")).unwrap());
+        assert!(!attempted);
+        assert!(super::wake_main_for_health(true, false, &mut attempted, || Ok(())).unwrap());
+        assert!(attempted);
+        assert!(!super::wake_main_for_health(true, false, &mut attempted, || panic!("duplicate wake")).unwrap());
+    }
+
+    #[test]
+    fn rejected_post_reboot_wake_is_not_main_health() {
+        let mut attempted = false;
+        assert_eq!(super::wake_main_for_health(true, false, &mut attempted, || Err("rejected".into())), Err("rejected".into()));
+        assert!(attempted);
+    }
 
     #[test]
     fn mac_only_flash_target_uses_discovery_not_catalog_ipv4() {

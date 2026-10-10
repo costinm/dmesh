@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Single entry point for ESP image deployment.
+"""Managed serial provisioning and repair for ESP images.
 
-Legacy UART byte forwards are disabled. Direct USB/espflash deployment is the
-current flashing path for every target, including Main. It opens only the
-selected physical port through the repository's verified wrapper and never
-starts, stops, or restores a managed serial forward. ESP-NOW/action and Wi-Fi
-flashing remain future paths for devices without a UART connection.
+Routine updates use dmesh-cli flash over Wi-Fi: Recovery writes Main, while
+running Main writes Recovery, Stage2, and modules. This wrapper is the serial
+fallback after a failed remote gate, or initial provisioning. It opens only
+the selected physical port through the repository's verified espflash wrapper
+and never starts, stops, or restores a managed serial forward.
 
 Before replacing a running Main image, the wrapper makes one bounded
 best-effort `runtime.reset` request through dmesh-cli.  Main explicitly
@@ -21,6 +21,7 @@ import argparse
 import fcntl
 import glob
 import ipaddress
+import json
 import os
 import re
 import shlex
@@ -36,6 +37,89 @@ ROOT = Path(os.environ.get("DMESH_INSTALL_ROOT", Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import dmesh_nodes  # noqa: E402
+
+FLASH_AUDIT: dict | None = None
+
+
+def flash_log_path() -> Path:
+    if "DMESH_FLASH_AUDIT_LOG" in os.environ:
+        return Path(os.environ["DMESH_FLASH_AUDIT_LOG"])
+    root = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state")))
+    return root / "dmesh/flash.jsonl"
+
+
+def append_flash_log(record: dict) -> None:
+    try:
+        path = flash_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX)
+            stream.write(json.dumps(record, separators=(",", ":")) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+    except OSError as error:
+        print(f"flash_log error={error} path={flash_log_path()}", file=sys.stderr)
+
+
+def flash_region_log(port: str, chip: str, offset: str, artifact: str, image: Path,
+                     baud: int, no_stub: bool, elapsed: float, write_elapsed: float | None,
+                     error: BaseException | None) -> None:
+    if FLASH_AUDIT is None:
+        return
+    import hashlib
+    size = image.stat().st_size
+    region = dict(port=port, chip=chip, offset=offset, artifact=artifact, bytes=size,
+                  sha256=hashlib.sha256(image.read_bytes()).hexdigest(), baud=baud,
+                  no_stub=no_stub, elapsed_ms=elapsed * 1000, success=error is None,
+                  transfer_ms=None if write_elapsed is None else write_elapsed * 1000,
+                  mbps=None if error is not None or not write_elapsed else size * 8 / write_elapsed / 1e6,
+                  error=None if error is None else str(error))
+    FLASH_AUDIT["regions"].append(region)
+    append_flash_log({**FLASH_AUDIT, **region, "event":"region_finished",
+                      "timestamp_unix_ms":time.time_ns() // 1_000_000})
+
+
+def audited_main() -> int:
+    global FLASH_AUDIT
+    # Read-only probes/help are not writes. Never record argv: NVS options
+    # may contain credentials. Only record the device and selected target.
+    audit = len(sys.argv) >= 3 and not any(a in sys.argv for a in ("--check", "--help", "-h"))
+    started = time.monotonic()
+    if audit:
+        timestamp = time.time_ns() // 1_000_000
+        transport = "usb"
+        for index, argument in enumerate(sys.argv):
+            if argument.startswith("--transport="):
+                transport = argument.split("=", 1)[1]
+            elif argument == "--transport" and index + 1 < len(sys.argv):
+                transport = sys.argv[index + 1]
+        if transport == "auto":
+            transport = "usb"
+        FLASH_AUDIT = dict(schema=1, attempt_id=f"{os.getpid()}-{timestamp}", event="started",
+                           timestamp_unix_ms=timestamp, device=sys.argv[1], target=sys.argv[2],
+                           method="espflash" if transport == "usb" else transport,
+                           dry_run=False, completion_scope="physical_write_readback_reset", regions=[])
+        append_flash_log(FLASH_AUDIT)
+    error = None
+    try:
+        result = main()
+        if result:
+            error = f"exit status {result}"
+        return result
+    except BaseException as failure:
+        error = str(failure)
+        raise
+    finally:
+        if FLASH_AUDIT is not None:
+            record = {**FLASH_AUDIT, "event":"finished", "timestamp_unix_ms":time.time_ns() // 1_000_000,
+                      "elapsed_ms":(time.monotonic() - started) * 1000,
+                      "success":error is None, "error":error}
+            regions = [r for r in record["regions"] if r["success"]]
+            record["bytes"] = sum(r["bytes"] for r in regions)
+            record["transfer_ms"] = sum(r["transfer_ms"] or 0 for r in regions) or None
+            record["mbps"] = record["bytes"] * 8 / record["transfer_ms"] / 1000 if record["transfer_ms"] else None
+            append_flash_log(record)
+            FLASH_AUDIT = None
 
 # Direct USB/JTAG identities are resolved from the device records shared with the
 # CLI and hardware E2E. A literal /dev path remains an explicit override.
@@ -387,7 +471,7 @@ def artifacts(device: object, target: str, module: str,
     if target == "recovery":
         return family, [(
             "0x10000",
-            ROOT / "target" / "recovery-rust" / "flash" / family / "dmesh-recovery-rs-app.bin",
+            ROOT / "target" / "flash" / family / "recovery.bin",
         )]
     if target == "module":
         # tag 44 is a temporary development slot for mod_flash.  It reuses
@@ -448,6 +532,7 @@ def nvs_boot_target_image(
     source_override: Path | None = None, sta_profile: Path | None = None,
     sta_ssid: str | None = None, sta_server_ll: str | None = None,
     sta_server_port: int = 3336, provision_security: bool = False,
+    uart_baud: int | None = None, stage2_flash: str | None = None,
 ) -> Path:
     """Preserve NVS contents while setting or removing the lab boot target."""
     output = ROOT / "target" / "nvs" / role
@@ -472,8 +557,12 @@ def nvs_boot_target_image(
         command.append("--clear-boot-target")
     elif boot_target is not None:
         command.extend(("--boot-target", str(boot_target)))
+    if stage2_flash is not None:
+        command.extend(("--stage2-flash", stage2_flash))
     if mode is not None:
         command.extend(("--mode", mode))
+    if uart_baud is not None:
+        command.extend(("--uart-baud", str(uart_baud)))
     if clear_sta_profile:
         command.append("--clear-sta-profile")
     if clear_pairing:
@@ -497,6 +586,7 @@ def nvs_boot_target_image(
 
 def write_verified(port: str, chip: str, pairs: list[tuple[str, Path]], baud: int,
                    reset_after: bool = False) -> None:
+    import hashlib
     import tempfile
 
     # Builds publish to shared artifact paths. Freeze every requested region
@@ -504,17 +594,22 @@ def write_verified(port: str, chip: str, pairs: list[tuple[str, Path]], baud: in
     # bytes submitted, even if another build replaces the original image.
     with tempfile.TemporaryDirectory(prefix="dmesh-espflash-images-") as temporary:
         snapshots = []
+        originals = {}
         for index, (offset, image) in enumerate(pairs):
             if not image.is_file():
                 raise RuntimeError(f"missing flash artifact: {image}")
             snapshot = Path(temporary) / f"{index}-{image.name}"
             shutil.copyfile(image, snapshot)
+            print(f"flash artifact offset={offset} source={image.resolve()} "
+                  f"bytes={snapshot.stat().st_size} "
+                  f"sha256={hashlib.sha256(snapshot.read_bytes()).hexdigest()}", flush=True)
             snapshots.append((offset, snapshot))
-        _write_verified_snapshot(port, chip, snapshots, baud, reset_after)
+            originals[str(snapshot)] = str(image.resolve())
+        _write_verified_snapshot(port, chip, snapshots, baud, reset_after, originals)
 
 
 def _write_verified_snapshot(port: str, chip: str, pairs: list[tuple[str, Path]], baud: int,
-                             reset_after: bool = False) -> None:
+                             reset_after: bool = False, originals: dict | None = None) -> None:
     import hashlib
     import tempfile
 
@@ -537,9 +632,12 @@ def _write_verified_snapshot(port: str, chip: str, pairs: list[tuple[str, Path]]
                           "--baud", str(attempt_baud), "--non-interactive"]
             if no_stub:
                 connection.append("--no-stub")
+            attempt_started = time.monotonic()
+            write_elapsed = None
             try:
                 subprocess.run(common + ["write-bin"] + connection +
                                ["--after", "no-reset", offset, str(image)], check=True)
+                write_elapsed = time.monotonic() - attempt_started
                 with tempfile.TemporaryDirectory(prefix="dmesh-espflash-verify-") as temporary:
                     readback = Path(temporary) / "readback.bin"
                     subprocess.run(common + ["read-flash"] + connection +
@@ -547,8 +645,17 @@ def _write_verified_snapshot(port: str, chip: str, pairs: list[tuple[str, Path]]
                                     str(readback)], check=True)
                     if hashlib.sha256(readback.read_bytes()).digest() != hashlib.sha256(image.read_bytes()).digest():
                         raise RuntimeError(f"espflash readback mismatch at {offset}: {image}")
+                    print(f"flash readback verified offset={offset} "
+                          f"bytes={image.stat().st_size} "
+                          f"sha256={hashlib.sha256(readback.read_bytes()).hexdigest()}", flush=True)
+                flash_region_log(port, chip, offset, (originals or {}).get(str(image), str(image)),
+                                 image, attempt_baud, no_stub, time.monotonic() - attempt_started,
+                                 write_elapsed, None)
                 break
             except (subprocess.CalledProcessError, OSError, RuntimeError) as error:
+                flash_region_log(port, chip, offset, (originals or {}).get(str(image), str(image)),
+                                 image, attempt_baud, no_stub, time.monotonic() - attempt_started,
+                                 write_elapsed, error)
                 last = error
                 print(f"flash attempt failed offset={offset} baud={attempt_baud} "
                       f"no_stub={no_stub}: {error}", flush=True)
@@ -627,6 +734,9 @@ def main() -> int:
                         help="with target=nvs: set Stage2 stg2:boot_target (1=Main, 2=Recovery)")
     parser.add_argument("--clear-boot-target", action="store_true",
                         help="with target=nvs: remove Stage2 boot target override")
+    parser.add_argument("--stage2-flash", choices=("dio", "qio", "auto"),
+                        help="with target=nvs: set stg2:flash, Main's code read mode "
+                             "(dio=1, qio=2, auto=3; unset means auto)")
     parser.add_argument("--nvs-source", type=Path,
                         help="with target=nvs: explicit preserved NVS source image")
     parser.add_argument("--sta-profile", type=Path,
@@ -645,6 +755,8 @@ def main() -> int:
                         help="with target=nvs: remove sec:key and ESP NimBLE bond data over physical USB")
     parser.add_argument("--provision-security", action="store_true",
                         help="with target=nvs: explicitly install the device record's secret and control-plane key")
+    parser.add_argument("--uart-baud", type=int, choices=(115200, 230400, 460800, 921600),
+                        help="with target=nvs: persist UART baud, preserving other NVS values")
     args = parser.parse_args()
     if args.artifact_root is not None and args.target not in ("all", "stage", "recovery", "main"):
         parser.error("--artifact-root supports all, stage, recovery, and main")
@@ -670,7 +782,17 @@ def main() -> int:
         if len(pairs) != 1 or pairs[0][0] != expected_offset:
             raise RuntimeError(f"unexpected {args.role} {args.target} JTAG artifact: {pairs}")
         print(f"{args.role}: JTAG {args.target} write {pairs[0][1]}", flush=True)
-        jtag_write_partition(args.role, pairs[0][1], expected_offset)
+        started = time.monotonic()
+        try:
+            jtag_write_partition(args.role, pairs[0][1], expected_offset)
+        except BaseException as error:
+            flash_region_log(jtag_adapter_location(args.role), "esp32c6", expected_offset,
+                             str(pairs[0][1]), pairs[0][1], 0, True,
+                             time.monotonic() - started, None, error)
+            raise
+        elapsed = time.monotonic() - started
+        flash_region_log(jtag_adapter_location(args.role), "esp32c6", expected_offset,
+                         str(pairs[0][1]), pairs[0][1], 0, True, elapsed, elapsed, None)
         print(f"{args.role}: JTAG verified {args.target} and reset", flush=True)
         return 0
     if args.boot_target is not None and args.clear_boot_target:
@@ -682,10 +804,15 @@ def main() -> int:
     if args.clear_pairing and args.provision_security:
         parser.error("--clear-pairing cannot be combined with --provision-security")
     if args.clear_pairing and (args.boot_target is not None or args.clear_boot_target or args.mode is not None
-                               or args.clear_sta_profile or args.sta_profile is not None):
+                               or args.clear_sta_profile or args.sta_profile is not None
+                               or args.stage2_flash is not None):
         parser.error("--clear-pairing cannot be combined with other NVS changes")
-    if args.target == "nvs" and args.boot_target is None and not args.clear_boot_target and args.mode is None and not args.clear_sta_profile and not args.clear_pairing and args.sta_profile is None and not args.provision_security:
-        parser.error("target=nvs requires a Stage2 override, mode, --sta-profile, --clear-pairing, or --provision-security")
+    if args.uart_baud is not None and args.target != "nvs":
+        parser.error("--uart-baud requires target=nvs")
+    if args.stage2_flash is not None and args.target != "nvs":
+        parser.error("--stage2-flash requires target=nvs")
+    if args.target == "nvs" and args.boot_target is None and not args.clear_boot_target and args.mode is None and not args.clear_sta_profile and not args.clear_pairing and args.sta_profile is None and not args.provision_security and args.uart_baud is None and args.stage2_flash is None:
+        parser.error("target=nvs requires a Stage2 override, --stage2-flash, mode, --sta-profile, --clear-pairing, --provision-security, or --uart-baud")
     if args.sta_ssid is not None and args.sta_profile is None:
         parser.error("--sta-ssid requires --sta-profile")
     if args.sta_server_ll is not None and args.sta_profile is None:
@@ -720,7 +847,8 @@ def main() -> int:
                 physical, chip, args.role, args.boot_target, args.clear_boot_target,
                 args.mode, args.clear_sta_profile, args.clear_pairing, args.server, args.board_ip, args.server_port, args.flash_baud,
                 args.nvs_source, args.sta_profile, args.sta_ssid, args.sta_server_ll,
-                args.sta_server_port, args.provision_security,
+                args.sta_server_port, args.provision_security, args.uart_baud,
+                args.stage2_flash,
             )
             pairs = [("0x9000", image)]
         else:
@@ -739,4 +867,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(audited_main())

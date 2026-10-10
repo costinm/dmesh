@@ -79,8 +79,6 @@
             </intent-filter>
         </service>
 
-        <!--             android:process=":dmesh"
-        -->
         <service
             android:name=".DMService"
             android:enabled="true"
@@ -131,15 +129,16 @@
             <meta-data
                 android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
                 android:resource="@xml/dmesh_usb_device_filter" />
+
             <intent-filter>
                 <action android:name="android.intent.action.SETTINGS" />
                 <action android:name="android.intent.action.MANAGE_NETWORK_USAGE" />
 
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
+
             <intent-filter>
                 <action android:name="com.github.costinm.dmesh.START_VPN" />
-
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </activity>

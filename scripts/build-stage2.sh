@@ -22,6 +22,11 @@ unset IDF_DEACTIVATE_FILE_PATH IDF_PYTHON_ENV_PATH ESP_PYTHON PYTHON
 
 TARGET_NAME="${1:-all}"
 SELECTED_SIZE="${2:-}"
+FLASH_MODE="${DMESH_FLASH_MODE:-}"
+FLASH_MHZ="${DMESH_FLASH_MHZ:-80}"
+# Stage2 is always DIO; it enables QIO for Main at runtime (NVS stg2:flash).
+case "$FLASH_MODE" in ''|dio) ;; *) echo 'DMESH_FLASH_MODE: Stage2 is always DIO; select QIO with NVS stg2:flash' >&2; exit 2 ;; esac
+case "$FLASH_MHZ" in ''|40|80) ;; *) echo 'DMESH_FLASH_MHZ must be 40 or 80' >&2; exit 2 ;; esac
 if [[ -n "$SELECTED_SIZE" && "$SELECTED_SIZE" != 4mb && "$SELECTED_SIZE" != 8mb ]]; then
     usage >&2
     exit 2
@@ -42,6 +47,16 @@ build_one() {
     mkdir -p "$out"
     {
         sed '/CONFIG_ESPTOOLPY_FLASHSIZE_/d' "$ROOT/fw/boot/$defaults"
+        if [[ -n "$FLASH_MODE" ]]; then
+            printf 'CONFIG_ESPTOOLPY_FLASHMODE_DIO=%s\nCONFIG_ESPTOOLPY_FLASHMODE_QIO=%s\nCONFIG_ESPTOOLPY_FLASHMODE="%s"\n' \
+                "$([[ "$FLASH_MODE" == dio ]] && echo y || echo n)" \
+                "$([[ "$FLASH_MODE" == qio ]] && echo y || echo n)" "$FLASH_MODE"
+        fi
+        if [[ -n "$FLASH_MHZ" ]]; then
+            printf 'CONFIG_ESPTOOLPY_FLASHFREQ_40M=%s\nCONFIG_ESPTOOLPY_FLASHFREQ_80M=%s\nCONFIG_ESPTOOLPY_FLASHFREQ="%sm"\n' \
+                "$([[ "$FLASH_MHZ" == 40 ]] && echo y || echo n)" \
+                "$([[ "$FLASH_MHZ" == 80 ]] && echo y || echo n)" "$FLASH_MHZ"
+        fi
         printf 'CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="%s"\n' "$partition"
         if [[ "$flash_size" == 8mb ]]; then
             printf 'CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y\n'
@@ -56,7 +71,7 @@ build_one() {
     # Publish the CPU-qualified boot image into the shared object catalog.
     # `object.flash target=2` writes only this bounded Stage2 region; the
     # partition table remains an explicit provisioning artifact.
-    local flash_root="$ROOT/target/flash/$name"
+    local flash_root="${DMESH_STAGE2_FLASH_ROOT:-$ROOT/target/flash}/$name"
     mkdir -p "$flash_root/$flash_size"
     cp "$out/bootloader.bin" "$flash_root/$flash_size/stage2.bin"
     cp "$out/partition-table.bin" "$flash_root/$flash_size/partition-table.bin"

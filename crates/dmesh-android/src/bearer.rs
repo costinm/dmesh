@@ -290,7 +290,7 @@ impl BearerRuntime {
         destination: &dmesh_server::probe::ProbeDestination,
         request: dmesh_server::probe::ProbeServiceRequest,
         timeout: Duration,
-    ) -> Result<quic_lite::probe::ProbeResult, String> {
+    ) -> Result<dmesh_server::stream_client::ProbeResult, String> {
         let (bearer_id, peer_l2_address) = match destination.scheme() {
             "udp" => {
                 let address = dmesh_discovery::endpoint::parse_udp_endpoint(

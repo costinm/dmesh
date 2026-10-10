@@ -1510,6 +1510,11 @@
             "type": "string",
             "x-protobuf-index": 15,
             "x-protobuf-type": "string"
+          },
+          "verify": {
+            "type": "boolean",
+            "x-protobuf-index": 16,
+            "x-protobuf-type": "bool"
           }
         },
         "required": [],
@@ -1616,6 +1621,11 @@
             "type": "integer",
             "x-protobuf-index": 10,
             "x-protobuf-type": "u8"
+          },
+          "verify": {
+            "type": "boolean",
+            "x-protobuf-index": 16,
+            "x-protobuf-type": "bool"
           }
         },
         "required": [],

@@ -3607,7 +3607,7 @@ dependencies = [
 [[package]]
 name = "mesh"
 version = "0.1.0"
-source = "git+https://github.com/costinm/ssh-mesh#c15c7a0acebea0b936a6a126d7b9e217632caf1d"
+source = "git+https://github.com/costinm/ssh-mesh#d2428b738e9c5e3d299ffef8bc4972fd5ee1de26"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3631,7 +3631,7 @@ dependencies = [
 [[package]]
 name = "mesh-api"
 version = "0.1.0"
-source = "git+https://github.com/costinm/ssh-mesh#c15c7a0acebea0b936a6a126d7b9e217632caf1d"
+source = "git+https://github.com/costinm/ssh-mesh#d2428b738e9c5e3d299ffef8bc4972fd5ee1de26"
 dependencies = [
  "serde",
 ]
@@ -3639,7 +3639,7 @@ dependencies = [
 [[package]]
 name = "mesh-mcp"
 version = "0.1.0"
-source = "git+https://github.com/costinm/ssh-mesh#c15c7a0acebea0b936a6a126d7b9e217632caf1d"
+source = "git+https://github.com/costinm/ssh-mesh#d2428b738e9c5e3d299ffef8bc4972fd5ee1de26"
 dependencies = [
  "mesh",
  "serde",
@@ -5817,7 +5817,7 @@ dependencies = [
 [[package]]
 name = "sftp-server"
 version = "0.1.0"
-source = "git+https://github.com/costinm/ssh-mesh#c15c7a0acebea0b936a6a126d7b9e217632caf1d"
+source = "git+https://github.com/costinm/ssh-mesh#d2428b738e9c5e3d299ffef8bc4972fd5ee1de26"
 dependencies = [
  "anyhow",
  "bytes",
@@ -6334,7 +6334,7 @@ dependencies = [
 [[package]]
 name = "ssh-config"
 version = "0.57.0"
-source = "git+https://github.com/costinm/ssh-mesh#c15c7a0acebea0b936a6a126d7b9e217632caf1d"
+source = "git+https://github.com/costinm/ssh-mesh#d2428b738e9c5e3d299ffef8bc4972fd5ee1de26"
 dependencies = [
  "futures",
  "glob",
@@ -6397,7 +6397,7 @@ dependencies = [
 [[package]]
 name = "ssh-mesh"
 version = "0.1.0"
-source = "git+https://github.com/costinm/ssh-mesh#c15c7a0acebea0b936a6a126d7b9e217632caf1d"
+source = "git+https://github.com/costinm/ssh-mesh#d2428b738e9c5e3d299ffef8bc4972fd5ee1de26"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8290,7 +8290,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 [[package]]
 name = "ws"
 version = "0.1.0"
-source = "git+https://github.com/costinm/ssh-mesh#c15c7a0acebea0b936a6a126d7b9e217632caf1d"
+source = "git+https://github.com/costinm/ssh-mesh#d2428b738e9c5e3d299ffef8bc4972fd5ee1de26"
 dependencies = [
  "async-trait",
  "axum",
