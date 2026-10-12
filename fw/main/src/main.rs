@@ -3,6 +3,8 @@ extern crate alloc;
 #[cfg(feature = "ble-stack")]
 mod ble;
 mod loader_flash;
+#[cfg(feature = "modules")]
+mod modules;
 mod pairing;
 
 fn receive_boot_control(record: dmesh_server::tagged::Record<'_>) -> Option<alloc::vec::Vec<u8>> {
@@ -114,7 +116,7 @@ pub extern "C" fn app_main() {
     loader_flash::start();
     unsafe { esp_idf_sys::esp_rom_printf(b"DMESH main: health-start\n\0".as_ptr().cast()) };
     #[cfg(feature = "modules")]
-    dmesh_fw_modules::register_tagged_handlers();
+    modules::register_tagged_handlers();
     // Capture formatted ESP-IDF output as CBOR LogRecord entries in Main's
     // shared packet-pool history. Do not write routine logs onto framed UART.
     unsafe {
@@ -145,23 +147,4 @@ pub extern "C" fn app_main() {
 
 extern "C" {
     fn dmesh_uart_log_vprintf(format: *const core::ffi::c_char, args: esp_idf_sys::va_list) -> i32;
-}
-
-/// Module-to-transport bridge for a completed radio receive.  This is invoked
-/// only by an active module task; it neither starts a module nor retains the
-/// packet after the current bearer fan-out returns.
-#[no_mangle]
-pub unsafe extern "C" fn dmesh_module_lora_receive(
-    payload: *const u8,
-    payload_len: usize,
-    rssi: i16,
-    snr: i8,
-) -> i32 {
-    if payload.is_null() || payload_len == 0 {
-        return -1;
-    }
-    let payload = core::slice::from_raw_parts(payload, payload_len);
-    i32::from(dmesh_fw_transport::main_runtime::forward_lora_packet(
-        payload, rssi, snr,
-    ))
 }

@@ -391,13 +391,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dmesh-fw-modules"
-version = "0.1.0"
-dependencies = [
- "dmesh-server",
-]
-
-[[package]]
 name = "dmesh-fw-transport"
 version = "0.1.0"
 dependencies = [
@@ -421,12 +414,14 @@ name = "dmesh-rs"
 version = "0.1.0"
 dependencies = [
  "dmesh-ble",
- "dmesh-fw-modules",
  "dmesh-fw-transport",
  "dmesh-server",
  "embuild",
  "esp-idf-sys",
+ "esp-mod-hw",
+ "esp-mod-lora",
  "esp-wifi-loader",
+ "espmod-host",
  "quic-lite",
 ]
 
@@ -549,12 +544,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "esp-mod-hw"
+version = "0.2.0"
+dependencies = [
+ "espmod-abi",
+]
+
+[[package]]
+name = "esp-mod-lora"
+version = "0.2.0"
+dependencies = [
+ "espmod-abi",
+]
+
+[[package]]
 name = "esp-wifi-loader"
 version = "0.1.0"
-source = "git+https://github.com/costinm/esp-wifi-loader#07e0e407fbe07e0baf8eff702e9ba0065e3bb052"
+source = "git+https://github.com/costinm/esp-wifi-loader#84e01c2d2f2a882d142a8b56ef6527df6b230554"
 dependencies = [
  "p256",
  "sha2 0.10.9",
+]
+
+[[package]]
+name = "espmod-abi"
+version = "0.1.0"
+
+[[package]]
+name = "espmod-host"
+version = "0.1.0"
+dependencies = [
+ "espmod-abi",
 ]
 
 [[package]]

@@ -197,6 +197,10 @@ fn bind_listener(entry: &Entry) {
 
 fn listener_ready(registration: Registration, fd: i32, events: i16) {
     if events & esp_idf_sys::POLLIN as i16 == 0 {
+        if events != 0 {
+            ENTRIES[registration.index].fd.store(-1, Ordering::Release);
+            unsafe { esp_idf_sys::lwip_close(fd) };
+        }
         return;
     }
     let accept = ENTRIES[registration.index].accept.load(Ordering::Acquire);

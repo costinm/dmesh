@@ -13,9 +13,10 @@ const ERASE_BLOCK_BYTES: usize = 64 * 1024;
 const STATE_LOG_BYTES: usize = 8192;
 
 /// Module slots in the `data` partition: name, offset, size. The position is the slot number the state log
-/// keeps the module's minimum version under.
+/// keeps the module's minimum version under. This is the table of `fw/main/src/modules.rs`
+/// (the esp-xip-modules loader that runs the images): change both together.
 const MODULE_SLOTS: [(&[u8], usize, usize); 4] = [
-    (b"lora", 0x00000, 0x20000),
+    (b"lora", 0x00000, 0x10000),
     (b"flash", 0x10000, 0x10000),
     (b"hw", 0x20000, 0x10000),
     (b"hello", 0x30000, 0x10000),

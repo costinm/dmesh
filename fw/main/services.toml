@@ -7,8 +7,14 @@ slot_size = 65536
 [[service]]
 tag = 43
 name = "lora"
-slots = 2
+slots = 1
 artifact = "mod_lora"
+
+[[service]]
+tag = 44
+name = "flash"
+slots = 1
+artifact = "mod_flash"
 
 [[service]]
 tag = 45
@@ -20,4 +26,4 @@ artifact = "mod_hw"
 tag = 46
 name = "hello"
 slots = 1
-artifact = "mod_hello"
+artifact = "mod_hello"   # esp-xip-modules/modules/mod_hello

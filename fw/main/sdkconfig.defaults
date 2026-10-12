@@ -91,3 +91,10 @@ CONFIG_LWIP_TCPIP_TASK_PRIO=23
 CONFIG_LWIP_IRAM_OPTIMIZATION=y
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=16384
 CONFIG_LWIP_TCP_WND_DEFAULT=16384
+
+# esp-xip-modules host: one worker task runs every module's handlers (the LoRa module needs ~6 KiB)
+# esp-xip-modules' loader is built on esp-wifi-loader's C component as a library (state log reader); DMesh has its own
+# Wi-Fi and installer, so the loader's network and upload code stays unused.
+CONFIG_WL_MODE_LIBRARY=y
+CONFIG_ESPMOD_WORKER_STACK=8192
+CONFIG_ESPMOD_HANDLER_MS=20

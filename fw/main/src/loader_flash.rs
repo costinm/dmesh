@@ -44,11 +44,28 @@ impl Platform for Main {
         if !matches!(tgt, target::LOADER | target::STAGE2 | target::MODULE) {
             return Err(wire::WRONG_TARGET);
         }
+        // The slot's code may be executing: it has to have returned before the first block is erased.
+        #[cfg(feature = "modules")]
+        if tgt == target::MODULE && !dry {
+            let stopped = dmesh_fw_transport::flash::module_slot(name).map_or(true, crate::modules::stop_slot);
+            if !stopped {
+                return Err(wire::FLASH);
+            }
+        }
         let sink = dmesh_fw_transport::flash::open_loader_sink(tgt, name, dry).map_err(|_| wire::WRONG_TARGET)?;
         if image_size as usize > sink.capacity() {
             return Err(wire::BAD_LENGTH);
         }
         Ok(FlashSink(sink))
+    }
+
+    /// The loader key in the Stage2 region (fixed offset, same on every chip): the only key that may sign the loader and Stage2.
+    fn trusted_key(&self) -> Option<[u8; wire::PUBKEY_SIZE]> {
+        let mut slot = [0u8; wire::TRUST_SIZE];
+        let ok = unsafe {
+            esp_idf_sys::esp_flash_read(core::ptr::null_mut(), slot.as_mut_ptr().cast(), wire::TRUST_OFFSET, slot.len() as u32)
+        } == esp_idf_sys::ESP_OK;
+        ok.then(|| wire::parse_trust_slot(&slot)).flatten()
     }
 
     /// The module slots of the `data` partition (names and locations: dmesh_fw_transport::flash).
@@ -110,8 +127,8 @@ fn serve_connection(mut stream: TcpStream) {
         say(b"DMESH main: loader flash unavailable (no loader partition)\n\0");
         return;
     };
-    // No trust on first use on this network: a key must already be pinned (the loader pins the first one
-    // when it installs Main, or it is provisioned), otherwise every upload is refused.
+    // No trust on first use on this network: the Stage2 trust slot, or a key the loader already pinned,
+    // must exist, otherwise every upload is refused.
     let mut device = Device::new(Main, state).require_pinned_key();
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));

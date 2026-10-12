@@ -8,7 +8,7 @@ resolver = "2"
 
 [features]
 default = ["modules", "ble-stack"]
-modules = ["dep:dmesh-fw-modules"]
+modules = ["dep:espmod-host", "dep:esp-mod-lora", "dep:esp-mod-hw"]
 ble-stack = ["dep:dmesh-ble"]
 rtos-stats = ["dmesh-fw-transport/rtos-stats"]
 udp6-socket = ["dmesh-fw-transport/udp6-socket"]
@@ -18,7 +18,11 @@ tcp-stream = ["dmesh-fw-transport/tcp-stream"]
 dmesh-ble = { path = "../ble", optional = true }
 dmesh-fw-transport = { path = "../dmesh-fw-transport" }
 dmesh-server = { path = "../../crates/dmesh-server", default-features = false }
-dmesh-fw-modules = { path = "../modules", optional = true }
+# Runs and calls flash modules; the esp-xip-modules repository is checked out next to this one (ESP_MODULES_DIR for
+# scripts/build-fw.sh must name the same directory).
+espmod-host = { path = "../../../esp-xip-modules/crates/espmod-host", optional = true }
+esp-mod-lora = { path = "../../../esp-xip-modules/modules/mod_lora", optional = true }
+esp-mod-hw = { path = "../../../esp-xip-modules/modules/mod_hw", optional = true }
 quic-lite = { path = "../../crates/quic-lite" }
 # The loader upload protocol (verification, state log, one-connection server); see src/loader_flash.rs.
 esp-wifi-loader = { git = "https://github.com/costinm/esp-wifi-loader" }
@@ -28,7 +32,9 @@ esp-idf-sys = { version = "0.37", default-features = false, features = ["std"] }
 embuild = "0.33.3"
 
 [[package.metadata.esp-idf-sys.extra_components]]
-component_dirs = ["../modules/native", "../ble/native", "native"]
+# espmod_host, espmod_loader and espmod_rs come from the esp-xip-modules checkout next to this repository; its loader
+# component is built on esp-wifi-loader's C component (state log reader), found in the checkout next to that.
+component_dirs = ["../../../esp-xip-modules/components", "../../../esp-wifi-loader/components", "../ble/native", "native"]
 
 [profile.release]
 codegen-units = 1

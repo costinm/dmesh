@@ -7,8 +7,6 @@
 #include "esp_attr.h"
 #include "esp_log.h"
 #include "sdkconfig.h"
-#include "hal/gpio_ll.h"
-#include "soc/gpio_struct.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #if CONFIG_BT_ENABLED && CONFIG_BT_NIMBLE_ENABLED
@@ -41,64 +39,6 @@ static const uint8_t DMESH_BLE_OPERATIONAL_UUID128[16] = {
     0x80, 0x6f, 0x6b, 0x5f, 0x2a, 0x4f, 0x4a, 0x6f,
     0x8c, 0x42, 0x4d, 0x65, 0x73, 0x68, 0x00, 0x02,
 };
-
-static volatile TaskHandle_t s_button_irq_task;
-static volatile TaskHandle_t s_lora_irq_task;
-static volatile bool s_button_irq_pending;
-static volatile bool s_lora_irq_pending;
-
-void dmesh_button_irq_set_task(void *task) {
-    s_button_irq_task = (TaskHandle_t)task;
-    s_button_irq_pending = false;
-}
-
-void dmesh_lora_irq_set_task(void *task) {
-    s_lora_irq_task = (TaskHandle_t)task;
-    s_lora_irq_pending = false;
-}
-
-void dmesh_button_irq_rearm(void) {
-    s_button_irq_pending = false;
-}
-
-void dmesh_lora_irq_rearm(void) {
-    s_lora_irq_pending = false;
-}
-
-static void IRAM_ATTR notify_task_from_gpio_isr(volatile TaskHandle_t *task,
-                                                 volatile bool *pending) {
-    TaskHandle_t target = *task;
-    if (target == NULL || *pending) {
-        return;
-    }
-    *pending = true;
-    BaseType_t higher_priority_task_woken = pdFALSE;
-    vTaskGenericNotifyGiveFromISR(target, 0, &higher_priority_task_woken);
-    if (higher_priority_task_woken == pdTRUE) {
-        portYIELD_FROM_ISR();
-    }
-}
-
-void IRAM_ATTR dmesh_button_gpio_isr(void *arg) {
-    (void)arg;
-    notify_task_from_gpio_isr(&s_button_irq_task, &s_button_irq_pending);
-}
-
-void IRAM_ATTR dmesh_lora_gpio_isr(void *arg) {
-    const uint32_t pin = (uint32_t)(uintptr_t)arg;
-    // The configured LoRa IRQ pin is asserted for every modem event. Mask it before waking the
-    // task so a noisy or uncleared radio IRQ cannot repeatedly enter the GPIO
-    // dispatcher and starve CPU0. The LoRa task reads/clears the chip IRQ and
-    // re-enables this pin for the next mode-specific event.
-    if (pin < 32) {
-        gpio_ll_intr_disable(&GPIO, pin);
-        gpio_ll_clear_intr_status(&GPIO, 1U << pin);
-    } else {
-        gpio_ll_intr_disable(&GPIO, pin);
-        gpio_ll_clear_intr_status_high(&GPIO, 1U << (pin - 32));
-    }
-    notify_task_from_gpio_isr(&s_lora_irq_task, &s_lora_irq_pending);
-}
 
 #if CONFIG_BT_ENABLED && CONFIG_BT_NIMBLE_ENABLED
 static uint8_t s_addr_type;
