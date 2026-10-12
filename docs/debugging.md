@@ -142,20 +142,11 @@ confirm with independent clock/sleep measurements before changing timer behavior
 Passive `--watch` needs output redirection, not `UART_CODEC_LOG`.
 It keeps collecting after fatal diagnostics until its deadline, including
 following boot output, then exits with an error if a fatal marker was seen.
-Recovery2 has plain UART console logs, no UART bearer, and a TCP updater on
-port 3340. `QUIC_LITE_PCAP` does not capture TCP; use an authorized network
-capture (`tcpdump ... 'tcp port 3340 or udp port 3340'`). Its unsigned beacons
-are sent only while waiting for TCP. Preserve invalid CBOR
-bytes; do not strip carriage returns heuristically.
-
-For Recovery2 TCP experiments, compare the same `flash DEVICE --dry-run`
-with and without `DMESH_RECOVERY2_PACING_MBPS=4` (positive integer Mbps).
-Pacing is off by default. Linux-only `DMESH_RECOVERY2_CONGESTION=bbr` selects
-an available TCP algorithm; unsupported selections fail explicitly. Neither
-option changes system-wide settings. Capture `ss -tin '( dport = :3340 )'`
-during uploads and preserve Recovery's UART memory/drop summaries. Input
-`ERR_MEM`, TCP drops and retransmissions locate different layers; zero
-`link_drop` does not prove zero radio or driver drops.
+The loader has plain UART console logs and no UART bearer. Capture its TCP upload with an authorized network
+capture (`tcpdump ... 'tcp port 5227 or udp port 5227'`); `QUIC_LITE_PCAP` does not see TCP. Preserve invalid CBOR
+bytes; do not strip carriage returns heuristically. Upload pacing and congestion experiments, and the lwIP
+`ERR_MEM` / retransmission / `link_drop` reading, are in the esp-wifi-loader repository's
+`docs/dmesh-flash-lessons.md`.
 
 For a Wi-Fi upload, watch UART in one process and set `QUIC_LITE_PCAP` on the
 separate upload process. Keep captures through handoff/reboot. An optional
@@ -212,7 +203,7 @@ For the opt-in Main TCP comparison adapter, build with
 `DMESH_FW_NO_DEFAULT_FEATURES=1 DMESH_FW_FEATURES=modules,tcp-stream` to keep
 BLE off). Run the same `probe.start` options with a discovered
 `tcp://[ADDRESS%IFACE]:3341` endpoint. The adapter uses the existing registered
-handler and CBOR-header/body/FIN protocol, not Recovery2's upload protocol.
+handler and CBOR-header/body/FIN protocol.
 It currently admits two TCP clients for simultaneous upload/download and is
 experimental, unencrypted, and off in normal builds. Keep verification and
 byte counts identical when comparing with QUIC; TCP captures require a network

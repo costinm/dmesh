@@ -635,7 +635,7 @@ protocol prerequisite.
 | 15 | `now` | `u8` | ESP-NOW policy. |
 | 16 | `ap` | `u8` | AP policy. |
 | 17 | `passphrase` | `string` | Volatile WPA2 override. |
-| 18 | `uart` | `u8` | Physical UART selector: 0/default or 1=115200, 2=9600, 3=19200, 4=38400, 5=57600, 6=230400, 7=460800, 8=off, 9=921600. ESP applies the volatile rate after the response finishes; native USB-JTAG ignores it. Persist boot rate separately with settings key `uart.baud`. |
+| 18 | `uart` | `u8` | Physical UART selector: 0/default or 1=115200, 2=9600, 3=19200, 4=38400, 5=57600, 6=230400, 7=460800, 8=off, 9=921600. ESP applies the volatile rate after the response finishes; native USB-JTAG ignores it. The UART bearer starts at 115200 and uses this field to upgrade to 921600 after its handshake; `uart.baud` is only a legacy boot override. |
 | 19 | `ndp` | `u8` | NAN Data Path policy. |
 | 24 | `open` | `bool` | Open-mode policy. |
 | 25 | `wake_target` | `string` | MAC address allowed to apply NAN wake. |
@@ -1019,11 +1019,17 @@ the transport library's `ProbePayload`.
 Device settings requests use component `1`. `settings.set` writes the named
 setting; use `settings.get` to verify its value.
 
-ESP Main accepts persistent `uart.baud` values `115200` (default), `230400`,
-`460800`, and `921600`. The setting applies on reboot, so its write and response
-use the old rate. Update the host device record's `uart_baud` to the same value
-before reconnecting. Native USB-JTAG is unaffected; ROM/Stage2/Recovery consoles
-retain their own rate. Missing or invalid stored values use the image default.
+A physical UART always starts at 115200 (ROM, Stage2, Main console and the first QUIC handshake). The UART QUIC
+bearer then upgrades the rate: after the handshake the host sends `transport.set` with `uart=9` (921600, volatile),
+the ESP applies it once the response is sent, and the host reopens the port at the new rate. A reset returns to
+115200; nothing needs to be configured per device, and the host never has to know a rate in advance.
+
+ESP Main still accepts a persistent `uart.baud` (`115200` default, `230400`, `460800`, `921600`) that applies on
+reboot (its write and response use the old rate). It is a legacy override: a device with it set no longer starts at
+115200, so a host that does not know it sees silence (this happened with an old value on a freshly flashed board).
+Clear it with `settings.set` / an NVS erase. The `uart_baud` of a host device record is that same legacy knowledge and
+goes away with the config/inventory in favour of discovery. Native USB-JTAG is unaffected; ROM/Stage2/Recovery
+consoles retain their own rate. Missing or invalid stored values use the image default.
 
 ```sh
 dmesh-cli DEVICE settings.get --key=name
@@ -1325,7 +1331,6 @@ surface), `debug` or `internal`; every method in this document has one.
 | Component | Method | Wire name | Purpose | Platforms | Tier |
 |---:|---:|---|---|---|---|
 | 101 | 2 | `runtime.reset` | Reset the runtime diagnostics counters. | E | debug |
-| 10 | 2 | `object.flash` | CLI name of `POST /flash` (wire: `http.post`, path `/flash`): transfer a firmware image into a selected durable slot. | E | internal |
 | 1000 | 3 | `module.stop` | Request module shutdown with a deadline before flash work. | E | internal |
 | 1000 | 1 | `module.status` | Refresh and read the installed module header and loader result. | E | internal |
 | 1000 | 2 | `module.init` | Initialize the installed module loader. | E | internal |
@@ -1348,12 +1353,9 @@ surface), `debug` or `internal`; every method in this document has one.
 Platform registration notes:
 
 - Only implemented methods are registered. Android and Linux do not register
-  `boot.recovery`, `module.*`, `runtime.reset`, `object.flash` or
+  `boot.recovery`, `module.*`, `runtime.reset` or
   `ble.start/stop/coc.send`: they depend on the ESP Stage2/Recovery/module
   layout or its radio lifecycle, so a request receives the numeric error.
-- `object.flash` (`POST /flash`): registered by Main and Recovery firmware at the key
-  `[http (2002), post (2), 10]`. Android and Linux do not register the device flash
-  operation. The request header and the raw image body share one stream.
 - Stubs are not registered. Android answers `status`, `services`,
   `telemetry.nan_status`, `battery`, `quic`, `quic_associations`, `bearers`, `memory`
   and `log.watch`; Linux
@@ -1413,78 +1415,12 @@ are described by the method purpose above.
 | `sta_bssid` | `string` | Associated AP BSSID, or `unavailable` when not associated. |
 | `sta_ipv4` | `string` | Current STA IPv4 address, or `unavailable` until DHCP assigns one. |
 
-### `object.flash` request fields
+### Firmware images (not a tagged method)
 
-`object.flash` is the CLI name of `POST /flash`. On the wire it is the generic REST request of the
-common envelope (component `2002` `http`, method `2` `post`, `params` the path `[10]`, `fields` the headers below, see ssh-mesh `mesh-api/PROTOCOLS.md`, "HTTP component"). A
-command built by the CLI carries the same headers as its fields; the sender adds `content-length`
-(header `1`) and posts it.
-
-| Tag | Field | Type | Values |
-|---:|---|---|---|
-| 64 | `name` | `text` | — |
-| 65 | `cpu` | `u8` | — |
-| 66 | `target` | `u8` | — |
-| 67 | `address` | `u32` | — |
-| 68 | `transport` | `u8` | — |
-| 69 | `dry_run` | `bool` | — |
-
-Header keys may be spelled by number or by name; a name and its number together are a duplicate.
-`name` optionally selects the object; `cpu` and nonzero `target` identify its platform image.
-`address` is an optional platform-specific destination, `transport=0` means use the active
-connection's default path, and `dry_run=false` is the normal write mode. Omitted `transport` and
-`dry_run` have those same defaults. `content-length` is the number of image bytes that follow, and a
-request without it (or with a length larger than the destination) is refused. Unknown, duplicate, or
-malformed headers are rejected before the firmware sink can erase anything.
-
-**Request body:** the image: raw bytes that follow the request header on the same stream; FIN follows
-the last image byte. There is no manifest, block table, digest or signature (the transport carries
-integrity; see `notes/design/object-transfer-integrity.md`), and the device chooses its own block
-size. A body shorter or longer than `content-length` is rejected.
-
-**Response body:** none. The response header carries `fields {0: status}` and, for success, the
-result text `flash complete`; a refusal carries `error` with status `400` (invalid target), `413`
-(image larger than the destination or no length), `501` (unavailable) or `503` (a flash is already in
-progress).
-
-The firmware registers the flash handler at the dispatch key `[http, post, 10]` (component, method,
-path: the longest registered prefix of a request's key wins, there is no second router). The handler
-is chosen as soon as the header is complete and may refuse before any body byte arrives; it then
-streams the body incrementally into the sink. The association and stream that carried the
-request own the entire operation, and a stream with no progress for 15 seconds is abandoned and
-releases the writer.
-
-The response is returned on that same stream only after the body ends and the sink has made the
-image durable. Handler acceptance, stream ACKs, and byte counts are not proof of durable completion or
-successful reboot. The response has no body and ends with FIN, like every header-only handler
-response. Main leaves the written slot for the normal boot/update path.
-Legacy QUIC Recovery schedules its Stage2 handoff after that response;
-Recovery2 uses the separate minimal TCP contract below.
-`dry_run=true` validates through the sink's dry-run behavior and does not signal durable flash
-completion.
-
-### Recovery2 TCP updater (not a Main handler)
-
-Recovery2 accepts one connection on TCP port `3340`. The 16-byte little-endian
-header is: magic `DMR2` (4 bytes), version `1` (u8), flags (u8; bit 1 dry-run,
-all other bits rejected), target (u8; `0` Main, `255` reboot), reserved zero
-(u8), image length (u32), reserved zero (u32). Main image bytes follow the
-header; the client half-closes its write direction. Length must be between
-4096 and `0x2b0000`; reboot requires zero length and flags.
-
-Responses are ASCII lines: `P <received> <written>`, `ERR <code> <reason>`,
-or `OK <length> ms=<total> erase_ms=<erase> write_ms=<write>[ dry]`, followed
-by server FIN. Reboot returns `OK 0`. The head sector is committed only after
-exact length and client FIN. `OK` reports successful flash operations, not
-authentication or additional readback verification. Final success still needs
-signed Main discovery and a fresh Main status.
-
-While waiting, Recovery2 sends an unsigned `dmesh-recovery2 v=1 ...` presence
-line from UDP `3340` to `[ff02::5227]:3340` every five seconds. Beacons stop
-during TCP connections and resume on return to accept. They are only routing
-hints, matched to the selected scoped device address. Recovery2 exits with a
-one-shot RTC Main handoff, which outranks NVS; no NVS writes occur in Recovery2.
-Wire v1 is unauthenticated and intended for controlled development networks.
+`object.flash` (`POST /flash`) and Recovery2's DMR2 updater were removed on 2026-10-10. Images are installed
+with the signed protocol of the esp-wifi-loader repository (`docs/protocol.md` there): TCP port 5227 on the
+loader, and on Main through the `esp-wifi-loader` crate (`fw/main/src/loader_flash.rs`). `boot.recovery`
+remains the request to restart Main into the loader.
 
 ### `ble.scan` request fields
 

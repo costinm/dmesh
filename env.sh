@@ -66,6 +66,18 @@ export DMESH_LMESH_CONTROL_ENDPOINT="${DMESH_LMESH_CONTROL_ENDPOINT:-unix://${LM
 export LMESH_ESP_GATEWAY="${LMESH_ESP_GATEWAY:-}"
 export LMESH_ESP_TARGETS="${LMESH_ESP_TARGETS:-lora2=1d4c5e1d,lora3=8e0742c5,lora4=f6fc543d,e5=fcf5c40ef1e8}"
 
+# The esp-wifi-loader checkout: Stage2, the loader and its tools are built and run from there
+# (scripts/build-stage2.sh, scripts/e2e/loader.py). Main itself uses the esp-wifi-loader crate
+# from GitHub (fw/main/Cargo.toml) and does not need the checkout to build.
+if [ -z "${ESP_WIFI_LOADER_DIR:-}" ]; then
+    for _dmesh_wl_candidate in "$DMESH_REPO/../esp-wifi-loader" /ws/esp-wifi-loader; do
+        if [ -x "$_dmesh_wl_candidate/scripts/build.sh" ]; then
+            export ESP_WIFI_LOADER_DIR="$(cd "$_dmesh_wl_candidate" && pwd)"
+            break
+        fi
+    done
+fi
+
 # DMesh consumes the generic mesh/ssh crates from a sibling checkout when it
 # is available. This is discovery only: an explicitly supplied path wins.
 if [ -z "${DMESH_SSH_MESH_DIR:-}" ]; then
@@ -198,6 +210,7 @@ unset _dmesh_cache_base
 unset _dmesh_cargo_target_dir
 unset _dmesh_rust_bin
 unset _dmesh_ssh_candidate
+unset _dmesh_wl_candidate
 unset _dmesh_ssh_mesh_release
 unset _dmesh_cargo_home
 unset _dmesh_rustup_home

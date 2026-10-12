@@ -243,10 +243,9 @@ scripts/build-stage2.sh --help
 The C Stage2 builder also defaults to `all`. Main artifacts are under
 `target/flash/` and Stage2 under `target/stage2/`.
 
-Rust Recovery is frozen and low priority. `scripts/build-recovery-rust.sh`
-fails deliberately; do not use it in current build or deployment workflows.
-For a compile/size check only, set `DMESH_ALLOW_RECOVERY_BUILD=1`; this does
-not make Recovery a supported deployment lane.
+Recovery is the esp-wifi-loader loader: build it in the esp-wifi-loader checkout (`$ESP_WIFI_LOADER_DIR`, github.com/costinm/esp-wifi-loader) with `scripts/build.sh`.
+The Rust Recovery (`fw/recovery-rust`) and Recovery2 were removed on 2026-10-10;
+`scripts/build-recovery-rust.sh` and `scripts/build-recovery2.sh` only print a pointer.
 
 Current development and provisioning use the direct USB/esptool implementation
 inside `flash-device.py`. Its target defaults to `main`:
@@ -259,12 +258,11 @@ scripts/flash-device.py <board> stage
 scripts/flash-device.py <board> recovery  # emergency rollback only
 ```
 
-Legacy UART byte forwarding is retired. Explicit USB provisioning opens only
-the requested physical port for esptool's verified write; it neither starts
-nor restores a service-owned serial forward. This is the current development
-path for Main, Stage2, modules, and NVS. Wi-Fi Recovery is the
-intended production Main-update path, but it is not the default flashing
-transport in this checkout.
+Legacy UART byte forwarding is retired. USB provisioning opens only the requested physical port for esptool's
+verified write; it neither starts nor restores a service-owned serial forward. Main is installed over Wi-Fi by the
+esp-wifi-loader flow (Android flasher; `docs/flashing.md`); USB is used to put Stage2 and the loader on a board and to
+clear a pinned Main key (`esptool erase-region 0xee000 0x2000`). `flash-device.py` is for boards still on the older
+Recovery layout.
 
 Raw UDP6 and raw ESP-NOW/action are current QUIC-lite bearers shared by Main
 and Recovery. They use `dmesh-fw-transport` hardware glue and portable framing

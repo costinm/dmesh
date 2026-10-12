@@ -104,8 +104,9 @@ dmesh-cli DEVICE --reset                            # Pulse the local serial RTS
 log.watch is a service request and can use Wi-Fi. --watch and
 --reset require a local serial path or a catalog entry with serial_id; they
 cannot reset a remote device through lmesh. --watch --interactive also accepts
-terminal input. A physical UART bridge uses its catalog uart_baud or an
-explicit --baud 115200; packetized USB/JTAG needs no nominal baud. A reset or
+terminal input. A physical UART bridge starts at 115200 and the QUIC handshake upgrades it to
+921600 (`transport.set uart=9`); a catalog uart_baud or an explicit --baud is a legacy override for devices
+with a persisted `uart.baud`; packetized USB/JTAG needs no nominal baud. A reset or
 boot line alone is not proof of Main health: follow it with firmware.identity
 and status.
 

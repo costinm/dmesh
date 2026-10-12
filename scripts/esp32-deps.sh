@@ -44,19 +44,29 @@ export ESP_HOME="${ESP_ROOT}/home"
 unset IDF_PYTHON_ENV_PATH
 mkdir -p "$ESP_ROOT" "$IDF_TOOLS_PATH" "$CARGO_HOME" "$RUSTUP_HOME" "$ESP_HOME" "$XDG_CACHE_HOME" "$(dirname "$PROFILE")"
 
-echo "Installing ESP32 host tools into Nix profile: $PROFILE"
-if command -v nix >/dev/null 2>&1; then
-    nix profile install --profile "$PROFILE" "path:${REPO_ROOT}/fw/esp32#esp32-deps"
-elif [[ -x "$PROFILE/bin/espup" && -x "$PROFILE/bin/python" &&
-        -x "$PROFILE/bin/cmake" && -x "$PROFILE/bin/ninja" ]]; then
-    # Some build containers expose the already-populated Nix profile but not
-    # the nix client itself. Reusing that immutable profile is reproducible;
-    # a missing profile remains an error rather than falling back to host
-    # packages.
-    echo "nix client unavailable; using existing complete profile $PROFILE" >&2
+if [[ "${DMESH_ESP32_HOST_TOOLS:-0}" == 1 ]]; then
+    # CI and plain Linux hosts: cmake, ninja, python3 (with venv), git, espup, ldproxy and espflash come from the
+    # host (apt and `cargo install`), not from a Nix profile. See .github/workflows/firmware.yml.
+    for tool in espup cmake ninja python3 git ldproxy espflash; do
+        command -v "$tool" >/dev/null 2>&1 || { echo "missing host tool: $tool" >&2; exit 127; }
+    done
+    PROFILE="$ESP_ROOT/no-profile"
+    mkdir -p "$PROFILE/bin"
 else
-    echo "nix is unavailable and the required profile is incomplete: $PROFILE" >&2
-    exit 127
+    echo "Installing ESP32 host tools into Nix profile: $PROFILE"
+    if command -v nix >/dev/null 2>&1; then
+        nix profile install --profile "$PROFILE" "path:${REPO_ROOT}/fw/esp32#esp32-deps"
+    elif [[ -x "$PROFILE/bin/espup" && -x "$PROFILE/bin/python" &&
+            -x "$PROFILE/bin/cmake" && -x "$PROFILE/bin/ninja" ]]; then
+        # Some build containers expose the already-populated Nix profile but not
+        # the nix client itself. Reusing that immutable profile is reproducible;
+        # a missing profile remains an error rather than falling back to host
+        # packages.
+        echo "nix client unavailable; using existing complete profile $PROFILE" >&2
+    else
+        echo "nix is unavailable and the required profile is incomplete: $PROFILE" >&2
+        exit 127
+    fi
 fi
 export PATH="$PROFILE/bin:$CARGO_HOME/bin:$PATH"
 
@@ -76,14 +86,17 @@ fi
 IDF_TOOLS_PATH="$IDF_TOOLS_PATH" "$ESP_ROOT/esp-idf/install.sh" esp32,esp32s3,esp32c6
 HOME="$ESP_HOME" espup install --targets esp32,esp32s3,esp32c6 --export-file "$ESP_ROOT/export-esp.sh"
 
-IDF_PYTHON_ENV_PATH="$IDF_TOOLS_PATH/python_env/idf${ESP_IDF_PYTHON_ENV_VERSION}_py3.13_env"
+# The directory name carries the Python version that install.sh used (py3.13 on the Nix profile, whatever the
+# host has otherwise).
+IDF_PYTHON_ENV_PATH="$(ls -d "$IDF_TOOLS_PATH/python_env/idf${ESP_IDF_PYTHON_ENV_VERSION}"_py*_env 2>/dev/null | head -1)"
+[[ -n "$IDF_PYTHON_ENV_PATH" ]] || { echo "ESP-IDF python environment missing under $IDF_TOOLS_PATH/python_env" >&2; exit 1; }
 
 cat >"$ESP_ROOT/env.sh" <<EOF
 export REPO_ROOT="$REPO_ROOT"
 export ESP_ROOT="$ESP_ROOT"
 export IDF_PATH="$ESP_ROOT/esp-idf"
 export IDF_TOOLS_PATH="$IDF_TOOLS_PATH"
-export IDF_PYTHON_ENV_PATH="$IDF_TOOLS_PATH/python_env/idf${ESP_IDF_PYTHON_ENV_VERSION}_py3.13_env"
+export IDF_PYTHON_ENV_PATH="$IDF_PYTHON_ENV_PATH"
 export DMESH_PYTHON="$IDF_PYTHON_ENV_PATH/bin/python"
 export PYTHON="$IDF_PYTHON_ENV_PATH/bin/python"
 export CARGO_HOME="$CARGO_HOME"

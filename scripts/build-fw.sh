@@ -206,12 +206,7 @@ build_one() {
     # loader fix cannot silently package the prior C object file.
     sdk_defaults_digest="$(sha256sum \
         "$sdk_defaults_path" "$partition_overlay" "$FIRMWARE_DIR/Cargo.toml" \
-        "$DMESH_REPO/fw/modules/native/dmesh_module_loader/CMakeLists.txt" \
-        "$DMESH_REPO/fw/modules/native/dmesh_module_loader/dmesh_module_loader.c" \
-        "$DMESH_REPO/fw/modules/native/dmesh_module_loader/dmesh_hw_host.c" \
-        "$DMESH_REPO/fw/modules/native/dmesh_module_loader/dmesh_module_weak_platform.c" \
-        "$DMESH_REPO/fw/modules/native/dmesh_module_loader/include/dmesh_module_loader.h" \
-        "$DMESH_REPO/fw/mod_lora/include/dmesh_lora_abi.h" \
+        $(find "${ESP_MODULES_DIR:-$DMESH_REPO/../esp-xip-modules}/components" -type f \( -name '*.c' -o -name '*.h' -o -name CMakeLists.txt -o -name Kconfig \) | sort) \
         "$DMESH_REPO/fw/main/native/dmesh_uart_log/CMakeLists.txt" \
         "$DMESH_REPO/fw/main/native/dmesh_uart_log/dmesh_uart_log.c" \
         "$DMESH_REPO/fw/ble/native/dmesh_nimble/CMakeLists.txt" \

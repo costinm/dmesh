@@ -57,7 +57,8 @@ const FIELD_STA_PASSPHRASE: u64 = 17;
 /// existing passphrase field while keeping this addition backward-compatible.
 /// `0` selects the default 115200 UART rate, `1` explicitly means 115200,
 /// `2..=7` select other common rates, and `8` explicitly turns off a real
-/// UART bearer; `9` selects 921600. USB packet mode ignores the selector.
+/// UART bearer; `9` selects 921600. The UART starts at 115200 and the handshake upgrades it with this field. USB packet
+/// mode ignores the selector.
 const FIELD_UART: u64 = 18;
 /// Enable the NAN Data Path (NDP) bearer for this immutable radio epoch.
 /// NDP is meaningful only to adapters that implement it today (Android), but
