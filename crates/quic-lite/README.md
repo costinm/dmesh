@@ -150,10 +150,16 @@ the control plane.
 
 ## Future changes
 
-Each ESP32 device will get a secret key, shared with the control plane - and will derive keys for MAC signing.
+- Relay: each ESP32 device will get a secret key, shared with the control plane - and will derive keys for MAC signing.
 No encryption at this level - there is still no trust in any of the nodes - but it may provide access control
 and allow for priorities/QoS to be enforced when traffic transits cooperating/owned paths.
 
+- short messages: streams with one packet and FIN, or with content-length in first frame (need to add part of envelope
+  to quic level) and <3-4k should get priority. RPC tail latency
+
+- Out-of-order is the main memory user, controlled by advertised window - for re-transmit buffers the sender can put back-pressure or app write. A 
+  special write mode 'app backed' or 'callback to app' can be added to avoid retransmit buffers on app. Or app using
+  and holding quic buffers (with space in front/back for marshalling), like logger.
 
 ## History 
 

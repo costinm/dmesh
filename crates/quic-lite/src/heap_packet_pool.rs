@@ -264,6 +264,72 @@ impl<const MAX_SLOTS: usize, const MTU: usize> HeapPacketPool<MAX_SLOTS, MTU> {
                 .count()
     }
 
+    /// Raw slot access for a packet runtime that is not written in Rust (the module runtime's C host): the same slots, reference counts
+    /// and growth policy as the leases, addressed by index. `acquire_raw` keeps `reserved` slots free for the node's own traffic and
+    /// returns a slot holding one reference; `retain_raw` adds one; `release_raw` drops one and the last frees the slot. The
+    /// storage pointer stays valid while a reference is held.
+    pub fn acquire_raw(&'static self, reserved: usize) -> Option<usize> {
+        let _guard = self.try_guard()?;
+        let capacity = self.capacity.load(Ordering::Relaxed);
+        let available = self.references[..capacity]
+            .iter()
+            .filter(|references| references.load(Ordering::Relaxed) == 0)
+            .count();
+        if available <= reserved {
+            return None;
+        }
+        let slot = self.references[..capacity]
+            .iter()
+            .position(|references| references.load(Ordering::Relaxed) == 0)?;
+        self.references[slot].store(1, Ordering::Release);
+        Some(slot)
+    }
+
+    /// Add a reference to a slot that holds one.
+    pub fn retain_raw(&self, slot: usize) {
+        if slot < MAX_SLOTS {
+            let previous = self.references[slot].fetch_add(1, Ordering::AcqRel);
+            assert!(previous != 0 && previous < WRITER - 1, "packet reference overflow");
+        }
+    }
+
+    /// Drop a reference; the last one frees the slot (and its storage if the slot is outside the active capacity).
+    pub fn release_raw(&self, slot: usize) {
+        if slot < MAX_SLOTS && self.references[slot].load(Ordering::Acquire) != 0 {
+            if self.references[slot].fetch_sub(1, Ordering::AcqRel) == 1 {
+                self.final_release(slot);
+            }
+        }
+    }
+
+    /// References held on a slot (0: free).
+    pub fn references_raw(&self, slot: usize) -> u32 {
+        if slot < MAX_SLOTS {
+            self.references[slot].load(Ordering::Acquire) as u32
+        } else {
+            0
+        }
+    }
+
+    /// The slot's storage, valid while a reference is held; null when the slot has none.
+    pub fn data_raw(&self, slot: usize) -> *mut u8 {
+        if slot < MAX_SLOTS {
+            self.buffers[slot].load(Ordering::Acquire)
+        } else {
+            ptr::null_mut()
+        }
+    }
+
+    /// Bytes in every slot.
+    pub const fn slot_size() -> usize {
+        MTU
+    }
+
+    /// Slots the table can hold at most (the device limit is lower).
+    pub const fn table_size() -> usize {
+        MAX_SLOTS
+    }
+
     pub(crate) fn acquire_writer_reserving(
         &'static self,
         headroom: usize,
