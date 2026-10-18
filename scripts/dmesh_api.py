@@ -6,6 +6,16 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
+def read_api(path: str) -> str:
+    source = (ROOT / path).read_text()
+    marker = '<!-- xip-transport-schema -->'
+    if marker in source:
+        canonical = ROOT.parent / 'esp-xip-modules/abi/API.md'
+        schema = canonical.read_text().split('# `transport` API (1)\n', 1)[1]
+        source = source.replace(marker, '# `transport` API (1)\n' + schema)
+    return source
+
+
 # Groups documented outside the root API.md.
 GROUP_FILES = {'linux': 'crates/lmesh-wifi/API.md'}
 
@@ -19,7 +29,7 @@ def section_platforms() -> dict[str, set[str]]:
     for path in ('API.md', 'crates/lmesh-wifi/API.md'):
         component = None
         method = None
-        for line in (ROOT / path).read_text().split('\n'):
+        for line in read_api(path).split('\n'):
             heading = re.match(r'^# `(\w+)` API', line)
             if heading:
                 component = heading.group(1)
@@ -39,7 +49,7 @@ def private_methods() -> set[str]:
     for path in ('API.md', 'crates/lmesh-wifi/API.md'):
         component = None
         method = None
-        for line in (ROOT / path).read_text().split('\n'):
+        for line in read_api(path).split('\n'):
             heading = re.match(r'^# `(\w+)` API', line)
             if heading:
                 component = heading.group(1)
@@ -55,7 +65,7 @@ def section_tiers() -> dict[str, str]:
     """`component.method` -> tier for every section method of the formal API documents."""
     tiers: dict[str, str] = {}
     for path in ('API.md', 'crates/lmesh-wifi/API.md'):
-        source = (ROOT / path).read_text()
+        source = read_api(path)
         component = None
         method = None
         for line in source.split('\n'):
@@ -84,7 +94,7 @@ def check_tiers(group: str, body: str) -> None:
 
 
 def extract(group: str, platform: str | None = None) -> str:
-    source = (ROOT / GROUP_FILES.get(group, 'API.md')).read_text()
+    source = read_api(GROUP_FILES.get(group, 'API.md'))
     start = f'<!-- dmesh-api:{group} -->\n'
     if source.count(start) != 1:
         raise ValueError(f'expected one {group} API section')
@@ -107,7 +117,7 @@ def extract(group: str, platform: str | None = None) -> str:
 
 def check_additional_device_methods(catalog: dict) -> None:
     """Check the root API tables that mesh-api-gen cannot name directly."""
-    source = (ROOT / 'API.md').read_text()
+    source = read_api('API.md')
     section = source.split('## Additional device methods\n', 1)[1].split(
         '## Firmware module payload contracts', 1
     )[0]

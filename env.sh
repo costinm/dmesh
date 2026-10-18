@@ -1,4 +1,4 @@
-# Source from the DMesh repository root before Cargo, Nix, Android, or firmware
+# Source from the DMesh repository root before Cargo, Nix, or Android
 # commands. All mutable build state stays under target/.
 
 if [ -n "${BASH_SOURCE:-}" ]; then
@@ -32,12 +32,6 @@ export XDG_DATA_HOME="${XDG_DATA_HOME:-${_dmesh_target_base}/share}"
 export XDG_STATE_HOME="${XDG_STATE_HOME:-${_dmesh_target_base}/state}"
 export CARGO_HOME="${DMESH_CARGO_HOME:-${_dmesh_target_base}/cargo}"
 export RUSTUP_HOME="${DMESH_RUSTUP_HOME:-${_dmesh_target_base}/rustup}"
-# SDK 6 is the repository default.  Do not inherit an old SDK environment
-# from the parent shell: that was the source of commands needing `env -u`
-# during the migration.  An alternate SDK is an explicit exception.
-export DMESH_ESP_ROOT="${DMESH_ESP_ROOT_OVERRIDE:-${_dmesh_target_base}/esp32-6.0}"
-export DMESH_BOOT_RECOVERY_SDK_VERSION="v6.0.2"
-export DMESH_BOOT_RECOVERY_ESP_ROOT="${DMESH_BOOT_RECOVERY_ESP_ROOT_OVERRIDE:-${_dmesh_target_base}/esp32-6.0}"
 export CARGO_TARGET_DIR="${DMESH_CARGO_TARGET_DIR:-${_dmesh_cargo_target_dir}}"
 export GRADLE_BUILD_DIR="${GRADLE_BUILD_DIR:-${CARGO_TARGET_DIR}/android-build}"
 export GRADLE_USER_HOME="${GRADLE_USER_HOME:-${_dmesh_target_base}/gradle}"
@@ -66,9 +60,8 @@ export DMESH_LMESH_CONTROL_ENDPOINT="${DMESH_LMESH_CONTROL_ENDPOINT:-unix://${LM
 export LMESH_ESP_GATEWAY="${LMESH_ESP_GATEWAY:-}"
 export LMESH_ESP_TARGETS="${LMESH_ESP_TARGETS:-lora2=1d4c5e1d,lora3=8e0742c5,lora4=f6fc543d,e5=fcf5c40ef1e8}"
 
-# The esp-wifi-loader checkout: Stage2, the loader and its tools are built and run from there
-# (scripts/build-stage2.sh, scripts/e2e/loader.py). Main itself uses the esp-wifi-loader crate
-# from GitHub (fw/main/Cargo.toml) and does not need the checkout to build.
+# The esp-wifi-loader checkout: the loader and its tools are run from there (tests/e2e/loader.py).
+# The ESP firmware (Main) is built in the esp-xip-modules repository (fw/build.sh), not here.
 if [ -z "${ESP_WIFI_LOADER_DIR:-}" ]; then
     for _dmesh_wl_candidate in "$DMESH_REPO/../esp-wifi-loader" /ws/esp-wifi-loader; do
         if [ -x "$_dmesh_wl_candidate/scripts/build.sh" ]; then
@@ -147,43 +140,6 @@ done
 IFS="$_dmesh_old_ifs"
 export PATH="$_dmesh_path_clean"
 
-# Firmware dependencies and toolchains are repo-local too. Source the
-# generated ESP-IDF environment once here so normal shells do not need a
-# second firmware-specific env script. Restore DMesh Cargo locations after it:
-# ESP tooling is selected by RUST_ESP_TOOLCHAIN_BIN/PATH, while all Cargo cache
-# and build state remains under the one top-level target/ directory.
-# Clear SDK-owned variables first so a previously sourced SDK cannot leak into
-# this invocation when its generated env fragment is absent or incomplete.
-unset IDF_PATH IDF_TOOLS_PATH IDF_PYTHON_ENV_PATH RUST_ESP_TOOLCHAIN_BIN \
-    ESP_PYTHON DMESH_PYTHON
-if [ -f "$DMESH_ESP_ROOT/env.sh" ]; then
-    _dmesh_cargo_home="$CARGO_HOME"
-    _dmesh_rustup_home="$RUSTUP_HOME"
-    # The generated activation script is part of the environment contract and
-    # must be silent when successful. Do not hide output here: a banner or
-    # warning means the generated SDK environment needs fixing, not that every
-    # caller should redirect it.
-    . "$DMESH_ESP_ROOT/env.sh"
-    export CARGO_HOME="$_dmesh_cargo_home"
-    export RUSTUP_HOME="$_dmesh_rustup_home"
-fi
-if [ -n "${RUST_ESP_TOOLCHAIN_BIN:-}" ] && [ -d "$RUST_ESP_TOOLCHAIN_BIN" ]; then
-    export PATH="$RUST_ESP_TOOLCHAIN_BIN:$PATH"
-fi
-# ESP-IDF's component manager is installed in its managed virtual environment.
-# The Nix profile also provides Python, but it intentionally lacks ESP-IDF
-# modules, so firmware CMake must resolve this interpreter first.
-if [ -n "${IDF_PYTHON_ENV_PATH:-}" ] && [ -x "$IDF_PYTHON_ENV_PATH/bin/python" ]; then
-    export PATH="$IDF_PYTHON_ENV_PATH/bin:$PATH"
-    export PYTHON="$IDF_PYTHON_ENV_PATH/bin/python"
-fi
-# Firmware scripts use one explicit interpreter for ESP-IDF's Python helpers
-# and image extraction. Source env.sh instead of rediscovering it in each script.
-if [ -z "${DMESH_PYTHON:-}" ] && [ -n "${IDF_PYTHON_ENV_PATH:-}" ] \
-    && [ -x "$IDF_PYTHON_ENV_PATH/bin/python" ]; then
-    export DMESH_PYTHON="$IDF_PYTHON_ENV_PATH/bin/python"
-fi
-export DMESH_FW_TOOLS="${DMESH_FW_TOOLS:-$DMESH_REPO/fw/esp32/rust/tools}"
 export PYTHONPATH="$DMESH_REPO${PYTHONPATH:+:$PYTHONPATH}"
 
 # Defaults for the Wi-Fi flash control plane.  Scripts can be read and run

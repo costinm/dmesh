@@ -57,7 +57,7 @@ for tool in device:
     # their hand-checked request tables until migrated to the same model.
     request = source.get('inputSchema', {})
     if request.get('properties') and (
-        tool['name'] in ('probe.start', 'probe.handler')
+        tool['name'] in ('probe.start', 'probe.handler', 'transport.set')
         or not tool['inputSchema'].get('properties')
     ):
         tool['inputSchema'] = request

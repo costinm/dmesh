@@ -1,5 +1,5 @@
 {
-  description = "DMesh device-mesh, Android, MUSL, and ESP32 build dependencies";
+  description = "DMesh device-mesh, Android, and MUSL build dependencies";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -154,7 +154,7 @@
           # (without the musl/Android toolchain: NixOS targets run the GNU
           # build), so deployments can come from the flake like other DMesh
           # dependencies instead of prebuilt `target/` files.
-          mkDmesh = firmwareRoot: sourceRoot: sshMeshRoot: pkgs.rustPlatform.buildRustPackage {
+          mkDmesh = sourceRoot: sshMeshRoot: pkgs.rustPlatform.buildRustPackage {
             pname = "dmesh";
             version = "0.1.0";
             src = pkgs.lib.cleanSourceWith {
@@ -194,39 +194,10 @@
                 --set DMESH_INSTALL_ROOT "$out" \
                 --prefix PATH : "$out/bin"
               install -Dm644 docs/flashing.md "$out/share/doc/dmesh/flashing.md"
-            '' + pkgs.lib.optionalString (firmwareRoot != null) ''
-              for cpu in esp32 esp32s3 esp32c6; do
-                for image in recovery.bin main-app.bin; do
-                  source="${firmwareRoot}/$cpu/$image"
-                  if [ ! -s "$source" ]; then
-                    echo "missing firmware artifact: $source" >&2
-                    exit 1
-                  fi
-                  install -Dm644 "$source" "$out/share/dmesh/flash/$cpu/$image"
-                done
-                for size in 4mb 8mb; do
-                  for image in stage2.bin partition-table.bin; do
-                    source="${firmwareRoot}/$cpu/$size/$image"
-                    if [ ! -s "$source" ]; then
-                      echo "missing firmware artifact: $source" >&2
-                      exit 1
-                    fi
-                    install -Dm644 "$source" "$out/share/dmesh/flash/$cpu/$size/$image"
-                  done
-                done
-                default_size=4mb
-                if [ "$cpu" = esp32s3 ]; then default_size=8mb; fi
-                for image in stage2.bin partition-table.bin; do
-                  cp "$out/share/dmesh/flash/$cpu/$default_size/$image" \
-                     "$out/share/dmesh/flash/$cpu/$image"
-                done
-              done
             '';
-            passthru.withFirmware = firmware: mkDmesh firmware sourceRoot sshMeshRoot;
             meta.priority = 5;
           };
-          dmesh = mkDmesh null self null;
-          firmwareRoot = builtins.getEnv "DMESH_FIRMWARE_ROOT";
+          dmesh = mkDmesh self null;
           localSourceRoot = builtins.getEnv "DMESH_SOURCE_ROOT";
           sshMeshSourceRoot = builtins.getEnv "DMESH_SSH_MESH_DIR";
           localSource =
@@ -280,14 +251,6 @@
         in
         {
           inherit deps musl-toolchain wpa-supplicant-nan dmesh;
-          dmesh-with-firmware =
-            if firmwareRoot == "" then
-              pkgs.runCommand "dmesh-with-firmware-unset" {} ''
-                echo "Set DMESH_FIRMWARE_ROOT to the flash directory with all three CPUs and 4mb/8mb Stage2 variants, then use nix build --impure .#dmesh-with-firmware" >&2
-                exit 1
-              ''
-            else
-              mkDmesh (builtins.path { path = firmwareRoot; name = "dmesh-firmware"; }) localSource sshMeshSource;
           musl-deps = muslDeps;
           default = dmesh;
         }
