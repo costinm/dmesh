@@ -24,7 +24,7 @@ pub fn wifi_driver_policy_changed(initialized: bool, ampdu: bool, rates_11b_disa
 /// while association is in progress. Requests carrying settings remain edits.
 pub fn targeted_wake_renews_sta(profile: &TransportProfile, config: TransportConfig<'_>) -> bool {
     config.wake_target.is_some()
-        && config == (TransportConfig { wake_target: config.wake_target, ..TransportConfig::default() })
+        && config == (TransportConfig { wake_target: config.wake_target, iface: config.iface, ..TransportConfig::default() })
         && profile.requested_transport == Some(TransportKind::Sta)
 }
 
@@ -58,239 +58,109 @@ mod driver_policy_tests {
     }
 }
 
-/// A zero UART selector means "use the product default", currently 115200.
-/// This lets a controller avoid board-specific baud knowledge without making
-/// the default spelling ambiguous with an explicit bearer shutdown.
-pub const UART_DEFAULT: u8 = 0;
-/// The product's default physical UART rate.
-pub const UART_115200: u8 = 1;
-/// Explicitly stop a real UART bearer. USB-Serial/JTAG deliberately ignores
-/// this selector: it is a debug/JTAG path, not a controllable UART peripheral.
-pub const UART_OFF: u8 = 8;
-pub const UART_921600: u8 = 9;
+pub use crate::transport_profile::{UART_DEFAULT, UART_115200, UART_OFF, UART_921600, normalize_uart_selector};
+pub use crate::transport_profile::parse_uart_baud;
 
-/// Parse the persistent physical UART rate. Native USB ignores this setting.
-pub fn parse_uart_baud(value: &[u8]) -> Option<i32> {
-    match value {
-        b"115200" => Some(115_200),
-        b"230400" => Some(230_400),
-        b"460800" => Some(460_800),
-        b"921600" => Some(921_600),
-        _ => None,
-    }
-}
-
-/// Normalize the transport profile's legacy on/off/speed selector.
-pub const fn normalize_uart_selector(selector: u8) -> Option<u8> {
-    match selector {
-        UART_DEFAULT => Some(UART_115200),
-        UART_115200..=7 | UART_OFF | UART_921600 => Some(selector),
-        _ => None,
-    }
-}
-
+/// DMesh protocol and diagnostic controls, kept outside the host bearer store.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TransportProfile {
-    pub ssid: [u8; 33],
-    pub ssid_len: usize,
-    /// Optional per-epoch WPA2 override from transport.start; never stored in
-    /// NVS. A zero length selects the fixed DMesh WPA2 key unless `open` was
-    /// explicitly selected for this transient radio epoch.
-    pub sta_passphrase: [u8; 64],
-    pub sta_passphrase_len: usize,
-    /// Optional exact AP identity supplied with the transient STA start.
-    pub sta_bssid: [u8; 6],
-    pub sta_bssid_set: bool,
-    /// `0` lets ESP-IDF choose; a nonzero value pins the association scan.
-    pub sta_channel: u8,
-    /// Default UDP destination for unsolicited events. A handler-owned
-    /// connection may select its own destination instead.
+pub struct DmeshPolicy {
     pub event_port: u16,
     pub log_level: u8,
     pub benchmark: bool,
     pub transport_test: bool,
-    /// Explicit opt-in for the tested associated STA+NAN+NOW coexistence
-    /// personality. It is false by default so STA/UDP6 remains the baseline.
-    /// It is not the planned unassociated NAN+NOW boot policy, nor does it
-    /// encode NAN SD rendezvous/retry timing.
-    pub espnow_capture: bool,
-    /// NAN discovery-window interval in 512 ms DWs. Main defaults to one so
-    /// NAN remains available in every radio mode; zero is an explicit
-    /// diagnostic off spelling, while eight and sixteen select lower-duty
-    /// cadences.
-    pub nan_dw_interval: u8,
-    /// `now=0` is the default private NOW action path; `now=1` is an explicit
-    /// on spelling and `now=2` is the raw-UDP6-only regression baseline. A
-    /// future `udp6` setting remains independent.
-    pub now: u8,
-    /// Requested NAN Data Path policy. ESP adapters currently retain this
-    /// common transport-start parameter without implementing NDP; Android
-    /// turns it into a Wi-Fi Aware data-path capability for the epoch.
-    pub ndp: u8,
-    /// `ap=1` enables a local AP alongside the selected STA or NAN mode.
-    pub ap: u8,
-    /// Explicit unauthenticated AP/STA epoch. This is volatile and defaults
-    /// to false: absent credentials retain the fixed DMesh WPA2 policy.
-    pub open: bool,
-    /// UART selector: `0` is the default 115200 setting, `1` explicitly means
-    /// 115200, `2..=7` select other common rates, `8` is off, and `9` is921600.
-    /// USB packet mode ignores this selector.
-    pub uart: u8,
-    pub ble: u8,
-    pub run_requested: bool,
     pub command_mode: bool,
-    /// Requested physical bearer personality. `None` means the shared Wi-Fi
-    /// owner must be stopped; it has no QUIC-lite connection semantics.
-    pub requested_transport: Option<TransportKind>,
-    /// Association policy belongs to a connection, not to a benchmark run.
     pub ack_frequency: u8,
     pub ack_delay_ms: u8,
-    /// Maximum raw-bearer packets emitted from one ingress turn. Zero keeps
-    /// the transport's C6 default; a nonzero value is an association-scoped
-    /// pacing control, not an PROBE request field.
     pub tx_burst_packets: u8,
-    pub raw_tx_rate: u8,
-    /// Associated-STA egress policy: true submits Ethernet through ESP-IDF's
-    /// normal STA data path. Raw 802.11 injection remains a runtime
-    /// diagnostic opt-out for A/B investigations.
-    pub sta_driver_tx: bool,
-    /// Preserve the previously proven raw-receive policy by default, while
-    /// allowing a direct runtime A/B with standard STA BSSID filtering.
-    pub sta_bssid_check_disabled: bool,
-    /// Association-scoped A-MPDU policy. Changing this requires a controlled
-    /// Wi-Fi driver reinitialization so ESP-IDF sees it in wifi_init_config_t.
-    pub sta_ampdu_enabled: bool,
-    /// Pre-start 802.11b rate suppression.  Keep the existing raw UDP6
-    /// baseline by default, but make the association policy testable.
-    pub sta_11b_rates_disabled: bool,
-    /// Raw UDP6 takes ownership of the driver RX buffer only when explicitly
-    /// enabled. `false` is the standard ESP-IDF esp-netif/lwIP RX path.
-    pub sta_raw_rx_enabled: bool,
     pub path_policy: u8,
     pub timeout_ms: u32,
-}
-
-impl TransportProfile {
-    /// Stored STA credentials do not activate STA. UART also remains
-    /// available without changing the NAN-only Wi-Fi sleep personality.
-    pub fn is_nan_only(&self) -> bool {
-        self.requested_transport == Some(TransportKind::Nan)
-            && self.now == 2 && self.ap == 0
-    }
-    pub const fn new() -> Self {
-        Self {
-            ssid: [0; 33],
-            ssid_len: 0,
-            sta_passphrase: [0; 64],
-            sta_passphrase_len: 0,
-            sta_bssid: [0; 6],
-            sta_bssid_set: false,
-            sta_channel: 0,
+ }
+impl DmeshPolicy { pub const fn new() -> Self { Self {
             event_port: DEFAULT_EVENT_PORT,
             log_level: 2,
             benchmark: false,
             transport_test: false,
-            espnow_capture: false,
-            nan_dw_interval: 1,
-            now: 0,
-            ndp: 0,
-            // The out-of-box unassociated radio is AP+NOW on channel 6 for
-            // the current NOW/NAN validation lane. An explicit start can
-            // replace it with `ap=0` or associated STA later.
-            ap: 1,
-            open: false,
-            uart: UART_115200,
-            ble: 0,
-            run_requested: false,
             command_mode: false,
-            requested_transport: None,
             ack_frequency: 0,
             ack_delay_ms: 0,
             tx_burst_packets: 0,
-            raw_tx_rate: 0,
-            sta_driver_tx: true,
-            sta_bssid_check_disabled: true,
-            sta_ampdu_enabled: true,
-            sta_11b_rates_disabled: true,
-            sta_raw_rx_enabled: true,
             path_policy: 0,
             timeout_ms: 300_000,
-        }
+ } } }
+/// DMesh view of the shared transport profile used across firmware, Android
+/// and host. `bearers` is `transport_profile::TransportProfile`: the transport
+/// structure and tagged-CBOR representation (`docs/transport-cbor.md`).
+/// Android/host also use `control::TransportConfig` and the generated
+/// `platform_api::TransportSetRequest`. Keep their field meanings, tags,
+/// defaults and encodings in sync with that schema.
+/// The additional fields below hold DMesh application policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransportProfile {
+    pub bearers: crate::transport_profile::TransportProfile,
+    pub event_port: u16,
+    pub log_level: u8,
+    pub benchmark: bool,
+    pub transport_test: bool,
+    pub command_mode: bool,
+    pub ack_frequency: u8,
+    pub ack_delay_ms: u8,
+    pub tx_burst_packets: u8,
+    pub path_policy: u8,
+    pub timeout_ms: u32,
+ }
+impl TransportProfile {
+    pub const fn new() -> Self { Self { bearers: crate::transport_profile::TransportProfile::new(),
+            event_port: DEFAULT_EVENT_PORT,
+            log_level: 2,
+            benchmark: false,
+            transport_test: false,
+            command_mode: false,
+            ack_frequency: 0,
+            ack_delay_ms: 0,
+            tx_burst_packets: 0,
+            path_policy: 0,
+            timeout_ms: 300_000,
+ } }
+    pub fn with_policy(bearers: crate::transport_profile::TransportProfile, policy: DmeshPolicy) -> Self {
+        Self { bearers,
+            event_port: policy.event_port,
+            log_level: policy.log_level,
+            benchmark: policy.benchmark,
+            transport_test: policy.transport_test,
+            command_mode: policy.command_mode,
+            ack_frequency: policy.ack_frequency,
+            ack_delay_ms: policy.ack_delay_ms,
+            tx_burst_packets: policy.tx_burst_packets,
+            path_policy: policy.path_policy,
+            timeout_ms: policy.timeout_ms,
+ }
     }
-
-    pub const fn has_flash_profile(&self) -> bool {
-        self.ssid_len != 0 || self.sta_bssid_set
-    }
+    pub fn policy(&self) -> DmeshPolicy { DmeshPolicy {
+            event_port: self.event_port,
+            log_level: self.log_level,
+            benchmark: self.benchmark,
+            transport_test: self.transport_test,
+            command_mode: self.command_mode,
+            ack_frequency: self.ack_frequency,
+            ack_delay_ms: self.ack_delay_ms,
+            tx_burst_packets: self.tx_burst_packets,
+            path_policy: self.path_policy,
+            timeout_ms: self.timeout_ms,
+ } }
 }
-
-impl Default for TransportProfile {
-    fn default() -> Self {
-        Self::new()
-    }
+impl Default for TransportProfile { fn default() -> Self { Self::new() } }
+impl core::ops::Deref for TransportProfile {
+    type Target = crate::transport_profile::TransportProfile;
+    fn deref(&self) -> &Self::Target { &self.bearers }
+}
+impl core::ops::DerefMut for TransportProfile {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.bearers }
 }
 
 /// Apply a physical-bearer configuration. Omitted fields leave the active
 /// bearer unchanged; persistence is handled through `settings.*`.
 pub fn apply_transport_config(config: TransportConfig, profile: &mut TransportProfile) {
-    if let Some(value) = config.passphrase {
-        profile.sta_passphrase[..value.len()].copy_from_slice(value);
-        profile.sta_passphrase_len = value.len();
-    }
-    if let Some(value) = config.bssid {
-        profile.sta_bssid = value;
-        profile.sta_bssid_set = true;
-    }
-    if let Some(value) = config.channel {
-        profile.sta_channel = value;
-    }
-    if let Some(value) = config.espnow_capture {
-        profile.espnow_capture = value;
-    }
-    if let Some(value) = config.nan_dw_interval {
-        profile.nan_dw_interval = value;
-    }
-    if let Some(value) = config.ndp {
-        profile.ndp = value;
-    }
-    if let Some(value) = config.now {
-        profile.now = value;
-    }
-    if let Some(value) = config.ap {
-        profile.ap = value;
-    }
-    if let Some(value) = config.open {
-        profile.open = value;
-    }
-    if let Some(value) = config.uart {
-        // Preserve the active profile on an invalid in-process value. Normal
-        // tagged-CBOR callers are already rejected by the decoder below.
-        if let Some(selector) = normalize_uart_selector(value) {
-            profile.uart = selector;
-        }
-    }
-    if let Some(value) = config.ble {
-        if value <= 2 {
-            profile.ble = value;
-        }
-    }
-    if let Some(value) = config.raw_tx_rate {
-        profile.raw_tx_rate = value;
-    }
-    if let Some(value) = config.sta_driver_tx {
-        profile.sta_driver_tx = value;
-    }
-    if let Some(value) = config.sta_bssid_check_disabled {
-        profile.sta_bssid_check_disabled = value;
-    }
-    if let Some(value) = config.sta_ampdu_enabled {
-        profile.sta_ampdu_enabled = value;
-    }
-    if let Some(value) = config.sta_11b_rates_disabled {
-        profile.sta_11b_rates_disabled = value;
-    }
-    if let Some(value) = config.sta_raw_rx_enabled {
-        profile.sta_raw_rx_enabled = value;
-    }
+    let _ = crate::transport_profile::apply_config(config, &mut profile.bearers);
 }
 
 /// Remove the volatile WPA2 credential before applying a replacement STA

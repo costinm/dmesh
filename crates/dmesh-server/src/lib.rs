@@ -26,6 +26,8 @@ pub mod radio_history;
 pub mod companion;
 /// Shared, bearer- and ESP-independent Recovery/Main bootstrap profile.
 pub mod firmware_profile;
+/// The DMesh transport profile, its codec and store, and the mapping to the module ABI's `wifi` component.
+pub mod transport_profile;
 /// Common CBOR contract for platform-observed local interfaces and addresses.
 /// Adapters report available fields; common routing/discovery consumes it.
 pub mod local_networks;

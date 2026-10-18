@@ -97,7 +97,7 @@ prevents competing watchers or CLIs from opening the same serial port.
 cd "$(git rev-parse --show-toplevel)"
 session=dmesh
 tmux new-session -d -s "$session" -n build
-tmux send-keys -t "$session":build 'source ./env.sh && scripts/build-fw.sh e6' Enter
+tmux send-keys -t "$session":build 'source ./env.sh && cargo build -p dmesh-cli' Enter
 
 # Naming convention: build, DEVICE.uart, DEVICE.udp, and matrix.DESCRIPTION.
 # DEVICE.uart is interactive: it renders UART diagnostics and accepts commands
@@ -217,35 +217,16 @@ Web resources (HTML, JavaScript, and tool definitions) are packaged as Android f
 
 ## ESP32 firmware
 
-Install ESP32 host tools into their dedicated profile and ESP-IDF/Rust ESP
-toolchains under `target/`:
+The ESP firmware (Main, the transport crate and the BLE adapter) moved to the esp-xip-modules repository
+(`/ws/esp-xip-modules`: `crates/dmesh-fw-transport`, `fw/main`, `fw/ble`). DMesh builds none of it and no longer
+installs ESP-IDF or the ESP Rust toolchain. Build there, with the DMesh checkout next to it (the firmware uses
+`crates/quic-lite`, `crates/dmesh-server`, `crates/rawnan`, `crates/uart-codec` by path):
 
 ```sh
-scripts/esp32-deps.sh
-scripts/build-fw.sh all
+cd ../esp-xip-modules && . ./env.sh && fw/build.sh esp32c6    # also esp32, esp32s3; image: target/fw/<cpu>/main-app.bin
 ```
 
-ESP-IDF and Rust ESP state live under `target/esp32-6.0`; its Nix host profile
-is `target/nix/esp32-profile`. See [fw/esp32/BUILD.md](fw/esp32/BUILD.md) for
-build details and
-[notes/plans/main-recovery-transport-reuse.md](notes/plans/main-recovery-transport-reuse.md)
-for the current transport/flashing migration.
-
-The build scripts expose side-effect-free help and state their defaults:
-
-```sh
-scripts/build-fw.sh --help
-scripts/build-stage2.sh --help
-```
-
-`scripts/build-fw.sh` builds Rust Main images; no argument means `all`. Pass
-`e5`/`esp32`, `esp32s3`, or `e6`/`esp32c6` for one CPU family.
-The C Stage2 builder also defaults to `all`. Main artifacts are under
-`target/flash/` and Stage2 under `target/stage2/`.
-
-Recovery is the esp-wifi-loader loader: build it in the esp-wifi-loader checkout (`$ESP_WIFI_LOADER_DIR`, github.com/costinm/esp-wifi-loader) with `scripts/build.sh`.
-The Rust Recovery (`fw/recovery-rust`) and Recovery2 were removed on 2026-10-10;
-`scripts/build-recovery-rust.sh` and `scripts/build-recovery2.sh` only print a pointer.
+Stage2 and the loader are built in the esp-xip-modules (`boot/`) and esp-wifi-loader repositories.
 
 Current development and provisioning use the direct USB/esptool implementation
 inside `flash-device.py`. Its target defaults to `main`:

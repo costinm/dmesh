@@ -3,6 +3,10 @@
 The [DMesh API](API.md) is the single schema and request reference for device,
 Linux, Android, and optional module services.
 
+## Related projects
+
+[ssh-mesh](https://github.com/costinm/ssh-mesh) provides mesh service access and SSH support. [esp-xip-modules](https://github.com/costinm/esp-xip-modules) provides a runtime and reusable modules for low-end devices such as lights, sensors and packet relays.
+
 ## Pairing implementation status
 
 The API defines device ownership across USB/UART, BLE, and Wi-Fi. Initial
@@ -44,7 +48,6 @@ The central sync and discovery is a custom subset of WifiAware/NAN implementatio
 ESP32 devices to enter light sleep between the discovery windows. The protocol
 uses ESP-NOW as a transport for NAN frames if an Android NAN cluster is not discovered - since ESP32 can't send NAN beacons, but the rest of the discovery/sync protocol is unchanged.
 
-
 ## Devices
 
 Current project support Linux (low end or normal servers/laptops) - but it is
@@ -75,7 +78,6 @@ and has (privacy driven) limitations on WiFi modes.
 The idea is to use what you have available - at highest speed and lowest power to form a chain
 to a gateway. The gateways can complete the path over the Internet or are local powered devices
 that have better connectivity.
-
 
 ## Protocols
 

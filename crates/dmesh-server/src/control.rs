@@ -25,95 +25,11 @@ pub const TRANSPORT_SET: u64 = 4;
 const FIELD_KEY: u64 = 1;
 const FIELD_VALUE: u64 = 2;
 const FIELD_MODE: u64 = 1;
-/// Volatile STA target for `transport.start`. It is intentionally not a
-/// setting: UART and future NAN Service Info use the same association command.
-const FIELD_STA_SSID: u64 = 2;
-/// Optional AP identity/channel learned from `lmesh-wifi` or future NAN SD.
-/// They are part of the immutable association target, not radio-lab state.
-const FIELD_STA_BSSID: u64 = 3;
-const FIELD_STA_CHANNEL: u64 = 4;
-const FIELD_RAW_TX_RATE: u64 = 5;
-const FIELD_STA_DRIVER_TX: u64 = 6;
-const FIELD_STA_BSSID_CHECK_DISABLED: u64 = 7;
-const FIELD_STA_AMPDU_ENABLED: u64 = 8;
-const FIELD_STA_11B_RATES_DISABLED: u64 = 9;
-const FIELD_STA_RAW_RX_ENABLED: u64 = 10;
-const FIELD_ESPNOW_CAPTURE: u64 = 13;
-/// NAN discovery-window cadence, in 512 ms discovery windows. `0` disables
-/// promiscuous NAN capture; `1` captures every DW; `8` and `16` select the
-/// four- and eight-second cadences.
-const FIELD_NAN_DW_INTERVAL: u64 = 14;
-/// Associated NOW action policy. `0` is the default/on, `1` is explicit on,
-/// and `2` is explicit off. Future controls such as `udp6` remain independent
-/// rather than minting another transport-start name.
-const FIELD_NOW: u64 = 15;
-/// Start a local AP alongside either physical mode. `0` is off and `1` is on.
-const FIELD_AP: u64 = 16;
-/// Optional WPA2 passphrase for an ephemeral STA target, for example an
-/// Android P2P Group Owner. It is transport-start session data, never a
-/// setting or persisted credential.
-const FIELD_STA_PASSPHRASE: u64 = 17;
-/// UART ownership/speed selector for the applied profile. Tag 18 preserves the
-/// existing passphrase field while keeping this addition backward-compatible.
-/// `0` selects the default 115200 UART rate, `1` explicitly means 115200,
-/// `2..=7` select other common rates, and `8` explicitly turns off a real
-/// UART bearer; `9` selects 921600. The UART starts at 115200 and the handshake upgrades it with this field. USB packet
-/// mode ignores the selector.
-const FIELD_UART: u64 = 18;
-/// Enable the NAN Data Path (NDP) bearer for this immutable radio epoch.
-/// NDP is meaningful only to adapters that implement it today (Android), but
-/// it belongs in the common start record so peers can negotiate it without an
-/// Android-only control schema.
-const FIELD_NDP: u64 = 19;
-/// Select unauthenticated 802.11 only for this volatile AP/STA epoch. The
-/// default remains WPA2-PSK; `open=1` is an explicit interoperability and
-/// measurement choice, never an implicit fallback for a missing passphrase.
-const FIELD_OPEN: u64 = 24;
-/// The hardware address which may accept a NAN wake profile.  This is
-/// deliberately part of the signed/bounded control record rather than NAN
-/// discovery metadata: an active Subscribe is normally broadcast, so its
-/// receiver must reject a wake for another device.
-const FIELD_WAKE_TARGET: u64 = 25;
-const FIELD_BLE: u64 = 26;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TransportKind {
-    /// Associate with an infrastructure AP.
-    Sta,
-    /// Do not associate with an infrastructure AP.
-    Nan,
-    Uart,
-}
-
-/// Volatile physical-bearer parameters captured atomically by
-/// `transport.start`. They are immutable for that Wi-Fi radio epoch; changing
-/// any one requires a new `transport.start`, which replaces the old epoch.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct TransportConfig<'a> {
-    pub ssid: Option<&'a [u8]>,
-    pub passphrase: Option<&'a [u8]>,
-    pub bssid: Option<[u8; 6]>,
-    pub channel: Option<u8>,
-    pub raw_tx_rate: Option<u8>,
-    pub sta_driver_tx: Option<bool>,
-    pub sta_bssid_check_disabled: Option<bool>,
-    pub sta_ampdu_enabled: Option<bool>,
-    pub sta_11b_rates_disabled: Option<bool>,
-    pub sta_raw_rx_enabled: Option<bool>,
-    pub espnow_capture: Option<bool>,
-    pub nan_dw_interval: Option<u8>,
-    pub now: Option<u8>,
-    /// `0` disables and `1` enables NAN Data Path where the adapter supports
-    /// it. Unsupported adapters retain the requested profile and report their
-    /// capability separately rather than reinterpreting the field.
-    pub ndp: Option<u8>,
-    pub ap: Option<u8>,
-    pub open: Option<bool>,
-    pub uart: Option<u8>,
-    pub ble: Option<u8>,
-    pub wake_target: Option<[u8; 6]>,
-}
-
+// Shared transport declaration for DMesh firmware, Android and host. It has
+// the same fields and tagged-CBOR representation as esp-xip-modules' profile
+// (src/transport_profile/mod.rs); keep both sides in sync via docs/transport-cbor.md.
+// Android/host's generated platform_api::TransportSetRequest uses that schema too.
+pub use crate::transport_profile::{TransportConfig, TransportKind};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Request<'a> {
     SettingsGet {
@@ -220,138 +136,9 @@ pub fn decode_record(record: Record<'_>) -> Option<Request<'_>> {
     }
 }
 
-fn transport_kind(value: u64) -> Option<TransportKind> {
-    Some(match value {
-        1 => TransportKind::Sta,
-        5 => TransportKind::Uart,
-        // Appended after retiring the old combined modes. Values 2, 3, and 4
-        // are deliberately rejected rather than reinterpreted.
-        6 => TransportKind::Nan,
-        _ => return None,
-    })
-}
-
-fn parse_bssid_text(text: &[u8]) -> Option<[u8; 6]> {
-    if text.len() != 17 { return None; }
-    let mut mac = [0; 6];
-    for (index, octet) in mac.iter_mut().enumerate() {
-        let start = index * 3;
-        if index != 5 && text[start + 2] != b':' { return None; }
-        let digit = |c: u8| match c {
-            b'0'..=b'9' => Some(c - b'0'),
-            b'a'..=b'f' => Some(c - b'a' + 10),
-            b'A'..=b'F' => Some(c - b'A' + 10),
-            _ => None,
-        };
-        *octet = digit(text[start])? * 16 + digit(text[start + 1])?;
-    }
-    Some(mac)
-}
-
+use crate::transport_profile::transport_kind;
 fn decode_transport_config(encoded: &[u8]) -> Option<TransportConfig<'_>> {
-    let mut d = Decoder::new(encoded);
-    let (major, count) = d.head()?;
-    if major != 5 || count == u64::MAX {
-        return None;
-    }
-    let mut config = TransportConfig::default();
-    for _ in 0..count {
-        match d.uint()? {
-            FIELD_STA_SSID => {
-                let ssid = d.text_ref().or_else(|| d.bytes_ref())?;
-                if ssid.is_empty() || ssid.len() > 32 || ssid.contains(&0) {
-                    return None;
-                }
-                config.ssid = Some(ssid);
-            }
-            FIELD_STA_BSSID => {
-                let position = d.position();
-                config.bssid = Some(if let Some(value) = d.bytes_ref() {
-                    value.try_into().ok()?
-                } else {
-                    d.set_position(position);
-                    parse_bssid_text(d.text_ref()?)?
-                });
-            }
-            FIELD_STA_CHANNEL => {
-                let channel = u8::try_from(d.uint()?).ok()?;
-                if !(1..=14).contains(&channel) {
-                    return None;
-                }
-                config.channel = Some(channel);
-            }
-            FIELD_STA_PASSPHRASE => {
-                let passphrase = d.text_ref().or_else(|| d.bytes_ref())?;
-                if !(8..=63).contains(&passphrase.len()) || passphrase.contains(&0) {
-                    return None;
-                }
-                config.passphrase = Some(passphrase);
-            }
-            FIELD_RAW_TX_RATE => {
-                let rate = d.uint()? as u8;
-                if !matches!(rate, 0 | 6 | 9 | 12 | 18 | 24 | 36 | 48 | 54) {
-                    return None;
-                }
-                config.raw_tx_rate = Some(rate);
-            }
-            FIELD_STA_DRIVER_TX => config.sta_driver_tx = Some(d.boolean()?),
-            FIELD_STA_BSSID_CHECK_DISABLED => config.sta_bssid_check_disabled = Some(d.boolean()?),
-            FIELD_STA_AMPDU_ENABLED => config.sta_ampdu_enabled = Some(d.boolean()?),
-            FIELD_STA_11B_RATES_DISABLED => config.sta_11b_rates_disabled = Some(d.boolean()?),
-            FIELD_STA_RAW_RX_ENABLED => config.sta_raw_rx_enabled = Some(d.boolean()?),
-            FIELD_ESPNOW_CAPTURE => config.espnow_capture = Some(d.boolean()?),
-            FIELD_NAN_DW_INTERVAL => {
-                let interval = d.uint()? as u8;
-                if !matches!(interval, 0 | 1 | 8 | 16) {
-                    return None;
-                }
-                config.nan_dw_interval = Some(interval);
-            }
-            FIELD_NOW => {
-                let enabled = d.uint()? as u8;
-                if enabled > 2 {
-                    return None;
-                }
-                config.now = Some(enabled);
-            }
-            FIELD_NDP => {
-                let enabled = d.uint()? as u8;
-                if enabled > 1 {
-                    return None;
-                }
-                config.ndp = Some(enabled);
-            }
-            FIELD_AP => {
-                let enabled = d.uint()? as u8;
-                if enabled > 1 {
-                    return None;
-                }
-                config.ap = Some(enabled);
-            }
-            FIELD_OPEN => config.open = Some(d.boolean()?),
-            FIELD_BLE => {
-                let enabled = d.uint()? as u8;
-                if enabled > 2 {
-                    return None;
-                }
-                config.ble = Some(enabled);
-            }
-            FIELD_WAKE_TARGET => {
-                let bytes = d.bytes_ref()?;
-                config.wake_target = (bytes.len() == 6).then(|| bytes.try_into().ok()).flatten();
-                config.wake_target?;
-            }
-            FIELD_UART => {
-                let speed = u8::try_from(d.uint()?).ok()?;
-                if crate::firmware_profile::normalize_uart_selector(speed).is_none() {
-                    return None;
-                }
-                config.uart = Some(speed);
-            }
-            _ => d.skip()?,
-        }
-    }
-    d.is_finished().then_some(config)
+    crate::transport_profile::decode_config(encoded)
 }
 
 fn map_is_empty(encoded: &[u8]) -> bool {
@@ -446,137 +233,16 @@ pub fn encode_request(request: Request<'_>, id: Option<u64>, out: &mut [u8]) -> 
         Request::SettingsList => {}
         Request::TransportSet { kind, config } => {
             e.uint(FIELD_MODE)?;
-            e.uint(match kind {
-                TransportKind::Sta => 1,
-                TransportKind::Uart => 5,
-                TransportKind::Nan => 6,
-            })?;
+            e.uint(u64::from(crate::transport_profile::mode(Some(kind))))?;
             encode_config(config, &mut e)?;
         }
     }
     Some(e.len())
 }
 
-fn transport_config_count(config: TransportConfig<'_>) -> u64 {
-    [
-        config.ssid.is_some(),
-        config.passphrase.is_some(),
-        config.bssid.is_some(),
-        config.channel.is_some(),
-        config.raw_tx_rate.is_some(),
-        config.sta_driver_tx.is_some(),
-        config.sta_bssid_check_disabled.is_some(),
-        config.sta_ampdu_enabled.is_some(),
-        config.sta_11b_rates_disabled.is_some(),
-        config.sta_raw_rx_enabled.is_some(),
-        config.espnow_capture.is_some(),
-        config.nan_dw_interval.is_some(),
-        config.now.is_some(),
-        config.ndp.is_some(),
-        config.ap.is_some(),
-        config.open.is_some(),
-        config.uart.is_some(),
-        config.ble.is_some(),
-        config.wake_target.is_some(),
-    ]
-    .into_iter()
-    .filter(|present| *present)
-    .count() as u64
-}
-
+fn transport_config_count(config: TransportConfig<'_>) -> u64 { crate::transport_profile::field_count(config) }
 fn encode_config(config: TransportConfig<'_>, e: &mut Encoder<'_>) -> Option<()> {
-    if let Some(ssid) = config.ssid {
-        if ssid.is_empty() || ssid.len() > 32 || ssid.contains(&0) {
-            return None;
-        }
-        e.uint(FIELD_STA_SSID)?;
-        e.text_value(ssid)?;
-    }
-    if let Some(passphrase) = config.passphrase {
-        if !(8..=63).contains(&passphrase.len()) || passphrase.contains(&0) {
-            return None;
-        }
-        e.uint(FIELD_STA_PASSPHRASE)?;
-        e.text_value(passphrase)?;
-    }
-    if let Some(bssid) = config.bssid {
-        e.uint(FIELD_STA_BSSID)?;
-        e.bytes_value(&bssid)?;
-    }
-    if let Some(channel) = config.channel {
-        if !(1..=14).contains(&channel) {
-            return None;
-        }
-        e.uint(FIELD_STA_CHANNEL)?;
-        e.uint(u64::from(channel))?;
-    }
-    for (field, value) in [(FIELD_RAW_TX_RATE, config.raw_tx_rate)] {
-        if let Some(value) = value {
-            e.uint(field)?;
-            e.uint(value as u64)?;
-        }
-    }
-    if let Some(value) = config.nan_dw_interval {
-        e.uint(FIELD_NAN_DW_INTERVAL)?;
-        e.uint(value as u64)?;
-    }
-    if let Some(value) = config.now {
-        e.uint(FIELD_NOW)?;
-        e.uint(value as u64)?;
-    }
-    if let Some(value) = config.ndp {
-        if value > 1 {
-            return None;
-        }
-        e.uint(FIELD_NDP)?;
-        e.uint(value as u64)?;
-    }
-    if let Some(value) = config.ap {
-        e.uint(FIELD_AP)?;
-        e.uint(value as u64)?;
-    }
-    if let Some(value) = config.open {
-        e.uint(FIELD_OPEN)?;
-        e.boolean(value)?;
-    }
-    if let Some(value) = config.uart {
-        // Keep locally generated control records subject to the same selector
-        // contract as decoded records.  In particular, zero means the product
-        // default and eight is the explicit real-UART shutdown request.
-        if crate::firmware_profile::normalize_uart_selector(value).is_none() {
-            return None;
-        }
-        e.uint(FIELD_UART)?;
-        e.uint(u64::from(value))?;
-    }
-    if let Some(value) = config.ble {
-        if value > 2 {
-            return None;
-        }
-        e.uint(FIELD_BLE)?;
-        e.uint(value as u64)?;
-    }
-    if let Some(target) = config.wake_target {
-        e.uint(FIELD_WAKE_TARGET)?;
-        e.bytes_value(&target)?;
-    }
-    for (field, value) in [
-        (FIELD_STA_DRIVER_TX, config.sta_driver_tx),
-        (
-            FIELD_STA_BSSID_CHECK_DISABLED,
-            config.sta_bssid_check_disabled,
-        ),
-        (FIELD_STA_AMPDU_ENABLED, config.sta_ampdu_enabled),
-        (FIELD_STA_11B_RATES_DISABLED, config.sta_11b_rates_disabled),
-        (FIELD_STA_RAW_RX_ENABLED, config.sta_raw_rx_enabled),
-        (FIELD_ESPNOW_CAPTURE, config.espnow_capture),
-    ] {
-        if let Some(value) = value {
-            e.uint(field)?;
-            e.boolean(value)?;
-        }
-    }
-    Some(())
+    crate::transport_profile::encode_config_into(config, e)
 }
 
 #[cfg(test)]
@@ -590,8 +256,8 @@ mod tests {
             assert_eq!(super::decode_transport_config(encoded).unwrap().bssid,
                 Some([0xaa, 0xbb, 2, 3, 4, 5]));
         }
-        assert!(super::parse_bssid_text(b"aa-bb-02-03-04-05").is_none());
-        assert!(super::parse_bssid_text(b"aa:gg:02:03:04:05").is_none());
+        assert!(crate::transport_profile::parse_bssid_text(b"aa-bb-02-03-04-05").is_none());
+        assert!(crate::transport_profile::parse_bssid_text(b"aa:gg:02:03:04:05").is_none());
         assert!(super::decode_transport_config(b"\xa1\x03\x45abcde").is_none());
         assert!(super::decode_transport_config(b"\xa1\x03\x66abcdef").is_none());
     }

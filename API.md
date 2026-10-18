@@ -606,41 +606,10 @@ protocol prerequisite.
 | 4 | `flash_bytes` | `u64` | no | Physical flash capacity when applicable. |
 | 5 | `role` | `string` | yes | main, recovery, linux, or android. |
 
-# `transport` API (1)
+The transport schema is owned by [the XIP host ABI](../esp-xip-modules/abi/API.md).
+The generator includes that definition here.
 
-## 4. `set` — Replace a node's complete volatile physical transport profile
-
-**Platforms:** A L E
-
-**Tier:** internal
-
-**UI:** default
-
-### Request
-
-| Tag | Field | Type | Description |
-|---:|---|---|---|
-| 1 | `mode` | `u8` | Selected physical transport: STA=1, UART=5, NAN=6. |
-| 2 | `ssid` | `string` | STA target. |
-| 3 | `bssid` | `string` | Optional directed STA BSSID. |
-| 4 | `channel` | `u8` | Selected channel. |
-| 5 | `raw_tx_rate` | `u8` | Raw injection diagnostic rate. |
-| 6 | `sta_driver_tx` | `bool` | Legacy setting; UDP6 always sends through the ESP-IDF/lwIP socket path. |
-| 7 | `sta_bssid_check_disabled` | `bool` | Disable BSSID filtering in raw RX. |
-| 8 | `sta_ampdu_enabled` | `bool` | Enable STA A-MPDU. |
-| 9 | `sta_11b_rates_disabled` | `bool` | Disable legacy 802.11b rates. |
-| 10 | `sta_raw_rx_enabled` | `bool` | Enable the UDP6 socket receive adapter. |
-| 13 | `espnow_capture` | `bool` | Legacy diagnostic capture setting. |
-| 14 | `nan_dw_interval` | `u8` | NAN discovery-window interval. |
-| 15 | `now` | `u8` | ESP-NOW policy. |
-| 16 | `ap` | `u8` | AP policy. |
-| 17 | `passphrase` | `string` | Volatile WPA2 override. |
-| 18 | `uart` | `u8` | Physical UART selector: 0/default or 1=115200, 2=9600, 3=19200, 4=38400, 5=57600, 6=230400, 7=460800, 8=off, 9=921600. ESP applies the volatile rate after the response finishes; native USB-JTAG ignores it. The UART bearer starts at 115200 and uses this field to upgrade to 921600 after its handshake; `uart.baud` is only a legacy boot override. |
-| 19 | `ndp` | `u8` | NAN Data Path policy. |
-| 24 | `open` | `bool` | Open-mode policy. |
-| 25 | `wake_target` | `string` | MAC address allowed to apply NAN wake. |
-| 26 | `ble` | `u8` | BLE policy. |
-| 27 | `iface` | `string` | Linux-owned interface; omitted on devices. |
+<!-- xip-transport-schema -->
 
 # `companion` API (209)
 

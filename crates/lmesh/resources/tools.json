@@ -83,119 +83,175 @@
       "name": "transport.set",
       "description": "Call the transport.set QUIC stream handler",
       "inputSchema": {
-        "type": "object",
         "properties": {
-          "mode": {
-            "type": "integer",
-            "x-protobuf-index": 1,
-            "x-dmesh-kind": "enum",
-            "x-dmesh-values": {
-              "sta": 1,
-              "uart": 5,
-              "nan": 6
-            }
-          },
-          "ssid": {
-            "type": "string",
-            "x-protobuf-index": 2,
-            "x-dmesh-kind": "text"
-          },
-          "bssid": {
-            "type": "string",
-            "x-protobuf-index": 3,
-            "x-dmesh-kind": "mac"
-          },
-          "channel": {
-            "type": "integer",
-            "x-protobuf-index": 4,
-            "x-dmesh-kind": "u8"
-          },
-          "raw_tx_rate": {
-            "type": "integer",
-            "x-protobuf-index": 5,
-            "x-dmesh-kind": "u8"
-          },
-          "sta_driver_tx": {
-            "type": "boolean",
-            "x-protobuf-index": 6,
-            "x-dmesh-kind": "bool"
-          },
-          "sta_bssid_check_disabled": {
-            "type": "boolean",
-            "x-protobuf-index": 7,
-            "x-dmesh-kind": "bool"
-          },
-          "sta_ampdu_enabled": {
-            "type": "boolean",
-            "x-protobuf-index": 8,
-            "x-dmesh-kind": "bool"
-          },
-          "sta_11b_rates_disabled": {
-            "type": "boolean",
-            "x-protobuf-index": 9,
-            "x-dmesh-kind": "bool"
-          },
-          "sta_raw_rx_enabled": {
-            "type": "boolean",
-            "x-protobuf-index": 10,
-            "x-dmesh-kind": "bool"
-          },
-          "espnow_capture": {
-            "type": "boolean",
-            "x-protobuf-index": 13,
-            "x-dmesh-kind": "bool"
-          },
-          "nan_dw_interval": {
-            "type": "integer",
-            "x-protobuf-index": 14,
-            "x-dmesh-kind": "u8"
-          },
-          "now": {
-            "type": "integer",
-            "x-protobuf-index": 15,
-            "x-dmesh-kind": "u8"
-          },
           "ap": {
             "type": "integer",
             "x-protobuf-index": 16,
-            "x-dmesh-kind": "u8"
+            "x-protobuf-type": "u8"
           },
-          "passphrase": {
+          "ap_passphrase": {
             "type": "string",
-            "x-protobuf-index": 17,
-            "x-dmesh-kind": "text"
+            "x-protobuf-index": 39,
+            "x-protobuf-type": "string"
           },
-          "uart": {
-            "type": "integer",
-            "x-protobuf-index": 18,
-            "x-dmesh-kind": "u8"
-          },
-          "open": {
-            "type": "boolean",
-            "x-protobuf-index": 24,
-            "x-dmesh-kind": "bool"
-          },
-          "wake_target": {
+          "ap_ssid": {
             "type": "string",
-            "x-protobuf-index": 25,
-            "x-dmesh-kind": "mac"
+            "x-protobuf-index": 38,
+            "x-protobuf-type": "string"
           },
           "ble": {
             "type": "integer",
             "x-protobuf-index": 26,
-            "x-dmesh-kind": "u8"
+            "x-protobuf-type": "u8"
           },
-          "ndp": {
+          "bssid": {
+            "type": "string",
+            "x-protobuf-index": 3,
+            "x-protobuf-type": "string"
+          },
+          "channel": {
             "type": "integer",
-            "x-protobuf-index": 19,
-            "x-dmesh-kind": "u8"
+            "x-protobuf-index": 4,
+            "x-protobuf-type": "u8"
+          },
+          "espnow_capture": {
+            "type": "boolean",
+            "x-protobuf-index": 13,
+            "x-protobuf-type": "bool"
           },
           "iface": {
             "type": "string",
             "x-protobuf-index": 27,
-            "x-dmesh-kind": "text"
+            "x-protobuf-type": "string"
+          },
+          "mode": {
+            "type": "integer",
+            "x-protobuf-index": 1,
+            "x-protobuf-type": "u8"
+          },
+          "nan_dw_interval": {
+            "type": "integer",
+            "x-protobuf-index": 14,
+            "x-protobuf-type": "u8"
+          },
+          "ndp": {
+            "type": "integer",
+            "x-protobuf-index": 19,
+            "x-protobuf-type": "u8"
+          },
+          "now": {
+            "type": "integer",
+            "x-protobuf-index": 15,
+            "x-protobuf-type": "u8"
+          },
+          "open": {
+            "type": "boolean",
+            "x-protobuf-index": 24,
+            "x-protobuf-type": "bool"
+          },
+          "passphrase": {
+            "type": "string",
+            "x-protobuf-index": 17,
+            "x-protobuf-type": "string"
+          },
+          "radio_bandwidth": {
+            "type": "integer",
+            "x-protobuf-index": 33,
+            "x-protobuf-type": "u32"
+          },
+          "radio_bitrate": {
+            "type": "integer",
+            "x-protobuf-index": 34,
+            "x-protobuf-type": "u32"
+          },
+          "radio_coding_rate": {
+            "type": "integer",
+            "x-protobuf-index": 37,
+            "x-protobuf-type": "u8"
+          },
+          "radio_frequency": {
+            "type": "integer",
+            "x-protobuf-index": 32,
+            "x-protobuf-type": "u32"
+          },
+          "radio_mode": {
+            "type": "integer",
+            "x-protobuf-index": 31,
+            "x-protobuf-type": "u8"
+          },
+          "radio_spreading_factor": {
+            "type": "integer",
+            "x-protobuf-index": 36,
+            "x-protobuf-type": "u8"
+          },
+          "radio_tx_power": {
+            "type": "integer",
+            "x-protobuf-index": 35,
+            "x-protobuf-type": "i32"
+          },
+          "raw_tx_rate": {
+            "type": "integer",
+            "x-protobuf-index": 5,
+            "x-protobuf-type": "u8"
+          },
+          "ssid": {
+            "type": "string",
+            "x-protobuf-index": 2,
+            "x-protobuf-type": "string"
+          },
+          "sta_11b_rates_disabled": {
+            "type": "boolean",
+            "x-protobuf-index": 9,
+            "x-protobuf-type": "bool"
+          },
+          "sta_ampdu_enabled": {
+            "type": "boolean",
+            "x-protobuf-index": 8,
+            "x-protobuf-type": "bool"
+          },
+          "sta_bssid_check_disabled": {
+            "type": "boolean",
+            "x-protobuf-index": 7,
+            "x-protobuf-type": "bool"
+          },
+          "sta_driver_tx": {
+            "type": "boolean",
+            "x-protobuf-index": 6,
+            "x-protobuf-type": "bool"
+          },
+          "sta_raw_rx_enabled": {
+            "type": "boolean",
+            "x-protobuf-index": 10,
+            "x-protobuf-type": "bool"
+          },
+          "uart": {
+            "type": "integer",
+            "x-protobuf-index": 18,
+            "x-protobuf-type": "u8"
+          },
+          "uart_baud": {
+            "type": "integer",
+            "x-protobuf-index": 29,
+            "x-protobuf-type": "u32"
+          },
+          "uart_mode": {
+            "type": "integer",
+            "x-protobuf-index": 28,
+            "x-protobuf-type": "u8"
+          },
+          "uart_port": {
+            "type": "integer",
+            "x-protobuf-index": 30,
+            "x-protobuf-type": "u8"
+          },
+          "wake_target": {
+            "type": "string",
+            "x-protobuf-index": 25,
+            "x-protobuf-type": "string"
           }
-        }
+        },
+        "required": [],
+        "type": "object"
       },
       "outputSchema": {
         "type": "object"

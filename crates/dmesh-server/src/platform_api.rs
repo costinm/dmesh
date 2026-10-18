@@ -3269,7 +3269,7 @@ impl crate::registry_bridge::TaggedCbor for TelemetryDeviceResponse {
     }
 }
 
-/// Replace a node's complete volatile physical transport profile
+/// Apply a partial volatile physical transport request
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct TransportSetRequest {
     /// API field `mode`.
@@ -3335,10 +3335,46 @@ pub struct TransportSetRequest {
     /// API field `iface`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub iface: Option<String>,
+    /// API field `uart_mode`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uart_mode: Option<u8>,
+    /// API field `uart_baud`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uart_baud: Option<u32>,
+    /// API field `uart_port`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uart_port: Option<u8>,
+    /// API field `radio_mode`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radio_mode: Option<u8>,
+    /// API field `radio_frequency`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radio_frequency: Option<u32>,
+    /// API field `radio_bandwidth`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radio_bandwidth: Option<u32>,
+    /// API field `radio_bitrate`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radio_bitrate: Option<u32>,
+    /// API field `radio_tx_power`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radio_tx_power: Option<i32>,
+    /// API field `radio_spreading_factor`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radio_spreading_factor: Option<u8>,
+    /// API field `radio_coding_rate`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radio_coding_rate: Option<u8>,
+    /// API field `ap_ssid`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ap_ssid: Option<String>,
+    /// API field `ap_passphrase`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ap_passphrase: Option<String>,
 }
 
 impl mesh::tagged::TaggedFields for TransportSetRequest {
-    const FIELDS: &'static [(&'static str, u32)] = &[("mode", 1), ("ssid", 2), ("bssid", 3), ("channel", 4), ("raw_tx_rate", 5), ("sta_driver_tx", 6), ("sta_bssid_check_disabled", 7), ("sta_ampdu_enabled", 8), ("sta_11b_rates_disabled", 9), ("sta_raw_rx_enabled", 10), ("espnow_capture", 13), ("nan_dw_interval", 14), ("now", 15), ("ap", 16), ("passphrase", 17), ("uart", 18), ("ndp", 19), ("open", 24), ("wake_target", 25), ("ble", 26), ("iface", 27)];
+    const FIELDS: &'static [(&'static str, u32)] = &[("mode", 1), ("ssid", 2), ("bssid", 3), ("channel", 4), ("raw_tx_rate", 5), ("sta_driver_tx", 6), ("sta_bssid_check_disabled", 7), ("sta_ampdu_enabled", 8), ("sta_11b_rates_disabled", 9), ("sta_raw_rx_enabled", 10), ("espnow_capture", 13), ("nan_dw_interval", 14), ("now", 15), ("ap", 16), ("passphrase", 17), ("uart", 18), ("ndp", 19), ("open", 24), ("wake_target", 25), ("ble", 26), ("iface", 27), ("uart_mode", 28), ("uart_baud", 29), ("uart_port", 30), ("radio_mode", 31), ("radio_frequency", 32), ("radio_bandwidth", 33), ("radio_bitrate", 34), ("radio_tx_power", 35), ("radio_spreading_factor", 36), ("radio_coding_rate", 37), ("ap_ssid", 38), ("ap_passphrase", 39)];
 }
 
 impl TransportSetRequest {
@@ -3358,7 +3394,7 @@ impl TransportSetRequest {
     /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
     pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
         let mut e = crate::cbor::Encoder::new(out);
-        e.map(0u64 + u64::from(self.mode.is_some()) + u64::from(self.ssid.is_some()) + u64::from(self.bssid.is_some()) + u64::from(self.channel.is_some()) + u64::from(self.raw_tx_rate.is_some()) + u64::from(self.sta_driver_tx.is_some()) + u64::from(self.sta_bssid_check_disabled.is_some()) + u64::from(self.sta_ampdu_enabled.is_some()) + u64::from(self.sta_11b_rates_disabled.is_some()) + u64::from(self.sta_raw_rx_enabled.is_some()) + u64::from(self.espnow_capture.is_some()) + u64::from(self.nan_dw_interval.is_some()) + u64::from(self.now.is_some()) + u64::from(self.ap.is_some()) + u64::from(self.passphrase.is_some()) + u64::from(self.uart.is_some()) + u64::from(self.ndp.is_some()) + u64::from(self.open.is_some()) + u64::from(self.wake_target.is_some()) + u64::from(self.ble.is_some()) + u64::from(self.iface.is_some()))?;
+        e.map(0u64 + u64::from(self.mode.is_some()) + u64::from(self.ssid.is_some()) + u64::from(self.bssid.is_some()) + u64::from(self.channel.is_some()) + u64::from(self.raw_tx_rate.is_some()) + u64::from(self.sta_driver_tx.is_some()) + u64::from(self.sta_bssid_check_disabled.is_some()) + u64::from(self.sta_ampdu_enabled.is_some()) + u64::from(self.sta_11b_rates_disabled.is_some()) + u64::from(self.sta_raw_rx_enabled.is_some()) + u64::from(self.espnow_capture.is_some()) + u64::from(self.nan_dw_interval.is_some()) + u64::from(self.now.is_some()) + u64::from(self.ap.is_some()) + u64::from(self.passphrase.is_some()) + u64::from(self.uart.is_some()) + u64::from(self.ndp.is_some()) + u64::from(self.open.is_some()) + u64::from(self.wake_target.is_some()) + u64::from(self.ble.is_some()) + u64::from(self.iface.is_some()) + u64::from(self.uart_mode.is_some()) + u64::from(self.uart_baud.is_some()) + u64::from(self.uart_port.is_some()) + u64::from(self.radio_mode.is_some()) + u64::from(self.radio_frequency.is_some()) + u64::from(self.radio_bandwidth.is_some()) + u64::from(self.radio_bitrate.is_some()) + u64::from(self.radio_tx_power.is_some()) + u64::from(self.radio_spreading_factor.is_some()) + u64::from(self.radio_coding_rate.is_some()) + u64::from(self.ap_ssid.is_some()) + u64::from(self.ap_passphrase.is_some()))?;
         if let Some(value) = &self.mode {
         e.uint(1)?;
         e.uint(u64::from(*value))?;
@@ -3443,6 +3479,54 @@ impl TransportSetRequest {
         e.uint(27)?;
         e.text_value(value.as_bytes())?;
         }
+        if let Some(value) = &self.uart_mode {
+        e.uint(28)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.uart_baud {
+        e.uint(29)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.uart_port {
+        e.uint(30)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.radio_mode {
+        e.uint(31)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.radio_frequency {
+        e.uint(32)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.radio_bandwidth {
+        e.uint(33)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.radio_bitrate {
+        e.uint(34)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.radio_tx_power {
+        e.uint(35)?;
+        e.int(i64::from(*value))?;
+        }
+        if let Some(value) = &self.radio_spreading_factor {
+        e.uint(36)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.radio_coding_rate {
+        e.uint(37)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.ap_ssid {
+        e.uint(38)?;
+        e.text_value(value.as_bytes())?;
+        }
+        if let Some(value) = &self.ap_passphrase {
+        e.uint(39)?;
+        e.text_value(value.as_bytes())?;
+        }
         Some(e.len())
     }
 
@@ -3479,6 +3563,18 @@ impl TransportSetRequest {
                 25 => out.wake_target = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
                 26 => out.ble = Some(u8::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
                 27 => out.iface = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                28 => out.uart_mode = Some(u8::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                29 => out.uart_baud = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                30 => out.uart_port = Some(u8::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                31 => out.radio_mode = Some(u8::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                32 => out.radio_frequency = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                33 => out.radio_bandwidth = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                34 => out.radio_bitrate = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                35 => out.radio_tx_power = Some(i32::try_from(d.int().ok_or("invalid integer")?).map_err(|_| "integer out of range")?),
+                36 => out.radio_spreading_factor = Some(u8::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                37 => out.radio_coding_rate = Some(u8::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                38 => out.ap_ssid = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                39 => out.ap_passphrase = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
                 _ => d.skip().ok_or("invalid value")?,
             }
         }
@@ -3496,7 +3592,7 @@ impl crate::registry_bridge::TaggedCbor for TransportSetRequest {
     }
 }
 
-/// Replace a node's complete volatile physical transport profile
+/// Apply a partial volatile physical transport request
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct TransportSetResponse;
 
