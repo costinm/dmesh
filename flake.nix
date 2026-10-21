@@ -167,7 +167,7 @@
             cargoLock = {
               lockFile = ./Cargo.lock;
               # mesh-api is sourced from the pinned ssh-mesh git revision.
-              outputHashes."mesh-api-0.1.0" = "sha256-C3eWQxWt+g6jOACLZvyDX0P2MBTQK0DXvigLP/gg/Fs=";
+              outputHashes."mesh-api-0.1.0" = "sha256-/tlACYNExIcJ0MpWwcj3QJ0MnkfRbdCFtLQDx1ftdqI=";
             };
             postPatch = pkgs.lib.optionalString (sshMeshRoot != null) ''
               cat >> Cargo.toml <<'EOF'
@@ -179,21 +179,12 @@
             doCheck = false;
             cargoBuildFlags = [
               "-p" "lmesh"
-              "-p" "dmesh-cli"
               "-p" "mesh-tun"
               "-p" "dmeshtui"
             ];
             postInstall = ''
               install -Dm644 crates/lmesh/resources/tools.json "$out/etc/schemas/tools.json"
               install -Dm644 crates/lmesh/resources/tools.json "$out/etc/schemas/lmesh/tools.json"
-              wrapProgram "$out/bin/dmesh-cli" --set-default MESH_SCHEMA_DIR "$out/etc/schemas"
-              ln -s ${pkgs.espflash}/bin/espflash "$out/bin/espflash"
-              install -Dm755 scripts/flash-device.py "$out/libexec/dmesh/flash-device.py"
-              makeWrapper ${pkgs.python3}/bin/python3 "$out/bin/dmesh-flash" \
-                --add-flags "$out/libexec/dmesh/flash-device.py" \
-                --set DMESH_INSTALL_ROOT "$out" \
-                --prefix PATH : "$out/bin"
-              install -Dm644 docs/flashing.md "$out/share/doc/dmesh/flashing.md"
             '';
             meta.priority = 5;
           };

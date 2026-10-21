@@ -228,22 +228,8 @@ cd ../esp-xip-modules && . ./env.sh && fw/build.sh esp32c6    # also esp32, esp3
 
 Stage2 and the loader are built in the esp-xip-modules (`boot/`) and esp-wifi-loader repositories.
 
-Current development and provisioning use the direct USB/esptool implementation
-inside `flash-device.py`. Its target defaults to `main`:
-
-```sh
-scripts/flash-device.py <board>
-scripts/flash-device.py <board> main
-scripts/flash-device.py <board> module --module lora
-scripts/flash-device.py <board> stage
-scripts/flash-device.py <board> recovery  # emergency rollback only
-```
-
-Legacy UART byte forwarding is retired. USB provisioning opens only the requested physical port for esptool's
-verified write; it neither starts nor restores a service-owned serial forward. Main is installed over Wi-Fi by the
-esp-wifi-loader flow (Android flasher; `docs/flashing.md`); USB is used to put Stage2 and the loader on a board and to
-clear a pinned Main key (`esptool erase-region 0xee000 0x2000`). `flash-device.py` is for boards still on the older
-Recovery layout.
+Flashing is done from the esp-xip-modules repository (`esptool`, or `scripts/flash-via-loader.sh` for Wi-Fi). DMesh's old USB/esptool provisioning
+script `flash-device.py` and the QUIC flashing code retired on 2026-10-10 are kept as a reference in that project's notes (`reference/dmesh-flash`).
 
 Raw UDP6 and raw ESP-NOW/action are current QUIC-lite bearers shared by Main
 and Recovery. They use `dmesh-fw-transport` hardware glue and portable framing
@@ -254,9 +240,7 @@ for exact C6 commands, rates, sizes, and known limitations.
 
 All routine commands, logs, and object transfers use `dmesh-server` services
 on QUIC-lite streams over an available L2 bearer. UART is one such L2 bearer;
-it has no special command or logging role. Routine flashing uses
-`scripts/flash-device.py`.
-`--check <board>` probes only the selected direct USB port and reports its
+it has no special command or logging role. `--check <board>` probes only the selected direct USB port and reports its
 chip. It does not contact a mesh service or open a runtime transport.
 
 The persistent UDP object bearer is owned by the mesh-init-supervised

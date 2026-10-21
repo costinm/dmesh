@@ -236,7 +236,6 @@ musl() {
     # ships a host CLI (android-control-cli) used to drive ADB pairing/connect.
     "$DMESH_CARGO_BIN" build --release --target x86_64-unknown-linux-musl \
         -p lmesh \
-        -p dmesh-cli \
         -p mesh-tun \
         -p dmeshtui \
         -p android-control
@@ -300,23 +299,11 @@ lmesh_test() {
     check_lmesh_api
 }
 
-# lmesh uses uart-codec for explicitly paired companion ports. Keep the
-# retired forwarding daemon and CLI from becoming service dependencies.
-check_host_uart_ownership() {
-    for package in lmesh lmesh-wifi; do
-        if "$DMESH_CARGO_BIN" tree -p "$package" -e normal | grep -Eq '(^| )((dmesh-cli|lmesh-uart) v)'; then
-            echo "$package must not link dmesh-cli or the retired lmesh-uart daemon" >&2
-            return 1
-        fi
-    done
-}
-
 lmesh_control_test() {
     require_dmesh_cargo
     configure_ssh_mesh_override
     "$DMESH_CARGO_BIN" test -p lmesh --bin lmesh
     "$DMESH_CARGO_BIN" test -p lmesh-wifi json_rpc_gateway_flattens_params_for_existing_handlers --lib
-    check_host_uart_ownership
     check_lmesh_api
 }
 

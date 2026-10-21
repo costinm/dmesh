@@ -1,7 +1,7 @@
 //! REST-style requests in the tagged-CBOR envelope: component 2002 (`mesh::http_ids`), the verb as
 //! the method, the path as `params`, the headers as `fields`, the body as the stream body.
 //!
-//! This is the generic form `POST /flash` uses; the wire rules are in ssh-mesh
+//! This is the generic form a REST resource such as `POST /objects` uses; the wire rules are in ssh-mesh
 //! `mesh-api/PROTOCOLS.md` ("HTTP component"). There is no router layer: the registry dispatches on
 //! the list `[component, method, path...]` and the longest registered prefix wins (see
 //! `Registry::register_stream_at`).
@@ -78,7 +78,7 @@ pub fn for_each_header<'a>(
 }
 
 /// One element of a dispatch key: a number or a text string. The registry key is the list
-/// `[component, method, path...]`: for `POST /flash` that is `[http, post, FLASH]`, for a static
+/// `[component, method, path...]`: for `POST /objects` that is `[http, post, "objects"]`, for a static
 /// file server `[http, get, "service.namespace.example.com", "path1"]` registered as a prefix.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Seg {

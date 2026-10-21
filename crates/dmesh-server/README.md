@@ -283,9 +283,8 @@ next-hop description is resolved locally.
 
 ## Object transfer and flash
 
-Removed on 2026-10-10 (`object.flash`, `POST /flash`, `ObjectServer`). Firmware images are installed with the
-signed protocol of the esp-wifi-loader repository; see `docs/flashing.md` and that repository's
-`docs/dmesh-flash-lessons.md`.
+There is no flashing service in DMesh. Modules and firmware images are installed over Wi-Fi by `mod_flash`
+(esp-xip-modules), which is the canonical flashing path.
 
 ## Radio laboratory handlers
 

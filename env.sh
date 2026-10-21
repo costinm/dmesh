@@ -48,7 +48,7 @@ export DMESH_ANDROID_SDK="${DMESH_ANDROID_SDK:-${ANDROID_HOME}}"
 
 # Use the same per-service tools.json discovery layout as mesh-cli. An
 # explicitly set MESH_TOOLS remains an override for one catalog.
-export MESH_SCHEMA_DIR="${MESH_SCHEMA_DIR:-${DMESH_REPO}/crates/dmesh-cli/schemas}"
+# MESH_SCHEMA_DIR: dmesh-cli (and its schemas/) moved to esp-xip-modules (crates/dmesh-cli) on 2026-10-20; set it there or explicitly.
 # Service names such as `lmesh` resolve through mesh-init definitions. This is
 # runtime discovery, not a build input; deployments can supply another catalog.
 export MESH_SERVICE_DIR="${MESH_SERVICE_DIR:-/home/system/etc/mesh-init}"

@@ -1583,28 +1583,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dmesh-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "dmesh-rawnan",
- "dmesh-server",
- "glob",
- "libc",
- "mesh",
- "minicbor",
- "quic-lite",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tempfile",
- "tokio",
- "toml",
- "tracing",
- "uart-codec",
-]
-
-[[package]]
 name = "dmesh-discovery"
 version = "0.1.0"
 dependencies = [

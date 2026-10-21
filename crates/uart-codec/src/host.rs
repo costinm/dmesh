@@ -1118,9 +1118,9 @@ mod tests {
         assert!(super::render_sideband_record(&[0xa1, 1]).starts_with("cbor_invalid hex="));
     }
     #[test]
-    fn long_flash_console_line_survives_fragmented_reads() {
+    fn long_console_line_survives_fragmented_reads() {
         let expected = format!(
-            "event=object_flash.quic_progress {} quic_submission_failures=17",
+            "event=quic.progress {} quic_submission_failures=17",
             "counter=1234567890 ".repeat(90)
         );
         let wire = format!("{expected}\r\n");

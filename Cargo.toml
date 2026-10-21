@@ -2,7 +2,6 @@
 members = [
     "crates/dmesh-android",
     "crates/dmesh-store",
-    "crates/dmesh-cli",
     "crates/dmesh-server",
     "crates/dmesh-discovery",
     "crates/quic-lite",

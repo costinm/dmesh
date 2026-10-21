@@ -1386,10 +1386,9 @@ are described by the method purpose above.
 
 ### Firmware images (not a tagged method)
 
-`object.flash` (`POST /flash`) and Recovery2's DMR2 updater were removed on 2026-10-10. Images are installed
-with the signed protocol of the esp-wifi-loader repository (`docs/protocol.md` there): TCP port 5227 on the
-loader, and on Main through the `esp-wifi-loader` crate (`fw/main/src/loader_flash.rs`). `boot.recovery`
-remains the request to restart Main into the loader.
+DMesh has no flashing method. Modules and images are installed over Wi-Fi by `mod_flash` (esp-xip-modules, the
+canonical path); the loader project's protocol remains the fallback and the way to put the first image on a board.
+`boot.recovery` remains the request to restart Main into the loader.
 
 ### `ble.scan` request fields
 
