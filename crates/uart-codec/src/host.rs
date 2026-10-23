@@ -271,7 +271,14 @@ impl UartPort {
         Ok(port)
     }
 
-    fn negotiate_baud_blocking(&mut self, baud: u32) -> io::Result<()> {
+    /// Exchange the shared UART rate-control record before creating a bearer.
+    /// Sends at the current rate, waits for a matching ACK, then changes local
+    /// line coding. C firmware drains that ACK before changing its own rate.
+    /// Call while the port is quiescent: this consumes incoming records during
+    /// negotiation. It is volatile and does not write the device's boot setting.
+    /// On timeout the peer may already have switched; reset/reopen at a known
+    /// rate before retrying. This is for a real UART, not native USB-JTAG.
+    pub fn negotiate_baud_blocking(&mut self, baud: u32) -> io::Result<()> {
         let request = crate::BaudHandshake { acknowledged: false, baud }.record()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "unsupported negotiation baud"))?;
         let wire = crate::codec::encode_payload(&request, request.len())
@@ -1207,6 +1214,8 @@ mod tests {
                     assert_eq!(unsafe { libc::cfgetispeed(&termios) }, libc::B115200);
                     request.acknowledged = true;
                     let record = request.record().unwrap();
+                    let wrong = crate::BaudHandshake { acknowledged: true, baud: 460800 }.record().unwrap();
+                    master.write_all(&crate::codec::encode_payload(&wrong, 6).unwrap()).unwrap();
                     master.write_all(&crate::codec::encode_payload(&record, 6).unwrap()).unwrap();
                     return (master, slave);
                 }

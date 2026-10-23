@@ -32,7 +32,7 @@ pub struct BaudHandshake {
 
 impl BaudHandshake {
     pub fn record(self) -> Option<[u8; 6]> {
-        if !matches!(self.baud, 115200 | 460800 | 921600) {
+        if !matches!(self.baud, 115200 | 230400 | 460800 | 921600) {
             return None;
         }
         let baud = self.baud.to_be_bytes();
@@ -130,7 +130,7 @@ mod datagram_tests {
 
     #[test]
     fn baud_handshake_is_framed_sideband_not_quic() {
-        for baud in [115200, 460800, 921600] {
+        for baud in [115200, 230400, 460800, 921600] {
             for acknowledged in [false, true] {
                 let handshake = BaudHandshake { acknowledged, baud };
                 let record = handshake.record().unwrap();

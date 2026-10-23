@@ -40,7 +40,11 @@ Another reason is that ESP32 allow long-range - using a custom more redundant bu
 speed modulation.
 
 The 'extension' is that we don't follow the IE encoding - but append the payload immediately
-after the required ESP-NOW header, more efficient and a bit higher MTU.
+after the required ESP-NOW header, more efficient and a bit higher MTU. The first
+vendor IE contains metadata/padding only (one pad byte by default); receivers skip
+the whole IE and deliver every following byte as the datagram. The 16-byte action
+prefix permits aligned in-place ESP TX with the usual 144-byte payload offset.
+This replaces the older multi-IE/first-payload-in-IE encoding; peers must be rebuilt together.
 
 ## P2P - Wifi Direct
 

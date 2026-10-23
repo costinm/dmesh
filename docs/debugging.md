@@ -114,7 +114,7 @@ For a single UDP bearer on x86_64 Linux, optionally set
 It records kernel receive timestamps without raw-capture privileges. Keep one
 process/socket per file; don't enable other socket timestamp options. Compare
 the two captures with the timing helper described in the
-[performance note](../notes/ai/2026-10-06-wifi-throughput-investigation.md).
+[performance note](/ws/notes/esp-modules/from-dmesh/ai/2026-10-06-wifi-throughput-investigation.md).
 This is diagnostic capture, not a change to QUIC's receive clock.
 
 ```sh
@@ -227,7 +227,7 @@ Compare direct USB termination with USB → companion → STA → host using the
 selected E2E pair, identical host limits/pool and repeated runs. Exclude setup.
 Keep failed runs; a timeout has no valid completed-transfer throughput.
 Harness details and measurements are in the
-[performance note](../notes/ai/2026-10-06-dynamic-pool-usb-performance.md).
+[performance note](/ws/notes/esp-modules/from-dmesh/ai/2026-10-06-dynamic-pool-usb-performance.md).
 
 Check packet timing, retransmitted wire bytes, pool drops and CPU/task waits.
 For a host-only control, run the normal probe over in-memory and UDP loopback

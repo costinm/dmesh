@@ -43,3 +43,18 @@ if the destination is local). NHC for UDP - result is 6 bytes in ideal case.
 
 Unframed boot text is surfaced as a log record for the service layer to encode
 as the one-way `log.record` message in the [root API](../../API.md).
+
+## Physical UART rate exchange
+
+Before moving an owned `UartPort` into its asynchronous bearer, lmesh or another
+client can call `port.negotiate_baud_blocking(baud)` from a blocking thread.
+Supported rates are 115200, 230400, 460800 and 921600. The library waits for the device acknowledgement at the current rate before
+changing local line coding. No QUIC session is required, and
+neither side persists this volatile exchange. Configure `uart.baud` separately
+through the console's NV method for a reboot default.
+
+Negotiate before bearer traffic: records arriving during the exchange are
+consumed. A timeout leaves the peer's rate uncertain; reset/reopen at a known
+rate before retrying. Native USB-Serial/JTAG has no physical baud and does not
+use this exchange. `UART_CODEC_NEGOTIATE_BAUD` remains an optional open-time
+wrapper around this same shared method; it is not a dmesh-cli protocol.
