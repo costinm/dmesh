@@ -27,6 +27,7 @@ mod crypto;
 mod mux;
 mod node;
 pub mod nostd;
+pub mod wire;
 mod peer_table;
 
 #[cfg(feature = "tokio")]
