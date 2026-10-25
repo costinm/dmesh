@@ -6361,7 +6361,7 @@ impl<const P: usize> EndpointState<P> {
         let Some(code) = self.close_code else {
             return Ok(None);
         };
-        let dcid = self.peer_cid.ok_or(Error::WrongConnectionId)?;
+        let dcid = self.peer_connection_id_on_path(0).ok_or(Error::WrongConnectionId)?;
         let mut used = ShortHeader {
             flags: FLAG_FIXED,
             dcid,
@@ -14659,6 +14659,15 @@ mod tests {
             .unwrap();
         assert!(used > 0);
         assert_ne!(replacement, packet_number);
+    }
+
+    #[test]
+    fn connection_close_uses_the_path_zero_relay_alias() {
+        let local=ConnectionId::new(71).unwrap();let peer=ConnectionId::new(72).unwrap();let alias=ConnectionId::new(73).unwrap();
+        let mut sender=EndpointState::<128>::new(Role::Client,ConnectionLimits::default(),1200);
+        sender.install_connection_ids(local,peer).unwrap();sender.set_peer_connection_id_on_path(0,alias).unwrap();sender.close(0);
+        let mut packet=[0;128];let n=sender.poll_close(&mut packet).unwrap().unwrap();
+        assert_eq!(ShortHeader::decode(&packet[..n]).unwrap().0.dcid,alias,"CLOSE must traverse the same relay route as stream packets");
     }
 
     #[test]
