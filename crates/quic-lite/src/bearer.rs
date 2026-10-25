@@ -383,6 +383,30 @@ pub(crate) trait PacketIngressQueue<B>: Send + Sync {
     fn enqueue_packet(&self, meta: PacketMeta, packet: OwnedPacket<B>);
 }
 
+// The no-executor queue is concrete so constructing an embedded bearer does
+// not emit an absolute-address trait vtable into a PIC read-only image.
+// Existing executor/custom queues retain their dynamic implementation.
+pub(crate) enum PacketIngressHandle<B> {
+    Queued(Arc<crate::nostd::IngressQueue<B>>),
+    Dynamic(Arc<dyn PacketIngressQueue<B>>),
+}
+impl<B> Clone for PacketIngressHandle<B> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Queued(q) => Self::Queued(q.clone()),
+            Self::Dynamic(q) => Self::Dynamic(q.clone()),
+        }
+    }
+}
+impl<B: AsRef<[u8]>> PacketIngressHandle<B> {
+    fn enqueue_packet(&self, meta: PacketMeta, packet: OwnedPacket<B>) {
+        match self {
+            Self::Queued(q) => q.enqueue_owned(meta, packet),
+            Self::Dynamic(q) => q.enqueue_packet(meta, packet),
+        }
+    }
+}
+
 /// Resources assigned by a [`QuicNode`](crate::QuicNode) to one bearer.
 ///
 /// The bearer uses the node-owned pool for receive storage and transfers every
@@ -391,8 +415,8 @@ pub(crate) trait PacketIngressQueue<B>: Send + Sync {
 pub struct BearerContext<P: PacketPool + 'static> {
     bearer: BearerId,
     pool: &'static P,
-    ingress: Arc<dyn PacketIngressQueue<P::Buffer>>,
-    events: Arc<dyn PacketEgressEvents<P::Buffer>>,
+    ingress: PacketIngressHandle<P::Buffer>,
+    events: Arc<CompletionQueue<P::Buffer>>,
 }
 
 impl<P: PacketPool + 'static> Clone for BearerContext<P> {
@@ -410,8 +434,8 @@ impl<P: PacketPool + 'static> BearerContext<P> {
     pub(crate) fn new(
         bearer: BearerId,
         pool: &'static P,
-        ingress: Arc<dyn PacketIngressQueue<P::Buffer>>,
-        events: Arc<dyn PacketEgressEvents<P::Buffer>>,
+        ingress: PacketIngressHandle<P::Buffer>,
+        events: Arc<CompletionQueue<P::Buffer>>,
     ) -> Self {
         Self {
             bearer,
@@ -453,18 +477,6 @@ impl<P: PacketPool + 'static> PacketIngress<P::Buffer> for BearerContext<P> {
     }
 }
 
-/// Completion callback from a registered sender to QUIC.
-pub(crate) trait PacketEgressEvents<B>: Send + Sync {
-    /// Return an accepted packet lease and report physical send completion.
-    ///
-    /// Implementations normally enqueue this event for the QUIC owner. They
-    /// must not call a mutably borrowed registry reentrantly from `submit`.
-    fn send_completed(&self, completion: PacketSendCompletion<B>);
-
-    /// Report capacity after a zero-byte `WouldBlock` result.
-    fn send_ready(&self, bearer: BearerId);
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Terminal physical-send result paired with a returned packet lease.
 ///
@@ -496,7 +508,7 @@ pub(crate) struct PacketSendCompletion<B> {
 /// lease. Its private fields prevent callers from fabricating completions.
 pub struct PacketCompletionToken<B> {
     bearer: BearerId,
-    events: Arc<dyn PacketEgressEvents<B>>,
+    events: Arc<CompletionQueue<B>>,
     acceptance: Option<PacketAcceptance>,
 }
 
@@ -542,7 +554,7 @@ impl<B: AsRef<[u8]>> EgressSubmission<B> {
     pub(crate) fn new(
         bearer: BearerId,
         packet: OwnedPacket<B>,
-        events: Arc<dyn PacketEgressEvents<B>>,
+        events: Arc<CompletionQueue<B>>,
     ) -> Self {
         Self {
             packet,
@@ -1015,7 +1027,7 @@ impl<B> CompletionQueue<B> {
     }
 }
 
-impl<B: Send> PacketEgressEvents<B> for CompletionQueue<B> {
+impl<B> CompletionQueue<B> {
     fn send_completed(&self, completion: PacketSendCompletion<B>) {
         assert!(
             self.completions.push(completion).is_ok(),
@@ -1120,13 +1132,65 @@ pub(crate) struct PacketAcceptance {
     pub packet_number: u32,
 }
 
+// Like ErasedPacketBuffer, the owning callbacks are built at runtime, rather
+// than referenced through an absolute-address compiler trait vtable in flash.
+struct OwnedPacketEgress<B: AsRef<[u8]>> {
+    owner: *mut (),
+    submit:
+        unsafe fn(*mut (), PeerL2Address, EgressSubmission<B>) -> Result<(), PacketSubmitError<B>>,
+    drop_owner: unsafe fn(*mut ()),
+}
+impl<B: AsRef<[u8]>> OwnedPacketEgress<B> {
+    fn new<T: PacketEgress<B> + 'static>(owner: T) -> Self {
+        unsafe fn submit<B: AsRef<[u8]>, T: PacketEgress<B>>(
+            p: *mut (),
+            peer: PeerL2Address,
+            packet: EgressSubmission<B>,
+        ) -> Result<(), PacketSubmitError<B>> {
+            // SAFETY: new stores a Box<T>; this specialized thunk is called
+            // only under the owner's exclusive mutable borrow.
+            unsafe { (&mut *p.cast::<T>()).submit(peer, packet) }
+        }
+        unsafe fn drop_owner<T>(p: *mut ()) {
+            // SAFETY: p came from Box::into_raw for this exact T and is
+            // reconstructed once, exclusively by OwnedPacketEgress::drop.
+            unsafe {
+                drop(Box::from_raw(p.cast::<T>()));
+            }
+        }
+        Self {
+            owner: Box::into_raw(Box::new(owner)).cast(),
+            submit: submit::<B, T>,
+            drop_owner: drop_owner::<T>,
+        }
+    }
+    fn submit(
+        &mut self,
+        peer: PeerL2Address,
+        packet: EgressSubmission<B>,
+    ) -> Result<(), PacketSubmitError<B>> {
+        // SAFETY: owner is exactly one Box<T> from new; callbacks are specialized
+        // for that same T, and the mutable borrow serializes access until drop.
+        unsafe { (self.submit)(self.owner, peer, packet) }
+    }
+}
+impl<B: AsRef<[u8]>> Drop for OwnedPacketEgress<B> {
+    fn drop(&mut self) {
+        // SAFETY: the stored thunk matches the unique Box<T> created in new;
+        // no submission can overlap this final owner destruction.
+        unsafe {
+            (self.drop_owner)(self.owner);
+        }
+    }
+}
+
 pub(crate) struct RegisteredBearer<B: AsRef<[u8]>> {
     id: BearerId,
     info: BearerInfo,
     state: BearerState,
     stats: BearerStats,
-    egress: Box<dyn PacketEgress<B>>,
-    events: Arc<dyn PacketEgressEvents<B>>,
+    egress: OwnedPacketEgress<B>,
+    events: Arc<CompletionQueue<B>>,
     pending: Option<(PeerL2Address, EgressSubmission<B>, Option<PacketAcceptance>)>,
 }
 
@@ -1406,7 +1470,7 @@ impl<B: AsRef<[u8]>, const BEARERS: usize> BearerRegistry<B, BEARERS> {
         id: BearerId,
         info: BearerInfo,
         egress: T,
-        events: Arc<dyn PacketEgressEvents<B>>,
+        events: Arc<CompletionQueue<B>>,
     ) -> Result<BearerId, BearerRegistryError>
     where
         T: PacketEgress<B> + 'static,
@@ -1427,7 +1491,7 @@ impl<B: AsRef<[u8]>, const BEARERS: usize> BearerRegistry<B, BEARERS> {
             info,
             state: BearerState::new(),
             stats: BearerStats::default(),
-            egress: Box::new(egress),
+            egress: OwnedPacketEgress::new(egress),
             events,
             pending: None,
         });
@@ -1888,5 +1952,44 @@ mod tests {
         sender.enqueue_packet(meta, OwnedPacket::from_buffer([1, 2]));
         sender.enqueue_packet(meta, OwnedPacket::from_buffer([3, 4]));
         assert_eq!(receiver.try_receive().unwrap().packet.bytes(), &[1, 2]);
+    }
+}
+
+#[cfg(test)]
+mod owned_egress_tests {
+    use super::*;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    struct Refusing(Arc<AtomicUsize>);
+    impl Drop for Refusing {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl PacketEgress<[u8; 3]> for Refusing {
+        fn submit(
+            &mut self,
+            _: PeerL2Address,
+            packet: EgressSubmission<[u8; 3]>,
+        ) -> Result<(), PacketSubmitError<[u8; 3]>> {
+            Err(PacketSubmitError::WouldBlock(packet))
+        }
+    }
+    #[test]
+    fn owning_callback_keeps_refused_submission_and_drops_exact_owner_once() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let events = Arc::new(CompletionQueue::new(1));
+        let packet = OwnedPacket::new([1, 2, 3], 0..3).unwrap();
+        let mut owner = OwnedPacketEgress::new(Refusing(drops.clone()));
+        let submission = EgressSubmission::new(BearerId::new(1).unwrap(), packet, events);
+        let packet = match owner.submit(PeerL2Address::new(1).unwrap(), submission) {
+            Err(PacketSubmitError::WouldBlock(packet)) => packet,
+            _ => panic!("expected unchanged refused submission"),
+        };
+        assert_eq!(packet.packet().bytes(), &[1, 2, 3]);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(owner);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        drop(packet);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 }

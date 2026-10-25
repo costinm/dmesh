@@ -386,6 +386,8 @@ pub enum Error {
     DatagramUnsupported,
     /// A DATAGRAM exceeds the peer frame-size limit or the selected path MTU.
     DatagramTooLarge,
+    /// Heap storage for connection state could not be allocated.
+    OutOfMemory,
 }
 
 /// Embedded callers use this enum directly. Host association managers can
@@ -4824,6 +4826,10 @@ impl<const P: usize> EndpointState<P> {
             core::ptr::addr_of_mut!((*out).receive_packet_floor).write(0);
             core::ptr::addr_of_mut!((*out).peer_ack_ranges).write(AckRangeSet::new());
             core::ptr::addr_of_mut!((*out).next_packet_number).write(0);
+            core::ptr::addr_of_mut!((*out).duplication_budget_capacity).write(0);
+            core::ptr::addr_of_mut!((*out).duplication_credit_bytes).write(0);
+            core::ptr::addr_of_mut!((*out).duplication_credit_remainder).write(0);
+            core::ptr::addr_of_mut!((*out).duplication_reserved_bytes).write(0);
             core::ptr::addr_of_mut!((*out).path_estimator_config)
                 .write(crate::PathEstimatorConfig::default_config());
             core::ptr::addr_of_mut!((*out).pacing_config).write(crate::PacingConfig::default());
@@ -17730,5 +17736,33 @@ mod stream_retirement_regressions {
                 .any(|frame| matches!(frame, Frame::MaxStreamsBidi(_))),
             "the raised MAX_STREAMS limit must still be published"
         );
+    }
+}
+
+#[cfg(test)]
+mod in_place_state_tests {
+    use super::*;
+    #[test]
+    fn poisoned_endpoint_storage_initializes_all_duplication_state() {
+        let mut storage = core::mem::MaybeUninit::<EndpointState<128>>::uninit();
+        unsafe {
+            core::ptr::write_bytes(
+                storage.as_mut_ptr().cast::<u8>(),
+                0xa5,
+                core::mem::size_of::<EndpointState<128>>(),
+            );
+            EndpointState::init_in_place(
+                storage.as_mut_ptr(),
+                Role::Server,
+                ConnectionLimits::default(),
+                128,
+                2,
+            );
+        }
+        let endpoint = unsafe { storage.assume_init() };
+        assert_eq!(endpoint.duplication_budget_capacity, 0);
+        assert_eq!(endpoint.duplication_credit_bytes, 0);
+        assert_eq!(endpoint.duplication_credit_remainder, 0);
+        assert_eq!(endpoint.duplication_reserved_bytes, 0);
     }
 }

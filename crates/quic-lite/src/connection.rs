@@ -13,6 +13,22 @@
 
 use crate::bearer::PacketMeta;
 
+/// Allocate final storage before initializing a large association value.
+fn try_box_uninit<T>() -> Result<alloc::boxed::Box<core::mem::MaybeUninit<T>>, crate::Error> {
+    let layout = core::alloc::Layout::new::<T>();
+    if layout.size() == 0 {
+        return Ok(alloc::boxed::Box::new(core::mem::MaybeUninit::uninit()));
+    }
+    // SAFETY: layout is nonzero and valid for T; null is handled before use.
+    let raw = unsafe { alloc::alloc::alloc(layout) };
+    if raw.is_null() {
+        return Err(crate::Error::OutOfMemory);
+    }
+    // SAFETY: this allocation has the size/alignment of MaybeUninit<T> and
+    // transfers to exactly one Box. Dropping uninitialized storage is safe.
+    Ok(unsafe { alloc::boxed::Box::from_raw(raw.cast()) })
+}
+
 /// Persistent server-side QUIC stream state, independent of application
 /// registries, events, sockets, and bearer addresses.
 pub(crate) struct ServerStreamConnection<const PACKET: usize = { crate::DEFAULT_MAX_PACKET_SIZE }> {
@@ -104,42 +120,6 @@ impl<const PACKET: usize> ServerStreamConnection<PACKET> {
             .set_delivery_limits(limits.max_pending_streams, limits.max_buffered_stream_bytes);
         Ok(())
     }
-    fn accept_open_state(
-        packet: &[u8],
-        server_cid: crate::ConnectionId,
-        local_limits: crate::ConnectionLimits,
-        config: ServerStreamConfig,
-        stateless_reset_token: Option<crate::StatelessResetToken>,
-    ) -> Result<Self, crate::Error> {
-        let history_packets = config.history_packets.max(1);
-        let (bootstrap_header, open) = crate::decode_bootstrap_open_packet_with_limits(packet)?;
-        let local_limits = local_limits.clamped_to_request(open.requested_peer_limits);
-        let mut mux = crate::mux::StreamMux::new_with_history_capacity(
-            crate::Role::Server,
-            local_limits,
-            PACKET as u64,
-            1,
-            config.max_pending_streams,
-            crate::callback::retention_for_receive_window(local_limits, config.max_stream_bytes),
-            history_packets,
-        );
-        mux.endpoint
-            .set_transmission_capacity(if config.transmission_records == 0 {
-                history_packets.saturating_mul(2)
-            } else {
-                config.transmission_records
-            })?;
-        Self::finish_open(&mut mux, bootstrap_header.packet_number, open, server_cid)?;
-        Ok(Self {
-            mux,
-            local_limits,
-            local_max_in_flight_packets: 0,
-            peer_open: open,
-            stateless_reset_token,
-            next_response_stream: crate::FIRST_SERVER_BIDI_STREAM_ID,
-        })
-    }
-
     pub(crate) fn accept_open_with_limits_and_reset_token_into(
         packet: &[u8],
         server_cid: crate::ConnectionId,
@@ -157,6 +137,71 @@ impl<const PACKET: usize> ServerStreamConnection<PACKET> {
         )
     }
 
+    /// Initialize admitted server state in its final owned allocation. The
+    /// value-returning compatibility constructor otherwise makes several full
+    /// endpoint copies live across a nested embedded receive call.
+    pub(crate) fn accept_open_boxed_with_config_into(
+        packet: &[u8],
+        server_cid: crate::ConnectionId,
+        local_limits: crate::ConnectionLimits,
+        config: ServerStreamConfig,
+        stateless_reset_token: Option<crate::StatelessResetToken>,
+        output: &mut [u8; PACKET],
+    ) -> Result<(alloc::boxed::Box<Self>, usize), crate::Error> {
+        let (bootstrap_header, open) = crate::decode_bootstrap_open_packet_with_limits(packet)?;
+        let local_limits = local_limits.clamped_to_request(open.requested_peer_limits);
+        let history_packets = config.history_packets.max(1);
+        let mut allocation = try_box_uninit::<Self>()?;
+        let out = allocation.as_mut_ptr();
+        // SAFETY: this one-element allocation is aligned for Self. Every field
+        // is initialized exactly once before Box<Self> or a reference exists.
+        unsafe {
+            crate::mux::StreamMux::init_in_place(
+                core::ptr::addr_of_mut!((*out).mux),
+                crate::Role::Server,
+                local_limits,
+                PACKET as u64,
+                config.max_pending_streams,
+                crate::callback::retention_for_receive_window(
+                    local_limits,
+                    config.max_stream_bytes,
+                ),
+                history_packets,
+            );
+            core::ptr::addr_of_mut!((*out).local_limits).write(local_limits);
+            core::ptr::addr_of_mut!((*out).local_max_in_flight_packets).write(0);
+            core::ptr::addr_of_mut!((*out).peer_open).write(open);
+            core::ptr::addr_of_mut!((*out).stateless_reset_token).write(stateless_reset_token);
+            core::ptr::addr_of_mut!((*out).next_response_stream)
+                .write(crate::FIRST_SERVER_BIDI_STREAM_ID);
+        }
+        // SAFETY: every Self field was initialized above, including the mux.
+        let mut server = unsafe { allocation.assume_init() };
+        server
+            .mux
+            .endpoint
+            .set_transmission_capacity(if config.transmission_records == 0 {
+                history_packets.saturating_mul(2)
+            } else {
+                config.transmission_records
+            })?;
+        Self::finish_open(
+            &mut server.mux,
+            bootstrap_header.packet_number,
+            open,
+            server_cid,
+        )?;
+        let used = Self::encode_open_ack_into(
+            open.client_receive_cid,
+            server_cid,
+            local_limits,
+            0,
+            stateless_reset_token,
+            output,
+        )?;
+        Ok((server, used))
+    }
+
     pub(crate) fn accept_open_with_config_into(
         packet: &[u8],
         server_cid: crate::ConnectionId,
@@ -165,22 +210,17 @@ impl<const PACKET: usize> ServerStreamConnection<PACKET> {
         stateless_reset_token: Option<crate::StatelessResetToken>,
         output: &mut [u8; PACKET],
     ) -> Result<(Self, usize), crate::Error> {
-        let server = Self::accept_open_state(
+        // Compatibility value API: all admission policy lives in the boxed
+        // constructor. Stack-sensitive owners keep its Box instead.
+        let (server, used) = Self::accept_open_boxed_with_config_into(
             packet,
             server_cid,
             local_limits,
             config,
             stateless_reset_token,
-        )?;
-        let used = Self::encode_open_ack_into(
-            server.peer_open.client_receive_cid,
-            server_cid,
-            server.local_limits,
-            server.local_max_in_flight_packets,
-            server.stateless_reset_token,
             output,
         )?;
-        Ok((server, used))
+        Ok((*server, used))
     }
 
     fn finish_open(
@@ -587,6 +627,34 @@ pub(crate) struct ClientConnection<const PACKET: usize> {
 }
 
 impl<const PACKET: usize> ClientConnection<PACKET> {
+    /// All fields must be initialized before the caller creates a reference.
+    unsafe fn init_in_place(
+        out: *mut Self,
+        local_cid: crate::ConnectionId,
+        local_limits: crate::ConnectionLimits,
+        history_packets: usize,
+        transmission_records: usize,
+    ) {
+        // SAFETY: caller supplies aligned, unique, uninitialized Self storage.
+        unsafe {
+            core::ptr::addr_of_mut!((*out).local_cid).write(local_cid);
+            core::ptr::addr_of_mut!((*out).local_limits).write(local_limits);
+            core::ptr::addr_of_mut!((*out).requested_peer_limits).write(None);
+            core::ptr::addr_of_mut!((*out).peer_cid).write(None);
+            core::ptr::addr_of_mut!((*out).peer_reset_token).write(None);
+            core::ptr::addr_of_mut!((*out).local_reset_token).write(None);
+            core::ptr::addr_of_mut!((*out).endpoint).write(None);
+            core::ptr::addr_of_mut!((*out).started).write(false);
+            core::ptr::addr_of_mut!((*out).open_packet_number).write(0);
+            core::ptr::addr_of_mut!((*out).history_packets).write(history_packets);
+            core::ptr::addr_of_mut!((*out).transmission_records).write(transmission_records);
+            core::ptr::addr_of_mut!((*out).duplication_budget_capacity).write(0);
+            core::ptr::addr_of_mut!((*out).path_estimator_config)
+                .write(crate::PathEstimatorConfig::default_config());
+            core::ptr::addr_of_mut!((*out).pacing_config).write(crate::PacingConfig::host());
+        }
+    }
+
     pub(crate) fn new(local_cid: crate::ConnectionId) -> Self {
         Self::with_limits(local_cid, crate::ConnectionLimits::default())
     }
@@ -995,6 +1063,30 @@ impl<const PACKET: usize> ClientAssociation<PACKET> {
         endpoint.set_duplication_budget_capacity(limits.duplication_budget_bytes as u64);
         Ok(())
     }
+    pub(crate) fn boxed_with_runtime_limits(
+        local_cid: crate::ConnectionId,
+        local_limits: crate::ConnectionLimits,
+        history_packets: usize,
+        transmission_records: usize,
+    ) -> Result<alloc::boxed::Box<Self>, crate::Error> {
+        let mut storage = try_box_uninit::<Self>()?;
+        let out = storage.as_mut_ptr();
+        // SAFETY: final aligned storage is uniquely owned. Initialize each
+        // connection field and stream cursor before constructing Box<Self>.
+        unsafe {
+            ClientConnection::init_in_place(
+                core::ptr::addr_of_mut!((*out).connection),
+                local_cid,
+                local_limits,
+                history_packets,
+                transmission_records,
+            );
+            core::ptr::addr_of_mut!((*out).next_client_bidi_stream_id)
+                .write(crate::FIRST_CLIENT_BIDI_STREAM_ID);
+            Ok(storage.assume_init())
+        }
+    }
+
     pub(crate) fn new(local_cid: crate::ConnectionId) -> Self {
         Self::with_limits(local_cid, crate::ConnectionLimits::default())
     }
@@ -1372,6 +1464,127 @@ impl<const PACKET: usize> ClientAssociation<PACKET> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boxed_and_value_acceptance_share_policy_state_and_wire_output() {
+        const PACKET: usize = 256;
+        let client = crate::ConnectionId::new(0x31).unwrap();
+        let server_cid = crate::ConnectionId::new(0x47).unwrap();
+        let mut input = [0; PACKET];
+        let n = crate::encode_bootstrap_open_packet(client, 7, &mut input).unwrap();
+        for (history_packets, transmission_records) in [(0, 0), (2, 0), (3, 7)] {
+            let config = ServerStreamConfig {
+                history_packets,
+                transmission_records,
+                max_pending_streams: 2,
+                max_stream_bytes: 2048,
+            };
+            let limits = crate::ConnectionLimits::with_receive_profile(4096, 2048, 2);
+            let mut value_wire = [0; PACKET];
+            let mut boxed_wire = [0; PACKET];
+            let (value, value_len) = ServerStreamConnection::accept_open_with_config_into(
+                &input[..n],
+                server_cid,
+                limits,
+                config,
+                None,
+                &mut value_wire,
+            )
+            .unwrap();
+            let (boxed, boxed_len) = ServerStreamConnection::accept_open_boxed_with_config_into(
+                &input[..n],
+                server_cid,
+                limits,
+                config,
+                None,
+                &mut boxed_wire,
+            )
+            .unwrap();
+            assert_eq!(&value_wire[..value_len], &boxed_wire[..boxed_len]);
+            assert_eq!(value.local_limits, boxed.local_limits);
+            assert_eq!(
+                value.local_max_in_flight_packets,
+                boxed.local_max_in_flight_packets
+            );
+            assert_eq!(value.peer_open, boxed.peer_open);
+            assert_eq!(value.next_response_stream, boxed.next_response_stream);
+            assert_eq!(value.mux.delivery_limits(), boxed.mux.delivery_limits());
+            assert_eq!(value.mux.endpoint.history_limit, history_packets.max(1));
+            assert_eq!(
+                value.mux.endpoint.history_limit,
+                boxed.mux.endpoint.history_limit
+            );
+            let expected = if transmission_records == 0 {
+                history_packets.max(1) * 2
+            } else {
+                transmission_records
+            };
+            assert_eq!(value.mux.endpoint.transmission_limit, expected);
+            assert_eq!(
+                value.mux.endpoint.transmission_limit,
+                boxed.mux.endpoint.transmission_limit
+            );
+            assert_eq!(
+                value.mux.endpoint.next_packet_number,
+                boxed.mux.endpoint.next_packet_number
+            );
+            assert_eq!(
+                value.mux.endpoint.ack_pending,
+                boxed.mux.endpoint.ack_pending
+            );
+        }
+    }
+
+    #[test]
+    fn in_place_client_matches_value_constructor_and_initial_packet() {
+        const PACKET: usize = 256;
+        let cid = crate::ConnectionId::new(0x31).unwrap();
+        let limits = crate::ConnectionLimits::with_receive_profile(4096, 2048, 2);
+        let mut storage = core::mem::MaybeUninit::<ClientConnection<PACKET>>::uninit();
+        // SAFETY: poison raw storage, then initialize every field before reading.
+        unsafe {
+            core::ptr::write_bytes(
+                storage.as_mut_ptr().cast::<u8>(),
+                0xa5,
+                core::mem::size_of::<ClientConnection<PACKET>>(),
+            );
+            ClientConnection::init_in_place(storage.as_mut_ptr(), cid, limits, 3, 7);
+        }
+        // SAFETY: init_in_place initialized every field.
+        let initialized = unsafe { storage.assume_init() };
+        let reference = ClientConnection::<PACKET>::with_limits_and_history(cid, limits, 3, 7);
+        macro_rules! compare { ($($field:ident),*) => { $(assert_eq!(initialized.$field, reference.$field);)* }; }
+        compare!(
+            local_cid,
+            local_limits,
+            requested_peer_limits,
+            peer_cid,
+            peer_reset_token,
+            local_reset_token,
+            started,
+            open_packet_number,
+            history_packets,
+            transmission_records,
+            duplication_budget_capacity,
+            path_estimator_config,
+            pacing_config
+        );
+        assert!(initialized.endpoint.is_none());
+        drop(initialized);
+
+        let mut value = ClientAssociation::<PACKET>::with_runtime_limits(cid, limits, 3, 7);
+        let mut boxed =
+            ClientAssociation::<PACKET>::boxed_with_runtime_limits(cid, limits, 3, 7).unwrap();
+        assert_eq!(
+            value.next_client_bidi_stream_id,
+            boxed.next_client_bidi_stream_id
+        );
+        let mut value_wire = [0; PACKET];
+        let mut boxed_wire = [0; PACKET];
+        let a = value.start(&mut value_wire).unwrap();
+        let b = boxed.start(&mut boxed_wire).unwrap();
+        assert_eq!(&value_wire[..a], &boxed_wire[..b]);
+    }
 
     #[test]
     fn listener_classification_keeps_initial_and_established_distinct() {

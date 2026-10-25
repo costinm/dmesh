@@ -17,7 +17,7 @@ use crate::{
     QuicAssociation, QuicNode, QuicNodeEgressError, ReceivedStreamChunk,
 };
 
-struct IngressQueue<B> {
+pub(crate) struct IngressQueue<B> {
     packets: Mutex<VecDeque<crate::bearer::ReceivedPacket<B>>>,
     capacity: AtomicUsize,
     enqueue_drops: AtomicUsize,
@@ -66,8 +66,8 @@ impl<B> IngressQueue<B> {
     }
 }
 
-impl<B: AsRef<[u8]> + Send> crate::bearer::PacketIngressQueue<B> for IngressQueue<B> {
-    fn enqueue_packet(&self, meta: PacketMeta, packet: OwnedPacket<B>) {
+impl<B: AsRef<[u8]>> IngressQueue<B> {
+    pub(crate) fn enqueue_owned(&self, meta: PacketMeta, packet: OwnedPacket<B>) {
         // A physical receive callback can preempt the node owner while it
         // briefly holds this queue lock. Spinning in that callback would
         // deadlock a single-core target, so contention is treated like a
@@ -83,6 +83,12 @@ impl<B: AsRef<[u8]> + Send> crate::bearer::PacketIngressQueue<B> for IngressQueu
         } else {
             packets.push_back(crate::bearer::ReceivedPacket { meta, packet });
         }
+    }
+}
+
+impl<B: AsRef<[u8]> + Send> crate::bearer::PacketIngressQueue<B> for IngressQueue<B> {
+    fn enqueue_packet(&self, meta: PacketMeta, packet: OwnedPacket<B>) {
+        self.enqueue_owned(meta, packet);
     }
 }
 
@@ -218,6 +224,83 @@ mod tests {
         fn attach(&mut self, context: BearerContext<Pool>) -> Result<(), Self::AttachError> {
             *self.context.lock().unwrap() = Some(context);
             Ok(())
+        }
+    }
+
+    #[test]
+    fn queued_and_dynamic_registration_deliver_the_same_owned_packet_without_copy() {
+        type Pool = crate::packet_pool::PacketPool<2, 128>;
+        type Buffer = <Pool as PacketPool>::Buffer;
+        struct Capture(Arc<spin::Mutex<Option<BearerContext<Pool>>>>);
+        impl crate::PacketEgress<Buffer> for Capture {
+            fn submit(
+                &mut self,
+                _: crate::PeerL2Address,
+                packet: crate::EgressSubmission<Buffer>,
+            ) -> Result<(), crate::PacketSubmitError<Buffer>> {
+                Err(crate::PacketSubmitError::WouldBlock(packet))
+            }
+        }
+        impl PacketBearer<Pool> for Capture {
+            type AttachError = ();
+            fn info(&self) -> crate::BearerInfo {
+                crate::BearerInfo {
+                    name: crate::BearerName::new("capture").unwrap(),
+                    max_packet_size: 64,
+                    prefix_required: 16,
+                    suffix_required: 16,
+                    secure_link: false,
+                    requires_packet_encryption: false,
+                    nominal_bitrate_bps: 1,
+                    local_mac: None,
+                }
+            }
+            fn attach(&mut self, context: BearerContext<Pool>) -> Result<(), ()> {
+                *self.0.lock() = Some(context);
+                Ok(())
+            }
+        }
+        for dynamic in [false, true] {
+            let pool = Box::leak(Box::new(Pool::new()));
+            let mut node = QuicNode::<Pool, 64>::new(pool);
+            let queue = Arc::new(IngressQueue::new(1));
+            let captured = Arc::new(spin::Mutex::new(None));
+            let id = if dynamic {
+                node.register_bearer_with_ingress(Capture(captured.clone()), queue.clone())
+                    .unwrap()
+            } else {
+                node.register_bearer_with_queue(Capture(captured.clone()), queue.clone())
+                    .unwrap()
+            };
+            // Cloning the context also exercises the handle variant's Clone.
+            let context = captured.lock().as_ref().unwrap().clone();
+            let meta = PacketMeta {
+                bearer: id,
+                peer_l2_address: crate::PeerL2Address::new(9).unwrap(),
+                received_at_us: 123,
+            };
+            let packet = PacketPool::build_packet(pool, 16, 0, |out| {
+                out[..3].copy_from_slice(b"one");
+                Ok::<_, ()>(3)
+            })
+            .unwrap();
+            let pointer = packet.bytes().as_ptr();
+            context.enqueue_packet(meta, packet);
+            let rejected = PacketPool::build_packet(pool, 16, 0, |out| {
+                out[0] = 2;
+                Ok::<_, ()>(1)
+            })
+            .unwrap();
+            context.enqueue_packet(meta, rejected);
+            assert_eq!(queue.take_enqueue_drops(), 1);
+            assert_eq!(pool.available(), 1); // rejected lease already returned
+            let delivered = queue.pop().unwrap();
+            assert_eq!(delivered.meta, meta);
+            assert_eq!(delivered.packet.bytes(), b"one");
+            assert_eq!(delivered.packet.bytes().as_ptr(), pointer);
+            drop(delivered);
+            assert_eq!(pool.available(), 2);
+            assert!(queue.pop().is_none());
         }
     }
 
@@ -4200,7 +4283,7 @@ where
         T: PacketBearer<P> + 'static,
     {
         self.node
-            .register_bearer_with_ingress(bearer, self.ingress.clone())
+            .register_bearer_with_queue(bearer, self.ingress.clone())
     }
 
     /// Remove a physical bearer and forget association routes learned through it.

@@ -10,7 +10,7 @@
 //! reported next deadline to arm the platform timer. Tokio is one optional host
 //! adapter; an ESP32 task drives the same non-std core methods.
 
-use alloc::{collections::VecDeque, sync::Arc, vec, vec::Vec};
+use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec, vec::Vec};
 use smallvec::SmallVec;
 
 #[cfg(feature = "stateless-reset")]
@@ -1106,8 +1106,30 @@ where
 {
     pub(crate) fn register_bearer_with_ingress<T>(
         &mut self,
-        mut bearer: T,
+        bearer: T,
         ingress: Arc<dyn crate::bearer::PacketIngressQueue<P::Buffer>>,
+    ) -> Result<BearerId, crate::AddBearerError<T::AttachError>>
+    where
+        T: PacketBearer<P> + 'static,
+    {
+        self.register_bearer_ingress(bearer, crate::bearer::PacketIngressHandle::Dynamic(ingress))
+    }
+
+    pub(crate) fn register_bearer_with_queue<T>(
+        &mut self,
+        bearer: T,
+        ingress: Arc<crate::nostd::IngressQueue<P::Buffer>>,
+    ) -> Result<BearerId, crate::AddBearerError<T::AttachError>>
+    where
+        T: PacketBearer<P> + 'static,
+    {
+        self.register_bearer_ingress(bearer, crate::bearer::PacketIngressHandle::Queued(ingress))
+    }
+
+    fn register_bearer_ingress<T>(
+        &mut self,
+        mut bearer: T,
+        ingress: crate::bearer::PacketIngressHandle<P::Buffer>,
     ) -> Result<BearerId, crate::AddBearerError<T::AttachError>>
     where
         T: PacketBearer<P> + 'static,
@@ -1807,8 +1829,8 @@ where
 }
 
 enum Association<Client, Server> {
-    Client(Client),
-    Server(Server),
+    Client(Box<Client>),
+    Server(Box<Server>),
 }
 
 struct AssociationSlot<Client, Server> {
@@ -2186,6 +2208,7 @@ impl<P: PacketPool, const PACKET: usize> QuicNode<P, PACKET> {
             #[cfg(not(feature = "tokio"))]
             let first_local_cid = 1;
             core::ptr::addr_of_mut!((*node).next_local_cid).write(first_local_cid);
+            core::ptr::addr_of_mut!((*node).next_setup_transaction_id).write(1);
             core::ptr::addr_of_mut!((*node).clock_us).write(0);
             core::ptr::addr_of_mut!((*node).idle_timeout_us).write(DEFAULT_IDLE_TIMEOUT_US);
             router.set_max_entries(node_limits.max_routes);
@@ -2564,7 +2587,7 @@ impl<P: PacketPool, const PACKET: usize> QuicNode<P, PACKET> {
     pub(crate) fn add_client(
         &mut self,
         receive_cid: ConnectionId,
-        association: ClientAssociation<PACKET>,
+        association: Box<ClientAssociation<PACKET>>,
     ) -> Result<QuicAssociation, QuicNodeError> {
         self.insert(receive_cid, Association::Client(association))
     }
@@ -2572,7 +2595,7 @@ impl<P: PacketPool, const PACKET: usize> QuicNode<P, PACKET> {
     pub(crate) fn add_server(
         &mut self,
         receive_cid: ConnectionId,
-        association: ServerStreamConnection<PACKET>,
+        association: Box<ServerStreamConnection<PACKET>>,
     ) -> Result<QuicAssociation, QuicNodeError> {
         self.insert(receive_cid, Association::Server(association))
     }
@@ -2993,7 +3016,7 @@ impl<P: PacketPool, const PACKET: usize> QuicNode<P, PACKET> {
     pub(crate) fn remove_client(
         &mut self,
         id: QuicAssociation,
-    ) -> Result<ClientAssociation<PACKET>, QuicNodeError> {
+    ) -> Result<Box<ClientAssociation<PACKET>>, QuicNodeError> {
         if !matches!(
             self.slot(id).map(|slot| &slot.state),
             Some(Association::Client(_))
@@ -3014,7 +3037,7 @@ impl<P: PacketPool, const PACKET: usize> QuicNode<P, PACKET> {
     fn remove_server(
         &mut self,
         id: QuicAssociation,
-    ) -> Result<ServerStreamConnection<PACKET>, QuicNodeError> {
+    ) -> Result<Box<ServerStreamConnection<PACKET>>, QuicNodeError> {
         if !matches!(
             self.slot(id).map(|slot| &slot.state),
             Some(Association::Server(_))
@@ -4312,12 +4335,13 @@ where
         now: u64,
     ) -> Result<NodeEgress<P::Buffer>, QuicNodeEgressError> {
         let limits = self.default_association_limits;
-        let mut client = ClientAssociation::with_runtime_limits(
+        let mut client = ClientAssociation::boxed_with_runtime_limits(
             receive_cid,
             limits.connection,
             limits.history_packets,
             limits.transmission_records,
-        );
+        )
+        .map_err(QuicNodeEgressError::Transport)?;
         if let Some(token) = self.router.reset_token_for(receive_cid) {
             client.connection_mut().set_local_reset_token(token);
         }
@@ -4362,7 +4386,7 @@ where
         let mut server = None;
         let reset_token = self.router.reset_token_for(server_cid);
         let response = Self::build_packet(self.pool, |output| {
-            let (accepted, used) = ServerStreamConnection::accept_open_with_config_into(
+            let (accepted, used) = ServerStreamConnection::accept_open_boxed_with_config_into(
                 packet,
                 server_cid,
                 local_limits,
@@ -8654,6 +8678,41 @@ mod tests {
     }
 
     #[test]
+    fn boxed_associations_keep_their_allocation_across_insert_remove_and_reinsert() {
+        let mut node = QuicNode::<TestPool>::new(&TEST_POOL);
+        let client =
+            ClientAssociation::boxed_with_runtime_limits(cid(1), ConnectionLimits::default(), 2, 4)
+                .unwrap();
+        let address = &*client as *const _;
+        let first = node.add_client(cid(1), client).unwrap();
+        let client = node.remove_client(first).unwrap();
+        assert_eq!(&*client as *const _, address);
+        let second = node.add_client(cid(1), client).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(&*node.remove_client(second).unwrap() as *const _, address);
+
+        let mut input = [0; crate::DEFAULT_MAX_PACKET_SIZE];
+        let n = crate::encode_bootstrap_open_packet(cid(2), 0, &mut input).unwrap();
+        let mut output = [0; crate::DEFAULT_MAX_PACKET_SIZE];
+        let (server, _) = ServerStreamConnection::accept_open_boxed_with_config_into(
+            &input[..n],
+            cid(3),
+            ConnectionLimits::default(),
+            ServerStreamConfig::default(),
+            None,
+            &mut output,
+        )
+        .unwrap();
+        let address = &*server as *const _;
+        let first = node.add_server(cid(3), server).unwrap();
+        let server = node.remove_server(first).unwrap();
+        assert_eq!(&*server as *const _, address);
+        let second = node.add_server(cid(3), server).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(&*node.remove_server(second).unwrap() as *const _, address);
+    }
+
+    #[test]
     fn unspecified_bearer_arrival_uses_dispatch_time_for_ack_delay() {
         type Pool = crate::packet_pool::PacketPool<4, DEFAULT_PACKET_POOL_SLOT_SIZE>;
         static POOL: Pool = Pool::new();
@@ -10352,7 +10411,7 @@ mod tests {
         let mut node: QuicNode<TestPool> = QuicNode::new(&TEST_POOL);
         let local = cid(0x76);
         let association = node
-            .add_client(local, ClientAssociation::new(local))
+            .add_client(local, Box::new(ClientAssociation::new(local)))
             .unwrap();
         let mut open = [0; crate::DEFAULT_MAX_PACKET_SIZE];
         let mut response = [0; 16];
@@ -10500,7 +10559,7 @@ mod tests {
         let mut node: QuicNode<TestPool, PACKET> = QuicNode::new(&TEST_POOL);
         let local = cid(0x71);
         let association = node
-            .add_client(local, ClientAssociation::new(local))
+            .add_client(local, Box::new(ClientAssociation::new(local)))
             .unwrap();
         let mut open_packet = [0u8; PACKET];
         let mut peer_packet = [0u8; 16];
@@ -10839,11 +10898,11 @@ mod tests {
         let mut node = QuicNode::<TestPool>::new(&TEST_POOL);
         assert!(!node.associations.spilled());
 
-        node.add_client(cid(1), ClientAssociation::new(cid(1)))
+        node.add_client(cid(1), Box::new(ClientAssociation::new(cid(1))))
             .unwrap();
         assert!(!node.associations.spilled());
 
-        node.add_client(cid(2), ClientAssociation::new(cid(2)))
+        node.add_client(cid(2), Box::new(ClientAssociation::new(cid(2))))
             .unwrap();
         assert!(node.associations.spilled());
         assert_eq!(node.association_count(), 2);
@@ -10891,13 +10950,13 @@ mod tests {
     fn removing_an_association_invalidates_its_generation_checked_id() {
         let mut node = QuicNode::<TestPool>::new(&TEST_POOL);
         let first = node
-            .add_client(cid(1), ClientAssociation::new(cid(1)))
+            .add_client(cid(1), Box::new(ClientAssociation::new(cid(1))))
             .unwrap();
         assert!(node.remove_client(first).is_ok());
         assert_eq!(node.association_count(), 0);
 
         let second = node
-            .add_client(cid(2), ClientAssociation::new(cid(2)))
+            .add_client(cid(2), Box::new(ClientAssociation::new(cid(2))))
             .unwrap();
         assert_ne!(first, second);
         assert!(node.client(first).is_none());
@@ -10908,10 +10967,10 @@ mod tests {
     fn cid_collision_does_not_install_or_replace_association_state() {
         let mut node = QuicNode::<TestPool>::new(&TEST_POOL);
         let client = node
-            .add_client(cid(1), ClientAssociation::new(cid(1)))
+            .add_client(cid(1), Box::new(ClientAssociation::new(cid(1))))
             .unwrap();
         assert_eq!(
-            node.add_client(cid(1), ClientAssociation::new(cid(2))),
+            node.add_client(cid(1), Box::new(ClientAssociation::new(cid(2)))),
             Err(QuicNodeError::Routing)
         );
         assert_eq!(node.association_count(), 1);
@@ -10922,7 +10981,7 @@ mod tests {
     fn wrong_role_removal_leaves_association_installed() {
         let mut node = QuicNode::<TestPool>::new(&TEST_POOL);
         let client = node
-            .add_client(cid(1), ClientAssociation::new(cid(1)))
+            .add_client(cid(1), Box::new(ClientAssociation::new(cid(1))))
             .unwrap();
         assert!(!node.remove_forward(cid(1)));
         assert!(matches!(
@@ -13180,7 +13239,8 @@ mod tests {
         .unwrap();
         for value in 1..=3 {
             let id = cid(value);
-            node.add_client(id, ClientAssociation::new(id)).unwrap();
+            node.add_client(id, Box::new(ClientAssociation::new(id)))
+                .unwrap();
         }
         assert_eq!(node.association_count(), 3);
 
@@ -13192,8 +13252,25 @@ mod tests {
         .unwrap();
         assert_eq!(node.association_count(), 3);
         assert_eq!(
-            node.add_client(cid(4), ClientAssociation::new(cid(4))),
+            node.add_client(cid(4), Box::new(ClientAssociation::new(cid(4)))),
             Err(QuicNodeError::AssociationTableFull)
         );
+    }
+    #[test]
+    fn poisoned_node_storage_initializes_setup_counter() {
+        type Pool = crate::packet_pool::PacketPool<4, 1204>;
+        static POOL: Pool = Pool::new();
+        type Node = QuicNode<Pool>;
+        let mut storage = core::mem::MaybeUninit::<Node>::uninit();
+        unsafe {
+            core::ptr::write_bytes(
+                storage.as_mut_ptr().cast::<u8>(),
+                0xa5,
+                core::mem::size_of::<Node>(),
+            );
+            Node::new_in_place(&mut storage, &POOL);
+        }
+        let node = unsafe { storage.assume_init() };
+        assert_eq!(node.next_setup_transaction_id, 1);
     }
 }
