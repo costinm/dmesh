@@ -4196,6 +4196,11 @@ where
         self.node.set_limits(limits)
     }
 
+    /// Install one exact relay destination without a static trait-object vtable.
+    pub fn set_path_open_route(&mut self,kind:u8,address:&[u8],next_hop:crate::CircuitNextHop)->Result<(),crate::Error> {
+        self.node.set_path_open_route(kind,address,next_hop)
+    }
+
     /// Resolve opaque PATH_OPEN destinations through registered local bearers.
     pub fn set_path_open_resolver(
         &mut self,

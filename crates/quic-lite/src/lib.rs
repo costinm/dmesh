@@ -8988,7 +8988,7 @@ impl<const P: usize> EndpointState<P> {
                         .get(packet.send_buffer_slot.unwrap_or(usize::MAX))
                         .and_then(Option::as_ref)
                         .is_some_and(|range| {
-                            range.payload.is_some() || (range.fin && !range.fin_acked)
+                            range.payload.is_some() || range.pool_payload.is_some() || (range.fin && !range.fin_acked)
                         })
             })
             .min_by_key(|packet| packet.sent_at)
@@ -9123,7 +9123,7 @@ impl<const P: usize> EndpointState<P> {
                     .send_buffer
                     .get(packet.send_buffer_slot.unwrap_or(usize::MAX))
                     .and_then(Option::as_ref)
-                    .is_some_and(|range| range.payload.is_some() || (range.fin && !range.fin_acked))
+                    .is_some_and(|range| range.payload.is_some() || range.pool_payload.is_some() || (range.fin && !range.fin_acked))
         })
     }
 
@@ -9157,7 +9157,7 @@ impl<const P: usize> EndpointState<P> {
                         .get(packet.send_buffer_slot.unwrap_or(usize::MAX))
                         .and_then(Option::as_ref)
                         .is_some_and(|range| {
-                            range.payload.is_some() || (range.fin && !range.fin_acked)
+                            range.payload.is_some() || range.pool_payload.is_some() || (range.fin && !range.fin_acked)
                         })
             })
             .min_by_key(|packet| packet.sent_at)
@@ -13071,6 +13071,27 @@ mod tests {
         let (_, header_len) = ShortHeader::decode(&packet[..retry_used]).unwrap();
         let (frame, _) = decode_frame(&packet[header_len..retry_used]).unwrap();
         assert!(matches!(frame, Frame::Stream(StreamFrame { data, .. }) if data == payload));
+    }
+
+    #[test]
+    fn pool_backed_history_participates_in_pto_and_marked_loss_recovery() {
+        for marked in [false,true] {
+            let local=ConnectionId::new(0x767).unwrap();let peer=ConnectionId::new(0x768).unwrap();
+            let mut sender=EndpointState::<128>::new(Role::Client,ConnectionLimits::default(),1200);
+            sender.install_connection_ids(local,peer).unwrap();sender.open_send_stream(4,INITIAL_MAX_STREAM_DATA).unwrap();
+            let payload=b"owned bytes must survive loss without copying";
+            let source=OwnedPacket::new(payload.to_vec(),0..payload.len()).unwrap().try_erase().ok().unwrap();
+            let mut packet=[0u8;256];
+            let (_,number)=sender.encode_stream_packet_from_owned_on_path(0,peer,4,0,false,source,&mut packet).unwrap();
+            let now=10_000_000;sender.set_time(now);
+            let retry=if marked {
+                assert!(sender.mark_lost(number));assert!(sender.has_retransmittable_loss());
+                sender.retransmit_marked_loss(&mut packet).unwrap()
+            }else{sender.retransmit_pto_probe(now,1,&mut packet).unwrap()};
+            let (n,_)=retry.expect("automatic recovery must include owned pool history");
+            let (_,header)=ShortHeader::decode(&packet[..n]).unwrap();let(frame,_)=decode_frame(&packet[header..n]).unwrap();
+            assert!(matches!(frame,Frame::Stream(StreamFrame{data,..}) if data==payload));
+        }
     }
 
     #[test]

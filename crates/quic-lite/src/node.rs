@@ -1958,6 +1958,7 @@ pub struct QuicNode<
     default_association_limits: AssociationLimits,
     datagram_handlers: Vec<(QuicAssociation, datagram::DatagramHandler<P::Buffer>)>,
     local_vip: Option<u64>,
+    path_open_route: Option<(u8, [u8; 16], usize, CircuitNextHop)>,
     path_open_resolver:
         Option<Arc<dyn Fn(u8, &[u8]) -> Option<CircuitNextHop> + Send + Sync + 'static>>,
     vip_path_open_resolver:
@@ -2143,6 +2144,7 @@ impl<P: PacketPool, const PACKET: usize> QuicNode<P, PACKET> {
             default_association_limits: association_limits,
             datagram_handlers: Vec::new(),
             local_vip: None,
+            path_open_route: None,
             path_open_resolver: None,
             vip_path_open_resolver: None,
         }
@@ -2238,6 +2240,7 @@ impl<P: PacketPool, const PACKET: usize> QuicNode<P, PACKET> {
             core::ptr::addr_of_mut!((*node).default_association_limits).write(association_limits);
             core::ptr::addr_of_mut!((*node).datagram_handlers).write(Vec::new());
             core::ptr::addr_of_mut!((*node).local_vip).write(None);
+            core::ptr::addr_of_mut!((*node).path_open_route).write(None);
             core::ptr::addr_of_mut!((*node).path_open_resolver).write(None);
             core::ptr::addr_of_mut!((*node).vip_path_open_resolver).write(None);
             storage.assume_init_mut()
@@ -2252,6 +2255,15 @@ impl<P: PacketPool, const PACKET: usize> QuicNode<P, PACKET> {
     /// pool as it moves through ingress, forwarding, egress, and completion.
     pub(crate) fn acquire_packet_writer(&self, headroom: usize) -> Option<P::Writer> {
         self.pool.acquire_writer(headroom, 0)
+    }
+
+    /// Install one exact opaque relay destination without a closure/vtable.
+    /// Useful for flash-resident modules which cannot relocate static vtables.
+    /// Replaces the previous exact route; dynamic resolver remains the fallback.
+    pub fn set_path_open_route(&mut self,kind:u8,address:&[u8],next_hop:CircuitNextHop)->Result<(),Error> {
+        if kind==0 || address.is_empty() || address.len()>16 {return Err(Error::Invalid);}
+        let mut key=[0;16];key[..address.len()].copy_from_slice(address);
+        self.path_open_route=Some((kind,key,address.len(),next_hop));Ok(())
     }
 
     /// Configure local bearer/address resolution for layered PATH_OPEN hops.
@@ -6884,9 +6896,11 @@ where
                             &instruction.address[..usize::from(instruction.address_len)];
                         let next_hop = match request.route_mode {
                             crate::RelayRouteMode::Layered => {
-                                self.path_open_resolver.as_ref().and_then(|resolver| {
-                                    resolver(instruction.address_kind, instruction_address)
-                                })
+                                self.path_open_route.and_then(|(kind,key,len,next)|
+                                    (kind==instruction.address_kind && &key[..len]==instruction_address).then_some(next))
+                                    .or_else(||self.path_open_resolver.as_ref().and_then(|resolver| {
+                                        resolver(instruction.address_kind,instruction_address)
+                                    }))
                             }
                             crate::RelayRouteMode::VipRouted => {
                                 request.destination_vip.and_then(|vip| {
@@ -9556,9 +9570,7 @@ mod tests {
         relay1.set_path_open_resolver(move |kind, address| {
             (kind == 2 && address == [2]).then_some(hop12)
         });
-        relay2.set_path_open_resolver(move |kind, address| {
-            (kind == 2 && address == [3]).then_some(hop23)
-        });
+        relay2.set_path_open_route(2,&[3],hop23).unwrap();
         relay3.set_path_open_resolver(move |kind, address| {
             (kind == 3 && address == [4]).then_some(hop3b)
         });
