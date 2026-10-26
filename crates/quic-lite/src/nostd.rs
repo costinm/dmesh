@@ -422,6 +422,107 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_stream_resumes_without_ingress_and_without_queued_chunks() {
+        static CLIENT: Pool = Pool::new();
+        static SERVER: Pool = Pool::new();
+        let (outgoing, incoming, mut network) = FakePacketBearer::<Pool>::pair_with_network(
+            BearerName::new("client").unwrap(),
+            BearerName::new("server").unwrap(),
+            FakeNetworkConfig::default(),
+        );
+        let mut client: NoStdRuntime<Pool> =
+            NoStdRuntime::new(QuicNode::new(&CLIENT), ConnectionLimits::default());
+        let mut server: NoStdRuntime<Pool> =
+            NoStdRuntime::new(QuicNode::new(&SERVER), ConnectionLimits::default());
+        let bearer = client.add_bearer(outgoing).unwrap();
+        server.add_bearer(incoming).unwrap();
+        let association = client
+            .associate(
+                PacketMeta {
+                    bearer,
+                    peer_l2_address: PeerL2Address::new(1).unwrap(),
+                    received_at_us: 0,
+                },
+                0,
+            )
+            .unwrap();
+        for _ in 0..8 {
+            network.advance_to(0);
+            client.progress_all().unwrap();
+            server.progress_all().unwrap();
+        }
+        let mut outgoing = client.open_stream(association).unwrap();
+        client
+            .write_stream_and_finish(&mut outgoing, b"request")
+            .unwrap();
+        network.advance_to(0);
+        let receive_ranges: Vec<_> = server.ingress.packets.lock().iter().map(|received| {
+            let bytes = received.packet.bytes();
+            (bytes.as_ptr() as usize, bytes.len())
+        }).collect();
+        assert!(!receive_ranges.is_empty());
+        let mut incoming = None;
+        server
+            .progress_all_with_stream(|stream, offset, fin, bytes| {
+                assert_eq!(offset, 0);
+                assert!(fin);
+                assert_eq!(bytes, b"request");
+                assert!(receive_ranges.iter().any(|(start, len)| {
+                    let ptr = bytes.as_ptr() as usize;
+                    ptr >= *start && ptr + bytes.len() <= start + len
+                }), "in-order callback must borrow the ingress pool packet");
+
+                incoming = Some(stream);
+                Ok(2)
+            })
+            .unwrap();
+        assert!(server.next_stream_chunk().is_none());
+        assert!(server.ingress.packets.lock().is_empty());
+        let stream = incoming.unwrap();
+        let mut pointer = 0usize;
+        assert_eq!(
+            server
+                .resume_stream_with(&stream, |_, offset, fin, bytes| {
+                    assert_eq!((offset, fin, bytes), (2, true, &b"quest"[..]));
+                    pointer = bytes.as_ptr() as usize;
+                    Ok(0)
+                })
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            server
+                .resume_stream_with(&stream, |_, offset, fin, bytes| {
+                    assert_eq!(
+                        bytes.as_ptr() as usize,
+                        pointer,
+                        "blocked retry borrows the same retained bytes"
+                    );
+                    assert_eq!((offset, fin, bytes), (2, true, &b"quest"[..]));
+                    Ok(3)
+                })
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            server
+                .resume_stream_with(&stream, |_, offset, fin, bytes| {
+                    assert_eq!((offset, fin, bytes), (5, true, &b"st"[..]));
+                    Ok(bytes.len())
+                })
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            server
+                .resume_stream_with(&stream, |_, _, _, _| panic!("already delivered"))
+                .unwrap(),
+            0
+        );
+        assert!(server.next_stream_chunk().is_none());
+    }
+
+    #[test]
     fn established_ingress_drains_while_another_bearer_retains_blocked_egress() {
         static CLIENT: Pool = Pool::new();
         static SERVER: Pool = Pool::new();
@@ -4584,7 +4685,8 @@ where
     /// unread suffix under its ordered-delivery limit and does not grant
     /// receive credit for it. A zero-length chunk (a bare FIN) cannot be
     /// refused: returning 0 for it accepts the end of the stream. In-order
-    /// chunks therefore require no per-chunk
+    /// chunks therefore require no per-chunk allocation. Use
+    /// [`Self::resume_stream_with`] when a blocked consumer becomes writable.
     pub fn progress_with_stream<F>(&mut self, mut on_stream: F) -> Result<bool, QuicNodeEgressError>
     where
         F: FnMut(crate::QuicStream, u64, bool, &[u8]) -> Result<usize, crate::Error>,
@@ -4614,6 +4716,56 @@ where
         };
         self.process_packet(received.meta, received.packet, Some(&mut on_stream))?;
         Ok(true)
+    }
+
+    /// Retry a stream suffix refused by `progress_with_stream`, without new ingress.
+    ///
+    /// The callback borrows retained storage only for this call and accepts a
+    /// prefix exactly as on ingress. Credit is granted only for accepted bytes.
+    /// A bare FIN is accepted by returning zero. Call this after the consumer
+    /// becomes writable; polling with no retained data performs no delivery.
+    pub fn resume_stream_with<F>(
+        &mut self,
+        stream: &crate::QuicStream,
+        mut on_stream: F,
+    ) -> Result<usize, QuicNodeEgressError>
+    where
+        F: FnMut(crate::QuicStream, u64, bool, &[u8]) -> Result<usize, crate::Error>,
+    {
+        let association = stream.association().ok_or(QuicNodeEgressError::Transport(
+            crate::Error::WrongConnectionId,
+        ))?;
+        let mut delivered = false;
+        let consumed = self
+            .node
+            .resume_stream_delivery(
+                association,
+                stream.id(),
+                &mut |source, id, offset, fin, bytes| {
+                    let ApplicationStreamSource::Association(association) = source;
+                    delivered = true;
+                    on_stream(
+                        crate::QuicStream::incoming(association, id),
+                        offset,
+                        fin,
+                        bytes,
+                    )
+                },
+            )
+            .map_err(|error| match error {
+                QuicNodePacketRejection::Packet(error)
+                | QuicNodePacketRejection::Application(error) => {
+                    QuicNodeEgressError::Transport(error)
+                }
+                QuicNodePacketRejection::Egress(error) => error,
+                QuicNodePacketRejection::PeerClosed(_) => {
+                    QuicNodeEgressError::Transport(crate::Error::WrongConnectionId)
+                }
+            })?;
+        if delivered {
+            self.node.submit_or_defer_control(association)?;
+        }
+        Ok(consumed)
     }
 
     /// Drain every currently queued packet while delivering stream bytes to
