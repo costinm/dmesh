@@ -116,6 +116,12 @@ pub struct BearerRuntime {
 }
 
 impl BearerRuntime {
+    /// Address of the socket actually attached to the UDP bearer.
+    pub fn udp_local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.bearers.get("udp")?;
+        self.udp.as_ref()?.local_addr().ok()
+    }
+
     pub fn spawn(runtime: tokio::runtime::Handle, egress: Arc<dyn BearerEgress>) -> Arc<Self> {
         Self::spawn_with_udp(runtime, egress, None)
     }

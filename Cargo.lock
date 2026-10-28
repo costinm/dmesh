@@ -2809,6 +2809,8 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rustls",
+ "rustls-native-certs",
+ "rustls-platform-verifier",
  "tokio",
  "tokio-rustls",
  "tower-service",
@@ -3049,6 +3051,32 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.6",
+]
+
+[[package]]
+name = "instant-acme"
+version = "0.8.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f05ad37c421b962354c358d347d4a6130151df9407978372d3ad7f0c8f71a64"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "http",
+ "http-body",
+ "http-body-util",
+ "httpdate",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "rcgen",
+ "ring",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]
@@ -3585,7 +3613,7 @@ dependencies = [
 [[package]]
 name = "mesh"
 version = "0.1.0"
-source = "git+https://github.com/costinm/ssh-mesh#d2428b738e9c5e3d299ffef8bc4972fd5ee1de26"
+source = "git+https://github.com/costinm/ssh-mesh#61077481c0bc4cab026c95e9e7edf8c856e3e50f"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3607,9 +3635,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "mesh-acme"
+version = "0.1.0"
+source = "git+https://github.com/costinm/ssh-mesh#61077481c0bc4cab026c95e9e7edf8c856e3e50f"
+dependencies = [
+ "anyhow",
+ "instant-acme",
+ "log",
+ "p256",
+ "pkcs8 0.11.0-rc.11",
+ "rcgen",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "toml_edit 0.22.27",
+ "x509-parser",
+]
+
+[[package]]
 name = "mesh-api"
 version = "0.1.0"
-source = "git+https://github.com/costinm/ssh-mesh#d2428b738e9c5e3d299ffef8bc4972fd5ee1de26"
+source = "git+https://github.com/costinm/ssh-mesh#61077481c0bc4cab026c95e9e7edf8c856e3e50f"
 dependencies = [
  "serde",
 ]
@@ -3617,7 +3665,7 @@ dependencies = [
 [[package]]
 name = "mesh-mcp"
 version = "0.1.0"
-source = "git+https://github.com/costinm/ssh-mesh#d2428b738e9c5e3d299ffef8bc4972fd5ee1de26"
+source = "git+https://github.com/costinm/ssh-mesh#61077481c0bc4cab026c95e9e7edf8c856e3e50f"
 dependencies = [
  "mesh",
  "serde",
@@ -4356,6 +4404,12 @@ dependencies = [
  "libc",
  "nix 0.23.2",
 ]
+
+[[package]]
+name = "openssl-probe"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e036b411754132fd6b74e94b74e9a13c5cf606fa93d1885c35860d3060820b1"
 
 [[package]]
 name = "orbclient"
@@ -5548,6 +5602,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustls-native-certs"
+version = "0.8.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a073f5dc7469f984c52ad2752b63b0807745133b6de880b7b64c1ac4c48aec4"
+dependencies = [
+ "openssl-probe",
+ "rustls-pki-types",
+ "schannel",
+ "security-framework",
+]
+
+[[package]]
 name = "rustls-pemfile"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5565,6 +5631,33 @@ dependencies = [
  "web-time",
  "zeroize",
 ]
+
+[[package]]
+name = "rustls-platform-verifier"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1167586491e2b18b8bfbb293e8180ec17c201c4f076d7cb3070ca964e7598f98"
+dependencies = [
+ "core-foundation 0.10.1",
+ "core-foundation-sys",
+ "jni 0.22.4",
+ "log",
+ "once_cell",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-platform-verifier-android",
+ "rustls-webpki",
+ "security-framework",
+ "security-framework-sys",
+ "webpki-root-certs",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rustls-platform-verifier-android"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eec689c0bc40ff2458a5977b6619cb718087084a18e02a131c599b62d05e1a5f"
 
 [[package]]
 name = "rustls-webpki"
@@ -5610,6 +5703,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "schannel"
+version = "0.1.30"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9cb23c424d8ee841bb4d813677ca237e2a610067d594fec130f87d6093495ab5"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "scoped-tls"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5645,6 +5747,29 @@ dependencies = [
  "hybrid-array",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "security-framework"
+version = "3.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7f4bc775c73d9a02cde8bf7b2ec4c9d12743edf609006c7facc23998404cd1d"
+dependencies = [
+ "bitflags 2.13.2",
+ "core-foundation 0.10.1",
+ "core-foundation-sys",
+ "libc",
+ "security-framework-sys",
+]
+
+[[package]]
+name = "security-framework-sys"
+version = "2.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ce2691df843ecc5d231c0b14ece2acc3efb62c0a398c7e1d875f3983ce020e3"
+dependencies = [
+ "core-foundation-sys",
+ "libc",
 ]
 
 [[package]]
@@ -5795,7 +5920,7 @@ dependencies = [
 [[package]]
 name = "sftp-server"
 version = "0.1.0"
-source = "git+https://github.com/costinm/ssh-mesh#d2428b738e9c5e3d299ffef8bc4972fd5ee1de26"
+source = "git+https://github.com/costinm/ssh-mesh#61077481c0bc4cab026c95e9e7edf8c856e3e50f"
 dependencies = [
  "anyhow",
  "bytes",
@@ -6312,7 +6437,7 @@ dependencies = [
 [[package]]
 name = "ssh-config"
 version = "0.57.0"
-source = "git+https://github.com/costinm/ssh-mesh#d2428b738e9c5e3d299ffef8bc4972fd5ee1de26"
+source = "git+https://github.com/costinm/ssh-mesh#61077481c0bc4cab026c95e9e7edf8c856e3e50f"
 dependencies = [
  "futures",
  "glob",
@@ -6375,7 +6500,7 @@ dependencies = [
 [[package]]
 name = "ssh-mesh"
 version = "0.1.0"
-source = "git+https://github.com/costinm/ssh-mesh#d2428b738e9c5e3d299ffef8bc4972fd5ee1de26"
+source = "git+https://github.com/costinm/ssh-mesh#61077481c0bc4cab026c95e9e7edf8c856e3e50f"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6392,6 +6517,7 @@ dependencies = [
  "libc",
  "log",
  "mesh",
+ "mesh-acme",
  "mesh-api",
  "mesh-mcp",
  "mime_guess",
@@ -7607,6 +7733,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "webpki-root-certs"
+version = "1.0.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e49d0e65abc00c142e8f9428da991da9f1a250c39be97459901eb12b9b49f62a"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
 name = "webpki-roots"
 version = "0.26.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8268,7 +8403,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 [[package]]
 name = "ws"
 version = "0.1.0"
-source = "git+https://github.com/costinm/ssh-mesh#d2428b738e9c5e3d299ffef8bc4972fd5ee1de26"
+source = "git+https://github.com/costinm/ssh-mesh#61077481c0bc4cab026c95e9e7edf8c856e3e50f"
 dependencies = [
  "async-trait",
  "axum",

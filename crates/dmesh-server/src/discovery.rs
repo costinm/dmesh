@@ -89,22 +89,7 @@ pub fn discover_multicast_ipv6() -> Result<Vec<MulticastDiscoveryPeer>, String> 
         let Some(announce) = crate::announce::decode_record(record) else {
             continue;
         };
-        let peer = match source {
-            SocketAddr::V6(source) if announce.udp_port != 0 => {
-                let address = announce
-                    .udp_link_local_v6()
-                    .or_else(|| announce.sta_link_local_v6())
-                    .map(Ipv6Addr::from)
-                    .unwrap_or(*source.ip());
-                SocketAddr::V6(SocketAddrV6::new(
-                    address,
-                    announce.udp_port,
-                    source.flowinfo(),
-                    source.scope_id(),
-                ))
-            }
-            source => source,
-        };
+        let peer = multicast_service_endpoint(source, &announce);
         if peers
             .iter()
             .any(|known: &MulticastDiscoveryPeer| known.peer == peer)
@@ -118,6 +103,18 @@ pub fn discover_multicast_ipv6() -> Result<Vec<MulticastDiscoveryPeer>, String> 
         });
     }
     Ok(peers)
+}
+
+/// Resolve a multicast reply to its service on the same observed network path.
+/// A node's cached announcement may describe a different interface; combining
+/// that address with this packet's scope produces an unusable link-local tuple.
+#[cfg(feature = "std")]
+pub fn multicast_service_endpoint(mut source: std::net::SocketAddr, announce: &crate::announce::Announce) -> std::net::SocketAddr {
+    let port = if announce.udp_port != 0 { announce.udp_port }
+        else if crate::announce::is_esp_device_class(announce.device_class) { crate::announce::DEFAULT_ESP_UDP_PORT }
+        else { source.port() };
+    source.set_port(port);
+    source
 }
 
 /// Exchange one raw discovery record with an already known UDP endpoint.

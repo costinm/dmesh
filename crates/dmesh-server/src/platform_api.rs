@@ -2,12 +2,22 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Return the retained cross-bearer observed-device inventory
+/// Read original announcements and live discovery observations
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
-pub struct DiscoveryNodesRequest;
+pub struct DiscoveryNodesRequest {
+    /// API field `duration_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u32>,
+    /// API field `retained`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained: Option<bool>,
+    /// API field `active`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<bool>,
+}
 
 impl mesh::tagged::TaggedFields for DiscoveryNodesRequest {
-    const FIELDS: &'static [(&'static str, u32)] = &[];
+    const FIELDS: &'static [(&'static str, u32)] = &[("duration_ms", 1), ("retained", 2), ("active", 3)];
 }
 
 impl DiscoveryNodesRequest {
@@ -26,9 +36,20 @@ impl DiscoveryNodesRequest {
 
     /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
     pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
-        let _ = &self;
         let mut e = crate::cbor::Encoder::new(out);
-        e.map(0u64)?;
+        e.map(0u64 + u64::from(self.duration_ms.is_some()) + u64::from(self.retained.is_some()) + u64::from(self.active.is_some()))?;
+        if let Some(value) = &self.duration_ms {
+        e.uint(1)?;
+        e.uint(u64::from(*value))?;
+        }
+        if let Some(value) = &self.retained {
+        e.uint(2)?;
+        e.bool(*value)?;
+        }
+        if let Some(value) = &self.active {
+        e.uint(3)?;
+        e.bool(*value)?;
+        }
         Some(e.len())
     }
 
@@ -44,6 +65,9 @@ impl DiscoveryNodesRequest {
         for _ in 0..count {
             let tag = d.uint().ok_or("invalid field tag")?;
             match tag {
+                1 => out.duration_ms = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
+                2 => out.retained = Some(d.bool().ok_or("invalid bool")?),
+                3 => out.active = Some(d.bool().ok_or("invalid bool")?),
                 _ => d.skip().ok_or("invalid value")?,
             }
         }
@@ -61,88 +85,16 @@ impl crate::registry_bridge::TaggedCbor for DiscoveryNodesRequest {
     }
 }
 
-/// Return the retained cross-bearer observed-device inventory
+/// Read original announcements and live discovery observations
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct DiscoveryNodesResponse {
-    /// API field `device_id`.
+    /// API field `format`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub device_id: Option<Vec<u8>>,
-    /// API field `peer`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub peer: Option<Vec<u8>>,
-    /// API field `bssid`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bssid: Option<Vec<u8>>,
-    /// API field `available_fields`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub available_fields: Option<u32>,
-    /// API field `first_seen_ms`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub first_seen_ms: Option<u32>,
-    /// API field `last_seen_ms`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_seen_ms: Option<u32>,
-    /// API field `packets`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub packets: Option<u32>,
-    /// API field `active_publish_rx`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_publish_rx: Option<u32>,
-    /// API field `active_subscribe_rx`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_subscribe_rx: Option<u32>,
-    /// API field `followup_rx`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub followup_rx: Option<u32>,
-    /// API field `last_kind`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_kind: Option<u8>,
-    /// API field `last_payload_len`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_payload_len: Option<u16>,
-    /// API field `last_payload_hash`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_payload_hash: Option<u32>,
-    /// API field `unavailable_fields`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub unavailable_fields: Option<u32>,
-    /// API field `channel`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub channel: Option<u8>,
-    /// API field `bearer`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bearer: Option<String>,
-    /// API field `rssi_dbm`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rssi_dbm: Option<i16>,
-    /// API field `name`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    /// API field `vip6`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vip6: Option<Vec<u8>>,
-    /// API field `device_class`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub device_class: Option<u8>,
-    /// API field `probe_capabilities`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub probe_capabilities: Option<u16>,
-    /// API field `authenticated`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub authenticated: Option<bool>,
-    /// API field `uptime_secs`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub uptime_secs: Option<u32>,
-    /// API field `udp_endpoint`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub udp_endpoint: Option<String>,
-    /// API field `network_name`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub network_name: Option<String>,
+    pub format: Option<u8>,
 }
 
 impl mesh::tagged::TaggedFields for DiscoveryNodesResponse {
-    const FIELDS: &'static [(&'static str, u32)] = &[("device_id", 1), ("peer", 2), ("bssid", 3), ("available_fields", 4), ("first_seen_ms", 5), ("last_seen_ms", 6), ("packets", 7), ("active_publish_rx", 8), ("active_subscribe_rx", 9), ("followup_rx", 10), ("last_kind", 11), ("last_payload_len", 12), ("last_payload_hash", 13), ("unavailable_fields", 14), ("channel", 15), ("bearer", 16), ("rssi_dbm", 17), ("name", 18), ("vip6", 19), ("device_class", 20), ("probe_capabilities", 21), ("authenticated", 22), ("uptime_secs", 23), ("udp_endpoint", 24), ("network_name", 25)];
+    const FIELDS: &'static [(&'static str, u32)] = &[("format", 1)];
 }
 
 impl DiscoveryNodesResponse {
@@ -162,106 +114,10 @@ impl DiscoveryNodesResponse {
     /// [`Self::encode_cbor`] into a caller buffer; `None` if it does not fit.
     pub fn encode_cbor_into(&self, out: &mut [u8]) -> Option<usize> {
         let mut e = crate::cbor::Encoder::new(out);
-        e.map(0u64 + u64::from(self.device_id.is_some()) + u64::from(self.peer.is_some()) + u64::from(self.bssid.is_some()) + u64::from(self.available_fields.is_some()) + u64::from(self.first_seen_ms.is_some()) + u64::from(self.last_seen_ms.is_some()) + u64::from(self.packets.is_some()) + u64::from(self.active_publish_rx.is_some()) + u64::from(self.active_subscribe_rx.is_some()) + u64::from(self.followup_rx.is_some()) + u64::from(self.last_kind.is_some()) + u64::from(self.last_payload_len.is_some()) + u64::from(self.last_payload_hash.is_some()) + u64::from(self.unavailable_fields.is_some()) + u64::from(self.channel.is_some()) + u64::from(self.bearer.is_some()) + u64::from(self.rssi_dbm.is_some()) + u64::from(self.name.is_some()) + u64::from(self.vip6.is_some()) + u64::from(self.device_class.is_some()) + u64::from(self.probe_capabilities.is_some()) + u64::from(self.authenticated.is_some()) + u64::from(self.uptime_secs.is_some()) + u64::from(self.udp_endpoint.is_some()) + u64::from(self.network_name.is_some()))?;
-        if let Some(value) = &self.device_id {
+        e.map(0u64 + u64::from(self.format.is_some()))?;
+        if let Some(value) = &self.format {
         e.uint(1)?;
-        e.bytes_value(value)?;
-        }
-        if let Some(value) = &self.peer {
-        e.uint(2)?;
-        e.bytes_value(value)?;
-        }
-        if let Some(value) = &self.bssid {
-        e.uint(3)?;
-        e.bytes_value(value)?;
-        }
-        if let Some(value) = &self.available_fields {
-        e.uint(4)?;
         e.uint(u64::from(*value))?;
-        }
-        if let Some(value) = &self.first_seen_ms {
-        e.uint(5)?;
-        e.uint(u64::from(*value))?;
-        }
-        if let Some(value) = &self.last_seen_ms {
-        e.uint(6)?;
-        e.uint(u64::from(*value))?;
-        }
-        if let Some(value) = &self.packets {
-        e.uint(7)?;
-        e.uint(u64::from(*value))?;
-        }
-        if let Some(value) = &self.active_publish_rx {
-        e.uint(8)?;
-        e.uint(u64::from(*value))?;
-        }
-        if let Some(value) = &self.active_subscribe_rx {
-        e.uint(9)?;
-        e.uint(u64::from(*value))?;
-        }
-        if let Some(value) = &self.followup_rx {
-        e.uint(10)?;
-        e.uint(u64::from(*value))?;
-        }
-        if let Some(value) = &self.last_kind {
-        e.uint(11)?;
-        e.uint(u64::from(*value))?;
-        }
-        if let Some(value) = &self.last_payload_len {
-        e.uint(12)?;
-        e.uint(u64::from(*value))?;
-        }
-        if let Some(value) = &self.last_payload_hash {
-        e.uint(13)?;
-        e.uint(u64::from(*value))?;
-        }
-        if let Some(value) = &self.unavailable_fields {
-        e.uint(14)?;
-        e.uint(u64::from(*value))?;
-        }
-        if let Some(value) = &self.channel {
-        e.uint(15)?;
-        e.uint(u64::from(*value))?;
-        }
-        if let Some(value) = &self.bearer {
-        e.uint(16)?;
-        e.text_value(value.as_bytes())?;
-        }
-        if let Some(value) = &self.rssi_dbm {
-        e.uint(17)?;
-        e.int(i64::from(*value))?;
-        }
-        if let Some(value) = &self.name {
-        e.uint(18)?;
-        e.text_value(value.as_bytes())?;
-        }
-        if let Some(value) = &self.vip6 {
-        e.uint(19)?;
-        e.bytes_value(value)?;
-        }
-        if let Some(value) = &self.device_class {
-        e.uint(20)?;
-        e.uint(u64::from(*value))?;
-        }
-        if let Some(value) = &self.probe_capabilities {
-        e.uint(21)?;
-        e.uint(u64::from(*value))?;
-        }
-        if let Some(value) = &self.authenticated {
-        e.uint(22)?;
-        e.bool(*value)?;
-        }
-        if let Some(value) = &self.uptime_secs {
-        e.uint(23)?;
-        e.uint(u64::from(*value))?;
-        }
-        if let Some(value) = &self.udp_endpoint {
-        e.uint(24)?;
-        e.text_value(value.as_bytes())?;
-        }
-        if let Some(value) = &self.network_name {
-        e.uint(25)?;
-        e.text_value(value.as_bytes())?;
         }
         Some(e.len())
     }
@@ -278,31 +134,7 @@ impl DiscoveryNodesResponse {
         for _ in 0..count {
             let tag = d.uint().ok_or("invalid field tag")?;
             match tag {
-                1 => out.device_id = Some(d.bytes_ref().ok_or("invalid byte string")?.to_vec()),
-                2 => out.peer = Some(d.bytes_ref().ok_or("invalid byte string")?.to_vec()),
-                3 => out.bssid = Some(d.bytes_ref().ok_or("invalid byte string")?.to_vec()),
-                4 => out.available_fields = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
-                5 => out.first_seen_ms = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
-                6 => out.last_seen_ms = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
-                7 => out.packets = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
-                8 => out.active_publish_rx = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
-                9 => out.active_subscribe_rx = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
-                10 => out.followup_rx = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
-                11 => out.last_kind = Some(u8::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
-                12 => out.last_payload_len = Some(u16::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
-                13 => out.last_payload_hash = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
-                14 => out.unavailable_fields = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
-                15 => out.channel = Some(u8::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
-                16 => out.bearer = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
-                17 => out.rssi_dbm = Some(i16::try_from(d.int().ok_or("invalid integer")?).map_err(|_| "integer out of range")?),
-                18 => out.name = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
-                19 => out.vip6 = Some(d.bytes_ref().ok_or("invalid byte string")?.to_vec()),
-                20 => out.device_class = Some(u8::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
-                21 => out.probe_capabilities = Some(u16::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
-                22 => out.authenticated = Some(d.bool().ok_or("invalid bool")?),
-                23 => out.uptime_secs = Some(u32::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
-                24 => out.udp_endpoint = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
-                25 => out.network_name = Some(String::from_utf8(d.text_ref().ok_or("invalid text")?.to_vec()).map_err(|_| "invalid UTF-8")?),
+                1 => out.format = Some(u8::try_from(d.uint().ok_or("invalid unsigned integer")?).map_err(|_| "integer out of range")?),
                 _ => d.skip().ok_or("invalid value")?,
             }
         }

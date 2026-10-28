@@ -593,10 +593,9 @@ fn update_local_networks(payload: &[u8]) -> anyhow::Result<usize> {
     Ok(current.networks.len())
 }
 
-/// Serve the compact, bearer-neutral `discovery.nodes` result used by ESP and
-/// lmesh. Android's JSON inventory remains useful to its UI, but a QUIC peer
-/// must receive this CBOR shape so controller-side discovery can merge
-/// observer provenance without a platform exception.
+/// Synchronous retained snapshot in the common signed-record wire. Network
+/// calls use AndroidDiscoveryNodes below for retained plus live observations;
+/// Android's UI can still read its local JSON inventory.
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 pub(crate) fn android_discovery_nodes_response(request: &[u8]) -> Option<Vec<u8>> {
     let record = dmesh_server::tagged::decode(request)?;
@@ -611,6 +610,23 @@ pub(crate) fn android_discovery_nodes_response(request: &[u8]) -> Option<Vec<u8>
         .map(|engine| engine.devices())
         .unwrap_or_default();
     dmesh_discovery::nodes::response(&devices, record.id?, false)
+}
+
+struct AndroidDiscoveryNodes;
+impl dmesh_server::stream::StreamHandler for AndroidDiscoveryNodes {
+    fn open<'a>(&'a self, request:dmesh_server::stream::Request<'a>) -> dmesh_server::stream::OpenFuture<'a> {
+        Box::pin(async move {
+            if request.record.to.is_some() || request.record.params.is_some() {return None;}
+            let options=dmesh_server::discovery_nodes::Options::decode(request.record.fields)?;
+            let response=dmesh_discovery::nodes::stream_response(discovery_engine()?.clone(),request.record.id?,options,false)?;
+            #[cfg(target_os="android")]
+            if options.active && options.duration_ms != 0 {
+                let _=crate::mesh_common::solicit_discovery();
+                let _=schedule_android_discovery_active();
+            }
+            Some(dmesh_server::stream::Outcome::Respond(response))
+        })
+    }
 }
 
 /// Schedule Android's framework-owned NAN active-discovery operation from the
@@ -809,9 +825,9 @@ pub(crate) fn register_android_methods() {
     ) & register(
         methods::NAN_WAKEUP,
         SyncBytesFn(android_nan_wakeup_response),
-    ) & register(
+    ) & dmesh_server::registry::register_stream(
         methods::DISCOVERY_NODES,
-        SyncBytesFn(android_discovery_nodes_response),
+        AndroidDiscoveryNodes,
     ) & register(
         methods::TELEMETRY_BATTERY,
         SyncBytesFn(android_battery_response),
@@ -1906,6 +1922,16 @@ pub(crate) fn install_discovery_engine(public_key: &str) -> Arc<dmesh_discovery:
 /// a second, UDP-only identity or a synthetic endpoint.
 pub(crate) struct AndroidFacts;
 
+/// Publish the service endpoint only while the corresponding listener exists.
+/// Java may supply a route-marked socket with a different port from the Rust
+/// fallback, so discovery must use the adopted socket rather than a default.
+fn set_android_udp_endpoint(announce: &mut dmesh_server::announce::Announce, address: Ipv6Addr) {
+    if let Some(listener) = crate::bearer::current().and_then(|runtime| runtime.udp_local_addr()) {
+        announce.set_udp_link_local_v6(address.octets());
+        announce.set_udp_port(listener.port());
+    }
+}
+
 impl dmesh_discovery::LocalFacts for AndroidFacts {
     fn describe(&self, announce: &mut dmesh_server::announce::Announce) {
         announce.set_probe_descriptor(
@@ -1937,8 +1963,7 @@ impl dmesh_discovery::LocalFacts for AndroidFacts {
                 .filter(Ipv6Addr::is_unicast_link_local)
         }) {
             announce.set_sta_link_local_v6(address.octets());
-            announce.set_udp_link_local_v6(address.octets());
-            announce.set_udp_port(dmesh_server::firmware_profile::DEFAULT_EVENT_PORT);
+            set_android_udp_endpoint(announce, address);
         }
     }
 
@@ -2498,8 +2523,7 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                 // A peer that learns Android's link-local endpoint over NAN
                 // must use the same normal QUIC UDP listener as multicast and
                 // directed discovery, not an Android-only port convention.
-                announce.set_udp_link_local_v6(address.octets());
-                announce.set_udp_port(dmesh_server::firmware_profile::DEFAULT_EVENT_PORT);
+                set_android_udp_endpoint(&mut announce, address);
             }
             let mut out = [0; 96];
             let used = dmesh_server::announce::encode(announce, &mut out)
@@ -3600,6 +3624,9 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeSetCal
         bearer_egress,
         udp_socket,
     )));
+    // The discovery worker can start before callback registration installs
+    // the UDP bearer. Refresh presence now that its actual endpoint exists.
+    crate::mesh_common::trigger_announce(handle);
 
     let client_listener = Arc::new(JniSshClientListener {
         jvm,
@@ -4756,6 +4783,17 @@ mod tests {
 
     #[test]
     fn android_nan_announce_retains_sta_network_name() {
+        let _guard = RADIO_STATE_TEST_LOCK.lock().unwrap();
+        struct NoEgress;
+        impl crate::bearer::BearerEgress for NoEgress {
+            fn send_packet(&self, _: &str, _: &[u8]) {}
+        }
+        let socket = std::net::UdpSocket::bind("[::1]:0").unwrap();
+        let listener = socket.local_addr().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        crate::bearer::set_current(Some(crate::bearer::BearerRuntime::spawn_with_udp(
+            runtime.handle().clone(), Arc::new(NoEgress), Some(socket),
+        )));
         let wire = radio_message(
             "radio.nan.build_announce",
             "kind=discovery device_id=616e64726f69642d31 uptime_secs=13 device_name=Pixel network_name=costin sta_link_local_v6=fe80::1234",
@@ -4775,10 +4813,12 @@ mod tests {
             announce.udp_link_local_v6(),
             Some("fe80::1234".parse::<Ipv6Addr>().unwrap().octets())
         );
-        assert_eq!(
-            announce.udp_port,
-            dmesh_server::firmware_profile::DEFAULT_EVENT_PORT
-        );
+        assert_eq!(announce.udp_port, listener.port());
+        crate::bearer::set_current(None);
+        let mut without_listener = dmesh_server::announce::Announce::discovery([0; 16], 8, 0);
+        set_android_udp_endpoint(&mut without_listener, "fe80::1234".parse().unwrap());
+        assert_eq!(without_listener.udp_link_local_v6(), None);
+        assert_eq!(without_listener.udp_port, 0);
     }
 
     #[test]
@@ -4911,7 +4951,7 @@ mod tests {
 
     #[test]
     fn discovery_nodes_rows_come_from_the_shared_inventory_one_per_bearer() {
-        use dmesh_server::announce::{Announce, decode_devices_observed_response, encode};
+        use dmesh_server::announce::{Announce, encode};
         let _guard = RADIO_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_discovery();
         let engine = test_engine();
@@ -4932,6 +4972,7 @@ mod tests {
         );
         nan.rssi_dbm = Some(-58);
         engine.on_datagram(&nan, &wire[..used]);
+        let original=wire[..used].to_vec();
 
         let mut request = [0u8; 32];
         let used = dmesh_server::tagged::encode_numeric_empty_request(
@@ -4942,19 +4983,21 @@ mod tests {
         )
         .unwrap();
         let response = android_discovery_nodes_response(&request[..used]).expect("response");
-        let rows = decode_devices_observed_response(&response).expect("rows");
-        assert_eq!(rows.len(), 2);
-        assert!(rows.iter().all(|row| row.device_id == vec![0x77; 16]));
-        let udp = rows.iter().find(|row| row.bearer.as_deref() == Some("udp_multicast")).unwrap();
-        let nan = rows.iter().find(|row| row.bearer.as_deref() == Some("nan")).unwrap();
-        assert_eq!(udp.name.as_deref(), Some("rowpeer"));
-        assert_eq!(udp.device_class, Some(dmesh_server::announce::DEVICE_CLASS_HOST));
-        assert_eq!(udp.uptime_secs, Some(42));
-        assert_eq!(udp.authenticated, Some(false));
-        // The endpoint is the advertised address with this receiver's scope.
-        assert_eq!(udp.udp_endpoint.as_deref(), Some("[fe80::77%5]:3336"));
-        assert_eq!(nan.rssi_dbm, Some(-58));
-        assert_eq!(rows[0].peer, None, "Android has no MAC for a NAN peer");
+        let mut decoder=dmesh_server::cbor::Decoder::new(&response);
+        decoder.skip().unwrap();
+        let mut rows=Vec::new();
+        while !decoder.is_finished() {
+            let at=decoder.position();decoder.skip().unwrap();let item=&response[at..decoder.position()];
+            if item==dmesh_server::discovery_nodes::END {break;}
+            rows.push(dmesh_server::discovery_nodes::Observation::decode(item).unwrap());
+        }
+        assert_eq!(rows.len(),2);
+        assert!(rows.iter().all(|row|row.record==original));
+        let nan=rows.iter().find(|row|row.bearer=="nan").unwrap();
+        assert_eq!(nan.rssi_dbm,Some(-58));assert_eq!(nan.peer,None,"Android PeerHandle is not a MAC");
+        let decoded=dmesh_server::announce::decode_announce(nan.record).unwrap();
+        assert_eq!(decoded.device_name(),Some("rowpeer"));assert_eq!(decoded.uptime_secs,42);
+
     }
 
     #[test]

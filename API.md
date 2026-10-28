@@ -48,7 +48,7 @@ where a method has one, what its body contains.
 
 # `discovery` API (6)
 
-## 9. `nodes` — Return the retained cross-bearer observed-device inventory
+## 9. `nodes` — Read original announcements and live discovery observations
 
 **Platforms:** A L E
 
@@ -56,44 +56,54 @@ where a method has one, what its body contains.
 
 **UI:** default
 
-### Response
-
-The response result has field `1`, an array of
-observer-local device rows. A stable `device_id` is the merge key; `peer` is an
-optional bearer-local correlation address and is never a device identity.
+### Request
 
 | Tag | Field | Type | Description |
 |---:|---|---|---|
-| 1 | `device_id` | `bytes` | Stable signed identity hint; empty for a provisional observation. |
-| 2 | `peer` | `bytes[6]` | Optional observer-local radio address; all-zero means unavailable. |
-| 3 | `bssid` | `bytes[6]` | Optional receiver-side BSSID. |
-| 4 | `available_fields` | `u32` | Observation capability bitset: peer=1, BSSID=2, channel=4, RSSI=8, payload fingerprint=16. |
-| 5 | `first_seen_ms` | `u32` | Observer-local first receipt time; zero or max means unavailable. |
-| 6 | `last_seen_ms` | `u32` | Observer-local last receipt time; zero or max means unavailable. |
-| 7 | `packets` | `u32` | Total admitted discovery packets. |
-| 8 | `active_publish_rx` | `u32` | Active Publish receipts. |
-| 9 | `active_subscribe_rx` | `u32` | Active Subscribe receipts. |
-| 10 | `followup_rx` | `u32` | Follow-up receipts. |
-| 11 | `last_kind` | `u8` | Last discovery packet kind. |
-| 12 | `last_payload_len` | `u16` | Payload length metadata; payload is not retained here. |
-| 13 | `last_payload_hash` | `u32` | Non-secret payload fingerprint. |
-| 14 | `unavailable_fields` | `u32` | Explicit complement of `available_fields`. |
-| 15 | `channel` | `u8` | Optional receiver-side capture channel. |
-| 16 | `bearer` | `string` | Bearer of this row's observation: `udp_multicast`, `nan`, `now`, `ble`. A device seen on several bearers has one row per bearer, all with the same `device_id`. |
-| 17 | `rssi_dbm` | `i16` | Last signal strength of this observation, when the bearer reports one. |
-| 18 | `name` | `string` | Device name from its announce. |
-| 19 | `vip6` | `bytes` | The device's 16-byte virtual IPv6 address. |
-| 20 | `device_class` | `u8` | Announced device class (ESP=1, host=2, Android=3, ...). |
-| 21 | `probe_capabilities` | `u16` | Announced probe capability set. |
-| 22 | `authenticated` | `bool` | The announce carried a public key whose signature verified. |
-| 23 | `uptime_secs` | `u32` | Producer-relative uptime from its announce. |
-| 24 | `udp_endpoint` | `string` | Where the device accepts mesh requests over UDP (advertised address and port, with this receiver's interface scope); absent when it has no UDP path, such as a device seen only over NAN or BLE. |
-| 25 | `network_name` | `string` | Shared network label from its announce. |
+| 1 | `duration_ms` | `u32` | Live collection interval, default 5000, maximum 300000; zero returns a retained snapshot only. |
+| 2 | `retained` | `bool` | Include already-known records first, default true. ESP has no retained inventory and returns none. |
+| 3 | `active` | `bool` | Solicit discovery after the live response source is registered, default true; ignored for a zero-duration snapshot. |
 
-Fields 1 to 15 are the compact form every platform sends. Fields 16 and up come from
-the announce, so a platform that has it (Android, Linux) includes them and a device
-that only has an identifier (firmware) omits them; an absent field is unknown, not
-empty.
+### Response
+
+| Tag | Field | Type | Description |
+|---:|---|---|---|
+| 1 | `format` | `u8` | 1: response body is the announcement sequence below. |
+
+A correlated numeric response header is followed by a CBOR sequence and FIN.
+All platforms use this same wire and request behavior. Hosts may aggregate
+retained records; ESP streams only observations received while the stream is
+open. There is no separate nan.watch observation API. Dropping/resetting the
+stream releases its active response state. Backpressure may lose live events;
+accepted ESP output packets belong to the stream until returned to its pool.
+
+### Stream body
+
+Each sequence item is a map. Kind 1 contains the original announcement as a
+byte string, with its public key and signature intact when supplied by the
+producer. Verify that original record before trusting its identity. Receiver
+metadata is optional and is NOT covered by the producer's signature. A bare
+identity hint from a legacy unsigned producer remains unauthenticated.
+
+| Tag | Field | Type | Description |
+|---:|---|---|---|
+| 0 | `kind` | `uint` | 1 observation; terminal item is exactly `{0:0}` followed by FIN. |
+| 1 | `peer` | `bytes[6]` | Actual observed radio MAC when known; never a platform peer handle. |
+| 2 | `rssi_dbm` | `int` | Signed receiver signal level, if available. |
+| 3 | `channel` | `uint` | Receiver's radio channel, if available. |
+| 4 | `received_us` | `uint` | Receiver-local monotonic microseconds; not comparable across observers. |
+| 6 | `record` | `bytes` | Original encoded announcement, including original signature. |
+| 7 | `last_seen_ms` | `uint` | Host UTC epoch milliseconds; absent without a wall clock. |
+| 8 | `origin` | `uint` | 0 directly observed by this reporter; 1 learned by crawling another observer. |
+| 9 | `bearer` | `string` | Receiver bearer, e.g. nan, now, udp_multicast or ble. |
+| 10 | `retained` | `bool` | This item came from the initial retained snapshot, rather than the live interval. |
+| 11 | `via` | `bytes` | Original observer's eight-byte identity hint for a crawled observation. |
+| 12 | `age_ms` | `uint` | Age at encoding, independent of the consumer's wall clock. |
+
+One device may have several bearer observations. A host may collapse repeated
+observations during a stream to the latest per device/bearer. Missing metadata
+means unavailable. The terminal item makes an empty result distinguishable from
+a truncated response. Stream chunk boundaries do not delimit CBOR items.
 
 ### Device record
 
@@ -606,7 +616,7 @@ protocol prerequisite.
 | 4 | `flash_bytes` | `u64` | no | Physical flash capacity when applicable. |
 | 5 | `role` | `string` | yes | main, recovery, linux, or android. |
 
-The transport schema is owned by [the XIP host ABI](../esp-xip-modules/abi/API.md).
+The transport schema is owned by [the XIP transport spec](../esp-xip-modules/api/transport.API.md).
 The generator includes that definition here.
 
 <!-- xip-transport-schema -->

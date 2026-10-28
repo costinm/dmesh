@@ -132,6 +132,9 @@ pub fn verify_identity(announce: Announce) -> bool {
 
 /// Tagged component reserved for one-way presence records.
 pub const ANNOUNCE_COMPONENT: u64 = 6;
+/// Compatibility service port for ESP announcements predating udp_port.
+/// Distinct from the multicast discovery socket and legacy event port.
+pub const DEFAULT_ESP_UDP_PORT: u16 = 3339;
 pub const ANNOUNCE_DISCOVERY: u64 = 2;
 /// Local request/response for bounded observation caches, not a broadcast.
 pub const ANNOUNCE_OBSERVED: u64 = 3;
@@ -954,7 +957,11 @@ pub fn is_followups_observed_request(packet: &[u8]) -> bool {
 
 /// True only for the canonical unified device-observation request.
 pub fn is_devices_observed_request(packet: &[u8]) -> bool {
-    is_empty_observation_request(packet, ANNOUNCE_DEVICES_OBSERVED)
+    let Some(record)=decode(packet) else {return false;};
+    record.to.is_none() && record.params.is_none()
+        && record.component==Some(Name::Tag(ANNOUNCE_COMPONENT))
+        && record.method==Some(Name::Tag(ANNOUNCE_DEVICES_OBSERVED))
+        && crate::discovery_nodes::Options::decode(record.fields).is_some()
 }
 
 fn is_empty_observation_request(packet: &[u8], method: u64) -> bool {

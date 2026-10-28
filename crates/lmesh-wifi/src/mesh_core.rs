@@ -1205,7 +1205,7 @@ impl LmeshService {
         // engine, so one inventory serves every bearer. UDP announces already
         // reach the engine through its own receive path.
         let engine = discovery.engine().clone();
-        radio.set_announce_sink(Arc::new(move |source, peer, announce| {
+        radio.set_announce_sink(Arc::new(move |source, peer, announce, payload| {
             use dmesh_server::discovery::DiscoveryPacketKind;
             let (bearer, kind) = match source {
                 "udp_multicast" => return,
@@ -1216,7 +1216,7 @@ impl LmeshService {
             engine.observe_announce(
                 &dmesh_discovery::Carrier::radio(bearer, peer, kind),
                 announce,
-                &[],
+                payload,
             );
         }));
         // Construction is deliberately radio-neutral. A lmesh restart must

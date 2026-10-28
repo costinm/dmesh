@@ -266,137 +266,34 @@
     },
     {
       "name": "discovery.nodes",
-      "description": "Call the discovery.nodes QUIC stream handler",
+      "description": "Read original announcements and live discovery observations",
       "inputSchema": {
-        "type": "object",
-        "properties": {}
+        "properties": {
+          "active": {
+            "type": "boolean",
+            "x-protobuf-index": 3,
+            "x-protobuf-type": "bool"
+          },
+          "duration_ms": {
+            "type": "integer",
+            "x-protobuf-index": 1,
+            "x-protobuf-type": "u32"
+          },
+          "retained": {
+            "type": "boolean",
+            "x-protobuf-index": 2,
+            "x-protobuf-type": "bool"
+          }
+        },
+        "required": [],
+        "type": "object"
       },
       "outputSchema": {
         "properties": {
-          "active_publish_rx": {
+          "format": {
             "type": "integer",
-            "x-protobuf-index": 8,
-            "x-protobuf-type": "u32"
-          },
-          "active_subscribe_rx": {
-            "type": "integer",
-            "x-protobuf-index": 9,
-            "x-protobuf-type": "u32"
-          },
-          "authenticated": {
-            "type": "boolean",
-            "x-protobuf-index": 22,
-            "x-protobuf-type": "bool"
-          },
-          "available_fields": {
-            "type": "integer",
-            "x-protobuf-index": 4,
-            "x-protobuf-type": "u32"
-          },
-          "bearer": {
-            "type": "string",
-            "x-protobuf-index": 16,
-            "x-protobuf-type": "string"
-          },
-          "bssid": {
-            "type": "string",
-            "x-protobuf-index": 3,
-            "x-protobuf-type": "bytes[6]"
-          },
-          "channel": {
-            "type": "integer",
-            "x-protobuf-index": 15,
-            "x-protobuf-type": "u8"
-          },
-          "device_class": {
-            "type": "integer",
-            "x-protobuf-index": 20,
-            "x-protobuf-type": "u8"
-          },
-          "device_id": {
-            "type": "string",
             "x-protobuf-index": 1,
-            "x-protobuf-type": "bytes"
-          },
-          "first_seen_ms": {
-            "type": "integer",
-            "x-protobuf-index": 5,
-            "x-protobuf-type": "u32"
-          },
-          "followup_rx": {
-            "type": "integer",
-            "x-protobuf-index": 10,
-            "x-protobuf-type": "u32"
-          },
-          "last_kind": {
-            "type": "integer",
-            "x-protobuf-index": 11,
             "x-protobuf-type": "u8"
-          },
-          "last_payload_hash": {
-            "type": "integer",
-            "x-protobuf-index": 13,
-            "x-protobuf-type": "u32"
-          },
-          "last_payload_len": {
-            "type": "integer",
-            "x-protobuf-index": 12,
-            "x-protobuf-type": "u16"
-          },
-          "last_seen_ms": {
-            "type": "integer",
-            "x-protobuf-index": 6,
-            "x-protobuf-type": "u32"
-          },
-          "name": {
-            "type": "string",
-            "x-protobuf-index": 18,
-            "x-protobuf-type": "string"
-          },
-          "network_name": {
-            "type": "string",
-            "x-protobuf-index": 25,
-            "x-protobuf-type": "string"
-          },
-          "packets": {
-            "type": "integer",
-            "x-protobuf-index": 7,
-            "x-protobuf-type": "u32"
-          },
-          "peer": {
-            "type": "string",
-            "x-protobuf-index": 2,
-            "x-protobuf-type": "bytes[6]"
-          },
-          "probe_capabilities": {
-            "type": "integer",
-            "x-protobuf-index": 21,
-            "x-protobuf-type": "u16"
-          },
-          "rssi_dbm": {
-            "type": "integer",
-            "x-protobuf-index": 17,
-            "x-protobuf-type": "i16"
-          },
-          "udp_endpoint": {
-            "type": "string",
-            "x-protobuf-index": 24,
-            "x-protobuf-type": "string"
-          },
-          "unavailable_fields": {
-            "type": "integer",
-            "x-protobuf-index": 14,
-            "x-protobuf-type": "u32"
-          },
-          "uptime_secs": {
-            "type": "integer",
-            "x-protobuf-index": 23,
-            "x-protobuf-type": "u32"
-          },
-          "vip6": {
-            "type": "string",
-            "x-protobuf-index": 19,
-            "x-protobuf-type": "bytes"
           }
         },
         "required": [],
@@ -412,27 +309,41 @@
         "android"
       ],
       "x-dmesh-device": true,
-      "x-tier": "core"
+      "x-tier": "core",
+      "x-standard-errors": [
+        "unauthenticated",
+        "permission_denied",
+        "timeout",
+        "remote_exception",
+        "invalid_argument",
+        "not_found",
+        "conflict",
+        "unavailable",
+        "internal"
+      ]
     },
     {
       "name": "discovery.active",
-      "description": "Call the discovery.active QUIC stream handler",
+      "description": "Run one discovery pass on every available local bearer",
       "inputSchema": {
-        "type": "object",
         "properties": {
           "medium": {
             "type": "string",
             "x-protobuf-index": 40,
-            "x-dmesh-kind": "text"
+            "x-protobuf-type": "string"
           },
           "to": {
             "type": "string",
             "x-protobuf-index": 41,
-            "x-dmesh-kind": "text"
+            "x-protobuf-type": "string"
           }
-        }
+        },
+        "required": [],
+        "type": "object"
       },
       "outputSchema": {
+        "properties": {},
+        "required": [],
         "type": "object"
       },
       "x-component-index": 6,
@@ -445,7 +356,18 @@
         "android"
       ],
       "x-dmesh-device": true,
-      "x-tier": "core"
+      "x-tier": "core",
+      "x-standard-errors": [
+        "unauthenticated",
+        "permission_denied",
+        "timeout",
+        "remote_exception",
+        "invalid_argument",
+        "not_found",
+        "conflict",
+        "unavailable",
+        "internal"
+      ]
     },
     {
       "name": "nan.wakeup",

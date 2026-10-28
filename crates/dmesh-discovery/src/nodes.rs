@@ -1,191 +1,416 @@
-//! The `discovery.nodes` response: one row per discovered device and bearer.
-//!
-//! The rows are the compact wire shared with the firmware (`API.md`, tags 1 to
-//! 15, observation facts) plus the optional tags 16 to 25 that come from the
-//! announce. Every platform that has a [`Device`] list builds its response here.
-
-use dmesh_server::announce::{self, ObservedDevice};
-use dmesh_server::discovery::DiscoveryObservation;
-
+//! Signed announcement streams, with optional retained receiver metadata.
 use crate::inventory::Device;
+use dmesh_server::{
+    discovery_nodes::{self as wire, Observation, Options, Origin},
+    stream::{BodyChunkProgress, BodyChunkWriteError, BodyChunkWriter, BodySource, Response},
+};
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-/// Most rows one response carries.
-pub const MAX_ROWS: usize = 64;
-
-struct Row {
-    id: Vec<u8>,
-    bearer: String,
-    observation: DiscoveryObservation,
-    name: Option<String>,
-    vip6: Option<[u8; 16]>,
-    device_class: Option<u8>,
-    probe_capabilities: Option<u16>,
-    authenticated: bool,
-    uptime_secs: Option<u32>,
-    udp_endpoint: Option<String>,
-    network_name: Option<String>,
+/// Same response header and record sequence on host, Android, and ESP.
+pub fn stream_response(
+    engine: Arc<crate::Engine>,
+    id: u64,
+    options: Options,
+    live_scopes_only: bool,
+) -> Option<Response> {
+    let mut header = vec![0; 64];
+    let n = wire::header(id, &mut header)?;
+    header.truncate(n);
+    Some(Response::with_body(
+        header,
+        NodesSource::new(engine, options, live_scopes_only),
+    ))
 }
 
-fn id_bytes(key: &str) -> Option<Vec<u8>> {
-    if key.is_empty() || key.len() % 2 != 0 || key.len() > 32 {
-        return None;
+/// A snapshot using the same wire; useful to synchronous local adapters. Network
+/// endpoints use stream_response to include live updates for the requested window.
+pub fn response(devices: &[Device], id: u64, live_scopes_only: bool) -> Option<Vec<u8>> {
+    let mut out = vec![0; 64];
+    let n = wire::header(id, &mut out)?;
+    out.truncate(n);
+    for (_, _, row) in records(devices, live_scopes_only, true) {
+        out.extend(row);
     }
-    (0..key.len() / 2)
-        .map(|index| u8::from_str_radix(&key[index * 2..index * 2 + 2], 16).ok())
-        .collect()
+    out.extend(wire::END);
+    Some(out)
 }
 
-/// Encode the correlated `discovery.nodes` result for request `id`.
-///
-/// A UDP observation whose link-local scope is no longer a live interface is
-/// left out when `live_scopes_only` is set: a scope id is a local kernel
-/// object id, and a vanished P2P group must not be offered as a path.
-pub fn response(devices: &[Device], request_id: u64, live_scopes_only: bool) -> Option<Vec<u8>> {
-    let mut rows = Vec::<Row>::new();
-    'devices: for device in devices {
-        let Some(id) = id_bytes(device.key()) else {
+fn records(
+    devices: &[Device],
+    live_scopes_only: bool,
+    retained: bool,
+) -> Vec<(String, (i64, u32), Vec<u8>)> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let mut rows = Vec::new();
+    for device in devices {
+        let Some(record) = device.record.as_deref() else {
             continue;
         };
-        let announce = device.announce.as_ref();
-        let udp_endpoint = device.udp_endpoint().ok().map(|address| address.to_string());
-        for (bearer, observation) in &device.observations {
-            if rows.len() == MAX_ROWS {
-                break 'devices;
-            }
+        for (bearer, facts) in &device.observations {
             if live_scopes_only
                 && bearer == crate::BEARER_UDP
                 && device
                     .udp_sender
-                    .is_some_and(|sender| !crate::interfaces::has_live_scope(&sender))
+                    .is_some_and(|p| !crate::interfaces::has_live_scope(&p))
             {
                 continue;
             }
-            rows.push(Row {
-                id: id.clone(),
-                bearer: bearer.clone(),
-                observation: observation.clone(),
-                name: device.name().map(str::to_owned),
-                vip6: device.vip6().map(|vip| vip.octets()),
-                device_class: announce.map(|announce| announce.device_class),
-                probe_capabilities: announce.map(|announce| announce.probe_capabilities),
-                authenticated: device.authenticated,
-                uptime_secs: announce.map(|announce| announce.uptime_secs),
-                udp_endpoint: udp_endpoint.clone(),
-                network_name: announce
-                    .and_then(|announce| announce.network_name())
-                    .map(str::to_owned),
-            });
+            let mut row = Observation::new(record, bearer);
+            // Only an actual six-byte colon-separated radio address is a MAC.
+            let mac: Option<Vec<u8>> = facts
+                .last_peer
+                .split(':')
+                .map(|b| {
+                    if b.len() == 2 {
+                        u8::from_str_radix(b, 16).ok()
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            row.peer = mac.and_then(|m| m.try_into().ok());
+            row.rssi_dbm = facts.last_rssi_dbm;
+            row.channel = facts.last_channel;
+            row.last_seen_ms = (facts.last_seen_ms>0).then(||u64::try_from(facts.last_seen_ms).ok()).flatten();
+            row.age_ms = row.last_seen_ms.map(|t| now.saturating_sub(t));
+            row.retained = retained;
+            if let Some(via) = device.crawled_via.get(bearer) {
+                row.origin = Origin::Crawled;
+                row.via = Some(via);
+            }
+            let mut out = vec![0; record.len() + 256];
+            if let Some(n) = row.encode(&mut out) {
+                out.truncate(n);
+                rows.push((
+                    format!("{}:{bearer}", device.id),
+                    (facts.last_seen_ms, facts.packets),
+                    out,
+                ));
+            }
         }
     }
-    let entries: Vec<ObservedDevice<'_>> = rows
-        .iter()
-        .map(|row| {
-            let observation = &row.observation;
-            ObservedDevice {
-                device_id: &row.id,
-                // A bearer-local handle (an Android PeerHandle, a UDP source) is
-                // not a MAC and is never serialized as one; the semantic id is
-                // the cross-bearer merge key.
-                peer: [0; 6],
-                bssid: observation.last_bssid,
-                channel: observation.last_channel,
-                available_fields: observation.available_fields,
-                first_seen_ms: u32::try_from(observation.first_seen_ms).unwrap_or(u32::MAX),
-                last_seen_ms: u32::try_from(observation.last_seen_ms).unwrap_or(u32::MAX),
-                packets: observation.packets,
-                active_publish_rx: observation.active_publish_rx,
-                active_subscribe_rx: observation.active_subscribe_rx,
-                followup_rx: observation.followup_rx,
-                last_kind: observation.last_kind as u8,
-                last_payload_len: observation.last_payload_len,
-                last_payload_hash: observation.last_payload_hash,
-                bearer: Some(&row.bearer),
-                rssi_dbm: observation.last_rssi_dbm,
-                name: row.name.as_deref(),
-                vip6: row.vip6,
-                device_class: row.device_class,
-                probe_capabilities: row.probe_capabilities,
-                authenticated: Some(row.authenticated),
-                uptime_secs: row.uptime_secs,
-                udp_endpoint: row.udp_endpoint.as_deref(),
-                network_name: row.network_name.as_deref(),
+    rows
+}
+
+struct NodesSource {
+    engine: Arc<crate::Engine>,
+    until: Instant,
+    next_poll: Instant,
+    scopes: bool,
+    seen: BTreeMap<String, (i64, u32)>,
+    ready: std::collections::VecDeque<Vec<u8>>,
+    current: Vec<u8>,
+    position: usize,
+    ended: bool,
+    closing: bool,
+}
+impl NodesSource {
+    fn new(engine: Arc<crate::Engine>, options: Options, scopes: bool) -> Self {
+        let now = Instant::now();
+        let mut source = Self {
+            engine,
+            until: now + Duration::from_millis(options.duration_ms as u64),
+            next_poll: now,
+            scopes,
+            seen: BTreeMap::new(),
+            ready: Default::default(),
+            current: Vec::new(),
+            position: 0,
+            ended: false,
+            closing: false,
+        };
+        for (key, stamp, row) in records(&source.engine.devices(), scopes, true) {
+            source.seen.insert(key, stamp);
+            if options.retained {
+                source.ready.push_back(row);
             }
+        }
+        source
+    }
+    fn prepare(&mut self) -> bool {
+        if self.position < self.current.len() {
+            return true;
+        }
+        self.current = Vec::new();
+        self.position = 0;
+        if let Some(row) = self.ready.pop_front() {
+            self.current = row;
+            return true;
+        }
+        if self.ended {
+            return false;
+        }
+        let now = Instant::now();
+        if self.closing {
+            self.current = wire::END.to_vec();
+            self.ended = true;
+            return true;
+        }
+        self.closing = now >= self.until;
+        if !self.closing && now < self.next_poll {
+            return false;
+        }
+        self.next_poll = now + Duration::from_millis(50);
+        for (key, stamp, row) in records(&self.engine.devices(), self.scopes, false) {
+            if self.seen.insert(key, stamp) != Some(stamp) {
+                self.ready.push_back(row);
+            }
+        }
+        if let Some(row) = self.ready.pop_front() {
+            self.current = row;
+            true
+        } else if self.closing {
+            self.current = wire::END.to_vec();
+            self.ended = true;
+            true
+        } else {
+            false
+        }
+    }
+}
+impl BodySource for NodesSource {
+    fn read(&mut self, out: &mut [u8]) -> (usize, bool) {
+        if !self.prepare() {
+            return (0, self.ended);
+        }
+        let n = out.len().min(self.current.len() - self.position);
+        out[..n].copy_from_slice(&self.current[self.position..self.position + n]);
+        self.position += n;
+        (n, self.ended && self.position == self.current.len())
+    }
+    fn write_chunk(&mut self, writer: &mut dyn BodyChunkWriter) -> Option<BodyChunkProgress> {
+        if !self.prepare() {
+            return Some(if self.ended {
+                BodyChunkProgress::Done
+            } else {
+                BodyChunkProgress::Waiting
+            });
+        }
+        Some(match writer.write(&self.current[self.position..]) {
+            Ok(0) => BodyChunkProgress::Waiting,
+            Ok(n) if n <= self.current.len() - self.position => {
+                self.position += n;
+                BodyChunkProgress::Accepted(n)
+            }
+            Ok(_) => BodyChunkProgress::Failed,
+            Err(BodyChunkWriteError::Retryable) => BodyChunkProgress::Retryable,
+            Err(BodyChunkWriteError::Failed) => BodyChunkProgress::Failed,
         })
-        .collect();
-    let mut direct = vec![0u8; 128 + entries.len() * 320];
-    let direct_len = announce::encode_devices_observed_response(&entries, &mut direct)?;
-    let fields = dmesh_server::tagged::decode(&direct[..direct_len])?.fields?;
-    let mut wire = vec![0u8; fields.len() + 64];
-    let used = dmesh_server::tagged::encode_numeric_response(
-        announce::ANNOUNCE_COMPONENT,
-        announce::ANNOUNCE_DEVICES_OBSERVED,
-        request_id,
-        fields,
-        &mut wire,
-    )?;
-    wire.truncate(used);
-    Some(wire)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BEARER_UDP, Carrier, Engine, NoFacts, UnsignedIdentity};
-    use dmesh_server::announce::{Announce, DEVICE_CLASS_HOST, decode_devices_observed_response};
-    use dmesh_server::discovery::DiscoveryPacketKind;
-    use std::sync::Arc;
-
+    use crate::{Carrier, Engine, NoFacts, P256Identity, UnsignedIdentity};
+    use dmesh_server::{announce, cbor::Decoder, discovery::DiscoveryPacketKind};
+    fn engine() -> Arc<Engine> {
+        Arc::new(Engine::new(
+            Arc::new(UnsignedIdentity::from_seed(b"observer")),
+            Arc::new(NoFacts),
+        ))
+    }
+    fn signed() -> Vec<u8> {
+        Engine::new(Arc::new(P256Identity::generate()), Arc::new(NoFacts))
+            .announce_wire()
+            .unwrap()
+    }
+    fn items(bytes: &[u8]) -> Vec<Observation<'_>> {
+        let mut d = Decoder::new(bytes);
+        let mut rows = Vec::new();
+        while !d.is_finished() {
+            let at = d.position();
+            d.skip().unwrap();
+            let item = &bytes[at..d.position()];
+            if item == wire::END {
+                assert!(d.is_finished());
+                break;
+            }
+            rows.push(Observation::decode(item).unwrap());
+        }
+        rows
+    }
+    fn drain(source: &mut NodesSource) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut small = [0; 13];
+        loop {
+            let (n, done) = source.read(&mut small);
+            bytes.extend_from_slice(&small[..n]);
+            if done {
+                break;
+            }
+            assert!(n > 0, "test deadline must have elapsed");
+        }
+        bytes
+    }
     #[test]
-    fn rows_are_per_bearer_with_the_announce_attributes() {
-        let engine = Engine::new(Arc::new(UnsignedIdentity::from_seed(b"me")), Arc::new(NoFacts));
-        let mut peer = Announce::discovery([0x77; 16], 16, 42);
-        assert!(peer.set_device_name("rowpeer"));
-        peer.set_probe_descriptor(DEVICE_CLASS_HOST, 0x0f);
-        peer.set_udp_link_local_v6("fe80::77".parse::<std::net::Ipv6Addr>().unwrap().octets());
-        peer.set_udp_port(3336);
-        let mut wire = [0u8; 256];
-        let used = announce::encode(peer, &mut wire).unwrap();
-        let sender = "[fe80::77%5]:5227".parse().unwrap();
-        engine.on_datagram(&Carrier::udp("[fe80::77%5]:5227", sender), &wire[..used]);
-        let mut nan = Carrier::radio("nan", "aware:3", DiscoveryPacketKind::ActivePublish);
-        nan.rssi_dbm = Some(-58);
-        engine.on_datagram(&nan, &wire[..used]);
-
-        let response = response(&engine.devices(), 9, false).unwrap();
-        let rows = decode_devices_observed_response(&response).unwrap();
+    fn retained_rows_preserve_original_signed_bytes_per_bearer_and_complete() {
+        let engine = engine();
+        let signed = signed();
+        engine.on_datagram(
+            &Carrier::radio(
+                "nan",
+                "02:02:02:02:02:02",
+                DiscoveryPacketKind::ActivePublish,
+            ),
+            &signed,
+        );
+        engine.on_datagram(
+            &Carrier::udp("[fe80::1%3]:3339", "[fe80::1%3]:3339".parse().unwrap()),
+            &signed,
+        );
+        let response = response(&engine.devices(), 42, false).unwrap();
+        let mut d = Decoder::new(&response);
+        d.skip().unwrap();
+        assert!(wire::is_header(
+            dmesh_server::tagged::decode(&response[..d.position()]).unwrap()
+        ));
+        let rows = items(&response[d.position()..]);
         assert_eq!(rows.len(), 2);
-        assert!(rows.iter().all(|row| row.device_id == vec![0x77; 16]));
-        let udp = rows.iter().find(|row| row.bearer.as_deref() == Some(BEARER_UDP)).unwrap();
-        let nan = rows.iter().find(|row| row.bearer.as_deref() == Some("nan")).unwrap();
-        assert_eq!(udp.name.as_deref(), Some("rowpeer"));
-        assert_eq!(udp.device_class, Some(DEVICE_CLASS_HOST));
-        assert_eq!(udp.uptime_secs, Some(42));
-        assert_eq!(udp.authenticated, Some(false));
-        assert_eq!(udp.udp_endpoint.as_deref(), Some("[fe80::77%5]:3336"));
-        assert_eq!(nan.rssi_dbm, Some(-58));
-        assert_eq!(rows[0].peer, None);
+        assert_eq!(rows[0].record, signed);
+        assert_eq!(rows[1].record, signed);
+        assert!(rows.iter().all(|r| r.retained
+            && r.origin == Origin::Direct
+            && r.last_seen_ms.is_some()
+            && r.age_ms.is_some()));
+        assert!(
+            rows.iter()
+                .any(|r| r.bearer == "nan" && r.peer == Some([2; 6]))
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.bearer == crate::BEARER_UDP && r.peer.is_none())
+        );
+        assert!(announce::verify_identity(
+            announce::decode_announce(rows[0].record).unwrap()
+        ));
+    }
+    #[test]
+    fn live_stream_does_not_replay_old_rows_and_closing_collects_updates() {
+        let engine = engine();
+        let first = signed();
+        let fresh = signed();
+        let carrier = Carrier::radio(
+            "nan",
+            "02:02:02:02:02:02",
+            DiscoveryPacketKind::ActivePublish,
+        );
+        engine.on_datagram(&carrier, &first);
+        let mut source = NodesSource::new(
+            engine.clone(),
+            Options {
+                duration_ms: 5000,
+                retained: false,
+                active: false,
+            },
+            false,
+        );
+        engine.on_datagram(&carrier, &fresh);
+        source.until = Instant::now();
+        let bytes = drain(&mut source);
+        let rows = items(&bytes);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].record, fresh);
+        assert!(!rows[0].retained);
+    }
+    #[test]
+    fn crawl_provenance_is_unsigned_and_cannot_replace_a_direct_observation() {
+        let engine = engine();
+        let raw = signed();
+        let observer = [9; 8];
+        let mut row = Observation::new(&raw, "nan");
+        row.peer = Some([2; 6]);
+        row.rssi_dbm = Some(-80);
+        assert!(engine.observe_crawled(&observer, &row));
+        let data = response(&engine.devices(), 1, false).unwrap();
+        let mut d = Decoder::new(&data);
+        d.skip().unwrap();
+        let rows = items(&data[d.position()..]);
+        assert_eq!(rows[0].origin, Origin::Crawled);
+        assert_eq!(rows[0].via, Some(&observer[..]));
+        engine.on_datagram(
+            &Carrier::radio(
+                "nan",
+                "02:02:02:02:02:02",
+                DiscoveryPacketKind::ActivePublish,
+            ),
+            &raw,
+        );
+        assert!(!engine.observe_crawled(&observer, &row));
+        assert!(engine.devices()[0].crawled_via.is_empty());
+    }
+    #[test]
+    fn compact_unsigned_sightings_do_not_discard_the_last_verified_signature() {
+        let engine = engine();
+        let raw = signed();
+        let carrier = Carrier::radio(
+            "nan",
+            "02:02:02:02:02:02",
+            DiscoveryPacketKind::ActivePublish,
+        );
+        engine.on_datagram(&carrier, &raw);
+        let mut hint = announce::decode_announce(&raw).unwrap();
+        hint.public_key_len = 0;
+        hint.signature_len = 0;
+        hint.uptime_secs += 1;
+        let mut encoded = [0; 512];
+        let n = announce::encode(hint, &mut encoded).unwrap();
+        engine.on_datagram(&carrier, &encoded[..n]);
+        let devices = engine.devices();
+        assert!(devices[0].authenticated);
+        assert_eq!(devices[0].record.as_deref(), Some(raw.as_slice()));
     }
 
     #[test]
-    fn a_stale_link_local_scope_is_not_offered_when_asked_to_check() {
-        let engine = Engine::new(Arc::new(UnsignedIdentity::from_seed(b"me")), Arc::new(NoFacts));
-        let mut peer = Announce::discovery([0x78; 16], 16, 1);
-        assert!(peer.set_device_name("gone"));
-        let mut wire = [0u8; 256];
-        let used = announce::encode(peer, &mut wire).unwrap();
-        // Scope 4000000000 cannot be a live interface on any machine.
-        let sender = "[fe80::78%4000000000]:5227".parse().unwrap();
-        engine.on_datagram(&Carrier::udp("sender", sender), &wire[..used]);
-        let kept = decode_devices_observed_response(&response(&engine.devices(), 1, false).unwrap()).unwrap();
-        assert_eq!(kept.len(), 1);
-        let dropped = decode_devices_observed_response(&response(&engine.devices(), 1, true).unwrap()).unwrap();
-        assert!(dropped.is_empty());
+    fn crawling_an_expired_record_does_not_refresh_its_last_seen_time() {
+        let engine=engine();let raw=signed();let mut row=Observation::new(&raw,"nan");
+        row.age_ms=Some(3_601_000);
+        assert!(engine.observe_crawled(&[9;8],&row));
+        assert!(engine.devices().is_empty());
     }
 
     #[test]
-    fn no_devices_is_an_empty_list_not_an_error() {
-        let engine = Engine::new(Arc::new(UnsignedIdentity::from_seed(b"me")), Arc::new(NoFacts));
-        let rows = decode_devices_observed_response(&response(&engine.devices(), 3, false).unwrap()).unwrap();
-        assert!(rows.is_empty());
+    fn transport_refusal_keeps_the_same_record_and_byte_position() {
+        let engine = engine();
+        let raw = signed();
+        engine.on_datagram(
+            &Carrier::radio(
+                "nan",
+                "02:02:02:02:02:02",
+                DiscoveryPacketKind::ActivePublish,
+            ),
+            &raw,
+        );
+        let mut source = NodesSource::new(
+            engine,
+            Options {
+                duration_ms: 0,
+                ..Options::default()
+            },
+            false,
+        );
+        struct Refuse(usize);
+        impl BodyChunkWriter for Refuse {
+            fn write(&mut self, data: &[u8]) -> Result<usize, BodyChunkWriteError> {
+                self.0 = data.as_ptr() as usize;
+                Err(BodyChunkWriteError::Retryable)
+            }
+        }
+        let mut writer = Refuse(0);
+        assert!(matches!(
+            source.write_chunk(&mut writer),
+            Some(BodyChunkProgress::Retryable)
+        ));
+        assert_eq!(source.position, 0);
+        assert_eq!(source.current.as_ptr() as usize, writer.0);
+        let bytes = drain(&mut source);
+        assert_eq!(items(&bytes).len(), 1);
     }
 }

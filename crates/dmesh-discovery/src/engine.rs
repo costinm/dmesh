@@ -212,7 +212,8 @@ impl Engine {
 
     /// Record an announce a bearer has already decoded (a radio adapter that
     /// parses NAN Service Info itself). Validated like a received datagram;
-    /// `payload` is what the bearer saw, kept only as a fingerprint.
+    /// `payload` is the original record when available; hosts retain it so
+    /// discovery.nodes can forward signatures without trusting a decoded projection.
     pub fn observe_announce(
         &self,
         carrier: &Carrier<'_>,
@@ -268,6 +269,28 @@ impl Engine {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .observe_provisional(now_ms(), carrier, id, payload)
+    }
+
+    /// Import a signed announcement learned from another observer. Its signature
+    /// authenticates the announcer, not the supplied receiver metadata. Crawling
+    /// never replaces a direct observation on the same bearer or fulfills a
+    /// directed-discovery waiter.
+    pub fn observe_crawled(&self, via: &[u8], row: &dmesh_server::discovery_nodes::Observation<'_>) -> bool {
+        let Some(announce)=announce::decode_announce(row.record) else {return false};
+        if !announce.has_identity() || !announce::verify_identity(announce) || via.len()!=8 {return false;}
+        if announce.device_id()==&self.device_id()[..announce.device_id().len()] {return false;}
+        let key=hex(announce.device_id());
+        let mut inventory=self.inventory.write().unwrap_or_else(|e|e.into_inner());
+        if inventory.get(&key).is_some_and(|d| d.observations.contains_key(row.bearer) && !d.crawled_via.contains_key(row.bearer)) {return false;}
+        let peer=row.peer.map(|m|m.iter().map(|b|format!("{b:02x}")).collect::<Vec<_>>().join(":" )).unwrap_or_default();
+        let carrier=Carrier {bearer:row.bearer,peer:&peer,sender:None,rssi_dbm:row.rssi_dbm,bssid:None,channel:row.channel,kind:DiscoveryPacketKind::Other};
+        let now=now_ms();
+        let seen=row.age_ms.map(|age|now.saturating_sub(i64::try_from(age).unwrap_or(i64::MAX)))
+            .or_else(||row.last_seen_ms.and_then(|t|i64::try_from(t).ok()).map(|t|t.min(now)));
+        inventory.observe(now,&carrier,announce,None,announce.has_identity(),row.record);
+        inventory.set_crawled_source(&key,row.bearer,row.via.unwrap_or(via),seen);
+        inventory.prune(now);
+        true
     }
 
     /// The devices in the shape JSON consumers read (see

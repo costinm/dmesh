@@ -68,6 +68,7 @@ mod tests {
         Device {
             id: "d".into(),
             announce: Some(announce),
+            record: None, crawled_via: BTreeMap::new(),
             facts: None,
             authenticated,
             first_seen_ms: 1,

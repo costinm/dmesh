@@ -172,9 +172,9 @@ impl CaptureHost for RadioHost {
     fn nan_announce(&self, peer: &str, bssid: Option<&str>, payloads: &[&[u8]]) -> NanAnnounce {
         let decoded = payloads
             .iter()
-            .filter_map(|payload| dmesh_server::announce::decode_announce(payload))
-            .find(|item| !is_placeholder_announce_id(item.device_id()));
-        let Some(announce) = decoded else {
+            .filter_map(|payload| dmesh_server::announce::decode_announce(payload).map(|a|(a,*payload)))
+            .find(|(item,_)| !is_placeholder_announce_id(item.device_id()));
+        let Some((announce,payload)) = decoded else {
             return NanAnnounce::default();
         };
         if announce.has_identity() && !announce_identity_valid(announce) {
@@ -189,7 +189,7 @@ impl CaptureHost for RadioHost {
         self.discovered_devices
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .observe_announce("nan", peer.to_owned(), bssid.map(str::to_owned), announce);
+            .observe_announce_wire("nan", peer.to_owned(), bssid.map(str::to_owned), announce, payload);
         NanAnnounce {
             invalid_identity: false,
             summary: Some(announce_summary(&announce)),
@@ -214,11 +214,12 @@ impl CaptureHost for RadioHost {
             self.discovered_devices
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .observe_announce(
+                .observe_announce_wire(
                     "now_sync",
                     colon_mac(&peer),
                     Some(colon_mac(&cluster_id)),
                     announce,
+                    service_info,
                 );
         }
     }
@@ -234,7 +235,7 @@ impl CaptureHost for RadioHost {
         self.discovered_devices
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .observe_announce("now", colon_mac(&peer), bssid_text.clone(), announce);
+            .observe_announce_wire("now", colon_mac(&peer), bssid_text.clone(), announce, payload);
         push_radio_event(
             &self.history,
             RadioEvent {
@@ -327,7 +328,7 @@ struct DiscoveredDeviceRegistry {
 }
 
 /// `(source, peer, announce)` for each announce admitted from a radio bearer.
-pub type AnnounceSink = Arc<dyn Fn(&str, &str, dmesh_server::announce::Announce) + Send + Sync>;
+pub type AnnounceSink = Arc<dyn Fn(&str, &str, dmesh_server::announce::Announce, &[u8]) + Send + Sync>;
 
 #[derive(Clone, Debug)]
 struct DiscoveredBss {
@@ -560,9 +561,22 @@ impl DiscoveredDeviceRegistry {
         bssid: Option<String>,
         announce: dmesh_server::announce::Announce,
     ) {
+        let mut bytes=[0;512];
+        let n=dmesh_server::announce::encode(announce,&mut bytes).unwrap_or(0);
+        self.observe_announce_wire(source,peer,bssid,announce,&bytes[..n]);
+    }
+
+    fn observe_announce_wire(
+        &mut self,
+        source: &str,
+        peer: String,
+        bssid: Option<String>,
+        announce: dmesh_server::announce::Announce,
+        payload: &[u8],
+    ) {
         let device_id = hex_bytes(announce.device_id());
         if let Some(sink) = &self.sink {
-            sink(source, &peer, announce);
+            sink(source, &peer, announce, payload);
         }
         self.observe(DiscoveredDevice {
             device_id: device_id.clone(),
@@ -4867,7 +4881,7 @@ mod tests {
         );
         let seen = Arc::new(Mutex::new(Vec::new()));
         let sink_seen = seen.clone();
-        service.set_announce_sink(Arc::new(move |source, peer, announce| {
+        service.set_announce_sink(Arc::new(move |source, peer, announce, _payload| {
             sink_seen
                 .lock()
                 .unwrap()

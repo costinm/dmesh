@@ -591,7 +591,7 @@ fn linux_registry(
             "services registered twice"
         );
         assert!(
-            registry.register(methods::DISCOVERY_NODES, DiscoveryNodesHandler(service.clone())),
+            registry.register_stream(methods::DISCOVERY_NODES, DiscoveryNodesHandler(service.clone())),
             "discovery.nodes registered twice"
         );
         register_log_watch(&registry, this.clone());
@@ -760,17 +760,22 @@ impl Handler for ProbeStartHandler {
     }
 }
 
-/// `discovery.nodes` from the shared discovery inventory: one typed row per
-/// device and bearer, the same wire Android and the firmware send. Rows for a
-/// UDP path whose link-local scope has vanished are left out.
+/// Original announcement records and receiver metadata, using the same
+/// retained/live response source as Android and the same wire as ESP.
 #[derive(Clone)]
 struct DiscoveryNodesHandler(Arc<LmeshService>);
 
-impl Handler for DiscoveryNodesHandler {
-    fn call<'a>(&'a self, call: Call<'a>) -> Reply<'a> {
+impl dmesh_server::stream::StreamHandler for DiscoveryNodesHandler {
+    fn open<'a>(&'a self, request: dmesh_server::stream::Request<'a>) -> dmesh_server::stream::OpenFuture<'a> {
         Box::pin(async move {
-            let id = call.record.id?;
-            dmesh_discovery::nodes::response(&self.0.discovery_engine().devices(), id, true)
+            let options=dmesh_server::discovery_nodes::Options::decode(request.record.fields)?;
+            if request.record.to.is_some() || request.record.params.is_some() {return None;}
+            // Snapshot/subscription creation precedes solicitation.
+            let response=dmesh_discovery::nodes::stream_response(self.0.discovery_engine().clone(),request.record.id?,options,true)?;
+            if options.active && options.duration_ms != 0 {
+                let _=self.0.handle_request(crate::mesh_core::Request::DiscoveryActive {medium:None,to:None}).await;
+            }
+            Some(dmesh_server::stream::Outcome::Respond(response))
         })
     }
 }

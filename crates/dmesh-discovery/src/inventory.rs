@@ -15,7 +15,7 @@ use crate::engine::Carrier;
 pub type NodeKey = String;
 
 /// Port assumed for an ESP device that advertises none (its raw UDP6 listener).
-pub const ESP_UDP_PORT: u16 = 3339;
+pub const ESP_UDP_PORT: u16 = dmesh_server::announce::DEFAULT_ESP_UDP_PORT;
 
 /// One discovered device: its latest validated announce, and what each bearer
 /// has observed of it. A device seen only over NAN or BLE has no UDP sender.
@@ -26,6 +26,10 @@ pub struct Device {
     /// The latest validated announce; `None` for a provisional device, seen
     /// on a bearer that carried only an identifier (a legacy NAN follow-up).
     pub announce: Option<Announce>,
+    /// Original received announcement (signed when provided), separate from receiver metadata.
+    pub record: Option<Vec<u8>>,
+    /// Per-bearer original observer identity for observations learned by crawling.
+    pub crawled_via: BTreeMap<String, Vec<u8>>,
     /// Volatile radio facts the peer attached to its announce, if any.
     pub facts: Option<DiscoveryFacts>,
     /// The announce carried a public key whose signature verified.
@@ -175,6 +179,7 @@ impl Inventory {
         let device = self.devices.entry(key.clone()).or_insert_with(|| Device {
             id: key,
             announce: Some(announce),
+            record: None, crawled_via: BTreeMap::new(),
             facts: None,
             authenticated,
             first_seen_ms: now_ms,
@@ -182,9 +187,22 @@ impl Inventory {
             observations: BTreeMap::new(),
             udp_sender: None,
         });
-        device.announce = Some(announce);
+        // A compact/unsigned sighting may refresh receiver facts, but must not
+        // discard a previously verified full announcement and its signature.
+        if authenticated || !device.authenticated {
+            device.announce = Some(announce);
+            // Prefer the original record (including outer/future fields). Decoded-only
+            // legacy adapters still preserve the peer's signature when encoding it.
+            device.record = if dmesh_server::announce::decode_announce(payload) == Some(announce) {
+                Some(payload.to_vec())
+            } else {
+                let mut record=vec![0;512];
+                dmesh_server::announce::encode(announce,&mut record).map(|n|{record.truncate(n);record})
+            };
+            device.authenticated = authenticated;
+        }
+        device.crawled_via.remove(carrier.bearer);
         device.facts = facts.or(device.facts);
-        device.authenticated = authenticated;
         device.last_seen_ms = now_ms;
         if carrier.sender.is_some() {
             device.udp_sender = carrier.sender;
@@ -209,6 +227,7 @@ impl Inventory {
         let device = self.devices.entry(key.clone()).or_insert_with(|| Device {
             id: key,
             announce: None,
+            record: None, crawled_via: BTreeMap::new(),
             facts: None,
             authenticated: false,
             first_seen_ms: now_ms,
@@ -253,6 +272,14 @@ impl Inventory {
         let ttl = self.ttl_ms;
         self.devices
             .retain(|_, device| now_ms.saturating_sub(device.last_seen_ms) <= ttl);
+    }
+
+    pub(crate) fn set_crawled_source(&mut self, key: &str, bearer: &str, via: &[u8], last_seen: Option<i64>) {
+        if let Some(device)=self.devices.get_mut(key) {
+            device.crawled_via.insert(bearer.to_owned(),via.to_vec());
+            if let Some(row)=device.observations.get_mut(bearer) {row.last_seen_ms=last_seen.unwrap_or(0);}
+            if last_seen.is_some() {device.last_seen_ms=device.observations.values().map(|r|r.last_seen_ms).max().unwrap_or(device.last_seen_ms);}
+        }
     }
 
     pub fn get(&self, key: &str) -> Option<&Device> {

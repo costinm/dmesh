@@ -18,6 +18,7 @@ pub mod control;
 /// Shared receiver-side facts exposed by every platform's discovered-device
 /// list. Radio callbacks and retention remain adapter-owned.
 pub mod discovery;
+pub mod discovery_nodes;
 #[cfg(feature = "std")]
 pub mod device_record;
 #[cfg(feature = "std")]
