@@ -91,7 +91,7 @@ pub fn start_mesh(
         }
     });
 
-    let mesh_services = ssh_mesh::mesh_rest::MeshServiceRegistry::default();
+    let mesh_services = node.mesh_services.clone();
     #[cfg(target_os = "android")]
     crate::mesh_jni::android_note_started();
     #[cfg(target_os = "android")]
@@ -122,7 +122,6 @@ pub fn start_mesh(
             ssh_server: node.clone(),
             target_http_address: None,
             ssh_client_manager: client_manager.clone(),
-            mesh_services: mesh_services.clone(),
             web_root: Some(base_path.join("web")),
         };
         let app = ssh_mesh::handlers::app(app_state);
