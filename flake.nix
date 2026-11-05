@@ -167,7 +167,11 @@
             cargoLock = {
               lockFile = ./Cargo.lock;
               # mesh-api is sourced from the pinned ssh-mesh git revision.
-              outputHashes."mesh-api-0.1.0" = "sha256-/tlACYNExIcJ0MpWwcj3QJ0MnkfRbdCFtLQDx1ftdqI=";
+              # Keep this hash in sync with the ssh-mesh git rev recorded in
+              # Cargo.lock (currently fb4d7112); it changed when e4dddfc5
+              # bumped Cargo.lock without updating this entry, and dmesh HEAD
+              # now requires fb4d7112 for MeshNode::mesh_services.
+              outputHashes."mesh-api-0.1.0" = "sha256-fBzJynsE3ATjtd9MJRCc9xdVbooU3sJXj6xJogUP6FI=";
             };
             postPatch = pkgs.lib.optionalString (sshMeshRoot != null) ''
               cat >> Cargo.toml <<'EOF'

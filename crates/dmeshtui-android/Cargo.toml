@@ -18,9 +18,15 @@ egui = { version = "0.35", default-features = false, features = ["default_fonts"
 log = "0.4"
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
+# Desktop fallback window: eframe is used with default-features = false, so the
+# winit platform backends must be selected explicitly. Without x11/wayland,
+# winit resolves to its `unsupported` platform_impl and every host-side build
+# or `cargo check --workspace` fails with "platform not supported by winit".
 eframe = { version = "0.35", default-features = false, features = [
     "default_fonts",
     "glow",
+    "x11",
+    "wayland",
 ] }
 
 [target.'cfg(target_os = "android")'.dependencies]

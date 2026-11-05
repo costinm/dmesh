@@ -1597,7 +1597,10 @@ mod tests {
         assert_eq!(tool["inputSchema"]["properties"]["frame"]["type"], "string");
         assert_eq!(tool["inputSchema"]["properties"]["frame"]["format"], "hex");
 
-        let record = CONTROL_CATALOG
+        // `forward_record` clears `to` at the QUIC boundary (route selection
+        // is never a forwarded application field), so decode the same way the
+        // remote handler receives it.
+        let mut record = CONTROL_CATALOG
             .record_from_value(
                 "radio.tx",
                 &serde_json::json!({
@@ -1610,6 +1613,7 @@ mod tests {
                 }),
             )
             .unwrap();
+        record.to = None;
         let wire = CONTROL_CATALOG.encode_request(&record).unwrap();
         let request = dmesh_server::raw_wifi::decode_raw_wifi_tx_record(
             dmesh_server::tagged::decode(&wire).unwrap(),
