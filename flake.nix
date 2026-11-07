@@ -154,7 +154,11 @@
           # (without the musl/Android toolchain: NixOS targets run the GNU
           # build), so deployments can come from the flake like other DMesh
           # dependencies instead of prebuilt `target/` files.
-          mkDmesh = sourceRoot: sshMeshRoot: pkgs.rustPlatform.buildRustPackage {
+          # Static musl builds (static-pie like ssh-mesh): these binaries
+          # ship inside the initos erofs root and the minimal mesh systems,
+          # where no glibc/nix loader exists. A dynamic lmesh here is a bug,
+          # not a feature - do not paper over it with bundled loaders.
+          mkDmesh = sourceRoot: sshMeshRoot: pkgs.pkgsCross.musl64.rustPlatform.buildRustPackage {
             pname = "dmesh";
             version = "0.1.0";
             src = pkgs.lib.cleanSourceWith {
@@ -181,6 +185,7 @@
               EOF
             '';
             doCheck = false;
+            env.RUSTFLAGS = "-C target-feature=+crt-static";
             cargoBuildFlags = [
               "-p" "lmesh"
               "-p" "mesh-tun"
