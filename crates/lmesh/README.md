@@ -75,8 +75,9 @@ the Linux `lmesh` daemon owns the Wi-Fi bearer and raw-NAN monitor. The
 longer provides a second daemon.
 
 Local service requests use tagged CBOR with numeric IDs from the
-[root API](../../API.md). HTTP accepts JSON at the operator edge and
-uses the upstream ssh-mesh catalog translator before dispatch.
+[root API](../../API.md) over the UDS `/run/mesh/lmesh/mesh.sock.cbor`. lmesh
+does not serve HTTP; an ssh-mesh forwarder to the UDS (planned) provides the
+HTTP/JSON edge, authentication and certificates.
 
 The current radio architecture, verified Linux Wi-Fi/USB results, reproduction
 commands, and next-session test order are in
@@ -84,8 +85,8 @@ commands, and next-session test order are in
 
 ## Web UI
 
-The HTTP admin endpoint serves upstream ssh-mesh assets by default. Set
-`LMESH_HTTP_WEB_DIR` to use a packaged DMesh dashboard when one is available.
+None in lmesh. The web UI and admin assets are served by ssh-mesh, which will
+forward HTTP to the lmesh UDS (planned).
 
 ## TODO
 

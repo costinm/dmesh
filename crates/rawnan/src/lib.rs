@@ -1490,48 +1490,55 @@ pub fn service_descriptor_payload<'a>(frame: &'a [u8], service_id: [u8; 6]) -> O
     service_descriptor(frame, service_id).map(|descriptor| descriptor.payload)
 }
 
-/// Return every complete Service Descriptor Attribute carried by an SDF.
+/// Borrow every complete Service Descriptor Attribute carried by an SDF.
 ///
-/// Malformed trailing attributes are ignored, while a malformed outer frame
-/// returns no descriptors.  This keeps monitor/callback handling bounded and
-/// lets callers independently recognize service IDs they own.
-pub fn service_descriptors(frame: &[u8]) -> Vec<NamedServiceDescriptor<'_>> {
-    if !is_nan_sdf(frame) {
-        return Vec::new();
-    }
-    let mut descriptors = Vec::new();
-    let mut offset = NAN_ACTION_START;
-    while offset + 3 <= frame.len() {
-        let attr_id = frame[offset];
-        let len = u16::from_le_bytes([frame[offset + 1], frame[offset + 2]]) as usize;
-        let start = offset + 3;
-        let Some(end) = start.checked_add(len) else {
-            break;
-        };
-        let Some(body) = frame.get(start..end) else {
-            break;
-        };
-        if attr_id == 0x03 && body.len() >= 9 {
-            let mut service_id = [0; 6];
-            service_id.copy_from_slice(&body[..6]);
-            if let Some(descriptor) = service_descriptor_body(body, service_id) {
-                descriptors.push(NamedServiceDescriptor {
-                    service_id,
-                    descriptor,
-                });
+/// This scan never allocates, so radio ingress and classification also work
+/// when the caller's heap reserve rejects new allocations. Malformed trailing
+/// attributes end the scan; malformed descriptors are skipped.
+pub fn service_descriptors_iter(frame: &[u8]) -> ServiceDescriptors<'_> {
+    ServiceDescriptors { remaining: if is_nan_sdf(frame) { &frame[NAN_ACTION_START..] } else { &[] } }
+}
+
+pub struct ServiceDescriptors<'a> {
+    remaining: &'a [u8],
+}
+
+impl<'a> Iterator for ServiceDescriptors<'a> {
+    type Item = NamedServiceDescriptor<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.remaining.len() >= 3 {
+            let attr_id = self.remaining[0];
+            let len = u16::from_le_bytes([self.remaining[1], self.remaining[2]]) as usize;
+            let Some(body) = self.remaining.get(3..3 + len) else {
+                self.remaining = &[];
+                return None;
+            };
+            self.remaining = &self.remaining[3 + len..];
+            if attr_id == 0x03 && body.len() >= 9 {
+                let mut service_id = [0; 6];
+                service_id.copy_from_slice(&body[..6]);
+                if let Some(descriptor) = service_descriptor_body(body, service_id) {
+                    return Some(NamedServiceDescriptor { service_id, descriptor });
+                }
             }
         }
-        offset = end;
+        self.remaining = &[];
+        None
     }
-    descriptors
+}
+
+/// Collect descriptors for callers that need owned list storage. Radio ingress
+/// should use [`service_descriptors_iter`] instead.
+pub fn service_descriptors(frame: &[u8]) -> Vec<NamedServiceDescriptor<'_>> {
+    service_descriptors_iter(frame).collect()
 }
 
 pub fn service_descriptor<'a>(
     frame: &'a [u8],
     service_id: [u8; 6],
 ) -> Option<ServiceDescriptor<'a>> {
-    service_descriptors(frame)
-        .into_iter()
+    service_descriptors_iter(frame)
         .find(|item| item.service_id == service_id)
         .map(|item| item.descriptor)
 }

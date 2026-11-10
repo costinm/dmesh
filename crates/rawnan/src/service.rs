@@ -299,7 +299,7 @@ pub fn active_subscribe_service_info<'a>(
     // SDA. Prefer that explicit Subscribe descriptor before considering an
     // SDEA: selecting the first matching service ID would otherwise consume
     // the peer's announce and silently lose directed `announce.discovery`.
-    for descriptor in crate::service_descriptors(frame) {
+    for descriptor in crate::service_descriptors_iter(frame) {
         if descriptor.service_id == service_id
             && matches!(descriptor.descriptor.control, 0x11 | 0x12)
             && !descriptor.descriptor.payload.is_empty()
