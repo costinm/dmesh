@@ -1,4 +1,13 @@
-# Device Mesh Transport
+# Device Mesh Transport (`quic-lite` — DEPRECATED)
+
+> **DEPRECATED:** This monolithic crate has been superseded by the five modular QUIC crates in [`/ws/rust/ssh-mesh/crates/`](file:///ws/rust/ssh-mesh/crates):
+> - [`quic-base`](file:///ws/rust/ssh-mesh/crates/quic-base)
+> - [`quic-mux`](file:///ws/rust/ssh-mesh/crates/quic-mux)
+> - [`quic-link`](file:///ws/rust/ssh-mesh/crates/quic-link)
+> - [`quic-relay`](file:///ws/rust/ssh-mesh/crates/quic-relay)
+> - [`quic-tools`](file:///ws/rust/ssh-mesh/crates/quic-tools)
+>
+> See [`DEPRECATED.md`](file:///ws/dmesh/crates/quic-lite/DEPRECATED.md) for the architectural post-mortem, issues identified in `quic-lite`, how we refactored it, lessons learned, and historical benchmark results.
 
 The transport is based on - but not compatible with - QUIC (RFC9000), implementing the short packets and
 flow/congestion control using same packet and frame formats and semantics.

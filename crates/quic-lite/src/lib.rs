@@ -1,9 +1,20 @@
 #![no_std]
+#![deprecated(
+    since = "0.1.0",
+    note = "Deprecated: use the modular crates in ssh-mesh (`quic-base`, `quic-mux`, `quic-link`, `quic-relay`, `quic-tools`). See `DEPRECATED.md`."
+)]
+#![allow(deprecated)]
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 #![deny(unreachable_pub)]
 
-//! Bearer-neutral QUIC(-lite) packet transport.
+//! **Deprecated:** Monolithic QUIC-lite packet transport.
+//!
+//! This crate has been refactored and split into five modular crates in
+//! `ssh-mesh` (`quic-base`, `quic-mux`, `quic-link`, `quic-relay`, and
+//! `quic-tools`). See `DEPRECATED.md` in this crate directory for the
+//! architectural post-mortem, refactoring design, lessons learned, and
+//! historical benchmark results.
 //!
 //! [`QuicNode`] owns the client/server association and DCID namespace for one
 //! logical node. See [`bearer`] for the physical packet I/O contract.
