@@ -82,8 +82,9 @@ pub trait CaptureHost: Send + Sync {
     fn nan_announce(&self, peer: &str, bssid: Option<&str>, payloads: &[&[u8]]) -> NanAnnounce;
     /// An active Subscribe or follow-up payload from `peer`.
     fn nan_packet(&self, peer: &str, bssid: Option<&str>, kind: NanPacketKind, payload: &[u8]);
-    /// A NOW cluster-sync record from `peer`.
-    fn now_sync(&self, peer: [u8; 6], cluster_id: [u8; 6], service_info: &[u8]);
+    /// A NOW cluster-sync record from `peer`. A request in `service_info` is answered:
+    /// the returned bytes go back to `peer` wrapped in a NOW sync envelope.
+    fn now_sync(&self, peer: [u8; 6], cluster_id: [u8; 6], service_info: &[u8]) -> Option<Vec<u8>>;
     /// A NOW discovery payload (not QUIC, not sync) from `peer`: the same service-info
     /// bytes NAN carries, observed like a NAN descriptor. A request is answered: the
     /// returned bytes go back to `peer` as a NOW discovery payload.
@@ -869,7 +870,36 @@ pub fn monitor_receive_loop(
                                             now_micros_u64(),
                                             &rawnan_state,
                                         );
-                                        history.now_sync(peer, sync.cluster_id, sync.service_info);
+                                        if let Some(reply) = history.now_sync(
+                                            peer,
+                                            sync.cluster_id,
+                                            sync.service_info,
+                                        ) && let Some(socket) = tx_socket.as_ref()
+                                        {
+                                            let wrapped = wrap_now_sync_payload(
+                                                local_source.unwrap_or([0; 6]),
+                                                &rawnan_state,
+                                                &reply,
+                                            );
+                                            let result = send_raw_action_datagram_on_socket(
+                                                iface, socket, peer, &wrapped, 6,
+                                            );
+                                            push_radio_event(
+                                                &*history,
+                                                RadioEvent {
+                                                    ts_millis: now_millis(),
+                                                    key: "wifi.raw.discovery_reply_tx".to_string(),
+                                                    source: monitor_iface.to_string(),
+                                                    value: json!({
+                                                        "ok": result.is_ok(),
+                                                        "peer": colon_mac(&peer),
+                                                        "bytes": wrapped.len(),
+                                                        "error": result.err().map(|error| format!("{error:#}")),
+                                                    }),
+                                                    message: None,
+                                                },
+                                            );
+                                        }
                                         false
                                     }
                                     NowClass::Discovery => {
@@ -881,8 +911,13 @@ pub fn monitor_receive_loop(
                                             packet,
                                         ) && let Some(socket) = tx_socket.as_ref()
                                         {
+                                            let wrapped = wrap_now_sync_payload(
+                                                local_source.unwrap_or([0; 6]),
+                                                &rawnan_state,
+                                                &reply,
+                                            );
                                             let result = send_raw_action_datagram_on_socket(
-                                                iface, socket, peer, &reply, 6,
+                                                iface, socket, peer, &wrapped, 6,
                                             );
                                             push_radio_event(
                                                 &*history,
@@ -893,7 +928,7 @@ pub fn monitor_receive_loop(
                                                     value: json!({
                                                         "ok": result.is_ok(),
                                                         "peer": colon_mac(&peer),
-                                                        "bytes": reply.len(),
+                                                        "bytes": wrapped.len(),
                                                         "error": result.err().map(|error| format!("{error:#}")),
                                                     }),
                                                     message: None,
@@ -1356,6 +1391,39 @@ pub fn run_discovery_window(
     let _ = send_now_sync(local, &schedule.nan, &schedule.publish, |body| now_tx(None, body));
 }
 
+/// Wrap a non-QUIC NOW discovery/announce payload in the 30-byte `NOW_SYNC` envelope
+/// required by ESP32 `mod_nan` peers. If `payload` is already a `NOW_SYNC` body or
+/// exceeds `NOW_SYNC_SERVICE_INFO_MAX_LEN`, it is returned unchanged.
+pub fn wrap_now_sync_payload(
+    local: [u8; 6],
+    nan: &Arc<Mutex<NanState>>,
+    payload: &[u8],
+) -> Vec<u8> {
+    if crate::parse_now_sync_body(payload).is_some()
+        || payload.len() > crate::NOW_SYNC_SERVICE_INFO_MAX_LEN
+    {
+        return payload.to_vec();
+    }
+    let now = now_micros_u64();
+    let out = {
+        let mut state = nan.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.become_now_master(crate::MacAddr(local), now, unix_micros());
+        state.now_sync_outgoing(now)
+    };
+    let Some(out) = out else {
+        return payload.to_vec();
+    };
+    crate::build_now_sync_body(
+        out.cluster_id,
+        out.anchor_master,
+        out.tsf_us,
+        out.interval_tu,
+        out.flags,
+        payload,
+    )
+    .unwrap_or_else(|_| payload.to_vec())
+}
+
 /// Send this device's NOW sync record, the beacon-equivalent every NOW-capable device
 /// emits in each window so the others can follow the same cluster: the followed
 /// cluster's (the NAN cluster's, when one is followed), or this device's own when it is the
@@ -1458,11 +1526,12 @@ pub fn run_window_scheduler(schedule: WindowSchedule, host: Arc<dyn CaptureHost>
             })
         };
         let mut now_tx = |target: Option<[u8; 6]>, request: &[u8]| -> Result<()> {
+            let wrapped = wrap_now_sync_payload(local, &schedule.nan, request);
             send_raw_action_datagram_on_socket(
                 &schedule.iface,
                 &tx,
                 target.unwrap_or([0xff; 6]),
-                request,
+                &wrapped,
                 6,
             )
         };
@@ -1500,7 +1569,9 @@ mod tests {
         fn nan_packet(&self, peer: &str, _: Option<&str>, kind: NanPacketKind, payload: &[u8]) {
             self.packets.lock().unwrap().push((peer.to_owned(), kind, payload.to_vec()));
         }
-        fn now_sync(&self, _: [u8; 6], _: [u8; 6], _: &[u8]) {}
+        fn now_sync(&self, _: [u8; 6], _: [u8; 6], _: &[u8]) -> Option<Vec<u8>> {
+            None
+        }
         fn now_discovery(&self, _: [u8; 6], _: Option<[u8; 6]>, _: &[u8]) -> Option<Vec<u8>> {
             None
         }

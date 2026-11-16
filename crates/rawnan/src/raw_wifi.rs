@@ -1,0 +1,3181 @@
+//! CBOR schema for bounded raw 802.11 control and action injection.
+//!
+//! This is deliberately platform-independent. Adapters expose only the
+//! operations their hardware/API can perform: ESP and Linux may implement raw
+//! action injection, while Android must return unsupported for it. Control,
+//! snapshot and scan are separate operations with the same rule; a
+//! shared wire schema never claims platform support.
+
+use mesh_api::{
+    cbor::{Decoder, Encoder},
+    envelope::{Name, Record, decode},
+};
+
+pub const RAW_WIFI_OP_TX: u64 = 1;
+/// Configure the receiver/transmitter lab state, then return a snapshot.
+pub const RAW_WIFI_OP_CONTROL: u64 = 2;
+/// Return one bounded radio snapshot without changing state.
+pub const RAW_WIFI_OP_SNAPSHOT: u64 = 3;
+/// Advance the counter epoch and return the reset snapshot.
+pub const RAW_WIFI_OP_RESET_COUNTERS: u64 = 4;
+/// Return bounded nearby AP observations without changing association state.
+pub const RAW_WIFI_OP_SCAN: u64 = 7;
+/// Registered CBOR method identifier for raw 802.11 action injection. This is
+/// a hardware capability: unsupported adapters must reject it explicitly.
+pub const RAW_WIFI_METHOD_TX: u64 = 71;
+/// Clear name for [`RAW_WIFI_METHOD_TX`]. The numeric wire value is retained.
+pub const RAW_WIFI_METHOD_ACTION_INJECT: u64 = RAW_WIFI_METHOD_TX;
+/// Registered CBOR method identifiers for independently callable radio
+/// control, snapshot, and counter-reset operations. Each is independently
+/// capability-gated by the concrete adapter.
+pub const RAW_WIFI_METHOD_CONTROL: u64 = 72;
+pub const RAW_WIFI_METHOD_SNAPSHOT: u64 = 73;
+pub const RAW_WIFI_METHOD_RESET_COUNTERS: u64 = 74;
+/// Return bounded AP observations (`SSID`, BSSID, channel, `signal_dbm`).
+pub const RAW_WIFI_METHOD_SCAN: u64 = 77;
+/// Common tagged component for raw-radio laboratory and diagnostics.  The
+/// methods intentionally retain their existing numeric identities so only the
+/// retired outer envelope changes.
+pub const RAW_WIFI_COMPONENT: u64 = 4;
+pub const RAW_WIFI_MAX_FRAME: usize = 1500;
+/// Maximum encoded snapshot response. The response carries a fixed set of
+/// monotonic counters plus optional applied radio state, so callers can use a
+/// small fixed stack/packet buffer rather than allocate for diagnostics. It
+/// remains deliberately below the common 1100-byte bearer MTU.
+// Reserved monotonic NAN response counters keep a physical E2E row
+// diagnosable without retaining packet bytes. Leave headroom for optional
+// radio facts so a fully populated snapshot is still one bounded record.
+// Include live SDK configuration and full-width monotonic counters while
+// retaining one ordinary transport packet; this is not a private bearer queue.
+pub const RAW_WIFI_SNAPSHOT_MAX_BYTES: usize = 1024;
+/// `wifi.scan` carries a bounded list as well as aggregate facts.  Keep the
+/// response below the common bearer MTU while allowing ten visible DMesh APs.
+pub const RAW_WIFI_RESPONSE_MAX_BYTES: usize = RAW_WIFI_SNAPSHOT_MAX_BYTES;
+
+/// Encode the successful `radio.tx` result as the number of bytes submitted
+/// to the radio driver. Keep the result numeric rather than formatting it as
+/// a diagnostic string.
+pub fn encode_raw_wifi_tx_result(bytes: u64, out: &mut [u8]) -> Option<usize> {
+    let mut encoder = Encoder::new(out);
+    encoder.uint(bytes)?;
+    Some(encoder.len())
+}
+
+/// Common admission result for an ESP-NOW action payload. Synchronization and
+/// tagged connectionless records stay on discovery/control handling; only an
+/// opaque payload reaches the QUIC packet bearer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EspNowPayloadClass {
+    NowSync,
+    TaggedControl,
+    QuicDatagram,
+    Unrecognized,
+}
+
+/// QUIC's packet fixed bit. ESP-NOW adapters use it as the fast path for
+/// opaque datagrams; the one DMesh control payload whose prefix overlaps it
+/// (NOW sync) is recognized by its complete magic/version header first.
+const ESP_NOW_QUIC_FIXED_BIT: u8 = 0x40;
+
+/// Classify one already-framed ESP-NOW payload before it enters QUIC. The
+/// fixed bit is the common-case split: QUIC packets bypass CBOR decoding,
+/// while discovery/control records are decoded only when that bit is clear.
+/// Kept portable so Linux and ESP adapters apply the same admission rule.
+pub fn classify_espnow_payload(payload: &[u8]) -> EspNowPayloadClass {
+    if payload.first() == Some(&ESP_NOW_QUIC_FIXED_BIT)
+        && crate::parse_now_sync_body(payload).is_some()
+    {
+        EspNowPayloadClass::NowSync
+    } else if payload
+        .first()
+        .is_some_and(|first| first & ESP_NOW_QUIC_FIXED_BIT != 0)
+    {
+        EspNowPayloadClass::QuicDatagram
+    } else if decode(payload).is_some() {
+        EspNowPayloadClass::TaggedControl
+    } else {
+        EspNowPayloadClass::Unrecognized
+    }
+}
+
+/// Encode a complete tagged raw-action-injection request. The frame stays a
+/// borrowed byte string at the decoder boundary; this constructor does not
+/// fragment, copy into a transport queue, or imply that the selected adapter
+/// supports raw injection.
+pub fn encode_raw_wifi_tx_request(request: RawWifiTxRequest<'_>, out: &mut [u8]) -> Option<usize> {
+    encode_raw_wifi_tx_request_with_optional_id(request, None, out)
+}
+
+/// Encode a correlated raw-action request for the normal QUIC stream surface.
+///
+/// Raw action TX is intentionally stream-only, so callers crossing UART,
+/// UDP, or a relay must retain the request ID for its accepted/rejected
+/// response rather than relying on a driver submission log.
+pub fn encode_raw_wifi_tx_request_with_id(
+    request: RawWifiTxRequest<'_>,
+    id: u64,
+    out: &mut [u8],
+) -> Option<usize> {
+    encode_raw_wifi_tx_request_with_optional_id(request, Some(id), out)
+}
+
+fn encode_raw_wifi_tx_request_with_optional_id(
+    request: RawWifiTxRequest<'_>,
+    id: Option<u64>,
+    out: &mut [u8],
+) -> Option<usize> {
+    if !(24..=RAW_WIFI_MAX_FRAME).contains(&request.frame.len())
+        || !(1..=13).contains(&request.channel)
+    {
+        return None;
+    }
+    let mut encoder = Encoder::new(out);
+    encoder.map(if id.is_some() { 4 } else { 3 })?;
+    encoder.uint(1)?;
+    encoder.uint(RAW_WIFI_COMPONENT)?;
+    encoder.uint(2)?;
+    encoder.uint(RAW_WIFI_METHOD_TX)?;
+    if let Some(id) = id {
+        encoder.uint(3)?;
+        encoder.uint(id)?;
+    }
+    encoder.uint(5)?;
+    encoder.map(6)?;
+    encoder.uint(1)?;
+    encoder.bytes_value(request.frame)?;
+    encoder.uint(2)?;
+    encoder.uint(u64::from(request.channel))?;
+    encoder.uint(3)?;
+    encoder.uint(interface_value(request.interface))?;
+    encoder.uint(4)?;
+    encoder.boolean(request.system_sequence)?;
+    encoder.uint(5)?;
+    encoder.uint(rate_value(request.rate))?;
+    encoder.uint(6)?;
+    encoder.boolean(request.disable_11b)?;
+    Some(encoder.len())
+}
+
+/// Clear-name alias for [`encode_raw_wifi_tx_request`].
+pub fn encode_raw_wifi_action_inject_request(
+    request: RawWifiActionInjectRequest<'_>,
+    out: &mut [u8],
+) -> Option<usize> {
+    encode_raw_wifi_tx_request(request, out)
+}
+
+/// Encode an empty-payload registered snapshot/reset request.  This is shared
+/// by direct UART control, QUIC hardware service callers, and Rust E2E tests;
+/// callers never need to hand-write a radio command map merely to sample
+/// counters.
+pub fn encode_raw_wifi_snapshot_request(method: u64, out: &mut [u8]) -> Option<usize> {
+    if !matches!(
+        method,
+        RAW_WIFI_METHOD_SNAPSHOT | RAW_WIFI_METHOD_RESET_COUNTERS | RAW_WIFI_METHOD_SCAN
+    ) {
+        return None;
+    }
+    let mut encoder = Encoder::new(out);
+    encoder.map(3)?;
+    encoder.uint(1)?;
+    encoder.uint(RAW_WIFI_COMPONENT)?;
+    encoder.uint(2)?;
+    encoder.uint(method)?;
+    encoder.uint(5)?;
+    encoder.map(0)?;
+    Some(encoder.len())
+}
+
+/// Encode a correlated raw-Wi-Fi request in the common tagged envelope.
+/// New direct callers must use this rather than the legacy uncorrelated
+/// helper above; the latter remains only for existing staged diagnostics.
+pub fn encode_raw_wifi_snapshot_request_with_id(
+    method: u64,
+    id: u64,
+    out: &mut [u8],
+) -> Option<usize> {
+    if !matches!(
+        method,
+        RAW_WIFI_METHOD_SNAPSHOT | RAW_WIFI_METHOD_RESET_COUNTERS | RAW_WIFI_METHOD_SCAN
+    ) {
+        return None;
+    }
+    let mut encoder = Encoder::new(out);
+    encoder.map(4)?;
+    encoder.uint(1)?;
+    encoder.uint(RAW_WIFI_COMPONENT)?;
+    encoder.uint(2)?;
+    encoder.uint(method)?;
+    encoder.uint(3)?;
+    encoder.uint(id)?;
+    encoder.uint(5)?;
+    encoder.map(0)?;
+    Some(encoder.len())
+}
+
+/// Encode a typed partial radio update in the registered handler envelope.
+/// This is the sole host/firmware command constructor for dynamic lab and
+/// production diagnostic changes; it deliberately contains no persistence or
+/// transport-specific fields.
+pub fn encode_raw_wifi_control_request(
+    control: RawWifiControlRequest,
+    out: &mut [u8],
+) -> Option<usize> {
+    let entries = usize::from(control.channel.is_some())
+        + usize::from(control.interface.is_some())
+        + usize::from(control.rate.is_some())
+        + usize::from(control.disable_11b.is_some())
+        + usize::from(control.sta_state.is_some())
+        + usize::from(control.comparator_bssid.is_some())
+        + usize::from(control.comparator_enabled.is_some())
+        + usize::from(control.promiscuous.is_some())
+        + usize::from(control.dw_policy.is_some())
+        + usize::from(control.rx_filter.is_some())
+        + usize::from(control.ap_mode.is_some())
+        + usize::from(control.ap_beacon_tu.is_some())
+        + usize::from(control.raw_sta_mode.is_some())
+        + usize::from(control.mac_ack.is_some())
+        + usize::from(control.action_destination_broadcast.is_some())
+        + usize::from(control.roc_listen_ms.is_some())
+        + usize::from(control.roc_loop.is_some())
+        + usize::from(control.action_dispatcher.is_some())
+        + usize::from(control.nan_capture_ms.is_some());
+    let mut encoder = Encoder::new(out);
+    encoder.map(3)?;
+    encoder.uint(1)?;
+    encoder.uint(RAW_WIFI_COMPONENT)?;
+    encoder.uint(2)?;
+    encoder.uint(RAW_WIFI_METHOD_CONTROL)?;
+    encoder.uint(5)?;
+    encoder.map(entries as u64)?;
+    if let Some(value) = control.channel {
+        encoder.uint(2)?;
+        encoder.uint(u64::from(value))?;
+    }
+    if let Some(value) = control.interface {
+        encoder.uint(3)?;
+        encoder.uint(interface_value(value))?;
+    }
+    if let Some(value) = control.rate {
+        encoder.uint(5)?;
+        encoder.uint(rate_value(value))?;
+    }
+    if let Some(value) = control.disable_11b {
+        encoder.uint(6)?;
+        encoder.boolean(value)?;
+    }
+    if let Some(value) = control.sta_state {
+        encoder.uint(7)?;
+        encoder.uint(match value {
+            RawWifiStaState::Reconnect => 0,
+            RawWifiStaState::DisconnectHold => 1,
+        })?;
+    }
+    if let Some(value) = control.comparator_bssid {
+        encoder.uint(8)?;
+        encoder.bytes_value(&value)?;
+    }
+    if let Some(value) = control.comparator_enabled {
+        encoder.uint(9)?;
+        encoder.boolean(value)?;
+    }
+    if let Some(value) = control.promiscuous {
+        encoder.uint(10)?;
+        encoder.boolean(value)?;
+    }
+    if let Some(value) = control.dw_policy {
+        encoder.uint(11)?;
+        encoder.uint(match value {
+            RawWifiDwPolicy::Normal => 0,
+            RawWifiDwPolicy::Disabled => 1,
+            RawWifiDwPolicy::Manual => 2,
+        })?;
+    }
+    if let Some(value) = control.rx_filter {
+        encoder.uint(12)?;
+        encoder.uint(match value {
+            RawWifiRxFilter::Management => 0,
+            RawWifiRxFilter::ManagementAndData => 1,
+        })?;
+    }
+    if let Some(value) = control.ap_mode {
+        encoder.uint(13)?;
+        encoder.uint(match value {
+            RawWifiApMode::Disabled => 0,
+            RawWifiApMode::Open => 1,
+        })?;
+    }
+    if let Some(value) = control.ap_beacon_tu {
+        encoder.uint(14)?;
+        encoder.uint(u64::from(value))?;
+    }
+    if let Some(value) = control.raw_sta_mode {
+        encoder.uint(15)?;
+        encoder.uint(match value {
+            RawWifiStaMode::MainStyle => 1,
+        })?;
+    }
+    if let Some(value) = control.mac_ack {
+        encoder.uint(16)?;
+        encoder.boolean(value)?;
+    }
+    if let Some(value) = control.action_destination_broadcast {
+        encoder.uint(20)?;
+        encoder.boolean(value)?;
+    }
+    if let Some(value) = control.roc_listen_ms {
+        encoder.uint(25)?;
+        encoder.uint(u64::from(value))?;
+    }
+    if let Some(value) = control.roc_loop {
+        encoder.uint(26)?;
+        encoder.boolean(value)?;
+    }
+    if let Some(value) = control.action_dispatcher {
+        encoder.uint(27)?;
+        encoder.boolean(value)?;
+    }
+    if let Some(value) = control.nan_capture_ms {
+        encoder.uint(28)?;
+        encoder.uint(u64::from(value))?;
+    }
+    Some(encoder.len())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RawWifiInterface {
+    Auto,
+    Sta,
+    Ap,
+    /// ESP-IDF's NAN interface.  The common schema permits a caller to ask
+    /// for it so lab results can report the actual driver result; the public
+    /// `esp_wifi_80211_tx` contract does not promise NAN support.
+    Nan,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RawWifiRate {
+    Auto,
+    Mbps6,
+    Mbps9,
+    Mbps12,
+    Mbps18,
+    Mbps24,
+    Mbps36,
+    Mbps48,
+    Mbps54,
+}
+
+/// Explicit STA state for a connectionless radio experiment.  It is not a
+/// persisted Wi-Fi profile setting: `DisconnectHold` retains the initialized
+/// radio on a selected channel while suppressing automatic reassociation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RawWifiStaState {
+    Reconnect,
+    DisconnectHold,
+}
+
+/// Promiscuous capture policy used by the lab handler.  Normal NAN policy is
+/// separate from a raw-action experiment, so callers must state which one is
+/// desired rather than accidentally inheriting a prior test's capture mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RawWifiDwPolicy {
+    Normal,
+    Disabled,
+    Manual,
+}
+
+/// Receiver filter class.  The ESP adapter maps these portable values to the
+/// platform's available filter controls and reports the applied state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RawWifiRxFilter {
+    Management,
+    ManagementAndData,
+}
+
+/// Ephemeral SoftAP state used by the raw-radio matrix. `Open` creates an
+/// APSTA owner on the selected channel without creating an IP/lwIP data
+/// plane. It is never a persisted Wi-Fi profile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RawWifiApMode {
+    Disabled,
+    Open,
+}
+
+/// Select an explicit volatile raw-STA setup sequence for a lab case.  The
+/// Main-style mode is intentionally non-promiscuous: normal action/data
+/// callbacks remain registered through the driver, rather than turning a
+/// monitor experiment into the default receive path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RawWifiStaMode {
+    MainStyle,
+}
+
+/// A partial, explicit radio-state update.  `None` means leave that setting
+/// unchanged; this lets a host alter exactly one dimension of a matrix row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+pub struct RawWifiControlRequest {
+    pub channel: Option<u8>,
+    pub interface: Option<RawWifiInterface>,
+    pub rate: Option<RawWifiRate>,
+    pub disable_11b: Option<bool>,
+    pub sta_state: Option<RawWifiStaState>,
+    pub comparator_bssid: Option<[u8; 6]>,
+    pub comparator_enabled: Option<bool>,
+    pub promiscuous: Option<bool>,
+    pub dw_policy: Option<RawWifiDwPolicy>,
+    pub rx_filter: Option<RawWifiRxFilter>,
+    pub ap_mode: Option<RawWifiApMode>,
+    pub ap_beacon_tu: Option<u16>,
+    pub raw_sta_mode: Option<RawWifiStaMode>,
+    /// Require an 802.11 MAC ACK for action TX. This is a lab transport
+    /// policy; QUIC's end-to-end ACK/credit policy remains separate.
+    pub mac_ack: Option<bool>,
+    /// Use broadcast Address-1 for the NOW-like action bearer.  This is a
+    /// runtime receive-filter experiment for an unassociated STA; it does
+    /// not alter QUIC peer identity, which remains the action source MAC.
+    pub action_destination_broadcast: Option<bool>,
+    /// Request one bounded same-channel ROC action listener. This is an
+    /// observation lease, never a channel retune or a second transport.
+    pub roc_listen_ms: Option<u16>,
+    /// Enable repeated same-channel ROC windows using `roc_listen_ms`. This
+    /// is a bounded receive experiment, not normal NOW operation.
+    pub roc_loop: Option<bool>,
+    /// Enable the continuous private NOW dispatcher. ROC-only experiments
+    /// disable this so private callback delivery cannot mask ROC evidence.
+    pub action_dispatcher: Option<bool>,
+    /// One bounded permissive NAN management-capture window on the current
+    /// channel. This is an observation request, not an ESP-IDF scan/retune.
+    pub nan_capture_ms: Option<u16>,
+}
+
+/// The complete host-testable radio-lab request.  UART direct PPP and the
+/// QUIC hardware service carry these same bytes; neither bearer gets a
+/// private command grammar.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RawWifiLabRequest {
+    Control(RawWifiControlRequest),
+    Snapshot,
+    ResetCounters,
+    Scan(RawWifiScanRequest),
+}
+
+pub const RAW_WIFI_SCAN_MAX_RECORDS: usize = 10;
+
+/// Scan request policy.  The default permits a recent cached observation;
+/// `fresh` asks the adapter to scan, while `last_results` returns the cache
+/// even when it has aged.  A fresh scan may still fall back to the cache when
+/// ESP-IDF is associating and rejects a concurrent scan.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RawWifiScanRequest {
+    pub fresh: bool,
+    pub last_results: bool,
+}
+
+/// Bounded scan result.  Entries are only direct `dmesh*` AP observations;
+/// aggregate counts retain the surrounding RF context without keeping every
+/// unrelated SSID.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RawWifiScanResponse {
+    pub entries: usize,
+    pub total_aps: u16,
+    pub direct_dmesh_aps: u16,
+    pub age_ms: u32,
+    pub fresh: bool,
+    /// Provisioned NVS STA SSID. This is the selected local profile, not an
+    /// observation of an unrelated protected network.
+    pub configured_sta_ssid: [u8; 32],
+    pub configured_sta_ssid_len: u8,
+    /// ESP-IDF auth-mode enum advertised by the configured STA SSID during
+    /// the most recent scan. This reports compatibility evidence without
+    /// exposing unrelated protected SSIDs.
+    pub configured_sta_auth_mode: Option<u8>,
+}
+
+/// One bounded scan observation. The SSID bytes are not NUL-terminated.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RawWifiScanEntry {
+    pub ssid: [u8; 32],
+    pub ssid_len: u8,
+    pub bssid: [u8; 6],
+    pub channel: u8,
+    pub signal_dbm: i8,
+}
+
+impl Default for RawWifiScanEntry {
+    fn default() -> Self {
+        Self {
+            ssid: [0; 32],
+            ssid_len: 0,
+            bssid: [0; 6],
+            channel: 0,
+            signal_dbm: 0,
+        }
+    }
+}
+
+/// Encode the `wifi.scan` result object. The transport adapter wraps this in
+/// the common correlated tagged response envelope (`id` + `result`).
+pub fn encode_raw_wifi_scan_response(
+    entries: &[RawWifiScanEntry],
+    response: RawWifiScanResponse,
+    out: &mut [u8],
+) -> Option<usize> {
+    let mut e = Encoder::new(out);
+    e.map(
+        5 + u64::from(response.configured_sta_auth_mode.is_some())
+            + u64::from(response.configured_sta_ssid_len != 0),
+    )?;
+    e.uint(1)?;
+    e.array(entries.len() as u64)?;
+    for entry in entries {
+        e.map(4)?;
+        e.uint(1)?;
+        e.bytes_value(&entry.ssid[..usize::from(entry.ssid_len)])?;
+        e.uint(2)?;
+        e.bytes_value(&entry.bssid)?;
+        e.uint(3)?;
+        e.uint(u64::from(entry.channel))?;
+        e.uint(4)?;
+        e.int(i64::from(entry.signal_dbm))?;
+    }
+    e.uint(2)?;
+    e.uint(u64::from(response.total_aps))?;
+    e.uint(3)?;
+    e.uint(u64::from(response.direct_dmesh_aps))?;
+    e.uint(4)?;
+    e.uint(u64::from(response.age_ms))?;
+    e.uint(5)?;
+    e.boolean(response.fresh)?;
+    if let Some(auth_mode) = response.configured_sta_auth_mode {
+        e.uint(6)?;
+        e.uint(u64::from(auth_mode))?;
+    }
+    if response.configured_sta_ssid_len != 0 {
+        e.uint(7)?;
+        e.text_value(
+            &response.configured_sta_ssid[..usize::from(response.configured_sta_ssid_len)],
+        )?;
+    }
+    Some(e.len())
+}
+
+#[cfg(test)]
+mod scan_response_tests {
+    use super::{RawWifiScanResponse, encode_raw_wifi_scan_response};
+
+    #[test]
+    fn scan_response_exposes_only_the_configured_ssid() {
+        let mut response = RawWifiScanResponse::default();
+        response.configured_sta_ssid[..6].copy_from_slice(b"costin");
+        response.configured_sta_ssid_len = 6;
+        let mut wire = [0u8; 128];
+        let used = encode_raw_wifi_scan_response(&[], response, &mut wire).unwrap();
+        // CBOR field 7 followed by a six-byte string. The response includes
+        // no unrelated SSID observations, so this is the sole SSID payload.
+        assert!(
+            wire[..used]
+                .windows(8)
+                .any(|field| field == b"\x07\x66costin")
+        );
+    }
+}
+
+/// Bounded packet-observation counters shared by Linux monitor adapters and
+/// ESP Wi-Fi callbacks.  These are capture facts, not transport delivery or
+/// peer-completion evidence.  They intentionally retain no frame bytes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WifiCaptureCounters {
+    pub packets: u64,
+    pub bytes: u64,
+    pub max_packet_bytes: u32,
+    pub management_frames: u64,
+    pub control_frames: u64,
+    pub data_frames: u64,
+    /// 802.11 management-frame subtype histogram, indexed 0..15.
+    pub management_subtypes: [u64; 16],
+    pub nan_rx: u64,
+    pub nan_beacons: u64,
+}
+
+impl WifiCaptureCounters {
+    /// Record one already-classified 802.11 frame without retaining it.
+    pub fn observe_80211(&mut self, frame_type: u8, frame_subtype: u8, bytes: usize) {
+        self.packets = self.packets.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(bytes as u64);
+        self.max_packet_bytes = self
+            .max_packet_bytes
+            .max(bytes.min(u32::MAX as usize) as u32);
+        match frame_type {
+            0 => {
+                self.management_frames = self.management_frames.saturating_add(1);
+                if let Some(slot) = self.management_subtypes.get_mut(frame_subtype as usize) {
+                    *slot = slot.saturating_add(1);
+                }
+            }
+            1 => self.control_frames = self.control_frames.saturating_add(1),
+            2 => self.data_frames = self.data_frames.saturating_add(1),
+            _ => {}
+        }
+    }
+
+    pub fn observe_nan_rx(&mut self) {
+        self.nan_rx = self.nan_rx.saturating_add(1);
+    }
+
+    pub fn observe_nan_beacon(&mut self) {
+        self.nan_beacons = self.nan_beacons.saturating_add(1);
+    }
+}
+
+/// Monotonic counters sampled before and after one raw-radio matrix case.
+/// They deliberately separate driver acceptance from a receive dispatch and
+/// parser acceptance: a transmit completion or local action-TX hook is not
+/// evidence that a peer received the frame.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RawWifiCounters {
+    pub tx_attempted: u32,
+    pub tx_driver_accepted: u32,
+    pub tx_driver_failed: u32,
+    pub rx_driver_dispatch: u32,
+    pub rx_parser_accepted: u32,
+    pub rx_parser_rejected: u32,
+    pub rx_self_echo: u32,
+    pub rx_dropped: u32,
+    pub nan_beacons: u32,
+    pub nan_sdfs: u32,
+    pub nan_followups: u32,
+    /// Directed NAN responses accepted into the ESP bounded DW queue.
+    pub nan_followup_queued: u32,
+    /// Directed NAN responses submitted from a discovery window. Submission is
+    /// local evidence only; the peer must still report its receive separately.
+    pub nan_followup_sent: u32,
+    /// Directed NAN responses discarded because the bounded queue or TX path
+    /// could not retain them.
+    pub nan_followup_dropped: u32,
+    /// Advisory current depth of the bounded directed-response queue.
+    pub nan_followup_pending: u32,
+    /// Active NAN Publish frames handed to the ESP action transmitter from a
+    /// bounded discovery window. This is local submission evidence only.
+    pub nan_active_publish_attempted: u32,
+    /// Active NAN Publish submissions accepted by the local driver. A remote
+    /// discovery observation remains necessary to establish RF receipt.
+    pub nan_active_publish_sent: u32,
+    /// Active NAN Publish submissions rejected by the local TX path.
+    pub nan_active_publish_dropped: u32,
+    /// DMesh Service Info records recognized inside NAN SDFs.
+    pub nan_service_info_matched: u32,
+    /// DMesh SDA records carrying an active-Subscribe control value.
+    pub nan_active_subscribe_descriptors: u32,
+    /// Active DMesh Subscribe SDAs whose SDEA did not yield a bounded Service
+    /// Info record. This distinguishes RF receipt from parser compatibility.
+    pub nan_active_subscribe_sdea_misses: u32,
+    /// Fixed four-byte SDEA header seen with the latest active Subscribe.
+    /// It contains structural metadata only, never Service Info bytes.
+    pub nan_active_subscribe_sdea_header: u32,
+    /// Declared Service Info length from that SDEA's fixed prefix.
+    pub nan_active_subscribe_sdea_info_len: u32,
+    /// Active NAN Subscribe SDFs carrying DMesh Service Info in their SDEA.
+    pub nan_active_subscribes: u32,
+    /// Recognized Service Info records copied from the Wi-Fi callback to the
+    /// shared ingress worker.
+    pub nan_service_info_enqueued: u32,
+    /// Recognized Service Info records that could not be copied because the
+    /// bounded shared ingress pool was full or unavailable.
+    pub nan_service_info_dropped: u32,
+    /// Copied NAN Service Info records whose shared worker invoked the normal
+    /// runtime handler. This is stronger than callback admission but still
+    /// does not prove a peer received a resulting response.
+    pub nan_service_info_dispatched: u32,
+    pub tx_duration_us_total: u32,
+    pub tx_duration_us_max: u32,
+    pub tx_duration_le_250us: u32,
+    pub tx_duration_le_750us: u32,
+    pub tx_duration_le_2ms: u32,
+    pub tx_duration_gt_2ms: u32,
+    /// ESP-IDF bounded action-listener requests (ROC); hardware-specific but
+    /// retained in the shared snapshot vocabulary for host/device tests.
+    pub roc_action_listen_requests: u32,
+    pub roc_action_listen_failures: u32,
+    pub roc_action_frames: u32,
+    /// Non-promiscuous vendor-IE callback evidence. The ESP adapter exposes
+    /// only scalar counts, not a retained beacon/frame queue.
+    pub vendor_beacon_ies: u32,
+    pub vendor_nan_beacon_ies: u32,
+    pub vendor_other_ies: u32,
+    /// Classification of the bounded ROC callback's action bodies.
+    pub roc_espnow_actions: u32,
+    pub roc_nan_actions: u32,
+    pub roc_other_actions: u32,
+    /// Raw IPv6 bearer observations, independent of the action/NOW path.
+    /// These are the STA Ethernet callback and bounded ingress results, not
+    /// MAC-level receive/ACK accounting (which ESP-IDF does not expose).
+    pub udp6_rx_frames: u32,
+    pub udp6_rx_queue_drops: u32,
+    pub udp6_rx_invalid: u32,
+    pub udp6_udp_delivered: u32,
+    pub udp6_ndp_advertisements: u32,
+    pub udp6_tx_failures: u32,
+    pub udp6_last_tx_result: u32,
+    /// Completion evidence for public raw-802.11 STA TX. A completion failure
+    /// means ESP-IDF did not receive the expected MAC-level acknowledgement.
+    pub udp6_raw_tx_completions: u32,
+    pub udp6_raw_tx_completion_failures: u32,
+    pub udp6_raw_tx_completion_rate: u32,
+    /// P2P management Probe Requests observed by the radio owner. This is
+    /// receipt evidence only; an AP driver may produce its Probe Response.
+    pub p2p_probe_requests: u32,
+    /// P2P Probe Responses submitted by the Wi-Fi owner.
+    pub p2p_probe_responses: u32,
+    /// P2P Service Discovery GAS Initial Requests accepted by the bounded
+    /// management ingress.
+    pub p2p_gas_requests: u32,
+    /// GAS Initial Responses submitted by the Wi-Fi owner.
+    pub p2p_gas_responses: u32,
+    /// P2P response intents dropped before a successful driver submission.
+    pub p2p_response_drops: u32,
+    /// Frames delivered by the continuously registered action callback and
+    /// classified as NAN, NOW, or P2P before semantic parsing.
+    pub registered_nan_actions: u32,
+    pub registered_now_actions: u32,
+    pub registered_p2p_actions: u32,
+    /// Registered action callbacks dropped because the bounded scratch was
+    /// invalid, oversized, or already in use.
+    pub registered_action_drops: u32,
+}
+
+/// Version of the cross-platform per-peer Wi-Fi metrics record.
+///
+/// Producers must omit observations their driver cannot provide rather than
+/// substituting a zero.  In particular, Linux nl80211 exposes AP-side MAC
+/// retries/failures while ESP-IDF currently exposes raw-TX completion results.
+/// Keeping both in one optional record lets the metrics exporter use one
+/// OpenTelemetry mapping without pretending the observations are identical.
+pub const WIFI_LINK_METRICS_SCHEMA_VERSION: u8 = 1;
+
+/// Per-peer Wi-Fi link observations suitable for a metrics exporter.
+///
+/// This is intentionally a small, allocation-free common vocabulary.  The
+/// transport-specific [`RawWifiCounters`] stay attached to a radio snapshot;
+/// this record holds link/MAC observations that can come from either a Linux
+/// AP's nl80211 station dump or a device-side radio snapshot.  Optional fields
+/// distinguish unavailable driver telemetry from a measured zero.
+#[cfg_attr(feature = "std", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WifiLinkMetrics {
+    pub schema_version: u8,
+    pub interface_index: Option<u32>,
+    pub peer_mac: Option<[u8; 6]>,
+    pub rx_bytes: Option<u64>,
+    pub tx_bytes: Option<u64>,
+    pub rx_packets: Option<u64>,
+    pub tx_packets: Option<u64>,
+    /// AP/host driver MAC retries (`NL80211_STA_INFO_TX_RETRIES`).
+    pub mac_tx_retries: Option<u64>,
+    /// AP/host driver MAC failures (`NL80211_STA_INFO_TX_FAILED`).
+    pub mac_tx_failed: Option<u64>,
+    pub rx_dropped: Option<u64>,
+    pub rx_airtime_us: Option<u64>,
+    pub tx_airtime_us: Option<u64>,
+    pub signal_dbm: Option<i8>,
+    pub signal_avg_dbm: Option<i8>,
+    pub ack_signal_dbm: Option<i8>,
+    pub ack_signal_avg_dbm: Option<i8>,
+    pub rx_bitrate_kbit_s: Option<u64>,
+    pub tx_bitrate_kbit_s: Option<u64>,
+    pub expected_throughput_kbit_s: Option<u64>,
+    /// Device raw-bearer observations; absent on a host-only station dump.
+    pub bearer_rx_frames: Option<u64>,
+    pub bearer_rx_drops: Option<u64>,
+    pub bearer_rx_invalid: Option<u64>,
+    pub bearer_udp_delivered: Option<u64>,
+    pub bearer_ndp_advertisements: Option<u64>,
+    pub bearer_tx_failures: Option<u64>,
+    /// ESP raw-injection MAC completion failures, not equivalent to Linux's
+    /// cumulative `mac_tx_failed` counter.
+    pub raw_tx_completion_failures: Option<u64>,
+}
+
+impl WifiLinkMetrics {
+    pub const fn new() -> Self {
+        Self {
+            schema_version: WIFI_LINK_METRICS_SCHEMA_VERSION,
+            interface_index: None,
+            peer_mac: None,
+            rx_bytes: None,
+            tx_bytes: None,
+            rx_packets: None,
+            tx_packets: None,
+            mac_tx_retries: None,
+            mac_tx_failed: None,
+            rx_dropped: None,
+            rx_airtime_us: None,
+            tx_airtime_us: None,
+            signal_dbm: None,
+            signal_avg_dbm: None,
+            ack_signal_dbm: None,
+            ack_signal_avg_dbm: None,
+            rx_bitrate_kbit_s: None,
+            tx_bitrate_kbit_s: None,
+            expected_throughput_kbit_s: None,
+            bearer_rx_frames: None,
+            bearer_rx_drops: None,
+            bearer_rx_invalid: None,
+            bearer_udp_delivered: None,
+            bearer_ndp_advertisements: None,
+            bearer_tx_failures: None,
+            raw_tx_completion_failures: None,
+        }
+    }
+}
+
+impl Default for WifiLinkMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RawWifiCounters {
+    /// Counter delta for a single test case.  Saturation makes an epoch/reset
+    /// mismatch visible as zero rather than wrapping into a false success.
+    pub const fn delta_since(self, before: Self) -> Self {
+        Self {
+            tx_attempted: self.tx_attempted.saturating_sub(before.tx_attempted),
+            tx_driver_accepted: self
+                .tx_driver_accepted
+                .saturating_sub(before.tx_driver_accepted),
+            tx_driver_failed: self
+                .tx_driver_failed
+                .saturating_sub(before.tx_driver_failed),
+            rx_driver_dispatch: self
+                .rx_driver_dispatch
+                .saturating_sub(before.rx_driver_dispatch),
+            rx_parser_accepted: self
+                .rx_parser_accepted
+                .saturating_sub(before.rx_parser_accepted),
+            rx_parser_rejected: self
+                .rx_parser_rejected
+                .saturating_sub(before.rx_parser_rejected),
+            rx_self_echo: self.rx_self_echo.saturating_sub(before.rx_self_echo),
+            rx_dropped: self.rx_dropped.saturating_sub(before.rx_dropped),
+            nan_beacons: self.nan_beacons.saturating_sub(before.nan_beacons),
+            nan_sdfs: self.nan_sdfs.saturating_sub(before.nan_sdfs),
+            nan_followups: self.nan_followups.saturating_sub(before.nan_followups),
+            nan_followup_queued: self
+                .nan_followup_queued
+                .saturating_sub(before.nan_followup_queued),
+            nan_followup_sent: self
+                .nan_followup_sent
+                .saturating_sub(before.nan_followup_sent),
+            nan_followup_dropped: self
+                .nan_followup_dropped
+                .saturating_sub(before.nan_followup_dropped),
+            nan_followup_pending: self.nan_followup_pending,
+            nan_active_publish_attempted: self
+                .nan_active_publish_attempted
+                .saturating_sub(before.nan_active_publish_attempted),
+            nan_active_publish_sent: self
+                .nan_active_publish_sent
+                .saturating_sub(before.nan_active_publish_sent),
+            nan_active_publish_dropped: self
+                .nan_active_publish_dropped
+                .saturating_sub(before.nan_active_publish_dropped),
+            nan_service_info_matched: self
+                .nan_service_info_matched
+                .saturating_sub(before.nan_service_info_matched),
+            nan_active_subscribe_descriptors: self
+                .nan_active_subscribe_descriptors
+                .saturating_sub(before.nan_active_subscribe_descriptors),
+            nan_active_subscribe_sdea_misses: self
+                .nan_active_subscribe_sdea_misses
+                .saturating_sub(before.nan_active_subscribe_sdea_misses),
+            nan_active_subscribe_sdea_header: self.nan_active_subscribe_sdea_header,
+            nan_active_subscribe_sdea_info_len: self.nan_active_subscribe_sdea_info_len,
+            nan_active_subscribes: self
+                .nan_active_subscribes
+                .saturating_sub(before.nan_active_subscribes),
+            nan_service_info_enqueued: self
+                .nan_service_info_enqueued
+                .saturating_sub(before.nan_service_info_enqueued),
+            nan_service_info_dropped: self
+                .nan_service_info_dropped
+                .saturating_sub(before.nan_service_info_dropped),
+            nan_service_info_dispatched: self
+                .nan_service_info_dispatched
+                .saturating_sub(before.nan_service_info_dispatched),
+            tx_duration_us_total: self
+                .tx_duration_us_total
+                .saturating_sub(before.tx_duration_us_total),
+            tx_duration_us_max: self.tx_duration_us_max,
+            tx_duration_le_250us: self
+                .tx_duration_le_250us
+                .saturating_sub(before.tx_duration_le_250us),
+            tx_duration_le_750us: self
+                .tx_duration_le_750us
+                .saturating_sub(before.tx_duration_le_750us),
+            tx_duration_le_2ms: self
+                .tx_duration_le_2ms
+                .saturating_sub(before.tx_duration_le_2ms),
+            tx_duration_gt_2ms: self
+                .tx_duration_gt_2ms
+                .saturating_sub(before.tx_duration_gt_2ms),
+            roc_action_listen_requests: self
+                .roc_action_listen_requests
+                .saturating_sub(before.roc_action_listen_requests),
+            roc_action_listen_failures: self
+                .roc_action_listen_failures
+                .saturating_sub(before.roc_action_listen_failures),
+            roc_action_frames: self
+                .roc_action_frames
+                .saturating_sub(before.roc_action_frames),
+            vendor_beacon_ies: self
+                .vendor_beacon_ies
+                .saturating_sub(before.vendor_beacon_ies),
+            vendor_nan_beacon_ies: self
+                .vendor_nan_beacon_ies
+                .saturating_sub(before.vendor_nan_beacon_ies),
+            vendor_other_ies: self
+                .vendor_other_ies
+                .saturating_sub(before.vendor_other_ies),
+            roc_espnow_actions: self
+                .roc_espnow_actions
+                .saturating_sub(before.roc_espnow_actions),
+            roc_nan_actions: self.roc_nan_actions.saturating_sub(before.roc_nan_actions),
+            roc_other_actions: self
+                .roc_other_actions
+                .saturating_sub(before.roc_other_actions),
+            udp6_rx_frames: self.udp6_rx_frames.saturating_sub(before.udp6_rx_frames),
+            udp6_rx_queue_drops: self
+                .udp6_rx_queue_drops
+                .saturating_sub(before.udp6_rx_queue_drops),
+            udp6_rx_invalid: self.udp6_rx_invalid.saturating_sub(before.udp6_rx_invalid),
+            udp6_udp_delivered: self
+                .udp6_udp_delivered
+                .saturating_sub(before.udp6_udp_delivered),
+            udp6_ndp_advertisements: self
+                .udp6_ndp_advertisements
+                .saturating_sub(before.udp6_ndp_advertisements),
+            udp6_tx_failures: self
+                .udp6_tx_failures
+                .saturating_sub(before.udp6_tx_failures),
+            udp6_last_tx_result: self.udp6_last_tx_result,
+            udp6_raw_tx_completions: self
+                .udp6_raw_tx_completions
+                .saturating_sub(before.udp6_raw_tx_completions),
+            udp6_raw_tx_completion_failures: self
+                .udp6_raw_tx_completion_failures
+                .saturating_sub(before.udp6_raw_tx_completion_failures),
+            udp6_raw_tx_completion_rate: self.udp6_raw_tx_completion_rate,
+            p2p_probe_requests: self
+                .p2p_probe_requests
+                .saturating_sub(before.p2p_probe_requests),
+            p2p_probe_responses: self
+                .p2p_probe_responses
+                .saturating_sub(before.p2p_probe_responses),
+            p2p_gas_requests: self
+                .p2p_gas_requests
+                .saturating_sub(before.p2p_gas_requests),
+            p2p_gas_responses: self
+                .p2p_gas_responses
+                .saturating_sub(before.p2p_gas_responses),
+            p2p_response_drops: self
+                .p2p_response_drops
+                .saturating_sub(before.p2p_response_drops),
+            registered_nan_actions: self
+                .registered_nan_actions
+                .saturating_sub(before.registered_nan_actions),
+            registered_now_actions: self
+                .registered_now_actions
+                .saturating_sub(before.registered_now_actions),
+            registered_p2p_actions: self
+                .registered_p2p_actions
+                .saturating_sub(before.registered_p2p_actions),
+            registered_action_drops: self
+                .registered_action_drops
+                .saturating_sub(before.registered_action_drops),
+        }
+    }
+}
+
+/// One applied-state and counter snapshot.  This is the response model for
+/// the `radio.control`, `radio.snapshot`, and `radio.reset_counters` handlers;
+/// ESP and Linux adapters fill only properties their driver can observe and
+/// report unavailable properties as `None`, never as invented success.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RawWifiSnapshot {
+    pub epoch: u32,
+    pub channel: Option<u8>,
+    /// Whether the current product profile requests infrastructure STA.
+    pub sta_enabled: Option<bool>,
+    pub sta_associated: Option<bool>,
+    /// BSSID of the associated infrastructure AP, distinct from `sta_mac`.
+    pub sta_bssid: Option<[u8; 6]>,
+    /// Current infrastructure STA IPv4 address in network octet order.
+    pub sta_ipv4: Option<[u8; 4]>,
+    pub promiscuous: Option<bool>,
+    pub dw_capturing: Option<bool>,
+    /// Configured NAN DW cadence; unlike `dw_capturing`, it remains present
+    /// between the bounded capture windows.
+    pub nan_dw_interval: Option<u8>,
+    pub comparator_bssid: Option<[u8; 6]>,
+    /// Address-3 from the latest DMesh active-Subscribe SDF. This is NAN
+    /// cluster metadata only; no Service Info or frame bytes are retained.
+    pub nan_active_subscribe_bssid: Option<[u8; 6]>,
+    /// Source and service ID from the latest complete NAN Service Descriptor.
+    /// These are protocol routing identifiers only, never Service Info bytes.
+    pub nan_last_sdf_source: Option<[u8; 6]>,
+    pub nan_last_sdf_service_id: Option<[u8; 6]>,
+    /// Local elapsed time from the selected NAN beacon to the last SDF.
+    /// This is timing evidence only; no frame payload is retained.
+    pub nan_last_sdf_after_beacon_us: Option<u32>,
+    pub comparator_armed: Option<bool>,
+    pub comparator_errors: u32,
+    pub tx_interface: Option<RawWifiInterface>,
+    pub tx_rate: Option<RawWifiRate>,
+    pub ap_active: Option<bool>,
+    pub mac_ack: Option<bool>,
+    /// Last ESP/action driver result represented as its unsigned platform
+    /// value. Zero is success; absent means the adapter has no such driver.
+    pub last_tx_error: Option<u32>,
+    /// Last portable QUIC connection-server error. This is separate from the
+    /// initiating client error because a packet-at-a-time peer can accept an
+    /// OPEN_ACK before its server rejects the following request.
+    pub last_connection_error: Option<u32>,
+    /// MAC currently owned by the STA interface.  This is a link identity,
+    /// not an inferred IPv6 address; APSTA tests must not assume it equals
+    /// the AP MAC.
+    pub sta_mac: Option<[u8; 6]>,
+    /// MAC currently owned by the AP interface when the adapter can expose
+    /// it.  A raw action peer must select this identity when it targets AP
+    /// egress, rather than guessing a vendor-specific `STA + 1` convention.
+    pub ap_mac: Option<[u8; 6]>,
+    /// Current runtime Address-1 policy for the shared NOW-like bearer.
+    pub action_destination_broadcast: Option<bool>,
+    /// Current STA UDP6 egress selection. `false` is explicit raw 802.11;
+    /// `true` is ESP-IDF's associated Ethernet handoff.
+    pub sta_driver_tx: Option<bool>,
+    /// Current private STA BSSID-filter policy. `true` means the filter has
+    /// been bypassed for the selected STA receive lane.
+    pub sta_bssid_check_disabled: Option<bool>,
+    /// Current STA aggregation setting used when the ESP Wi-Fi driver was
+    /// initialized. It is absent for adapters which do not expose AMPDU.
+    pub sta_ampdu_enabled: Option<bool>,
+    /// Whether this STA driver's negotiated legacy rate set suppresses 11b.
+    pub sta_11b_rates_disabled: Option<bool>,
+    /// Whether the raw bearer currently owns the STA driver's Ethernet RX
+    /// callback rather than ESP-IDF's normal esp-netif/lwIP path.
+    pub sta_raw_rx_enabled: Option<bool>,
+    /// Driver-observed elapsed time from `esp_wifi_connect` to the connected
+    /// event. This intentionally excludes radio-epoch setup and is absent
+    /// until the current STA epoch has associated.
+    pub sta_connect_to_associated_ms: Option<u32>,
+    /// ESP-IDF STA disconnect reason from the current radio epoch. `0` means
+    /// no disconnect event was observed; it is not a success indication.
+    pub sta_last_disconnect_reason: Option<u8>,
+    /// Cumulative ESP-IDF callbacks since boot, including intentional release.
+    pub sta_connections: Option<u32>,
+    pub sta_disconnections: Option<u32>,
+    /// All disconnect callbacks, including STA_LEAVING (unlike epoch failure).
+    pub sta_last_event_disconnect_reason: Option<u8>,
+    /// Structured STA records rejected by the UART egress queue since boot.
+    pub sta_diagnostic_log_drops: Option<u32>,
+    /// Live ESP-IDF STA configuration, not an associated-peer observation.
+    pub sta_scan_rssi_threshold_dbm: Option<i8>,
+    pub sta_scan_authmode_threshold: Option<u8>,
+    pub sta_config_channel: Option<u8>,
+    pub sta_config_bssid: Option<[u8; 6]>,
+    pub sta_config_bssid_set: Option<bool>,
+    pub sta_scan_method: Option<u8>,
+    pub sta_pmf_capable: Option<bool>,
+    pub sta_pmf_required: Option<bool>,
+    pub sta_sae_pwe_method: Option<u8>,
+    /// Raw SDK SSID array; trailing NUL bytes are retained for diagnosis.
+    pub sta_config_ssid: Option<[u8; 32]>,
+    /// RSSI reported by the ESP STA for its associated AP. This is a
+    /// best-effort local PHY observation; it is not association authority.
+    pub sta_ap_rssi_dbm: Option<i8>,
+    /// Locally applied maximum Wi-Fi TX power in quarter-dBm units. This is
+    /// configuration telemetry, never proof that a peer received a frame.
+    pub max_tx_power_qdbm: Option<i8>,
+    /// Effective raw-bearer transmit credit for one ingress turn. A value of
+    /// one enables the deliberate one-tick paced continuation; larger values
+    /// emit the bounded burst synchronously.
+    pub udp6_tx_burst_packets: Option<u8>,
+    /// Device-side duration of the immediate Wi-Fi TX submission call. This
+    /// distinguishes a blocked submitter from later driver/radio airtime.
+    pub udp6_tx_submit_calls: Option<u32>,
+    pub udp6_tx_submit_us_total: Option<u32>,
+    pub udp6_tx_submit_us_max: Option<u32>,
+    pub counters: RawWifiCounters,
+}
+
+impl RawWifiSnapshot {
+    /// Project device-side raw-bearer observations into the shared per-link
+    /// metrics vocabulary.  ESP-IDF has no peer MAC retry/failure aggregate,
+    /// so those host-only fields remain absent rather than being synthesized
+    /// from raw injection completions.
+    pub fn link_metrics(&self) -> WifiLinkMetrics {
+        let mut metrics = WifiLinkMetrics::new();
+        metrics.peer_mac = if self.sta_associated == Some(true) {
+            self.sta_bssid
+        } else {
+            None
+        };
+        metrics.signal_dbm = self.sta_ap_rssi_dbm;
+        metrics.bearer_rx_frames = Some(self.counters.udp6_rx_frames as u64);
+        metrics.bearer_rx_drops = Some(self.counters.udp6_rx_queue_drops as u64);
+        metrics.bearer_rx_invalid = Some(self.counters.udp6_rx_invalid as u64);
+        metrics.bearer_udp_delivered = Some(self.counters.udp6_udp_delivered as u64);
+        metrics.bearer_ndp_advertisements = Some(self.counters.udp6_ndp_advertisements as u64);
+        metrics.bearer_tx_failures = Some(self.counters.udp6_tx_failures as u64);
+        metrics.raw_tx_completion_failures =
+            Some(self.counters.udp6_raw_tx_completion_failures as u64);
+        metrics
+    }
+}
+
+const fn interface_value(value: RawWifiInterface) -> u64 {
+    match value {
+        RawWifiInterface::Auto => 0,
+        RawWifiInterface::Sta => 1,
+        RawWifiInterface::Ap => 2,
+        RawWifiInterface::Nan => 3,
+    }
+}
+
+const fn rate_value(value: RawWifiRate) -> u64 {
+    match value {
+        RawWifiRate::Auto => 0,
+        RawWifiRate::Mbps6 => 6,
+        RawWifiRate::Mbps9 => 9,
+        RawWifiRate::Mbps12 => 12,
+        RawWifiRate::Mbps18 => 18,
+        RawWifiRate::Mbps24 => 24,
+        RawWifiRate::Mbps36 => 36,
+        RawWifiRate::Mbps48 => 48,
+        RawWifiRate::Mbps54 => 54,
+    }
+}
+
+/// Encode the common response envelope for a radio-lab handler.  The method
+/// is one of [`RAW_WIFI_METHOD_CONTROL`], [`RAW_WIFI_METHOD_SNAPSHOT`], or
+/// [`RAW_WIFI_METHOD_RESET_COUNTERS`].  Optional applied-state fields are
+/// absent when a driver cannot observe them; they are never represented as a
+/// made-up zero/false value.
+pub fn encode_raw_wifi_snapshot(
+    method: u64,
+    snapshot: RawWifiSnapshot,
+    out: &mut [u8],
+) -> Option<usize> {
+    if !matches!(
+        method,
+        RAW_WIFI_METHOD_CONTROL | RAW_WIFI_METHOD_SNAPSHOT | RAW_WIFI_METHOD_RESET_COUNTERS
+    ) {
+        return None;
+    }
+    let optional = usize::from(snapshot.channel.is_some())
+        + usize::from(snapshot.sta_enabled.is_some())
+        + usize::from(snapshot.sta_associated.is_some())
+        + usize::from(snapshot.sta_bssid.is_some())
+        + usize::from(snapshot.sta_ipv4.is_some())
+        + usize::from(snapshot.promiscuous.is_some())
+        + usize::from(snapshot.dw_capturing.is_some())
+        + usize::from(snapshot.nan_dw_interval.is_some())
+        + usize::from(snapshot.comparator_bssid.is_some())
+        + usize::from(snapshot.nan_active_subscribe_bssid.is_some())
+        + usize::from(snapshot.nan_last_sdf_source.is_some())
+        + usize::from(snapshot.nan_last_sdf_service_id.is_some())
+        + usize::from(snapshot.nan_last_sdf_after_beacon_us.is_some())
+        + usize::from(snapshot.comparator_armed.is_some())
+        + usize::from(snapshot.tx_interface.is_some())
+        + usize::from(snapshot.tx_rate.is_some())
+        + usize::from(snapshot.ap_active.is_some())
+        + usize::from(snapshot.mac_ack.is_some())
+        + usize::from(snapshot.last_tx_error.is_some())
+        + usize::from(snapshot.last_connection_error.is_some())
+        + usize::from(snapshot.sta_mac.is_some())
+        + usize::from(snapshot.ap_mac.is_some())
+        + usize::from(snapshot.action_destination_broadcast.is_some())
+        + usize::from(snapshot.sta_driver_tx.is_some())
+        + usize::from(snapshot.sta_bssid_check_disabled.is_some())
+        + usize::from(snapshot.sta_ampdu_enabled.is_some())
+        + usize::from(snapshot.sta_11b_rates_disabled.is_some())
+        + usize::from(snapshot.sta_raw_rx_enabled.is_some())
+        + usize::from(snapshot.sta_connect_to_associated_ms.is_some())
+        + usize::from(snapshot.sta_last_disconnect_reason.is_some())
+        + usize::from(snapshot.sta_connections.is_some())
+        + usize::from(snapshot.sta_disconnections.is_some())
+        + usize::from(snapshot.sta_last_event_disconnect_reason.is_some())
+        + usize::from(snapshot.sta_diagnostic_log_drops.is_some())
+        + usize::from(snapshot.sta_scan_rssi_threshold_dbm.is_some())
+        + usize::from(snapshot.sta_scan_authmode_threshold.is_some())
+        + usize::from(snapshot.sta_config_channel.is_some())
+        + usize::from(snapshot.sta_config_bssid.is_some())
+        + usize::from(snapshot.sta_config_bssid_set.is_some())
+        + usize::from(snapshot.sta_scan_method.is_some())
+        + usize::from(snapshot.sta_pmf_capable.is_some())
+        + usize::from(snapshot.sta_pmf_required.is_some())
+        + usize::from(snapshot.sta_sae_pwe_method.is_some())
+        + usize::from(snapshot.sta_config_ssid.is_some())
+        + usize::from(snapshot.sta_ap_rssi_dbm.is_some())
+        + usize::from(snapshot.max_tx_power_qdbm.is_some())
+        + usize::from(snapshot.udp6_tx_burst_packets.is_some())
+        + usize::from(snapshot.udp6_tx_submit_calls.is_some())
+        + usize::from(snapshot.udp6_tx_submit_us_total.is_some())
+        + usize::from(snapshot.udp6_tx_submit_us_max.is_some());
+    let mut e = Encoder::new(out);
+    e.map(3)?;
+    e.uint(1)?;
+    e.uint(RAW_WIFI_COMPONENT)?;
+    e.uint(2)?;
+    e.uint(method)?;
+    e.uint(6)?;
+    // Epoch, comparator errors, and monotonic counters are always
+    // present, letting the host calculate deltas without retaining FW state.
+    // 63 always-present scalar counters, including the three distinct active
+    // Publish TX outcomes below.
+    e.map((63 + optional) as u64)?;
+    e.uint(20)?;
+    e.uint(u64::from(snapshot.epoch))?;
+    if let Some(channel) = snapshot.channel {
+        e.uint(21)?;
+        e.uint(u64::from(channel))?;
+    }
+    if let Some(value) = snapshot.sta_enabled {
+        e.uint(128)?;
+        e.boolean(value)?;
+    }
+    if let Some(value) = snapshot.sta_associated {
+        e.uint(22)?;
+        e.boolean(value)?;
+    }
+    if let Some(value) = snapshot.sta_bssid {
+        e.uint(129)?;
+        e.bytes_value(&value)?;
+    }
+    if let Some(value) = snapshot.sta_ipv4 {
+        e.uint(130)?;
+        e.bytes_value(&value)?;
+    }
+    if let Some(value) = snapshot.promiscuous {
+        e.uint(23)?;
+        e.boolean(value)?;
+    }
+    if let Some(value) = snapshot.dw_capturing {
+        e.uint(24)?;
+        e.boolean(value)?;
+    }
+    if let Some(value) = snapshot.nan_dw_interval {
+        e.uint(96)?;
+        e.uint(u64::from(value))?;
+    }
+    if let Some(bssid) = snapshot.comparator_bssid {
+        e.uint(25)?;
+        e.bytes_value(&bssid)?;
+    }
+    if let Some(bssid) = snapshot.nan_active_subscribe_bssid {
+        e.uint(115)?;
+        e.bytes_value(&bssid)?;
+    }
+    if let Some(value) = snapshot.nan_last_sdf_source {
+        e.uint(116)?;
+        e.bytes_value(&value)?;
+    }
+    if let Some(value) = snapshot.nan_last_sdf_service_id {
+        e.uint(117)?;
+        e.bytes_value(&value)?;
+    }
+    if let Some(value) = snapshot.nan_last_sdf_after_beacon_us {
+        e.uint(118)?;
+        e.uint(u64::from(value))?;
+    }
+    if let Some(value) = snapshot.comparator_armed {
+        e.uint(26)?;
+        e.boolean(value)?;
+    }
+    e.uint(27)?;
+    e.uint(u64::from(snapshot.comparator_errors))?;
+    if let Some(value) = snapshot.tx_interface {
+        e.uint(28)?;
+        e.uint(interface_value(value))?;
+    }
+    if let Some(value) = snapshot.tx_rate {
+        e.uint(29)?;
+        e.uint(rate_value(value))?;
+    }
+    if let Some(value) = snapshot.ap_active {
+        e.uint(30)?;
+        e.boolean(value)?;
+    }
+    if let Some(value) = snapshot.mac_ack {
+        e.uint(31)?;
+        e.boolean(value)?;
+    }
+    if let Some(value) = snapshot.last_tx_error {
+        e.uint(33)?;
+        e.uint(u64::from(value))?;
+    }
+    if let Some(value) = snapshot.last_connection_error {
+        e.uint(105)?;
+        e.uint(u64::from(value))?;
+    }
+    if let Some(value) = snapshot.sta_mac {
+        e.uint(35)?;
+        e.bytes_value(&value)?;
+    }
+    if let Some(value) = snapshot.ap_mac {
+        e.uint(36)?;
+        e.bytes_value(&value)?;
+    }
+    if let Some(value) = snapshot.action_destination_broadcast {
+        e.uint(37)?;
+        e.boolean(value)?;
+    }
+    if let Some(value) = snapshot.sta_driver_tx {
+        e.uint(74)?;
+        e.boolean(value)?;
+    }
+    if let Some(value) = snapshot.sta_bssid_check_disabled {
+        e.uint(78)?;
+        e.boolean(value)?;
+    }
+    if let Some(value) = snapshot.sta_ampdu_enabled {
+        e.uint(83)?;
+        e.boolean(value)?;
+    }
+    if let Some(value) = snapshot.sta_11b_rates_disabled {
+        e.uint(84)?;
+        e.boolean(value)?;
+    }
+    if let Some(value) = snapshot.sta_raw_rx_enabled {
+        e.uint(85)?;
+        e.boolean(value)?;
+    }
+    if let Some(value) = snapshot.sta_connect_to_associated_ms {
+        e.uint(91)?;
+        e.uint(u64::from(value))?;
+    }
+    if let Some(value) = snapshot.sta_last_disconnect_reason {
+        e.uint(95)?;
+        e.uint(u64::from(value))?;
+    }
+    for (tag, value) in [
+        (131, snapshot.sta_connections),
+        (132, snapshot.sta_disconnections),
+        (
+            133,
+            snapshot.sta_last_event_disconnect_reason.map(u32::from),
+        ),
+        (134, snapshot.sta_diagnostic_log_drops),
+    ] {
+        if let Some(value) = value {
+            e.uint(tag)?;
+            e.uint(u64::from(value))?;
+        }
+    }
+    if let Some(value) = snapshot.sta_scan_rssi_threshold_dbm {
+        e.uint(135)?;
+        e.int(i64::from(value))?;
+    }
+    for (tag, value) in [
+        (136, snapshot.sta_scan_authmode_threshold),
+        (137, snapshot.sta_config_channel),
+        (140, snapshot.sta_scan_method),
+        (143, snapshot.sta_sae_pwe_method),
+    ] {
+        if let Some(value) = value {
+            e.uint(tag)?;
+            e.uint(u64::from(value))?;
+        }
+    }
+    if let Some(value) = snapshot.sta_config_bssid {
+        e.uint(138)?;
+        e.bytes_value(&value)?;
+    }
+    for (tag, value) in [
+        (139, snapshot.sta_config_bssid_set),
+        (141, snapshot.sta_pmf_capable),
+        (142, snapshot.sta_pmf_required),
+    ] {
+        if let Some(value) = value {
+            e.uint(tag)?;
+            e.boolean(value)?;
+        }
+    }
+    if let Some(value) = snapshot.sta_config_ssid {
+        e.uint(144)?;
+        e.bytes_value(&value)?;
+    }
+    if let Some(value) = snapshot.sta_ap_rssi_dbm {
+        e.uint(86)?;
+        e.int(i64::from(value))?;
+    }
+    if let Some(value) = snapshot.max_tx_power_qdbm {
+        e.uint(127)?;
+        e.int(i64::from(value))?;
+    }
+    if let Some(value) = snapshot.udp6_tx_burst_packets {
+        e.uint(87)?;
+        e.uint(u64::from(value))?;
+    }
+    if let Some(value) = snapshot.udp6_tx_submit_calls {
+        e.uint(88)?;
+        e.uint(u64::from(value))?;
+    }
+    if let Some(value) = snapshot.udp6_tx_submit_us_total {
+        e.uint(89)?;
+        e.uint(u64::from(value))?;
+    }
+    if let Some(value) = snapshot.udp6_tx_submit_us_max {
+        e.uint(90)?;
+        e.uint(u64::from(value))?;
+    }
+    for (key, value) in [
+        (40, snapshot.counters.tx_attempted),
+        (41, snapshot.counters.tx_driver_accepted),
+        (42, snapshot.counters.tx_driver_failed),
+        (43, snapshot.counters.rx_driver_dispatch),
+        (44, snapshot.counters.rx_parser_accepted),
+        (45, snapshot.counters.rx_parser_rejected),
+        (46, snapshot.counters.rx_self_echo),
+        (47, snapshot.counters.rx_dropped),
+        (48, snapshot.counters.nan_beacons),
+        (49, snapshot.counters.nan_sdfs),
+        (50, snapshot.counters.nan_followups),
+        (119, snapshot.counters.nan_followup_queued),
+        (120, snapshot.counters.nan_followup_sent),
+        (121, snapshot.counters.nan_followup_dropped),
+        (122, snapshot.counters.nan_followup_pending),
+        (124, snapshot.counters.nan_active_publish_attempted),
+        (125, snapshot.counters.nan_active_publish_sent),
+        (126, snapshot.counters.nan_active_publish_dropped),
+        (92, snapshot.counters.nan_service_info_matched),
+        (93, snapshot.counters.nan_service_info_enqueued),
+        (94, snapshot.counters.nan_service_info_dropped),
+        (123, snapshot.counters.nan_service_info_dispatched),
+        (51, snapshot.counters.tx_duration_us_total),
+        (52, snapshot.counters.tx_duration_us_max),
+        (53, snapshot.counters.tx_duration_le_250us),
+        (54, snapshot.counters.tx_duration_le_750us),
+        (55, snapshot.counters.tx_duration_le_2ms),
+        (56, snapshot.counters.tx_duration_gt_2ms),
+        (62, snapshot.counters.roc_action_listen_requests),
+        (63, snapshot.counters.roc_action_listen_failures),
+        (64, snapshot.counters.roc_action_frames),
+        (65, snapshot.counters.vendor_beacon_ies),
+        (66, snapshot.counters.vendor_nan_beacon_ies),
+        (67, snapshot.counters.vendor_other_ies),
+        (68, snapshot.counters.roc_espnow_actions),
+        (69, snapshot.counters.roc_nan_actions),
+        (70, snapshot.counters.roc_other_actions),
+        (79, snapshot.counters.udp6_rx_frames),
+        (80, snapshot.counters.udp6_rx_queue_drops),
+        (81, snapshot.counters.udp6_rx_invalid),
+        (82, snapshot.counters.udp6_udp_delivered),
+        (71, snapshot.counters.udp6_ndp_advertisements),
+        (72, snapshot.counters.udp6_tx_failures),
+        (73, snapshot.counters.udp6_last_tx_result),
+        (75, snapshot.counters.udp6_raw_tx_completions),
+        (76, snapshot.counters.udp6_raw_tx_completion_failures),
+        (77, snapshot.counters.udp6_raw_tx_completion_rate),
+        (97, snapshot.counters.p2p_probe_requests),
+        (101, snapshot.counters.p2p_probe_responses),
+        (98, snapshot.counters.p2p_gas_requests),
+        (99, snapshot.counters.p2p_gas_responses),
+        (100, snapshot.counters.p2p_response_drops),
+        (106, snapshot.counters.registered_nan_actions),
+        (107, snapshot.counters.registered_now_actions),
+        (108, snapshot.counters.registered_p2p_actions),
+        (109, snapshot.counters.registered_action_drops),
+        (110, snapshot.counters.nan_active_subscribes),
+        (111, snapshot.counters.nan_active_subscribe_descriptors),
+        (112, snapshot.counters.nan_active_subscribe_sdea_misses),
+        (113, snapshot.counters.nan_active_subscribe_sdea_header),
+        (114, snapshot.counters.nan_active_subscribe_sdea_info_len),
+    ] {
+        e.uint(key)?;
+        e.uint(u64::from(value))?;
+    }
+    Some(e.len())
+}
+
+/// Decode an applied radio snapshot returned by any registered radio method.
+/// This is intentionally in the shared schema crate so the Rust E2E runner
+/// and firmware/host adapters compare the same counter names.
+pub fn decode_raw_wifi_snapshot(data: &[u8]) -> Result<(u64, RawWifiSnapshot), &'static str> {
+    let record = decode(data).ok_or("radio snapshot CBOR")?;
+    if record.component != Some(Name::Tag(RAW_WIFI_COMPONENT)) {
+        return Err("radio snapshot component");
+    }
+    let method = match record.method {
+        Some(Name::Tag(method)) => method,
+        _ => return Err("radio snapshot method"),
+    };
+    if !matches!(
+        method,
+        RAW_WIFI_METHOD_CONTROL | RAW_WIFI_METHOD_SNAPSHOT | RAW_WIFI_METHOD_RESET_COUNTERS
+    ) {
+        return Err("radio snapshot method");
+    }
+    let mut decoder = Decoder::new(record.result.ok_or("radio snapshot fields")?);
+    let (major, entries) = decoder.head().ok_or("radio snapshot CBOR")?;
+    if major != 5 || entries == u64::MAX {
+        return Err("radio snapshot envelope");
+    }
+    let mut snapshot = RawWifiSnapshot::default();
+    for _ in 0..entries {
+        let key = decoder.uint().ok_or("radio snapshot key")?;
+        match key {
+            20 => {
+                snapshot.epoch = u32::try_from(decoder.uint().ok_or("radio epoch")?)
+                    .map_err(|_| "radio epoch")?
+            }
+            21 => {
+                snapshot.channel = Some(
+                    u8::try_from(decoder.uint().ok_or("radio channel")?)
+                        .map_err(|_| "radio channel")?,
+                )
+            }
+            128 => snapshot.sta_enabled = Some(decoder.boolean().ok_or("radio STA enabled")?),
+            131 => {
+                snapshot.sta_connections = Some(
+                    u32::try_from(decoder.uint().ok_or("STA connections")?)
+                        .map_err(|_| "STA connections")?,
+                )
+            }
+            132 => {
+                snapshot.sta_disconnections = Some(
+                    u32::try_from(decoder.uint().ok_or("STA disconnections")?)
+                        .map_err(|_| "STA disconnections")?,
+                )
+            }
+            133 => {
+                snapshot.sta_last_event_disconnect_reason = Some(
+                    u8::try_from(decoder.uint().ok_or("STA disconnect reason")?)
+                        .map_err(|_| "STA disconnect reason")?,
+                )
+            }
+            134 => {
+                snapshot.sta_diagnostic_log_drops = Some(
+                    u32::try_from(decoder.uint().ok_or("STA log drops")?)
+                        .map_err(|_| "STA log drops")?,
+                )
+            }
+            135 => {
+                snapshot.sta_scan_rssi_threshold_dbm = Some(
+                    i8::try_from(decoder.int().ok_or("STA RSSI threshold")?)
+                        .map_err(|_| "STA RSSI threshold")?,
+                )
+            }
+            136 => {
+                snapshot.sta_scan_authmode_threshold = Some(
+                    u8::try_from(decoder.uint().ok_or("STA auth threshold")?)
+                        .map_err(|_| "STA auth threshold")?,
+                )
+            }
+            137 => {
+                snapshot.sta_config_channel = Some(
+                    u8::try_from(decoder.uint().ok_or("STA configured channel")?)
+                        .map_err(|_| "STA configured channel")?,
+                )
+            }
+            138 => {
+                snapshot.sta_config_bssid = Some(
+                    decoder
+                        .bytes_ref()
+                        .and_then(|v| v.try_into().ok())
+                        .ok_or("STA configured BSSID")?,
+                )
+            }
+            139 => {
+                snapshot.sta_config_bssid_set = Some(decoder.boolean().ok_or("STA BSSID pinned")?)
+            }
+            140 => {
+                snapshot.sta_scan_method = Some(
+                    u8::try_from(decoder.uint().ok_or("STA scan method")?)
+                        .map_err(|_| "STA scan method")?,
+                )
+            }
+            141 => snapshot.sta_pmf_capable = Some(decoder.boolean().ok_or("STA PMF capable")?),
+            142 => snapshot.sta_pmf_required = Some(decoder.boolean().ok_or("STA PMF required")?),
+            143 => {
+                snapshot.sta_sae_pwe_method = Some(
+                    u8::try_from(decoder.uint().ok_or("STA SAE method")?)
+                        .map_err(|_| "STA SAE method")?,
+                )
+            }
+            144 => {
+                snapshot.sta_config_ssid = Some(
+                    decoder
+                        .bytes_ref()
+                        .and_then(|v| v.try_into().ok())
+                        .ok_or("STA configured SSID")?,
+                )
+            }
+            22 => snapshot.sta_associated = Some(decoder.boolean().ok_or("radio STA")?),
+            129 => {
+                snapshot.sta_bssid = Some(
+                    decoder
+                        .bytes_ref()
+                        .and_then(|v| v.try_into().ok())
+                        .ok_or("radio STA BSSID")?,
+                )
+            }
+            130 => {
+                snapshot.sta_ipv4 = Some(
+                    decoder
+                        .bytes_ref()
+                        .and_then(|v| v.try_into().ok())
+                        .ok_or("radio STA IPv4")?,
+                )
+            }
+            23 => snapshot.promiscuous = Some(decoder.boolean().ok_or("radio promiscuous")?),
+            24 => snapshot.dw_capturing = Some(decoder.boolean().ok_or("radio DW")?),
+            96 => {
+                snapshot.nan_dw_interval = Some(
+                    u8::try_from(decoder.uint().ok_or("radio DW interval")?)
+                        .map_err(|_| "radio DW interval")?,
+                )
+            }
+            97 => {
+                snapshot.counters.p2p_probe_requests =
+                    u32::try_from(decoder.uint().ok_or("radio P2P Probe Requests")?)
+                        .map_err(|_| "radio P2P Probe Requests")?
+            }
+            101 => {
+                snapshot.counters.p2p_probe_responses =
+                    u32::try_from(decoder.uint().ok_or("radio P2P Probe Responses")?)
+                        .map_err(|_| "radio P2P Probe Responses")?
+            }
+            98 => {
+                snapshot.counters.p2p_gas_requests =
+                    u32::try_from(decoder.uint().ok_or("radio P2P GAS requests")?)
+                        .map_err(|_| "radio P2P GAS requests")?
+            }
+            99 => {
+                snapshot.counters.p2p_gas_responses =
+                    u32::try_from(decoder.uint().ok_or("radio P2P GAS responses")?)
+                        .map_err(|_| "radio P2P GAS responses")?
+            }
+            100 => {
+                snapshot.counters.p2p_response_drops =
+                    u32::try_from(decoder.uint().ok_or("radio P2P response drops")?)
+                        .map_err(|_| "radio P2P response drops")?
+            }
+            106 => {
+                snapshot.counters.registered_nan_actions =
+                    u32::try_from(decoder.uint().ok_or("registered NAN actions")?)
+                        .map_err(|_| "registered NAN actions")?
+            }
+            107 => {
+                snapshot.counters.registered_now_actions =
+                    u32::try_from(decoder.uint().ok_or("registered NOW actions")?)
+                        .map_err(|_| "registered NOW actions")?
+            }
+            108 => {
+                snapshot.counters.registered_p2p_actions =
+                    u32::try_from(decoder.uint().ok_or("registered P2P actions")?)
+                        .map_err(|_| "registered P2P actions")?
+            }
+            109 => {
+                snapshot.counters.registered_action_drops =
+                    u32::try_from(decoder.uint().ok_or("registered action drops")?)
+                        .map_err(|_| "registered action drops")?
+            }
+            25 => {
+                snapshot.comparator_bssid = Some(
+                    decoder
+                        .bytes_ref()
+                        .and_then(|v| v.try_into().ok())
+                        .ok_or("radio comparator BSSID")?,
+                )
+            }
+            115 => {
+                snapshot.nan_active_subscribe_bssid = Some(
+                    decoder
+                        .bytes_ref()
+                        .and_then(|v| v.try_into().ok())
+                        .ok_or("radio NAN active Subscribe BSSID")?,
+                )
+            }
+            116 => {
+                snapshot.nan_last_sdf_source = Some(
+                    decoder
+                        .bytes_ref()
+                        .and_then(|v| v.try_into().ok())
+                        .ok_or("radio NAN SDF source")?,
+                )
+            }
+            117 => {
+                snapshot.nan_last_sdf_service_id = Some(
+                    decoder
+                        .bytes_ref()
+                        .and_then(|v| v.try_into().ok())
+                        .ok_or("radio NAN SDF service")?,
+                )
+            }
+            118 => {
+                snapshot.nan_last_sdf_after_beacon_us = Some(
+                    u32::try_from(decoder.uint().ok_or("radio NAN SDF timing")?)
+                        .map_err(|_| "radio counter")?,
+                );
+            }
+            26 => snapshot.comparator_armed = Some(decoder.boolean().ok_or("radio comparator")?),
+            27 => {
+                snapshot.comparator_errors =
+                    u32::try_from(decoder.uint().ok_or("radio comparator errors")?)
+                        .map_err(|_| "radio comparator errors")?
+            }
+            28 => {
+                snapshot.tx_interface =
+                    Some(decode_interface(decoder.uint().ok_or("radio interface")?)?)
+            }
+            29 => snapshot.tx_rate = Some(decode_rate(decoder.uint().ok_or("radio rate")?)?),
+            30 => snapshot.ap_active = Some(decoder.boolean().ok_or("radio AP")?),
+            31 => snapshot.mac_ack = Some(decoder.boolean().ok_or("radio MAC ACK")?),
+            33 => {
+                snapshot.last_tx_error = Some(
+                    u32::try_from(decoder.uint().ok_or("radio tx error")?)
+                        .map_err(|_| "radio tx error")?,
+                )
+            }
+            105 => {
+                snapshot.last_connection_error = Some(
+                    u32::try_from(decoder.uint().ok_or("radio service error")?)
+                        .map_err(|_| "radio service error")?,
+                )
+            }
+            35 => {
+                snapshot.sta_mac = Some(
+                    decoder
+                        .bytes_ref()
+                        .and_then(|v| v.try_into().ok())
+                        .ok_or("radio STA MAC")?,
+                )
+            }
+            36 => {
+                snapshot.ap_mac = Some(
+                    decoder
+                        .bytes_ref()
+                        .and_then(|v| v.try_into().ok())
+                        .ok_or("radio AP MAC")?,
+                )
+            }
+            37 => {
+                snapshot.action_destination_broadcast =
+                    Some(decoder.boolean().ok_or("radio action broadcast")?)
+            }
+            74 => snapshot.sta_driver_tx = Some(decoder.boolean().ok_or("radio STA egress")?),
+            78 => {
+                snapshot.sta_bssid_check_disabled =
+                    Some(decoder.boolean().ok_or("radio STA BSSID policy")?)
+            }
+            83 => snapshot.sta_ampdu_enabled = Some(decoder.boolean().ok_or("radio STA AMPDU")?),
+            84 => {
+                snapshot.sta_11b_rates_disabled =
+                    Some(decoder.boolean().ok_or("radio STA 11b policy")?)
+            }
+            85 => snapshot.sta_raw_rx_enabled = Some(decoder.boolean().ok_or("radio raw RX")?),
+            91 => {
+                snapshot.sta_connect_to_associated_ms = Some(
+                    u32::try_from(decoder.uint().ok_or("radio STA association time")?)
+                        .map_err(|_| "radio STA association time")?,
+                )
+            }
+            95 => {
+                snapshot.sta_last_disconnect_reason = Some(
+                    u8::try_from(decoder.uint().ok_or("radio STA disconnect reason")?)
+                        .map_err(|_| "radio STA disconnect reason")?,
+                )
+            }
+            86 => {
+                snapshot.sta_ap_rssi_dbm = Some(
+                    i8::try_from(decoder.int().ok_or("radio STA AP RSSI")?)
+                        .map_err(|_| "radio STA AP RSSI")?,
+                )
+            }
+            127 => {
+                snapshot.max_tx_power_qdbm = Some(
+                    i8::try_from(decoder.int().ok_or("radio maximum TX power")?)
+                        .map_err(|_| "radio maximum TX power")?,
+                )
+            }
+            87 => {
+                snapshot.udp6_tx_burst_packets = Some(
+                    u8::try_from(decoder.uint().ok_or("radio UDP6 TX burst")?)
+                        .map_err(|_| "radio UDP6 TX burst")?,
+                )
+            }
+            88 => {
+                snapshot.udp6_tx_submit_calls = Some(
+                    u32::try_from(decoder.uint().ok_or("radio UDP6 TX submits")?)
+                        .map_err(|_| "radio UDP6 TX submits")?,
+                )
+            }
+            89 => {
+                snapshot.udp6_tx_submit_us_total = Some(
+                    u32::try_from(decoder.uint().ok_or("radio UDP6 TX submit time")?)
+                        .map_err(|_| "radio UDP6 TX submit time")?,
+                )
+            }
+            90 => {
+                snapshot.udp6_tx_submit_us_max = Some(
+                    u32::try_from(decoder.uint().ok_or("radio UDP6 TX submit max")?)
+                        .map_err(|_| "radio UDP6 TX submit max")?,
+                )
+            }
+            40 => {
+                snapshot.counters.tx_attempted =
+                    u32::try_from(decoder.uint().ok_or("radio tx attempted")?)
+                        .map_err(|_| "radio counter")?
+            }
+            41 => {
+                snapshot.counters.tx_driver_accepted =
+                    u32::try_from(decoder.uint().ok_or("radio tx accepted")?)
+                        .map_err(|_| "radio counter")?
+            }
+            42 => {
+                snapshot.counters.tx_driver_failed =
+                    u32::try_from(decoder.uint().ok_or("radio tx failed")?)
+                        .map_err(|_| "radio counter")?
+            }
+            43 => {
+                snapshot.counters.rx_driver_dispatch =
+                    u32::try_from(decoder.uint().ok_or("radio rx dispatch")?)
+                        .map_err(|_| "radio counter")?
+            }
+            44 => {
+                snapshot.counters.rx_parser_accepted =
+                    u32::try_from(decoder.uint().ok_or("radio rx accepted")?)
+                        .map_err(|_| "radio counter")?
+            }
+            45 => {
+                snapshot.counters.rx_parser_rejected =
+                    u32::try_from(decoder.uint().ok_or("radio rx rejected")?)
+                        .map_err(|_| "radio counter")?
+            }
+            46 => {
+                snapshot.counters.rx_self_echo =
+                    u32::try_from(decoder.uint().ok_or("radio self echo")?)
+                        .map_err(|_| "radio counter")?
+            }
+            47 => {
+                snapshot.counters.rx_dropped = u32::try_from(decoder.uint().ok_or("radio drops")?)
+                    .map_err(|_| "radio counter")?
+            }
+            48 => {
+                snapshot.counters.nan_beacons =
+                    u32::try_from(decoder.uint().ok_or("radio NAN beacons")?)
+                        .map_err(|_| "radio counter")?
+            }
+            49 => {
+                snapshot.counters.nan_sdfs = u32::try_from(decoder.uint().ok_or("radio NAN SDF")?)
+                    .map_err(|_| "radio counter")?
+            }
+            50 => {
+                snapshot.counters.nan_followups =
+                    u32::try_from(decoder.uint().ok_or("radio NAN followup")?)
+                        .map_err(|_| "radio counter")?
+            }
+            119 => {
+                snapshot.counters.nan_followup_queued =
+                    u32::try_from(decoder.uint().ok_or("radio NAN followup queued")?)
+                        .map_err(|_| "radio counter")?
+            }
+            120 => {
+                snapshot.counters.nan_followup_sent =
+                    u32::try_from(decoder.uint().ok_or("radio NAN followup sent")?)
+                        .map_err(|_| "radio counter")?
+            }
+            121 => {
+                snapshot.counters.nan_followup_dropped =
+                    u32::try_from(decoder.uint().ok_or("radio NAN followup dropped")?)
+                        .map_err(|_| "radio counter")?
+            }
+            122 => {
+                snapshot.counters.nan_followup_pending =
+                    u32::try_from(decoder.uint().ok_or("radio NAN followup pending")?)
+                        .map_err(|_| "radio counter")?
+            }
+            124 => {
+                snapshot.counters.nan_active_publish_attempted =
+                    u32::try_from(decoder.uint().ok_or("radio NAN active Publish attempted")?)
+                        .map_err(|_| "radio counter")?
+            }
+            125 => {
+                snapshot.counters.nan_active_publish_sent =
+                    u32::try_from(decoder.uint().ok_or("radio NAN active Publish sent")?)
+                        .map_err(|_| "radio counter")?
+            }
+            126 => {
+                snapshot.counters.nan_active_publish_dropped =
+                    u32::try_from(decoder.uint().ok_or("radio NAN active Publish dropped")?)
+                        .map_err(|_| "radio counter")?
+            }
+            92 => {
+                snapshot.counters.nan_service_info_matched =
+                    u32::try_from(decoder.uint().ok_or("radio NAN Service Info match")?)
+                        .map_err(|_| "radio counter")?
+            }
+            110 => {
+                snapshot.counters.nan_active_subscribes =
+                    u32::try_from(decoder.uint().ok_or("radio NAN active Subscribe")?)
+                        .map_err(|_| "radio counter")?
+            }
+            111 => {
+                snapshot.counters.nan_active_subscribe_descriptors =
+                    u32::try_from(decoder.uint().ok_or("radio NAN active Subscribe SDA")?)
+                        .map_err(|_| "radio counter")?
+            }
+            112 => {
+                snapshot.counters.nan_active_subscribe_sdea_misses = u32::try_from(
+                    decoder
+                        .uint()
+                        .ok_or("radio NAN active Subscribe SDEA miss")?,
+                )
+                .map_err(|_| "radio counter")?
+            }
+            113 => {
+                snapshot.counters.nan_active_subscribe_sdea_header = u32::try_from(
+                    decoder
+                        .uint()
+                        .ok_or("radio NAN active Subscribe SDEA header")?,
+                )
+                .map_err(|_| "radio counter")?
+            }
+            114 => {
+                snapshot.counters.nan_active_subscribe_sdea_info_len = u32::try_from(
+                    decoder
+                        .uint()
+                        .ok_or("radio NAN active Subscribe SDEA info length")?,
+                )
+                .map_err(|_| "radio counter")?
+            }
+            93 => {
+                snapshot.counters.nan_service_info_enqueued =
+                    u32::try_from(decoder.uint().ok_or("radio NAN Service Info ingress")?)
+                        .map_err(|_| "radio counter")?
+            }
+            94 => {
+                snapshot.counters.nan_service_info_dropped =
+                    u32::try_from(decoder.uint().ok_or("radio NAN Service Info drop")?)
+                        .map_err(|_| "radio counter")?
+            }
+            123 => {
+                snapshot.counters.nan_service_info_dispatched =
+                    u32::try_from(decoder.uint().ok_or("radio NAN Service Info dispatch")?)
+                        .map_err(|_| "radio counter")?
+            }
+            51 => {
+                snapshot.counters.tx_duration_us_total =
+                    u32::try_from(decoder.uint().ok_or("radio tx time")?)
+                        .map_err(|_| "radio counter")?
+            }
+            52 => {
+                snapshot.counters.tx_duration_us_max =
+                    u32::try_from(decoder.uint().ok_or("radio tx max")?)
+                        .map_err(|_| "radio counter")?
+            }
+            53 => {
+                snapshot.counters.tx_duration_le_250us =
+                    u32::try_from(decoder.uint().ok_or("radio tx bucket")?)
+                        .map_err(|_| "radio counter")?
+            }
+            54 => {
+                snapshot.counters.tx_duration_le_750us =
+                    u32::try_from(decoder.uint().ok_or("radio tx bucket")?)
+                        .map_err(|_| "radio counter")?
+            }
+            55 => {
+                snapshot.counters.tx_duration_le_2ms =
+                    u32::try_from(decoder.uint().ok_or("radio tx bucket")?)
+                        .map_err(|_| "radio counter")?
+            }
+            56 => {
+                snapshot.counters.tx_duration_gt_2ms =
+                    u32::try_from(decoder.uint().ok_or("radio tx bucket")?)
+                        .map_err(|_| "radio counter")?
+            }
+            62 => {
+                snapshot.counters.roc_action_listen_requests =
+                    u32::try_from(decoder.uint().ok_or("radio ROC requests")?)
+                        .map_err(|_| "radio counter")?
+            }
+            63 => {
+                snapshot.counters.roc_action_listen_failures =
+                    u32::try_from(decoder.uint().ok_or("radio ROC failures")?)
+                        .map_err(|_| "radio counter")?
+            }
+            64 => {
+                snapshot.counters.roc_action_frames =
+                    u32::try_from(decoder.uint().ok_or("radio ROC frames")?)
+                        .map_err(|_| "radio counter")?
+            }
+            65 => {
+                snapshot.counters.vendor_beacon_ies =
+                    u32::try_from(decoder.uint().ok_or("radio vendor beacon IEs")?)
+                        .map_err(|_| "radio counter")?
+            }
+            66 => {
+                snapshot.counters.vendor_nan_beacon_ies =
+                    u32::try_from(decoder.uint().ok_or("radio vendor NAN IEs")?)
+                        .map_err(|_| "radio counter")?
+            }
+            67 => {
+                snapshot.counters.vendor_other_ies =
+                    u32::try_from(decoder.uint().ok_or("radio vendor other IEs")?)
+                        .map_err(|_| "radio counter")?
+            }
+            68 => {
+                snapshot.counters.roc_espnow_actions =
+                    u32::try_from(decoder.uint().ok_or("radio ROC NOW actions")?)
+                        .map_err(|_| "radio counter")?
+            }
+            69 => {
+                snapshot.counters.roc_nan_actions =
+                    u32::try_from(decoder.uint().ok_or("radio ROC NAN actions")?)
+                        .map_err(|_| "radio counter")?
+            }
+            70 => {
+                snapshot.counters.roc_other_actions =
+                    u32::try_from(decoder.uint().ok_or("radio ROC other actions")?)
+                        .map_err(|_| "radio counter")?
+            }
+            79 => {
+                snapshot.counters.udp6_rx_frames =
+                    u32::try_from(decoder.uint().ok_or("radio UDP6 RX frames")?)
+                        .map_err(|_| "radio counter")?
+            }
+            80 => {
+                snapshot.counters.udp6_rx_queue_drops =
+                    u32::try_from(decoder.uint().ok_or("radio UDP6 RX drops")?)
+                        .map_err(|_| "radio counter")?
+            }
+            81 => {
+                snapshot.counters.udp6_rx_invalid =
+                    u32::try_from(decoder.uint().ok_or("radio UDP6 RX invalid")?)
+                        .map_err(|_| "radio counter")?
+            }
+            82 => {
+                snapshot.counters.udp6_udp_delivered =
+                    u32::try_from(decoder.uint().ok_or("radio UDP6 delivered")?)
+                        .map_err(|_| "radio counter")?
+            }
+            71 => {
+                snapshot.counters.udp6_ndp_advertisements =
+                    u32::try_from(decoder.uint().ok_or("radio UDP6 NDP")?)
+                        .map_err(|_| "radio counter")?
+            }
+            72 => {
+                snapshot.counters.udp6_tx_failures =
+                    u32::try_from(decoder.uint().ok_or("radio UDP6 TX failures")?)
+                        .map_err(|_| "radio counter")?
+            }
+            73 => {
+                snapshot.counters.udp6_last_tx_result =
+                    u32::try_from(decoder.uint().ok_or("radio UDP6 TX result")?)
+                        .map_err(|_| "radio counter")?
+            }
+            75 => {
+                snapshot.counters.udp6_raw_tx_completions =
+                    u32::try_from(decoder.uint().ok_or("radio UDP6 raw TX completions")?)
+                        .map_err(|_| "radio counter")?
+            }
+            76 => {
+                snapshot.counters.udp6_raw_tx_completion_failures =
+                    u32::try_from(decoder.uint().ok_or("radio UDP6 raw TX failures")?)
+                        .map_err(|_| "radio counter")?
+            }
+            77 => {
+                snapshot.counters.udp6_raw_tx_completion_rate =
+                    u32::try_from(decoder.uint().ok_or("radio UDP6 raw TX rate")?)
+                        .map_err(|_| "radio counter")?
+            }
+            _ => decoder.skip().ok_or("radio snapshot value")?,
+        }
+    }
+    if !decoder.is_finished() {
+        return Err("radio snapshot trailing bytes");
+    }
+    Ok((method, snapshot))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RawWifiTxRequest<'a> {
+    pub channel: u8,
+    pub interface: RawWifiInterface,
+    pub system_sequence: bool,
+    pub rate: RawWifiRate,
+    pub disable_11b: bool,
+    pub frame: &'a [u8],
+}
+
+/// Clear-name alias for the raw 802.11 action-injection request schema.
+///
+/// `RawWifiTxRequest` remains the compatibility spelling for existing host,
+/// firmware, and CLI callers; it does not imply that every adapter has an
+/// 802.11 injection API.
+pub type RawWifiActionInjectRequest<'a> = RawWifiTxRequest<'a>;
+
+/// Clear-name alias for the control/snapshot/check/PROBE operation schema.
+/// The older `RawWifiLabRequest` spelling remains because it is source-facing
+/// in existing test and CLI code, while its CBOR wire values remain unchanged.
+pub type RawWifiControlOperation = RawWifiLabRequest;
+
+fn decode_interface(value: u64) -> Result<RawWifiInterface, &'static str> {
+    match value {
+        0 => Ok(RawWifiInterface::Auto),
+        1 => Ok(RawWifiInterface::Sta),
+        2 => Ok(RawWifiInterface::Ap),
+        3 => Ok(RawWifiInterface::Nan),
+        _ => Err("raw wifi interface"),
+    }
+}
+
+fn decode_rate(value: u64) -> Result<RawWifiRate, &'static str> {
+    match value {
+        0 => Ok(RawWifiRate::Auto),
+        6 => Ok(RawWifiRate::Mbps6),
+        9 => Ok(RawWifiRate::Mbps9),
+        12 => Ok(RawWifiRate::Mbps12),
+        18 => Ok(RawWifiRate::Mbps18),
+        24 => Ok(RawWifiRate::Mbps24),
+        36 => Ok(RawWifiRate::Mbps36),
+        48 => Ok(RawWifiRate::Mbps48),
+        54 => Ok(RawWifiRate::Mbps54),
+        _ => Err("raw wifi rate"),
+    }
+}
+
+fn decode_mac(value: &[u8]) -> Result<[u8; 6], &'static str> {
+    if let Ok(mac) = <[u8; 6]>::try_from(value) {
+        return Ok(mac);
+    }
+    let text = core::str::from_utf8(value).map_err(|_| "raw wifi comparator BSSID")?;
+    let mut mac = [0u8; 6];
+    let mut values = text.split(':');
+    for byte in &mut mac {
+        let part = values.next().ok_or("raw wifi comparator BSSID")?;
+        if part.len() != 2 {
+            return Err("raw wifi comparator BSSID");
+        }
+        *byte = u8::from_str_radix(part, 16).map_err(|_| "raw wifi comparator BSSID")?;
+    }
+    if values.next().is_some() {
+        return Err("raw wifi comparator BSSID");
+    }
+    Ok(mac)
+}
+
+fn decode_bytes_or_text<'a>(decoder: &mut Decoder<'a>) -> Option<&'a [u8]> {
+    let saved = decoder.position();
+    if let Some(value) = decoder.bytes_ref() {
+        return Some(value);
+    }
+    decoder.set_position(saved);
+    decoder.text_ref()
+}
+
+/// Decode the radio-TX handler fields: 1=frame bytes, 2=channel,
+/// 3=interface (0 auto, 1 sta, 2 ap, 3 nan), 4=system sequence, 5=rate, 6=disable
+/// 11b. Unknown keys are skipped so host tooling can add observation-only
+/// fields without changing firmware parsers.
+pub fn decode_raw_wifi_tx(data: &[u8]) -> Result<RawWifiTxRequest<'_>, &'static str> {
+    let record = decode(data).ok_or("raw wifi CBOR")?;
+    decode_raw_wifi_tx_record(record)
+}
+
+/// Decode a raw-Wi-Fi TX request already framed by the tagged stream plane.
+pub fn decode_raw_wifi_tx_record(
+    record: Record<'_>,
+) -> Result<RawWifiTxRequest<'_>, &'static str> {
+    if record.to.is_some()
+        || record.component != Some(Name::Tag(RAW_WIFI_COMPONENT))
+        || record.method != Some(Name::Tag(RAW_WIFI_METHOD_TX))
+    {
+        return Err("raw wifi handler");
+    }
+    decode_raw_wifi_tx_fields(record.fields.ok_or("raw wifi fields")?)
+}
+
+/// Clear-name alias for [`decode_raw_wifi_tx`].
+pub fn decode_raw_wifi_action_inject(
+    data: &[u8],
+) -> Result<RawWifiActionInjectRequest<'_>, &'static str> {
+    decode_raw_wifi_tx(data)
+}
+
+fn decode_raw_wifi_tx_fields(data: &[u8]) -> Result<RawWifiTxRequest<'_>, &'static str> {
+    let mut decoder = Decoder::new(data);
+    let (major, entries) = decoder.head().ok_or("raw wifi CBOR")?;
+    if major != 5 {
+        return Err("raw wifi map");
+    }
+    let mut frame = None;
+    let mut channel = 6u8;
+    let mut interface = RawWifiInterface::Auto;
+    let mut system_sequence = true;
+    let mut rate = RawWifiRate::Auto;
+    let mut disable_11b = true;
+    let mut entry = 0;
+    while (entries == u64::MAX && !decoder.consume_break())
+        || (entries != u64::MAX && entry < entries)
+    {
+        entry += 1;
+        let key = decoder.uint().ok_or("raw wifi key")?;
+        match key {
+            1 => frame = Some(decoder.bytes_ref().ok_or("raw wifi frame")?),
+            2 => {
+                channel = u8::try_from(decoder.uint().ok_or("raw wifi channel")?)
+                    .map_err(|_| "raw wifi channel")?
+            }
+            3 => interface = decode_interface(decoder.uint().ok_or("raw wifi interface")?)?,
+            4 => system_sequence = decoder.boolean().ok_or("raw wifi system sequence")?,
+            5 => rate = decode_rate(decoder.uint().ok_or("raw wifi rate")?)?,
+            6 => disable_11b = decoder.boolean().ok_or("raw wifi disable 11b")?,
+            _ => decoder.skip().ok_or("raw wifi value")?,
+        }
+    }
+    if !decoder.is_finished() {
+        return Err("raw wifi trailing data");
+    }
+    let frame = frame.ok_or("raw wifi frame")?;
+    if !(24..=RAW_WIFI_MAX_FRAME).contains(&frame.len()) || !(1..=13).contains(&channel) {
+        return Err("raw wifi bounds");
+    }
+    Ok(RawWifiTxRequest {
+        channel,
+        interface,
+        system_sequence,
+        rate,
+        disable_11b,
+        frame,
+    })
+}
+
+/// Decode the non-TX subset of the canonical raw Wi-Fi schema.
+///
+/// Map keys are shared with [`decode_raw_wifi_tx`] where their meaning
+/// overlaps: 0=operation, 2=channel, 3=interface, 5=rate and 6=disable 11b.
+/// Lab-only keys are 7=STA state (0 reconnect, 1 disconnect-hold), 8=A3
+/// comparator BSSID (six bytes), 9=comparator enabled, 10=promiscuous,
+/// 11=DW policy (0 normal, 1 disabled, 2 manual), and 12=RX filter (0 mgmt,
+/// 1 mgmt+data), 13=AP mode (0 disabled, 1 open), 14=AP beacon interval in
+/// TU, 15=raw STA mode (1 Main-style non-promiscuous), and 16=MAC ACK
+/// required. 25 is one bounded same-channel ROC listener duration in ms.
+/// Unknown keys are
+/// skipped for forward-compatible snapshots.
+fn decode_raw_wifi_lab_inner(
+    data: &[u8],
+    implied_operation: Option<u64>,
+) -> Result<RawWifiLabRequest, &'static str> {
+    let mut decoder = Decoder::new(data);
+    let (major, entries) = decoder.head().ok_or("raw wifi CBOR")?;
+    if major != 5 {
+        return Err("raw wifi map");
+    }
+    let mut operation = None;
+    let mut control = RawWifiControlRequest::default();
+    let mut scan = RawWifiScanRequest::default();
+    let mut entry = 0;
+    while (entries == u64::MAX && !decoder.consume_break())
+        || (entries != u64::MAX && entry < entries)
+    {
+        entry += 1;
+        let key = decoder.uint().ok_or("raw wifi key")?;
+        match key {
+            0 => operation = Some(decoder.uint().ok_or("raw wifi operation")?),
+            2 => {
+                control.channel = Some(
+                    u8::try_from(decoder.uint().ok_or("raw wifi channel")?)
+                        .map_err(|_| "raw wifi channel")?,
+                )
+            }
+            3 => {
+                control.interface = Some(decode_interface(
+                    decoder.uint().ok_or("raw wifi interface")?,
+                )?)
+            }
+            5 => control.rate = Some(decode_rate(decoder.uint().ok_or("raw wifi rate")?)?),
+            6 => control.disable_11b = Some(decoder.boolean().ok_or("raw wifi disable 11b")?),
+            7 => {
+                control.sta_state = Some(match decoder.uint().ok_or("raw wifi STA state")? {
+                    0 => RawWifiStaState::Reconnect,
+                    1 => RawWifiStaState::DisconnectHold,
+                    _ => return Err("raw wifi STA state"),
+                })
+            }
+            8 => {
+                let bssid =
+                    decode_bytes_or_text(&mut decoder).ok_or("raw wifi comparator BSSID")?;
+                control.comparator_bssid = Some(decode_mac(bssid)?);
+            }
+            9 => control.comparator_enabled = Some(decoder.boolean().ok_or("raw wifi comparator")?),
+            10 => control.promiscuous = Some(decoder.boolean().ok_or("raw wifi promiscuous")?),
+            11 => {
+                control.dw_policy = Some(match decoder.uint().ok_or("raw wifi DW policy")? {
+                    0 => RawWifiDwPolicy::Normal,
+                    1 => RawWifiDwPolicy::Disabled,
+                    2 => RawWifiDwPolicy::Manual,
+                    _ => return Err("raw wifi DW policy"),
+                })
+            }
+            12 => {
+                control.rx_filter = Some(match decoder.uint().ok_or("raw wifi RX filter")? {
+                    0 => RawWifiRxFilter::Management,
+                    1 => RawWifiRxFilter::ManagementAndData,
+                    _ => return Err("raw wifi RX filter"),
+                })
+            }
+            13 => {
+                control.ap_mode = Some(match decoder.uint().ok_or("raw wifi AP mode")? {
+                    0 => RawWifiApMode::Disabled,
+                    1 => RawWifiApMode::Open,
+                    _ => return Err("raw wifi AP mode"),
+                })
+            }
+            14 => {
+                control.ap_beacon_tu = Some(
+                    u16::try_from(decoder.uint().ok_or("raw wifi AP beacon interval")?)
+                        .map_err(|_| "raw wifi AP beacon interval")?,
+                )
+            }
+            15 => {
+                control.raw_sta_mode = Some(match decoder.uint().ok_or("raw wifi STA mode")? {
+                    1 => RawWifiStaMode::MainStyle,
+                    _ => return Err("raw wifi STA mode"),
+                })
+            }
+            16 => control.mac_ack = Some(decoder.boolean().ok_or("raw wifi MAC ACK")?),
+            20 => {
+                control.action_destination_broadcast =
+                    Some(decoder.boolean().ok_or("raw wifi action broadcast")?)
+            }
+            25 => {
+                control.roc_listen_ms = Some(
+                    u16::try_from(decoder.uint().ok_or("raw wifi ROC duration")?)
+                        .map_err(|_| "raw wifi ROC duration")?,
+                )
+            }
+            26 => control.roc_loop = Some(decoder.boolean().ok_or("raw wifi ROC loop")?),
+            27 => {
+                control.action_dispatcher =
+                    Some(decoder.boolean().ok_or("raw wifi action dispatcher")?)
+            }
+            28 => {
+                control.nan_capture_ms = Some(
+                    u16::try_from(decoder.uint().ok_or("raw wifi NAN capture duration")?)
+                        .map_err(|_| "raw wifi NAN capture duration")?,
+                )
+            }
+            30 => scan.fresh = decoder.boolean().ok_or("raw wifi scan fresh")?,
+            31 => scan.last_results = decoder.boolean().ok_or("raw wifi scan last results")?,
+            _ => decoder.skip().ok_or("raw wifi value")?,
+        }
+    }
+    if !decoder.is_finished() {
+        return Err("raw wifi trailing data");
+    }
+    match operation.or(implied_operation) {
+        Some(RAW_WIFI_OP_CONTROL) => {
+            if control
+                .channel
+                .is_some_and(|channel| !(1..=13).contains(&channel))
+            {
+                return Err("raw wifi channel");
+            }
+            if control.comparator_enabled == Some(true) && control.comparator_bssid.is_none() {
+                return Err("raw wifi comparator BSSID");
+            }
+            if control
+                .ap_beacon_tu
+                .is_some_and(|value| !(100..=60_000).contains(&value))
+            {
+                return Err("raw wifi AP beacon interval");
+            }
+            if control
+                .roc_listen_ms
+                .is_some_and(|value| !(10..=10_000).contains(&value))
+            {
+                return Err("raw wifi ROC duration");
+            }
+            if control.roc_loop == Some(true) && control.roc_listen_ms.is_none() {
+                return Err("raw wifi ROC loop duration");
+            }
+            if control
+                .nan_capture_ms
+                .is_some_and(|value| !(100..=600).contains(&value))
+            {
+                return Err("raw wifi NAN capture duration");
+            }
+            Ok(RawWifiLabRequest::Control(control))
+        }
+        Some(RAW_WIFI_OP_SNAPSHOT) => Ok(RawWifiLabRequest::Snapshot),
+        Some(RAW_WIFI_OP_RESET_COUNTERS) => Ok(RawWifiLabRequest::ResetCounters),
+        Some(RAW_WIFI_OP_SCAN) => Ok(RawWifiLabRequest::Scan(scan)),
+        _ => Err("raw wifi operation"),
+    }
+}
+
+/// Decode the compact operation-map form.  This is useful to adapters that
+/// already reserve an outer service tag and therefore carry only a body map.
+pub fn decode_raw_wifi_lab(data: &[u8]) -> Result<RawWifiLabRequest, &'static str> {
+    decode_raw_wifi_lab_inner(data, None)
+}
+
+/// Decode a complete registered handler envelope.  Direct PPP and QUIC
+/// service bodies call this exact function; no UART-specific parser exists.
+pub fn decode_raw_wifi_handler(packet: &[u8]) -> Result<RawWifiLabRequest, &'static str> {
+    let record = decode(packet).ok_or("radio command CBOR")?;
+    decode_raw_wifi_handler_record(record)
+}
+
+/// Decode a raw-Wi-Fi lab request already framed by the tagged stream plane.
+pub fn decode_raw_wifi_handler_record(
+    record: Record<'_>,
+) -> Result<RawWifiLabRequest, &'static str> {
+    if record.to.is_some() || record.component != Some(Name::Tag(RAW_WIFI_COMPONENT)) {
+        return Err("radio command component");
+    }
+    match record.method {
+        Some(Name::Tag(RAW_WIFI_METHOD_CONTROL)) => {
+            let fields = record.fields.ok_or("radio command payload")?;
+            decode_raw_wifi_lab_inner(fields, Some(RAW_WIFI_OP_CONTROL))
+        }
+        Some(Name::Tag(RAW_WIFI_METHOD_SNAPSHOT)) => {
+            // A snapshot carries no command fields.  The schema adapter may
+            // omit the empty map entirely, whereas the compact legacy encoder
+            // includes it.  Both are the same tagged stream request.
+            match record.fields {
+                Some(fields) => decode_raw_wifi_lab_inner(fields, Some(RAW_WIFI_OP_SNAPSHOT)),
+                None => Ok(RawWifiLabRequest::Snapshot),
+            }
+        }
+        Some(Name::Tag(RAW_WIFI_METHOD_RESET_COUNTERS)) => match record.fields {
+            Some(fields) => decode_raw_wifi_lab_inner(fields, Some(RAW_WIFI_OP_RESET_COUNTERS)),
+            None => Ok(RawWifiLabRequest::ResetCounters),
+        },
+        Some(Name::Tag(RAW_WIFI_METHOD_SCAN)) => {
+            // No fields means the defaults (a cached scan), as for the other fieldless methods.
+            let fields = record.fields.unwrap_or(&[0xa0]);
+            decode_raw_wifi_lab_inner(fields, Some(RAW_WIFI_OP_SCAN))
+        }
+        _ => Err("radio command method"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn radio_tx_success_result_is_a_numeric_cbor_value() {
+        let mut out = [0u8; 16];
+        let used = encode_raw_wifi_tx_result(1_234, &mut out).unwrap();
+        let mut decoder = Decoder::new(&out[..used]);
+        assert_eq!(decoder.uint(), Some(1_234));
+        assert!(decoder.is_finished());
+    }
+
+    #[test]
+    fn espnow_admission_separates_sync_control_and_opaque_quic() {
+        let sync = crate::build_now_sync_body([1; 6], [2; 6], 3, 512, 0, &[]).unwrap();
+        let tagged_control = [0xa3, 1, 6, 2, 1, 3, 1];
+        // Both long- and short-header-like first bytes with the fixed bit set
+        // must dispatch QUIC before attempting a CBOR decode. The contents are
+        // intentionally not a valid CBOR control record.
+        let quic_datagrams = [[0x40, 0xff, 0xff, 0xff], [0xc0, 0xff, 0xff, 0xff]];
+
+        assert_eq!(classify_espnow_payload(&sync), EspNowPayloadClass::NowSync);
+        assert_eq!(
+            classify_espnow_payload(&tagged_control),
+            EspNowPayloadClass::TaggedControl
+        );
+        for packet in quic_datagrams {
+            assert_eq!(
+                classify_espnow_payload(&packet),
+                EspNowPayloadClass::QuicDatagram
+            );
+        }
+        assert_eq!(
+            classify_espnow_payload(&[0x20, 0xff]),
+            EspNowPayloadClass::Unrecognized
+        );
+    }
+
+    #[test]
+    fn capture_counters_are_bounded_and_classified_without_packet_storage() {
+        let mut counters = WifiCaptureCounters::default();
+        counters.observe_80211(0, 8, 128);
+        counters.observe_80211(0, 13, 96);
+        counters.observe_80211(2, 0, 512);
+        counters.observe_nan_rx();
+        counters.observe_nan_beacon();
+        assert_eq!(counters.packets, 3);
+        assert_eq!(counters.bytes, 736);
+        assert_eq!(counters.max_packet_bytes, 512);
+        assert_eq!(counters.management_frames, 2);
+        assert_eq!(counters.management_subtypes[8], 1);
+        assert_eq!(counters.management_subtypes[13], 1);
+        assert_eq!(counters.data_frames, 1);
+        assert_eq!(counters.nan_rx, 1);
+        assert_eq!(counters.nan_beacons, 1);
+    }
+    use mesh_api::cbor::Encoder;
+
+    #[test]
+    fn raw_tx_schema_decodes_all_radio_controls() {
+        let frame = [0xd0; 24];
+        let mut wire = [0; 80];
+        let used = encode_raw_wifi_tx_request(
+            RawWifiTxRequest {
+                channel: 6,
+                interface: RawWifiInterface::Ap,
+                system_sequence: false,
+                rate: RawWifiRate::Mbps24,
+                disable_11b: false,
+                frame: &frame,
+            },
+            &mut wire,
+        )
+        .unwrap();
+        let request = decode_raw_wifi_tx(&wire[..used]).unwrap();
+        assert_eq!(request.interface, RawWifiInterface::Ap);
+        assert_eq!(request.rate, RawWifiRate::Mbps24);
+        assert!(!request.system_sequence && !request.disable_11b);
+        assert_eq!(request.frame, frame);
+    }
+
+    #[test]
+    fn raw_tx_schema_preserves_nan_interface_request() {
+        let frame = [0xd0; 24];
+        let mut wire = [0; 64];
+        let used = encode_raw_wifi_tx_request(
+            RawWifiTxRequest {
+                channel: 6,
+                interface: RawWifiInterface::Nan,
+                system_sequence: true,
+                rate: RawWifiRate::Auto,
+                disable_11b: true,
+                frame: &frame,
+            },
+            &mut wire,
+        )
+        .unwrap();
+        assert_eq!(
+            decode_raw_wifi_tx(&wire[..used]).unwrap().interface,
+            RawWifiInterface::Nan
+        );
+    }
+
+    #[test]
+    fn correlated_raw_tx_keeps_the_stream_request_id() {
+        let frame = [0xd0; 24];
+        let mut wire = [0; 80];
+        let used = encode_raw_wifi_tx_request_with_id(
+            RawWifiTxRequest {
+                channel: 6,
+                interface: RawWifiInterface::Sta,
+                system_sequence: true,
+                rate: RawWifiRate::Mbps6,
+                disable_11b: true,
+                frame: &frame,
+            },
+            41,
+            &mut wire,
+        )
+        .unwrap();
+        let record = decode(&wire[..used]).unwrap();
+        assert_eq!(record.id, Some(41));
+        assert_eq!(decode_raw_wifi_tx_record(record).unwrap().frame, frame);
+    }
+
+    #[test]
+    fn radio_control_schema_decodes_prom_off_unassociated_matrix_state() {
+        let mut wire = [0; 96];
+        let mut e = Encoder::new(&mut wire);
+        e.map(8).unwrap();
+        e.uint(0).unwrap();
+        e.uint(RAW_WIFI_OP_CONTROL).unwrap();
+        e.uint(2).unwrap();
+        e.uint(6).unwrap();
+        e.uint(5).unwrap();
+        e.uint(54).unwrap();
+        e.uint(7).unwrap();
+        e.uint(1).unwrap();
+        e.uint(8).unwrap();
+        e.bytes_value(&[0x50, 0x6f, 0x9a, 0x01, 0x34, 0x4a])
+            .unwrap();
+        e.uint(9).unwrap();
+        e.boolean(true).unwrap();
+        e.uint(10).unwrap();
+        e.boolean(false).unwrap();
+        e.uint(11).unwrap();
+        e.uint(1).unwrap();
+        let used = e.len();
+        drop(e);
+        let RawWifiLabRequest::Control(control) = decode_raw_wifi_lab(&wire[..used]).unwrap()
+        else {
+            panic!("control request")
+        };
+        assert_eq!(control.channel, Some(6));
+        assert_eq!(control.rate, Some(RawWifiRate::Mbps54));
+        assert_eq!(control.sta_state, Some(RawWifiStaState::DisconnectHold));
+        assert_eq!(
+            control.comparator_bssid,
+            Some([0x50, 0x6f, 0x9a, 0x01, 0x34, 0x4a])
+        );
+        assert_eq!(control.comparator_enabled, Some(true));
+        assert_eq!(control.promiscuous, Some(false));
+        assert_eq!(control.dw_policy, Some(RawWifiDwPolicy::Disabled));
+    }
+
+    #[test]
+    fn radio_control_schema_decodes_ephemeral_open_ap_mode() {
+        let wire = [0xa2, 0x00, RAW_WIFI_OP_CONTROL as u8, 0x0d, 0x01];
+        let RawWifiLabRequest::Control(control) = decode_raw_wifi_lab(&wire).unwrap() else {
+            panic!("control request")
+        };
+        assert_eq!(control.ap_mode, Some(RawWifiApMode::Open));
+    }
+
+    #[test]
+    fn radio_control_rejects_an_enabled_comparator_without_a_bssid() {
+        let wire = [0xa2, 0x00, RAW_WIFI_OP_CONTROL as u8, 0x09, 0xf5];
+        assert_eq!(decode_raw_wifi_lab(&wire), Err("raw wifi comparator BSSID"));
+    }
+
+    #[test]
+    fn radio_control_accepts_the_cli_mac_spelling() {
+        let mut wire = [0; 64];
+        let mut e = Encoder::new(&mut wire);
+        e.map(3).unwrap();
+        e.uint(0).unwrap();
+        e.uint(RAW_WIFI_OP_CONTROL).unwrap();
+        e.uint(8).unwrap();
+        e.text_value(b"50:6f:9a:01:34:4a").unwrap();
+        e.uint(9).unwrap();
+        e.boolean(true).unwrap();
+        let used = e.len();
+        drop(e);
+        let RawWifiLabRequest::Control(control) = decode_raw_wifi_lab(&wire[..used]).unwrap()
+        else {
+            panic!("control request")
+        };
+        assert_eq!(
+            control.comparator_bssid,
+            Some([0x50, 0x6f, 0x9a, 0x01, 0x34, 0x4a])
+        );
+    }
+
+    #[test]
+    fn radio_snapshot_and_reset_need_no_radio_fields() {
+        assert_eq!(
+            decode_raw_wifi_lab(&[0xa1, 0x00, RAW_WIFI_OP_SNAPSHOT as u8]),
+            Ok(RawWifiLabRequest::Snapshot)
+        );
+        assert_eq!(
+            decode_raw_wifi_lab(&[0xa1, 0x00, RAW_WIFI_OP_RESET_COUNTERS as u8]),
+            Ok(RawWifiLabRequest::ResetCounters)
+        );
+    }
+
+    #[test]
+    fn registered_control_handler_uses_the_same_typed_schema() {
+        let request = RawWifiControlRequest {
+            channel: Some(6),
+            sta_state: Some(RawWifiStaState::DisconnectHold),
+            promiscuous: Some(false),
+            dw_policy: Some(RawWifiDwPolicy::Disabled),
+            nan_capture_ms: Some(600),
+            ..RawWifiControlRequest::default()
+        };
+        let mut command = [0; 64];
+        let used = encode_raw_wifi_control_request(request, &mut command).unwrap();
+        let RawWifiLabRequest::Control(control) =
+            decode_raw_wifi_handler(&command[..used]).unwrap()
+        else {
+            panic!("control request")
+        };
+        assert_eq!(control.channel, Some(6));
+        assert_eq!(control.sta_state, Some(RawWifiStaState::DisconnectHold));
+        assert_eq!(control.promiscuous, Some(false));
+        assert_eq!(control.dw_policy, Some(RawWifiDwPolicy::Disabled));
+        assert_eq!(control.nan_capture_ms, Some(600));
+    }
+
+    #[test]
+    fn registered_snapshot_and_reset_are_separate_handlers() {
+        let mut command = [0; 32];
+        let snapshot =
+            encode_raw_wifi_snapshot_request(RAW_WIFI_METHOD_SNAPSHOT, &mut command).unwrap();
+        assert_eq!(
+            decode_raw_wifi_handler(&command[..snapshot]),
+            Ok(RawWifiLabRequest::Snapshot)
+        );
+        let reset =
+            encode_raw_wifi_snapshot_request(RAW_WIFI_METHOD_RESET_COUNTERS, &mut command).unwrap();
+        assert_eq!(
+            decode_raw_wifi_handler(&command[..reset]),
+            Ok(RawWifiLabRequest::ResetCounters)
+        );
+    }
+
+    #[test]
+    fn tagged_snapshot_and_reset_allow_schema_omitted_empty_fields() {
+        // The schema adapter omits an empty `fields` map.  That must remain
+        // equivalent to the compact encoder above, otherwise a normal stream
+        // call depends on the bearer-side request formatter.
+        let snapshot = [
+            0xa3,
+            1,
+            RAW_WIFI_COMPONENT as u8,
+            2,
+            0x18,
+            RAW_WIFI_METHOD_SNAPSHOT as u8,
+            3,
+            1,
+        ];
+        assert_eq!(
+            decode_raw_wifi_handler(&snapshot),
+            Ok(RawWifiLabRequest::Snapshot)
+        );
+        let reset = [
+            0xa3,
+            1,
+            RAW_WIFI_COMPONENT as u8,
+            2,
+            0x18,
+            RAW_WIFI_METHOD_RESET_COUNTERS as u8,
+            3,
+            1,
+        ];
+        assert_eq!(
+            decode_raw_wifi_handler(&reset),
+            Ok(RawWifiLabRequest::ResetCounters)
+        );
+    }
+
+    #[test]
+    fn device_snapshot_projects_only_observed_fields_into_link_metrics() {
+        let snapshot = RawWifiSnapshot {
+            sta_associated: Some(true),
+            comparator_bssid: Some([1, 2, 3, 4, 5, 6]),
+            sta_bssid: Some([6, 5, 4, 3, 2, 1]),
+            sta_ap_rssi_dbm: Some(-41),
+            counters: RawWifiCounters {
+                udp6_rx_frames: 9,
+                udp6_tx_failures: 2,
+                udp6_raw_tx_completion_failures: 3,
+                ..RawWifiCounters::default()
+            },
+            ..RawWifiSnapshot::default()
+        };
+        let metrics = snapshot.link_metrics();
+        assert_eq!(metrics.schema_version, WIFI_LINK_METRICS_SCHEMA_VERSION);
+        assert_eq!(metrics.peer_mac, Some([6, 5, 4, 3, 2, 1]));
+        assert_eq!(metrics.signal_dbm, Some(-41));
+        assert_eq!(metrics.bearer_rx_frames, Some(9));
+        assert_eq!(metrics.bearer_tx_failures, Some(2));
+        assert_eq!(metrics.raw_tx_completion_failures, Some(3));
+        assert_eq!(metrics.mac_tx_retries, None);
+        assert_eq!(metrics.mac_tx_failed, None);
+        for (associated, sta_bssid) in [
+            (Some(true), None),
+            (Some(false), snapshot.sta_bssid),
+            (None, snapshot.sta_bssid),
+        ] {
+            let unknown_peer = RawWifiSnapshot {
+                sta_associated: associated,
+                sta_bssid,
+                comparator_bssid: snapshot.comparator_bssid,
+                ..RawWifiSnapshot::default()
+            }
+            .link_metrics();
+            assert_eq!(
+                unknown_peer.peer_mac, None,
+                "NAN comparator is not a STA peer"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_request_encoder_uses_the_registered_handler_envelope() {
+        let mut wire = [0; 16];
+        let used = encode_raw_wifi_snapshot_request(RAW_WIFI_METHOD_SNAPSHOT, &mut wire).unwrap();
+        assert_eq!(
+            decode_raw_wifi_handler(&wire[..used]),
+            Ok(RawWifiLabRequest::Snapshot)
+        );
+        assert!(encode_raw_wifi_snapshot_request(RAW_WIFI_METHOD_CONTROL, &mut wire).is_none());
+    }
+
+    #[test]
+    fn scan_request_keeps_cache_policy_in_the_registered_handler() {
+        let packet = [
+            0xa3,
+            0x01,
+            RAW_WIFI_COMPONENT as u8,
+            0x02,
+            0x18,
+            RAW_WIFI_METHOD_SCAN as u8,
+            0x05,
+            0xa2,
+            0x18,
+            30,
+            0xf5,
+            0x18,
+            31,
+            0xf5,
+        ];
+        assert_eq!(
+            decode_raw_wifi_handler(&packet),
+            Ok(RawWifiLabRequest::Scan(RawWifiScanRequest {
+                fresh: true,
+                last_results: true,
+            }))
+        );
+    }
+
+    #[test]
+    fn control_request_encoder_round_trips_dynamic_dw_and_ap_state() {
+        let control = RawWifiControlRequest {
+            channel: Some(6),
+            dw_policy: Some(RawWifiDwPolicy::Normal),
+            ap_mode: Some(RawWifiApMode::Open),
+            ap_beacon_tu: Some(500),
+            promiscuous: Some(false),
+            // Ten seconds is the ESP-IDF-supported maximum shared by host,
+            // Main, and Recovery. The sustained hardware test uses a smaller
+            // four-second dwell, but schema validation must not constrain it.
+            roc_listen_ms: Some(10_000),
+            roc_loop: Some(true),
+            action_dispatcher: Some(false),
+            ..RawWifiControlRequest::default()
+        };
+        let mut wire = [0; 96];
+        let used = encode_raw_wifi_control_request(control, &mut wire).unwrap();
+        assert_eq!(
+            decode_raw_wifi_handler(&wire[..used]),
+            Ok(RawWifiLabRequest::Control(control))
+        );
+        let out_of_range = RawWifiControlRequest {
+            roc_listen_ms: Some(10_001),
+            roc_loop: Some(true),
+            ..RawWifiControlRequest::default()
+        };
+        let used = encode_raw_wifi_control_request(out_of_range, &mut wire).unwrap();
+        assert_eq!(
+            decode_raw_wifi_handler(&wire[..used]),
+            Err("raw wifi ROC duration")
+        );
+    }
+
+    #[test]
+    fn metric_delta_never_wraps_across_a_counter_epoch() {
+        let before = RawWifiCounters {
+            tx_attempted: 9,
+            rx_parser_accepted: 12,
+            udp6_rx_frames: 10,
+            ..RawWifiCounters::default()
+        };
+        let after = RawWifiCounters {
+            tx_attempted: 12,
+            rx_parser_accepted: 3,
+            udp6_rx_frames: 14,
+            ..RawWifiCounters::default()
+        };
+        let delta = after.delta_since(before);
+        assert_eq!(delta.tx_attempted, 3);
+        assert_eq!(delta.rx_parser_accepted, 0);
+        assert_eq!(delta.udp6_rx_frames, 4);
+    }
+
+    #[test]
+    fn snapshot_encoder_omits_unknown_driver_state_but_keeps_counters() {
+        let mut out = [0u8; RAW_WIFI_SNAPSHOT_MAX_BYTES];
+        let used = encode_raw_wifi_snapshot(
+            RAW_WIFI_METHOD_SNAPSHOT,
+            RawWifiSnapshot {
+                epoch: 7,
+                promiscuous: Some(false),
+                counters: RawWifiCounters {
+                    tx_attempted: 3,
+                    rx_parser_accepted: 2,
+                    ..RawWifiCounters::default()
+                },
+                ..RawWifiSnapshot::default()
+            },
+            &mut out,
+        )
+        .unwrap();
+        let mut decoder = Decoder::new(&out[..used]);
+        assert_eq!(decoder.head(), Some((5, 3)));
+        assert_eq!(decoder.uint(), Some(1));
+        assert_eq!(decoder.uint(), Some(RAW_WIFI_COMPONENT));
+        assert_eq!(decoder.uint(), Some(2));
+        assert_eq!(decoder.uint(), Some(RAW_WIFI_METHOD_SNAPSHOT));
+        assert_eq!(decoder.uint(), Some(6));
+        let (major, fields) = decoder.head().unwrap();
+        assert_eq!(major, 5);
+        let mut has_promiscuous = false;
+        let mut has_tx_attempted = false;
+        let mut has_channel = false;
+        for _ in 0..fields {
+            let key = decoder.uint().unwrap();
+            match key {
+                21 => {
+                    has_channel = true;
+                    decoder.skip().unwrap();
+                }
+                23 => {
+                    has_promiscuous = decoder.boolean() == Some(false);
+                }
+                40 => {
+                    has_tx_attempted = decoder.uint() == Some(3);
+                }
+                _ => decoder.skip().unwrap(),
+            }
+        }
+        assert!(has_promiscuous && has_tx_attempted);
+        assert!(!has_channel);
+    }
+
+    #[test]
+    fn snapshot_decoder_round_trips_common_and_radio_counters() {
+        let expected = RawWifiSnapshot {
+            epoch: 9,
+            channel: Some(6),
+            sta_enabled: Some(true),
+            sta_associated: Some(true),
+            sta_bssid: Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]),
+            sta_ipv4: Some([192, 168, 4, 10]),
+            dw_capturing: Some(true),
+            sta_mac: Some([0x10, 0, 0, 0, 0, 1]),
+            ap_mac: Some([0x10, 0, 0, 0, 0, 2]),
+            sta_connect_to_associated_ms: Some(487),
+            sta_connections: Some(3),
+            sta_disconnections: Some(2),
+            sta_last_event_disconnect_reason: Some(36),
+            sta_diagnostic_log_drops: Some(17),
+            sta_scan_rssi_threshold_dbm: Some(-127),
+            sta_scan_authmode_threshold: Some(7),
+            sta_config_channel: Some(6),
+            sta_config_bssid: Some([1, 2, 3, 4, 5, 6]),
+            sta_config_bssid_set: Some(true),
+            sta_scan_method: Some(0),
+            sta_pmf_capable: Some(true),
+            sta_pmf_required: Some(false),
+            sta_sae_pwe_method: Some(3),
+            sta_config_ssid: Some([0; 32]),
+            sta_ap_rssi_dbm: Some(-42),
+            counters: RawWifiCounters {
+                rx_parser_accepted: 7,
+                nan_beacons: 3,
+                nan_followup_queued: 2,
+                nan_followup_sent: 1,
+                nan_followup_dropped: 1,
+                nan_followup_pending: 1,
+                nan_active_subscribes: 5,
+                tx_duration_le_750us: 2,
+                vendor_beacon_ies: 4,
+                vendor_nan_beacon_ies: 2,
+                vendor_other_ies: 1,
+                roc_espnow_actions: 3,
+                roc_nan_actions: 4,
+                roc_other_actions: 5,
+                registered_nan_actions: 6,
+                registered_now_actions: 7,
+                registered_p2p_actions: 8,
+                registered_action_drops: 9,
+                udp6_rx_frames: 7,
+                udp6_rx_queue_drops: 2,
+                udp6_rx_invalid: 6,
+                udp6_udp_delivered: 1,
+                ..RawWifiCounters::default()
+            },
+            ..RawWifiSnapshot::default()
+        };
+        let mut wire = [0; RAW_WIFI_SNAPSHOT_MAX_BYTES];
+        let used = encode_raw_wifi_snapshot(RAW_WIFI_METHOD_SNAPSHOT, expected, &mut wire).unwrap();
+        assert_eq!(
+            decode_raw_wifi_snapshot(&wire[..used]),
+            Ok((RAW_WIFI_METHOD_SNAPSHOT, expected))
+        );
+    }
+
+    #[test]
+    fn fully_populated_snapshot_with_full_width_counters_fits_response_storage() {
+        let snapshot = RawWifiSnapshot {
+            epoch: u32::MAX,
+            channel: Some(u8::MAX),
+            sta_enabled: Some(true),
+            sta_associated: Some(true),
+            sta_bssid: Some([0xff; 6]),
+            sta_ipv4: Some([0xff; 4]),
+            promiscuous: Some(true),
+            dw_capturing: Some(true),
+            nan_dw_interval: Some(u8::MAX),
+            comparator_bssid: Some([0xff; 6]),
+            nan_active_subscribe_bssid: Some([0xff; 6]),
+            nan_last_sdf_source: Some([0xff; 6]),
+            nan_last_sdf_service_id: Some([0xff; 6]),
+            nan_last_sdf_after_beacon_us: Some(u32::MAX),
+            comparator_armed: Some(true),
+            comparator_errors: u32::MAX,
+            tx_interface: Some(RawWifiInterface::Nan),
+            tx_rate: Some(RawWifiRate::Mbps54),
+            ap_active: Some(true),
+            mac_ack: Some(true),
+            last_tx_error: Some(u32::MAX),
+            last_connection_error: Some(u32::MAX),
+            sta_mac: Some([0xff; 6]),
+            ap_mac: Some([0xff; 6]),
+            action_destination_broadcast: Some(true),
+            sta_driver_tx: Some(true),
+            sta_bssid_check_disabled: Some(true),
+            sta_ampdu_enabled: Some(true),
+            sta_11b_rates_disabled: Some(true),
+            sta_raw_rx_enabled: Some(true),
+            sta_connect_to_associated_ms: Some(u32::MAX),
+            sta_last_disconnect_reason: Some(u8::MAX),
+            sta_connections: Some(u32::MAX),
+            sta_disconnections: Some(u32::MAX),
+            sta_last_event_disconnect_reason: Some(u8::MAX),
+            sta_diagnostic_log_drops: Some(u32::MAX),
+            sta_scan_rssi_threshold_dbm: Some(i8::MIN),
+            sta_scan_authmode_threshold: Some(u8::MAX),
+            sta_config_channel: Some(u8::MAX),
+            sta_config_bssid: Some([0xff; 6]),
+            sta_config_bssid_set: Some(true),
+            sta_scan_method: Some(u8::MAX),
+            sta_pmf_capable: Some(true),
+            sta_pmf_required: Some(true),
+            sta_sae_pwe_method: Some(u8::MAX),
+            sta_config_ssid: Some([0xff; 32]),
+            sta_ap_rssi_dbm: Some(i8::MIN),
+            max_tx_power_qdbm: Some(i8::MIN),
+            udp6_tx_burst_packets: Some(u8::MAX),
+            udp6_tx_submit_calls: Some(u32::MAX),
+            udp6_tx_submit_us_total: Some(u32::MAX),
+            udp6_tx_submit_us_max: Some(u32::MAX),
+            counters: RawWifiCounters {
+                tx_attempted: u32::MAX,
+                tx_driver_accepted: u32::MAX,
+                tx_driver_failed: u32::MAX,
+                rx_driver_dispatch: u32::MAX,
+                rx_parser_accepted: u32::MAX,
+                rx_parser_rejected: u32::MAX,
+                rx_self_echo: u32::MAX,
+                rx_dropped: u32::MAX,
+                nan_beacons: u32::MAX,
+                nan_sdfs: u32::MAX,
+                nan_followups: u32::MAX,
+                nan_followup_queued: u32::MAX,
+                nan_followup_sent: u32::MAX,
+                nan_followup_dropped: u32::MAX,
+                nan_followup_pending: u32::MAX,
+                nan_active_publish_attempted: u32::MAX,
+                nan_active_publish_sent: u32::MAX,
+                nan_active_publish_dropped: u32::MAX,
+                nan_service_info_matched: u32::MAX,
+                nan_active_subscribe_descriptors: u32::MAX,
+                nan_active_subscribe_sdea_misses: u32::MAX,
+                nan_active_subscribe_sdea_header: u32::MAX,
+                nan_active_subscribe_sdea_info_len: u32::MAX,
+                nan_active_subscribes: u32::MAX,
+                nan_service_info_enqueued: u32::MAX,
+                nan_service_info_dropped: u32::MAX,
+                nan_service_info_dispatched: u32::MAX,
+                tx_duration_us_total: u32::MAX,
+                tx_duration_us_max: u32::MAX,
+                tx_duration_le_250us: u32::MAX,
+                tx_duration_le_750us: u32::MAX,
+                tx_duration_le_2ms: u32::MAX,
+                tx_duration_gt_2ms: u32::MAX,
+                roc_action_listen_requests: u32::MAX,
+                roc_action_listen_failures: u32::MAX,
+                roc_action_frames: u32::MAX,
+                vendor_beacon_ies: u32::MAX,
+                vendor_nan_beacon_ies: u32::MAX,
+                vendor_other_ies: u32::MAX,
+                roc_espnow_actions: u32::MAX,
+                roc_nan_actions: u32::MAX,
+                roc_other_actions: u32::MAX,
+                udp6_rx_frames: u32::MAX,
+                udp6_rx_queue_drops: u32::MAX,
+                udp6_rx_invalid: u32::MAX,
+                udp6_udp_delivered: u32::MAX,
+                udp6_ndp_advertisements: u32::MAX,
+                udp6_tx_failures: u32::MAX,
+                udp6_last_tx_result: u32::MAX,
+                udp6_raw_tx_completions: u32::MAX,
+                udp6_raw_tx_completion_failures: u32::MAX,
+                udp6_raw_tx_completion_rate: u32::MAX,
+                p2p_probe_requests: u32::MAX,
+                p2p_probe_responses: u32::MAX,
+                p2p_gas_requests: u32::MAX,
+                p2p_gas_responses: u32::MAX,
+                p2p_response_drops: u32::MAX,
+                registered_nan_actions: u32::MAX,
+                registered_now_actions: u32::MAX,
+                registered_p2p_actions: u32::MAX,
+                registered_action_drops: u32::MAX,
+            },
+        };
+        let mut out = [0; RAW_WIFI_RESPONSE_MAX_BYTES];
+        let used = encode_raw_wifi_snapshot(RAW_WIFI_METHOD_SNAPSHOT, snapshot, &mut out).unwrap();
+        assert!(used <= RAW_WIFI_SNAPSHOT_MAX_BYTES);
+        assert_eq!(
+            decode_raw_wifi_snapshot(&out[..used]),
+            Ok((RAW_WIFI_METHOD_SNAPSHOT, snapshot))
+        );
+        assert!(
+            encode_raw_wifi_snapshot(RAW_WIFI_METHOD_SNAPSHOT, snapshot, &mut [0; 448]).is_none()
+        );
+    }
+
+    #[test]
+    fn fieldless_radio_requests_decode_with_or_without_the_empty_fields_map() {
+        // {1: radio, 2: method, 3: id} and the same with `5: {}` are one request.
+        for (method, expected) in [
+            (RAW_WIFI_METHOD_SNAPSHOT, RawWifiLabRequest::Snapshot),
+            (
+                RAW_WIFI_METHOD_RESET_COUNTERS,
+                RawWifiLabRequest::ResetCounters,
+            ),
+        ] {
+            for with_fields in [false, true] {
+                let mut wire = [0u8; 32];
+                let mut e = Encoder::new(&mut wire);
+                e.map(if with_fields { 4 } else { 3 }).unwrap();
+                e.uint(1).unwrap();
+                e.uint(RAW_WIFI_COMPONENT).unwrap();
+                e.uint(2).unwrap();
+                e.uint(method).unwrap();
+                e.uint(3).unwrap();
+                e.uint(7).unwrap();
+                if with_fields {
+                    e.uint(5).unwrap();
+                    e.map(0).unwrap();
+                }
+                let used = e.len();
+                assert_eq!(decode_raw_wifi_handler(&wire[..used]), Ok(expected));
+            }
+        }
+        let mut wire = [0u8; 32];
+        let mut e = Encoder::new(&mut wire);
+        e.map(3).unwrap();
+        e.uint(1).unwrap();
+        e.uint(RAW_WIFI_COMPONENT).unwrap();
+        e.uint(2).unwrap();
+        e.uint(RAW_WIFI_METHOD_SCAN).unwrap();
+        e.uint(3).unwrap();
+        e.uint(7).unwrap();
+        let used = e.len();
+        assert!(matches!(
+            decode_raw_wifi_handler(&wire[..used]),
+            Ok(RawWifiLabRequest::Scan(_))
+        ));
+    }
+}

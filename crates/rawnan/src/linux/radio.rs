@@ -258,10 +258,9 @@ impl CaptureHost for Core {
         }
     }
 
-    fn now_sync(&self, peer: [u8; 6], cluster_id: [u8; 6], service_info: &[u8]) {
-        let _ = self
-            .observer
-            .now(peer, Some(cluster_id), NowKind::Sync, service_info);
+    fn now_sync(&self, peer: [u8; 6], cluster_id: [u8; 6], service_info: &[u8]) -> Option<Vec<u8>> {
+        self.observer
+            .now(peer, Some(cluster_id), NowKind::Sync, service_info)
     }
 
     fn now_discovery(&self, peer: [u8; 6], bssid: Option<[u8; 6]>, payload: &[u8]) -> Option<Vec<u8>> {
@@ -295,8 +294,8 @@ impl Radio {
     /// then call [`Self::start`].
     pub fn new<P>(config: RadioConfig, observer: Arc<dyn Observer>) -> (EspNowBearer<P>, Self)
     where
-        P: quic_lite::bearer::PacketPool + Sync + 'static,
-        P::Buffer: Send,
+        P: mesh_api::pool::PacketPool + Send + Sync + 'static,
+        P::Packet: Send + 'static,
     {
         let (bearer, ingress) = EspNowBearer::<P>::new(config.iface.clone());
         let core = Arc::new(Core {
@@ -470,6 +469,64 @@ impl Radio {
         {
             running.stop.store(true, Ordering::Release);
         }
+        *self
+            .core
+            .tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    /// Stop the capture threads, delete the monitor VIF if present, release any open AP
+    /// on the base interface, and leave the base interface in station (`Managed`) mode.
+    pub fn stop_and_release(&self) -> Result<()> {
+        self.stop();
+        let config = &self.core.config;
+        let mut ops = SysOps::default();
+        if ops.state(&config.monitor)?.is_some() {
+            let _ = ops.delete(&config.monitor);
+        }
+        if let Some(state) = ops.state(&config.iface)? {
+            if state.iftype == IfType::Ap {
+                let _ = release_ap(&mut ops, &config.iface);
+            } else if state.up {
+                let _ = ops.set_link(&config.iface, false);
+            }
+            if state.iftype != IfType::Managed {
+                ops.set_type(&config.iface, IfType::Managed)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Ensure the monitor VIF exists on `channel` alongside an externally managed base
+    /// interface (for example `wpa_supplicant` running a WPA2 AP or associated as a STA
+    /// on channel 6) and start the NAN/NOW capture threads without touching the base
+    /// interface's AP/STA state.
+    pub fn start_monitor_only(&self, channel: u8) -> Result<()> {
+        let mut running = self
+            .running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = &self.core.config;
+        let mut ops = SysOps::default();
+        if ops.state(&config.monitor)?.is_none() {
+            ops.create_monitor(&config.iface, &config.monitor, channel)?;
+        } else if running.is_some() {
+            return Ok(());
+        }
+        if let Some(previous) = running.take() {
+            previous.stop.store(true, Ordering::Release);
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        if let Err(error) = self.spawn_capture(&mut ops, &stop) {
+            stop.store(true, Ordering::Release);
+            return Err(error);
+        }
+        *running = Some(Running {
+            stop,
+            _owner: None,
+        });
+        Ok(())
     }
 
     pub fn is_running(&self) -> bool {
@@ -559,11 +616,13 @@ impl Radio {
         if tx.is_none() {
             *tx = Some(MonitorTxSocket::open(&self.core.config.monitor)?);
         }
+        let local = iface_mac(&self.core.config.iface).unwrap_or([0; 6]);
+        let wrapped = wrap_now_sync_payload(local, &self.core.nan, payload);
         send_raw_action_datagram_on_socket(
             &self.core.config.iface,
             tx.as_ref().expect("opened above"),
             peer,
-            payload,
+            &wrapped,
             6,
         )
     }
@@ -615,7 +674,7 @@ mod tests {
         }
     }
 
-    type TestPool = quic_lite::packet_pool::PacketPool<4, { quic_lite::DEFAULT_PACKET_POOL_SLOT_SIZE }>;
+    type TestPool = &'static mesh_api::pool::StaticPacketPool<4, { mesh_api::pool::DEFAULT_SLOT_SIZE }>;
 
     fn radio() -> Radio {
         Radio::new::<TestPool>(RadioConfig::for_interface("wlan0"), Arc::new(Quiet)).1

@@ -855,7 +855,7 @@ fn send_raw_action_datagram_inner(
     tx_rate_mbps: u8,
 ) -> Result<()> {
     let local = iface_mac(iface).with_context(|| format!("missing local MAC for {iface}"))?;
-    let mut action = [0_u8; quic_lite::DEFAULT_MAX_PACKET_SIZE + 64];
+    let mut action = [0_u8; mesh_api::pool::DEFAULT_MAX_PAYLOAD + 64];
     let destination = raw_action_response_address(peer);
     let action_len = crate::espnow::encode_action_frame(
         &mut action,

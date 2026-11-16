@@ -10,9 +10,12 @@
 //! silently changing the Android/ESP interoperability format.
 
 extern crate alloc;
-#[cfg(feature = "linux")]
+#[cfg(any(test, feature = "std", feature = "linux"))]
 #[macro_use]
 extern crate std;
+
+/// CBOR-decoded, socket-free raw 802.11 hardware request and snapshot schema.
+pub mod raw_wifi;
 
 /// Linux backend (feature `linux`): the raw Wi-Fi bearer's system plumbing.
 #[cfg(feature = "linux")]

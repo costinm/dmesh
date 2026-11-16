@@ -54,6 +54,30 @@ pub const NL80211_CMD_DEL_STATION: u8 = 20;
 
 pub const NL80211_CMD_CONNECT: u8 = 46;
 
+pub const NL80211_CMD_GET_SCAN: u8 = 32;
+
+pub const NL80211_CMD_TRIGGER_SCAN: u8 = 33;
+
+pub const NL80211_ATTR_SCAN_SSIDS: u16 = 45;
+
+pub const NL80211_ATTR_BSS: u16 = 47;
+
+pub const NL80211_ATTR_SCAN_FLAGS: u16 = 158;
+
+pub const NL80211_SCAN_FLAG_AP: u32 = 1 << 2;
+
+pub const NL80211_BSS_BSSID: u16 = 1;
+
+pub const NL80211_BSS_FREQUENCY: u16 = 2;
+
+pub const NL80211_BSS_INFORMATION_ELEMENTS: u16 = 6;
+
+pub const NL80211_BSS_SIGNAL_MBM: u16 = 7;
+
+pub const NL80211_BSS_SEEN_MS_AGO: u16 = 10;
+
+pub const NL80211_BSS_BEACON_IES: u16 = 11;
+
 pub const NL80211_ATTR_WIPHY: u16 = 1;
 
 pub const NL80211_ATTR_IFINDEX: u16 = 3;
@@ -1114,6 +1138,60 @@ impl Nl80211Socket {
             .context("nl80211 station dump failed")
     }
 
+    /// Trigger an active Wi-Fi scan on `ifindex`. When the interface is operating as an
+    /// AP, `NL80211_SCAN_FLAG_AP` is requested first so mac80211 permits scanning while
+    /// beaconing; if the driver rejects the flag, falls back to an unflagged trigger.
+    pub fn trigger_scan(&self, ifindex: u32, ap_mode: bool) -> Result<()> {
+        let try_flags = if ap_mode {
+            &[Some(NL80211_SCAN_FLAG_AP), None][..]
+        } else {
+            &[None, Some(NL80211_SCAN_FLAG_AP)][..]
+        };
+        let mut last_err = None;
+        for (idx, flags) in try_flags.iter().enumerate() {
+            let mut payload = genl_payload(NL80211_CMD_TRIGGER_SCAN, NL80211_GENL_VERSION);
+            append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
+            let mut ssids = Vec::new();
+            append_attr(&mut ssids, 1, &[]);
+            append_attr(&mut payload, NL80211_ATTR_SCAN_SSIDS | (1 << 15), &ssids);
+            if let Some(flags) = flags {
+                append_attr(&mut payload, NL80211_ATTR_SCAN_FLAGS, &flags.to_ne_bytes());
+            }
+            self.send_genl(
+                self.family_id,
+                (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
+                30 + idx as u32,
+                &payload,
+            )?;
+            match self.recv_ack() {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    // EBUSY (os error 16) means a scan is already in progress on the phy.
+                    if err.to_string().contains("Device or resource busy")
+                        || err.to_string().contains("os error 16")
+                    {
+                        return Ok(());
+                    }
+                    last_err = Some(err);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("nl80211 trigger scan failed")))
+    }
+
+    /// Read the kernel's cached BSS scan table for `ifindex`.
+    pub fn scan_dump(&self, ifindex: u32) -> Result<Vec<ScannedBss>> {
+        let mut payload = genl_payload(NL80211_CMD_GET_SCAN, NL80211_GENL_VERSION);
+        append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
+        self.send_genl(
+            self.family_id,
+            (libc::NLM_F_REQUEST as u16) | NLM_F_DUMP,
+            32,
+            &payload,
+        )?;
+        self.recv_scan_dump().context("nl80211 scan dump failed")
+    }
+
 
 
 
@@ -1472,6 +1550,41 @@ impl Nl80211Socket {
                     }
                 } else if header.nlmsg_type == self.family_id {
                     stations.push(parse_station_dump_message(msg)?);
+                }
+                offset += nlmsg_align(len);
+            }
+        }
+    }
+
+    pub fn recv_scan_dump(&self) -> Result<Vec<ScannedBss>> {
+        let mut bss_list = Vec::new();
+        loop {
+            let response = self.recv_netlink_raw()?;
+            let mut offset = 0;
+            while offset + std::mem::size_of::<libc::nlmsghdr>() <= response.len() {
+                let header = unsafe {
+                    std::ptr::read_unaligned(response[offset..].as_ptr() as *const libc::nlmsghdr)
+                };
+                let len = header.nlmsg_len as usize;
+                if len < std::mem::size_of::<libc::nlmsghdr>() || offset + len > response.len() {
+                    break;
+                }
+                let msg = &response[offset..offset + len];
+                if header.nlmsg_type == libc::NLMSG_DONE as u16 {
+                    return Ok(bss_list);
+                }
+                if header.nlmsg_type == NLMSG_ERROR {
+                    if let Some(error) = netlink_error(msg) {
+                        bail!(
+                            "netlink error: {}{}",
+                            std::io::Error::from_raw_os_error(error),
+                            netlink_extack_message(msg)
+                        );
+                    }
+                } else if header.nlmsg_type == self.family_id
+                    && let Ok(Some(bss)) = parse_scan_dump_message(msg)
+                {
+                    bss_list.push(bss);
                 }
                 offset += nlmsg_align(len);
             }
@@ -1987,4 +2100,82 @@ pub struct InterfaceInfo {
     pub wiphy: Option<u32>,
     /// Operating frequency in MHz, when the interface has a channel context.
     pub freq: Option<u32>,
+}
+
+/// One BSS entry from `NL80211_CMD_GET_SCAN`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScannedBss {
+    pub bssid: [u8; 6],
+    pub ssid: Vec<u8>,
+    pub frequency_mhz: u32,
+    pub channel: u8,
+    pub signal_dbm: i8,
+    pub seen_ms_ago: u32,
+}
+
+pub fn parse_scan_dump_message(response: &[u8]) -> Result<Option<ScannedBss>> {
+    let mut bss_attrs = None;
+    for (kind, value) in genl_attrs(response)? {
+        if kind & NLA_TYPE_MASK == NL80211_ATTR_BSS {
+            bss_attrs = Some(parse_attrs(value)?);
+            break;
+        }
+    }
+    let Some(attrs) = bss_attrs else {
+        return Ok(None);
+    };
+    let mut bssid = None;
+    let mut frequency_mhz = 0_u32;
+    let mut signal_dbm = -100_i8;
+    let mut seen_ms_ago = 0_u32;
+    let mut ies: Option<&[u8]> = None;
+    let mut beacon_ies: Option<&[u8]> = None;
+    for (kind, value) in attrs {
+        match kind & NLA_TYPE_MASK {
+            NL80211_BSS_BSSID if value.len() >= 6 => {
+                let mut mac = [0_u8; 6];
+                mac.copy_from_slice(&value[..6]);
+                bssid = Some(mac);
+            }
+            NL80211_BSS_FREQUENCY if value.len() >= 4 => {
+                frequency_mhz = u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
+            }
+            NL80211_BSS_SIGNAL_MBM if value.len() >= 4 => {
+                let mbm = i32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
+                signal_dbm = (mbm / 100).clamp(i8::MIN as i32, i8::MAX as i32) as i8;
+            }
+            NL80211_BSS_SEEN_MS_AGO if value.len() >= 4 => {
+                seen_ms_ago = u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
+            }
+            NL80211_BSS_INFORMATION_ELEMENTS => {
+                ies = Some(value);
+            }
+            NL80211_BSS_BEACON_IES => {
+                beacon_ies = Some(value);
+            }
+            _ => {}
+        }
+    }
+    let Some(bssid) = bssid else {
+        return Ok(None);
+    };
+    let ssid = ies
+        .and_then(|bytes| management_ie_bytes(bytes, 0))
+        .or_else(|| beacon_ies.and_then(|bytes| management_ie_bytes(bytes, 0)))
+        .map(|slice| slice[..slice.len().min(32)].to_vec())
+        .unwrap_or_default();
+    let channel = freq_to_channel(frequency_mhz)
+        .or_else(|| {
+            ies.and_then(|bytes| management_ie_bytes(bytes, 3))
+                .and_then(|ds| ds.first().copied())
+        })
+        .unwrap_or(0);
+    Ok(Some(ScannedBss {
+        bssid,
+        ssid,
+        frequency_mhz,
+        channel,
+        signal_dbm,
+        seen_ms_ago,
+    }))
 }

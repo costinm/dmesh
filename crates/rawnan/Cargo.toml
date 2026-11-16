@@ -9,13 +9,14 @@ crate-type = ["rlib"]
 
 [features]
 default = ["std"]
-std = ["anyhow/std"]
+std = ["anyhow/std", "mesh-api/std", "dep:serde"]
 # Linux backend: nl80211/rtnetlink, monitor interface, open AP, capture (Linux-only code).
-linux = ["std", "dep:libc", "dep:serde_json", "dep:quic-lite", "dep:tracing"]
+linux = ["std", "dep:libc", "dep:serde_json", "mesh-api/host-pools", "dep:tracing"]
 
 [dependencies]
 anyhow = { version = "1", default-features = false }
 libc = { version = "0.2", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
-quic-lite = { path = "../quic-lite", optional = true, features = ["tokio"] }
+mesh-api = { git = "https://github.com/costinm/ssh-mesh", default-features = false }
 tracing = { version = "0.1", optional = true }
