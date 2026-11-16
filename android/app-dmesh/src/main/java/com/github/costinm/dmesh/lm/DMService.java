@@ -406,35 +406,58 @@ public class DMService extends MeshService {
      * HTTP interface surface served on 127.0.0.1:18480.
      */
     private void copyWebAssets(File webDir) {
-        copyWebAssets(webDir, "");
+        copyAssetSubtree("", "", webDir, "schemas");
     }
 
-    private void copyWebAssets(File webDir, String prefix) {
+    /**
+     * Copy bundled binary service schemas (`assets/schemas/<component>/api.cbor`)
+     * into `MESH_SCHEMA_DIR` (`<files>/ssh-mesh/schemas`).
+     */
+    private void copySchemaAssets(File schemaDir) {
+        copyAssetSubtree("schemas", "", schemaDir, null);
+    }
+
+    private void copyAssetSubtree(String assetBase, String relPath, File outRoot, String skipTopLevel) {
         try {
-            String[] names = getAssets().list(prefix);
+            String assetPath = assetBase.isEmpty()
+                    ? relPath
+                    : (relPath.isEmpty() ? assetBase : assetBase + "/" + relPath);
+            String[] names = getAssets().list(assetPath);
             if (names == null) {
                 return;
             }
             for (String name : names) {
-                String path = prefix.isEmpty() ? name : prefix + "/" + name;
-                if (getAssets().list(path).length > 0) {
-                    copyWebAssets(webDir, path);
+                if (relPath.isEmpty() && name.equals(skipTopLevel)) {
                     continue;
                 }
-                File out = new File(webDir, path);
+                String childRel = relPath.isEmpty() ? name : relPath + "/" + name;
+                String childAsset = assetBase.isEmpty() ? childRel : assetBase + "/" + childRel;
+                String[] children = getAssets().list(childAsset);
+                if (children != null && children.length > 0) {
+                    copyAssetSubtree(assetBase, childRel, outRoot, null);
+                    continue;
+                }
+                File out = new File(outRoot, childRel);
                 File parent = out.getParentFile();
                 if (parent != null && !parent.isDirectory() && !parent.mkdirs()) {
                     continue;
                 }
-                try (java.io.InputStream in = getAssets().open(path);
+                try (java.io.InputStream in = getAssets().open(childAsset);
                      java.io.OutputStream os = new java.io.FileOutputStream(out)) {
                     byte[] buffer = new byte[8192];
                     int read;
                     while ((read = in.read(buffer)) >= 0) os.write(buffer, 0, read);
                 }
+                if ("schemas".equals(assetBase) && name.endsWith(".cbor") && parent != null) {
+                    File legacyJson = new File(parent, "tools.json");
+                    if (legacyJson.isFile()) {
+                        //noinspection ResultOfMethodCallIgnored
+                        legacyJson.delete();
+                    }
+                }
             }
         } catch (IOException error) {
-            Log.w(TAG, "Failed to copy web assets", error);
+            Log.w(TAG, "Failed to copy assets from '" + assetBase + "'", error);
         }
     }
 
@@ -452,7 +475,12 @@ public class DMService extends MeshService {
             if (!webDir.exists() && !webDir.mkdirs()) {
                 Log.w(TAG, "Failed to create Rust web dir: " + webDir);
             }
+            File schemaDir = new File(baseDir, "schemas");
+            if (!schemaDir.exists() && !schemaDir.mkdirs()) {
+                Log.w(TAG, "Failed to create Rust schema dir: " + schemaDir);
+            }
             copyWebAssets(webDir);
+            copySchemaAssets(schemaDir);
             MeshNode node = new MeshNode(baseDir.getAbsolutePath());
             node.start(getApplicationContext(), RUST_SSH_PORT, RUST_HTTP_PORT);
             messageGateway = new MessageStreamGateway(this, () -> {

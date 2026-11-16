@@ -254,21 +254,6 @@ public class MeshNode implements AutoCloseable {
                 new byte[0], -1);
     }
 
-    /**
-     * Resolve the shared comprehensive pair-probe matrix from Android's live
-     * discovery inventory. This is planning only: it never changes the phone
-     * radio mode; the selected endpoint adapters execute the returned rows.
-     */
-    public static String planProbePair(String sourceId, String targetId,
-                                       int shortBytes, int longBytes) {
-        return radioMessageText("probe.plan",
-                "source_id=" + textArg(sourceId)
-                        + " target_id=" + textArg(targetId)
-                        + " short_bytes=" + shortBytes
-                        + " long_bytes=" + longBytes,
-                new byte[0], -1);
-    }
-
     public static String parseNanServiceInfo(byte[] serviceInfo) {
         return radioMessageText("radio.nan.parse_service_info", "", serviceInfo, -1);
     }

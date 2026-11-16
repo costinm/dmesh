@@ -46,3 +46,20 @@ Jobs may show notifications - for importance, with isUserInitiated() on the
 job parameters, and a call to setNotification() in 10 sec. 
 
 Jobs run with a wake lock held by system.
+
+The Java generic CBOR decoder accepts definite maps, arrays, byte and UTF-8
+text strings, signed Java long integers, booleans, null, and 16/32/64-bit
+floats. This constrained device codec rejects integers outside the signed long
+range and does not support heavyweight general-purpose number types. Component
+and method tags in `Envelope` are nonnegative
+Java longs or text names; larger integer tags are rejected. The generic decoder
+rejects undefined, tags, indefinite containers, and other simple values in
+materialized values. `Envelope.decode` skips unknown top-level field values,
+including tags, simple values, floats, and indefinite strings and containers;
+unknown integer field keys outside the signed long range are also skipped;
+skipped text is not UTF-8 validated. Known fields still use the strict generic
+decoder. Duplicate envelope keys and trailing bytes are rejected. Input and output
+are limited to 1 MiB, containers to 128 entries, values to 4096, and nesting
+to 32 levels; these limits also apply while skipping unknown fields, with at
+most 128 chunks per indefinite string. Bundle decoding additionally restricts arrays to text and map
+keys to text.

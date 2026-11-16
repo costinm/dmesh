@@ -1,0 +1,87 @@
+§jcomponentsÅ£cdocyÔPairing makes an unpaired ESP32 a companion of one Linux or Android controller.
+Every pairing attempt first sends `nan.pair_wakeup` through a nearby observer,
+even when the provisioning exchange will use USB or BLE. A sleepy
+unpaired device may then open a time-limited pairing window. A device that already
+has `sec:key` ignores this invitation.
+`kind` selects the bearer used for this operation: `uart` (USB or serial) or
+`ble`. Companions use only these two. `id` is its adapter-local identifier, a
+serial path or a BLE address. The host verifies the signed device identity,
+generates a shared secret (or reuses the stored secret for the same root on
+re-pair), writes it to the device, and durably stores the
+secret with the device MAC and public key in the device's record (a private file).
+The signed `device_id` is stable across bearers.
+
+Bearers add no cryptography of their own. The shared secret is what the transport
+uses to authenticate and encrypt once it is on the device. Over the wired UART
+(trusted physical access) the host may set or replace the secret, even on a
+device that has one and with no pairing window: that host could reflash the
+device anyway, so a later pair simply overrides the secret (future eFuse policy
+may restrict this). Pairing leaves the UART attached to the node and in use; a
+port that is already attached, for example at startup, is reused. Over BLE the
+channel is a plain, unencrypted L2CAP CoC (no BLE pairing or bond, so no prompt on any
+platform), and the device refuses when it already has a secret or its pairing window is
+closed; only a wired unpair or pair resets it. The shared secret, installed once over that
+channel, is what authenticates and encrypts everything after. Once paired, the same ownership works over any available
+transport.
+Firmware never returns the raw secret over control.
+
+Linux stores one pairing result per signed device VIP6 in
+`DMESH_PAIRED_DEVICES_DIR` (default `/home/system/etc/lmesh/paired`). The
+directory is mode 0700 and each TOML record is mode 0600. Android uses the
+same layout under its app-private `files/ssh-mesh/paired` directory. A result is
+created from signed discovery, the device's NVS name (or the name set during
+pairing), the installed control-plane root public key, and the shared secret.
+Its filename is the final eight VIP6 bytes as 16 lowercase hexadecimal digits
+plus `.toml`; legacy JSON is read and migrated on write. `companion = true`
+marks owned interfaces, separately from `trust = "paired"`. Discovery cannot
+grant or remove companion membership;
+the old catalog inventory is not pairing authority. The secret must not appear in normal
+discovery, logs, HTTP responses, or command history.
+
+BLE advertisements use a distinct DMesh pairing service while unpaired. Once
+paired they use the operational service and may include a short owner hint,
+such as the last four bytes of the owner's VIP, to help a controller match its
+private inventory. The hint is public metadata, not authorization; signed
+identity and shared-secret proof remain required.eindex—dnameicompanionfformatjmesh-api/1gmethodsÇ™icomponenticompanioncdocyG`vip6` is optional. The device is identified by its bearer (the serial port or
+BLE address) and by its signed discovery reply, whose VIP6 the owned record is
+keyed on. When `vip6` is given it must match that reply, and the host refuses a
+device that proves a different identity. UART and BLE use the same exchange over an ordinary
+association on the host's running node (BLE over a plain CoC): discover, `provision.install`, then
+save the device record. Refusal or a lost response does not create a new host
+record or remove an existing one. A re-pair over the wire atomically replaces
+the earlier record, retaining operator settings and attachment hints; the same
+root reuses the secret, while an explicit root change rotates it. `id` is the serial path or
+BLE address (from scan results); `psm` defaults to 128. A UART port stays attached
+afterwards; a port already attached (`LMESH_UART`) is reused.
+
+Pairing reads the device name from NVS through signed discovery. Optional
+`name` replaces it, or supplies an initial name, and must be written to NVS
+before the local pairing result is committed.
+Pairing also installs a control-plane root public key into `dmesh:cp` NVS.
+By default this is the controller's own public key. If a root CA is configured,
+the controller uses that CA's public key; `root_public_key_b64` can select an
+explicit compressed P-256 public key for this pairing. The selected root key
+is saved in the private pairing result and is not a shared secret.
+A successful pair response means the device accepted the new secret and the
+host saved the matching identity and secret durably. Android's native
+Bluetooth API owns permission and connecting.
+
+```sh
+mesh lmesh companion.pair --kind=uart --id=/dev/ttyUSB0
+mesh lmesh companion.pair --kind=ble --id=AA:BB:CC:DD:EE:FF --psm=128
+mesh lmesh companion.unpair --kind=uart --id=/dev/ttyUSB0
+```eindexfmethoddpairdnamencompanion.pairgrequest°ffieldsá§kdescriptionx%Provisioning bearer: `uart` or `ble`.dnamedkindctagdtypefstring§kdescriptionx(Adapter-local identifier from discovery.dnamebidctagdtypefstring§kdescriptionxGOptional signed VIP the device must prove; default: whatever it proves.dnamedvip6ctagdtypefstring§kdescriptionx!Optional UART physical baud rate.dnamedbaudctagdtypecu32§kdescriptionx"Optional BLE CoC PSM; default 128.dnamecpsmctagdtypecu16§kdescriptionx:Optional new device name, persisted in NVS during pairing.dnamednamectagdtypefstring§kdescriptionxJOptional base64 compressed P-256 control-plane root public key (33 bytes).dnamesroot_public_key_b64ctagdtypefstringhresponse°ffieldsÄgsummaryxProvision an unpaired companiondtierdcorejvisibilityfpublic™icomponenticompanioncdocy`kind` names the bearer carrying this operation; it does not identify the
+bearer on which pairing happened. Unpair removes the shared secret, the
+control-plane root and every BLE bond (stored peer keys) on the ESP32. Only after
+the reset response is confirmed does the host clear credentials and companion
+membership in its TOML record, retaining discovery and operator configuration.
+A local save failure is reported, not ignored. A UART stays attached. Afterwards
+the ESP32 behaves like an unpaired device. BLE device reset is not currently
+implemented: Linux rejects `unpair kind=ble`; Android retains its local BLE
+unpair callback for lifecycle tests, but that callback is not evidence of
+firmware ownership reset. When security is enabled, BLE device unpair will
+require proof of the companion secret. Use USB/UART for physical recovery. UART alone
+may unlock a device without that proof, including one paired to someone else.
+Physical UART access already permits Linux to flash the ESP32; future eFuse
+policy may restrict that ability. The UART exception must never apply to a
+request that arrives over BLE, even if its `kind` field says `uart`.eindexfmethodfunpairdnamepcompanion.unpairgrequest°ffieldsÇ§kdescriptionx#Bearer carrying the unpair request.dnamedkindctagdtypefstring§kdescriptionx!Target identifier on that bearer.dnamebidctagdtypefstringhresponse°ffieldsÄgsummaryx#Reset a companion to unpaired statedtierdcorejvisibilityfpublicetypesÄ

@@ -1,0 +1,41 @@
+§jcomponentsÅ£cdocy‹`probe` is a core test and diagnostic tool, and a production control-plane tool
+for comparing paths, so every platform registers it and any node can be probed
+from any other: Android to Android, Android to Linux, ESP32 to either, and every
+other combination. Two methods are involved, on two different nodes:
+
+- `probe.start` is a request to a node (the one addressed by `to`, or the node
+  that receives it) to run a probe against `peer`. It has no body in either
+  direction; its response header is the outcome.
+- `probe.handler` is the handler on the node that is probed (the `peer`). It is
+  an ordinary registered method with the usual request header in front, and its
+  request/response bodies carry the selected upload/download workload. All
+  throughput tests use this method, independent of the bearer.
+
+`direction` is relative to the client: `download` (default), `upload`, or `both`.
+`bytes` is the length per enabled direction. `both` runs upload and download
+simultaneously on two ordinary streams in the same association, each invoking
+the same handler with its individual direction. Success requires both response envelopes,
+exact payload byte counts and response FIN. Aggregate throughput counts both directions.
+Pattern verification is opt-in (`verify=true`, default false); use it periodically
+and compare otherwise identical runs to measure its CPU cost.
+
+The transport library has no registry: its probe workload is wrapped by these
+handlers, and its own tests attach it directly.eindexdnameeprobefformatjmesh-api/1gmethodsÇ´icomponenteprobecdocy”The envelope's destination `to` (a request field named `to`, tag 15 in this
+catalog) selects the node that runs the probe as the client; it is not part
+of the request's `fields` map. `peer` names the probed node: `espnow://MAC`,
+`udp://HOST:PORT`, `usb://`, `ble://`, or `mesh://VIP`, which is resolved through
+discovery to the current address and path. Bearer names select explicit
+transports. Query options may be added to the URI later; comma-separated
+multipath destinations are not accepted until multipath is implemented. Wakeup
+of a sleepy peer is a separate transport/discovery policy and is not part of
+this request.
+
+Tags 3 to 5 are reserved (`pace_us`, `burst_packets`, `burst_delay_us`); a
+decoder rejects them.eindexfmethodestartdnamekprobe.startgrequest°ffieldsè§kdescriptionwPayload length to move.dnameebytesctagdtypecu64§kdescriptionx&Packet size the payload is built from.dnamekpacket_sizectagdtypecu16§kdescriptionxPackets per acknowledgment.dnamemack_frequencyctagdtypebu8§kdescriptionuAcknowledgment delay.dnamelack_delay_msctagdtypebu8§kdescriptionxBytes on a low-priority stream.dnamerlow_priority_bytesctagdtypecu32§kdescriptionx Bytes on a high-priority stream.dnameshigh_priority_bytesctag	dtypecu32§kdescriptionsConcurrent streams.dnamepparallel_streamsctag
+dtypebu8§kdescriptionxDelay before the first read.dnamexinitial_consume_delay_msctagdtypecu32§kdescriptiontDelay between reads.dnamepconsume_delay_msctagdtypecu32§kdescriptionx"The probed node (destination URI).dnamedpeerctagdtypefstring§kdescriptionx7`download` (default), `upload`, or simultaneous `both`.dnameidirectionctagdtypefstring§kdescriptionx0Node that runs the probe (envelope destination).dnamebtoctagdtypefstring§kdescriptionxlDefault false. Check deterministic payload bytes on both receivers; byte counts and FIN are always required.dnamefverifyctagdtypedbool§kdescriptionxµOptional client-local link or interface selector used to originate the probe (`espnow`, `udp6`, `nan`, `ble`, or an interface name). Stripped from the inner `probe.handler` request.dnamedlinkctagdtypefstring§kdescriptionxïOptional relay hop or route URI used to reach `peer` (`FIRST_HOP:DCID`, `mesh://VIP`, or relay URI). Stripped from the inner `probe.handler` request.dnamecviactagdtypefstringhresponse°ffieldsá§kdescriptionp`ok` or `error`.dnamefstatusctagdtypefstring§kdescriptionpThe probed node.dnamedpeerctagdtypefstring§kdescriptionxRequested payload length.dnameorequested_bytesctagdtypecu64§kdescriptionxgTotal received payload bytes, including peer-confirmed upload; pattern-checked only when `verify=true`.dnamenreceived_bytesctagdtypecu64§kdescriptionmElapsed time.dnamejelapsed_usctagdtypecu64§kdescriptionx=Client-side link or interface used for the probe, when known.dnamedlinkctagdtypefstring§kdescriptionx7Relay hop or route used for the probe, when applicable.dnamecviactagdtypefstringgsummaryx(Ask a node to run a probe against a peerdtieredebugbuihadvancedjvisibilityfpublic´icomponenteprobecdocy´Packet `k` of the payload starts with `k` as a big-endian `u32`, and every other
+byte is its stream offset modulo 256, so a caller can validate it however the
+transport chunks it. A request the node does not support (a `peer`, more than one
+stream, priority streams, ACK tuning, more than the probe limit) is answered with
+an error header and no body. The generator and the validator are
+the transport library's `ProbePayload`.eindexfmethodghandlerdnamemprobe.handlergrequest°ffieldsã§kdescriptionwPayload length to send.dnameebytesctagdtypecu64§kdescriptionx&Packet size the payload is built from.dnamekpacket_sizectagdtypecu16§kdescriptionxPackets per acknowledgment.dnamemack_frequencyctagdtypebu8§kdescriptionuAcknowledgment delay.dnamelack_delay_msctagdtypebu8§kdescriptionxBytes on a low-priority stream.dnamerlow_priority_bytesctagdtypecu32§kdescriptionx Bytes on a high-priority stream.dnameshigh_priority_bytesctag	dtypecu32§kdescriptionsConcurrent streams.dnamepparallel_streamsctag
+dtypebu8§kdescriptionxDelay before the first read.dnamexinitial_consume_delay_msctagdtypecu32§kdescriptiontDelay between reads.dnamepconsume_delay_msctagdtypecu32§kdescriptionx]`download` (default) or `upload`; the client implements `both` with one of each concurrently.dnameidirectionctagdtypefstring§kdescriptionxaDefault false. Enable deterministic payload validation; length and FIN checks are always enabled.dnamefverifyctagdtypedboolhresponse°ffieldsÉ§kdescriptionx#Length of the payload that follows.dnameebytesctagdtypecu64§kdescriptionx&Packet size the payload is built from.dnamekpacket_sizectagdtypecu64§kdescriptionxJValidated request-body bytes after request FIN; omitted for download-only.dnamenuploaded_bytesctagdtypecu64gsummaryx7Answer a probe with a header and then the probe payloaddtieredebugbuihadvancedjvisibilityfpublicetypesÄ

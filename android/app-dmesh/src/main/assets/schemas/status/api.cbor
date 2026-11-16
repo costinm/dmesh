@@ -1,0 +1,3 @@
+¤jcomponents¢eindexËdnamefstatusfformatjmesh-api/1gmethods«icomponentfstatuscdocx¶Human-readable service state, IP addresses and direct-neighbor counts for the
+status shell. It is a local-only method: the table names local addresses, so a
+network peer is declined.eindexfmethoddtextdnamekstatus.textgrequest¡ffields€hresponse¡ffields¤kdescriptionxLine-oriented status table.dnamekstatus_textctagdtypefstringgsummaryx,Return the Rust-generated local status tabledtieredebugbuigdefaultjvisibilityfpublicetypes€

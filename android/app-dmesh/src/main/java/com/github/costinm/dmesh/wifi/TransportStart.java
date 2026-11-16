@@ -3,8 +3,8 @@ package com.github.costinm.dmesh.wifi;
 import android.os.Bundle;
 
 /**
- * Typed projection of dmesh_server::control::Request::TransportStart.
- * Canonical fields and tags are defined in crates/dmesh-server/src/control.rs;
+ * Typed projection of dmesh_discovery::control::Request::TransportStart.
+ * Canonical fields and tags are defined in crates/dmesh-discovery/src/control.rs;
  * this is deliberately not another Android wire format.
  */
 public final class TransportStart {

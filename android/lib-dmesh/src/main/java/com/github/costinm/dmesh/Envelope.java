@@ -31,6 +31,9 @@ public final class Envelope {
     /** Encode the envelope as definite-length CBOR. */
     public byte[] encode() {
         Map<Object, Object> root = new LinkedHashMap<>();
+        if ((componentTag != null && componentTag < 0) || (methodTag != null && methodTag < 0)) {
+            throw new IllegalArgumentException("component and method tags must be nonnegative");
+        }
         if (componentTag != null) root.put(1, componentTag);
         else if (componentName != null) root.put(1, componentName);
         if (methodTag != null) root.put(2, methodTag);
@@ -46,30 +49,25 @@ public final class Envelope {
 
     /** Decode one tagged record envelope, ignoring unknown keys. */
     public static Envelope decode(byte[] bytes) {
-        Object value = CborMessageCodec.decodeValue(bytes);
-        if (!(value instanceof Map)) {
-            throw new IllegalArgumentException("tagged record must be a CBOR map");
-        }
+        Map<Object, Object> value = CborMessageCodec.decodeEnvelopeMap(bytes);
         Envelope envelope = new Envelope();
-        for (Map.Entry<?, ?> entry : ((Map<?, ?>) value).entrySet()) {
-            if (!(entry.getKey() instanceof Number)) {
+        for (Map.Entry<?, ?> entry : value.entrySet()) {
+            Object key = entry.getKey();
+            if (!(key instanceof Long)) {
                 throw new IllegalArgumentException("record envelope keys must be integers");
             }
+            if ((Long) key < 0 || (Long) key > Integer.MAX_VALUE) continue;
             Object fieldValue = entry.getValue();
-            switch (((Number) entry.getKey()).intValue()) {
+            switch (((Long) key).intValue()) {
                 case 1:
-                    if (fieldValue instanceof Number) {
-                        envelope.componentTag = ((Number) fieldValue).longValue();
-                    } else {
-                        envelope.componentName = String.valueOf(fieldValue);
-                    }
+                    if (fieldValue instanceof Long && (Long) fieldValue >= 0) envelope.componentTag = (Long) fieldValue;
+                    else if (fieldValue instanceof String) envelope.componentName = (String) fieldValue;
+                    else throw new IllegalArgumentException("invalid component tag or name");
                     break;
                 case 2:
-                    if (fieldValue instanceof Number) {
-                        envelope.methodTag = ((Number) fieldValue).longValue();
-                    } else {
-                        envelope.methodName = String.valueOf(fieldValue);
-                    }
+                    if (fieldValue instanceof Long && (Long) fieldValue >= 0) envelope.methodTag = (Long) fieldValue;
+                    else if (fieldValue instanceof String) envelope.methodName = (String) fieldValue;
+                    else throw new IllegalArgumentException("invalid method tag or name");
                     break;
                 case 3:
                     envelope.id = fieldValue;

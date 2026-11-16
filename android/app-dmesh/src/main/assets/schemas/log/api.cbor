@@ -1,0 +1,21 @@
+¤jcomponents¢eindexÐdnameclogfformatjmesh-api/1gmethodsªicomponentclogcdocyÜPlatforms: A L E. This method exposes structured log records, events and
+metrics independently of transport or wire encoding. A log record has no
+`kind`; events and metric snapshots use `kind` to identify what they describe.
+
+Each node keeps a small rolling buffer of recent records. Without `stream`,
+`watch` returns matching records from that buffer, oldest first, along with a
+`cursor` for the next request. `dropped` reports records that left the buffer
+before they were read. The buffer is volatile and intended for recent history,
+not durable storage.
+
+With `stream` set, the initial response provides the current cursor and drop
+count, then matching records are delivered as they are produced until the
+request deadline expires or the caller closes the stream. Low-end nodes support
+one active streaming watcher; opening a new watcher closes the old one.
+
+For each name in `snapshots` (a telemetry method such as `telemetry.quic`), the
+node periodically emits a metric record whose `kind` is that method name and
+whose `fields` contain the method's response values. The period is
+`interval_ms`. A snapshot is not retained, so its `seq` is 0. An unavailable
+snapshot method is skipped and reported once as a `log` record from
+`log.watch`.eindexfmethodewatchdnameilog.watchgrequest¡ffieldsˆ¤kdescriptionx*Return records after this sequence number.dnameisince_seqctagdtypecu64¤kdescriptionx)Most records in the response (poll mode).dnameelimitctagdtypecu32¤kdescriptionxILeast severe level to return (error=1, warn=2, info=3, debug=4, trace=5).dnameelevelctagdtypebu8¤kdescriptionxNOnly records from this source or one below it (`bearer` matches `bearer.ble`).dnamefsourcectagdtypefstring¤kdescriptionx/Only events whose kind starts with this prefix.dnamedkindctagdtypefstring¤kdescriptionx9Keep the stream open and send new records as they arrive.dnamefstreamctagdtypedbool¤kdescriptionx0Telemetry method names to snapshot periodically.dnameisnapshotsctagdtypehstring[]¤kdescriptionx/Snapshot period; default 1000 and at least 100.dnamekinterval_msctagdtypecu32hresponse¡ffieldsƒ¤kdescriptionx*Records (poll mode; empty when streaming).dnamegrecordsctagdtypekLogRecord[]¤kdescriptionx1`seq` of the last record returned or sent so far.dnamefcursorctagdtypecu64¤kdescriptionx0Records lost from the history since `since_seq`.dnamegdroppedctagdtypecu64gsummaryxURead recent structured records, optionally streaming new records and periodic metricsdtieredebugjvisibilityfpublicetypes£ffields‡¥kdescriptionx;Sequence number, increasing by one per record on this node.dnamecseqhrequiredõctagdtypecu64¥kdescriptionx>Milliseconds since the node started; no wall clock is assumed.dnamegtime_mshrequiredõctagdtypecu64¥kdescriptionx*error=1, warn=2, info=3, debug=4, trace=5.dnameelevelhrequiredõctagdtypebu8¥kdescriptionx7Producing module, dotted (`quic`, `nan`, `bearer.ble`).dnamefsourcehrequiredõctagdtypefstring¤kdescriptionxSEvent type, or a telemetry method name for a snapshot; absent for a plain log line.dnamedkindctagdtypefstring¥kdescriptionx1Message; a device may shorten it to fit its slot.dnamedtexthrequiredõctagdtypefstring¤kdescriptionx2Structured values for an event or metric snapshot.dnameffieldsctagdtypefobjectdkindcrowdnameiLogRecord
