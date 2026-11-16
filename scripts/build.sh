@@ -111,6 +111,12 @@ configure_ssh_mesh_override() {
 ssh-mesh = { path = "$override_dir/crates/ssh-mesh" }
 mesh = { path = "$override_dir/crates/mesh" }
 mesh-api = { path = "$override_dir/crates/mesh-api" }
+micro-cel = { path = "$override_dir/crates/cel" }
+quic-base = { path = "$override_dir/crates/quic-base" }
+quic-mux = { path = "$override_dir/crates/quic-mux" }
+quic-link = { path = "$override_dir/crates/quic-link" }
+quic-relay = { path = "$override_dir/crates/quic-relay" }
+quic-tools = { path = "$override_dir/crates/quic-tools" }
 # END DMESH SSH_MESH OVERRIDE
 EOF
     SSH_MESH_OVERRIDE_ACTIVE=1
@@ -142,11 +148,10 @@ check_lmesh_api() {
         if [ -f ./env.sh ]; then
             . ./env.sh
         fi
-        local generated generated_api generated_rust generated_quic_api
+        local generated generated_api generated_rust
         generated="$(mktemp)"
         generated_api="$(mktemp)"
         generated_rust="$(mktemp)"
-        generated_quic_api="$(mktemp)"
         for group in portable settings nan; do
             if [ "${DMESH_API_UPDATE:-0}" = 1 ]; then continue; fi
             python3 "$DMESH_REPO/scripts/dmesh_api.py" "$group" "$generated_api" L
@@ -173,22 +178,17 @@ check_lmesh_api() {
         else
             python3 "$DMESH_REPO/scripts/generate-lmesh-tools.py" --check --local-tools "$generated"
         fi
-        python3 "$DMESH_REPO/scripts/dmesh_api.py" portable+android "$generated_api" A
-        cargo run -p mesh-api-gen -- --api "$generated_api" --out-tools "$generated"
-        api_generated_file "$generated" "$DMESH_REPO/crates/dmesh-server/platform/tools.json"
-        # The shared request/response types cover every portable and Android
-        # method on every platform, so Linux handlers use them too; only the
-        # Android catalog above is platform-filtered.
-        python3 "$DMESH_REPO/scripts/dmesh_api.py" portable+android "$generated_api"
-        cargo run -p mesh-api-gen -- --api "$generated_api" --out-tools "$generated" \
-            --out-rust "$generated_rust" --rust-tags
-        api_generated_file "$generated_rust" "$DMESH_REPO/crates/dmesh-server/src/platform_api.rs"
-        python3 "$DMESH_REPO/scripts/dmesh_api.py" portable "$generated_api" E
-        cargo run -p mesh-api-gen -- --api "$generated_api" --method telemetry.quic \
-            --out-rust-cbor "$generated_quic_api"
-        rustfmt --edition 2024 "$generated_quic_api"
-        api_generated_file "$generated_quic_api" "$DMESH_REPO/crates/dmesh-server/src/generated_quic_telemetry.rs"
-        rm -f "$generated" "$generated_api" "$generated_rust" "$generated_quic_api"
+        for group in portable+android settings nan; do
+            python3 "$DMESH_REPO/scripts/dmesh_api.py" "$group" "$generated_api" A
+            if [ "${DMESH_API_UPDATE:-0}" = 1 ]; then
+                cargo run -p mesh-api-gen -- --api "$generated_api" \
+                    --out-api-cbor-dir "$DMESH_REPO/android/app-dmesh/src/main/assets/schemas"
+            else
+                cargo run -p mesh-api-gen -- --check --api "$generated_api" \
+                    --out-api-cbor-dir "$DMESH_REPO/android/app-dmesh/src/main/assets/schemas"
+            fi
+        done
+        rm -f "$generated" "$generated_api" "$generated_rust"
     )
 }
 
@@ -307,76 +307,18 @@ lmesh_control_test() {
     check_lmesh_api
 }
 
-object_store_test() {
-    require_dmesh_cargo
-    configure_ssh_mesh_override
-    "$DMESH_CARGO_BIN" test -p dmesh-server
-}
-
 transport_test() {
     require_dmesh_cargo
     configure_ssh_mesh_override
-    "$DMESH_CARGO_BIN" test -p quic-lite
-    "$DMESH_CARGO_BIN" test -p dmesh-server --lib
-}
-
-transport_coverage() {
-    require_dmesh_cargo
-    configure_ssh_mesh_override
-    local llvm_cov_version
-    llvm_cov_version="$($DMESH_CARGO_BIN llvm-cov --version 2>/dev/null || true)"
-    if [ "$llvm_cov_version" != "cargo-llvm-cov 0.8.7" ]; then
-        echo "Requires cargo-llvm-cov 0.8.7 in the development environment" >&2
-        return 2
-    fi
-    mkdir -p "$DMESH_REPO/target/coverage"
-    "$DMESH_CARGO_BIN" llvm-cov test -p quic-lite --no-default-features \
-        --lcov --output-path "$DMESH_REPO/target/coverage/quic-lite-core.lcov"
-    "$DMESH_CARGO_BIN" llvm-cov test -p dmesh-server --features udp \
-        --lcov --output-path "$DMESH_REPO/target/coverage/dmesh-server-udp.lcov"
-    # Keep the crate-wide gates executable in CI. Module/scenario coverage is
-    # reviewed from the emitted LCOV and the protocol matrix; these totals are
-    # the non-negotiable backstop against silently losing broad coverage.
-    "$DMESH_CARGO_BIN" llvm-cov report -p quic-lite \
-        --fail-under-lines 80 \
-        --fail-under-regions 85
+    "$DMESH_CARGO_BIN" test -p uart-codec --all-features
+    "$DMESH_CARGO_BIN" test -p dmesh-rawnan
+    "$DMESH_CARGO_BIN" test -p dmesh-discovery --features tokio
 }
 
 transport_fuzz_smoke() {
     require_dmesh_cargo
     configure_ssh_mesh_override
-    "$DMESH_CARGO_BIN" test -p quic-lite --features std
-}
-
-transport_loopback() {
-    shift || true
-    require_dmesh_cargo
-    configure_ssh_mesh_override
-    "$DMESH_CARGO_BIN" test -p quic-lite memory_stream_stress \
-        -- --ignored --nocapture --test-threads=1 "$@"
-}
-
-transport_tcp_loopback() {
-    shift || true
-    require_dmesh_cargo
-    configure_ssh_mesh_override
-    "$DMESH_CARGO_BIN" test -p dmesh-server tcp_memory_stream_64m_baseline \
-        -- --ignored --nocapture --test-threads=1 "$@"
-}
-
-transport_compare() {
-    shift || true
-    local bytes="${DMESH_STREAM_BYTES:-67108864}"
-    DMESH_STREAM_BYTES="$bytes" transport_loopback
-    DMESH_STREAM_BYTES="$bytes" transport_tcp_loopback
-}
-
-object_store_tcp_loopback() {
-    shift || true
-    require_dmesh_cargo
-    configure_ssh_mesh_override
-    "$DMESH_CARGO_BIN" test -p dmesh-server tcp_16m_baseline \
-        -- --ignored --nocapture --test-threads=1 "$@"
+    "$DMESH_CARGO_BIN" test -p uart-codec --all-features
 }
 
 lmesh_restart() {
@@ -596,15 +538,9 @@ case "${1:-musl}" in
     lmesh-test) lmesh_test ;;
     lmesh-control-test) lmesh_control_test ;;
     lmesh-api-generate) lmesh_api_generate ;;
-    object-store-test) object_store_test ;;
     transport-test) transport_test ;;
-    transport-coverage) transport_coverage ;;
     transport-fuzz-smoke) transport_fuzz_smoke ;;
-    transport-loopback) transport_loopback "$@" ;;
-    transport-tcp-loopback) transport_tcp_loopback "$@" ;;
-    transport-compare) transport_compare "$@" ;;
-    object-store-tcp-loopback) object_store_tcp_loopback "$@" ;;
     lmesh-restart) lmesh_restart ;;
     android-libs|android-native) shift; build_android_libs "${1:-debug}" ;;
-    *) echo "Usage: scripts/build.sh {deps|musl|android-libs|check|lmesh-check|lmesh-test|lmesh-control-test|lmesh-api-generate|object-store-test|transport-test|transport-coverage|transport-fuzz-smoke|transport-loopback|transport-tcp-loopback|transport-compare|object-store-tcp-loopback|lmesh-restart}" >&2; exit 2 ;;
+    *) echo "Usage: scripts/build.sh {deps|musl|android-libs|check|lmesh-check|lmesh-test|lmesh-control-test|lmesh-api-generate|transport-test|transport-fuzz-smoke|lmesh-restart}" >&2; exit 2 ;;
 esac

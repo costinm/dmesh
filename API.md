@@ -616,10 +616,53 @@ protocol prerequisite.
 | 4 | `flash_bytes` | `u64` | no | Physical flash capacity when applicable. |
 | 5 | `role` | `string` | yes | main, recovery, linux, or android. |
 
-The transport schema is owned by [the XIP transport spec](../esp-xip-modules/api/transport.API.md).
-The generator includes that definition here.
+# `transport` API (1)
 
-<!-- xip-transport-schema -->
+## 4. `set` — Apply a partial volatile physical transport request
+
+**Platforms:** A L E
+
+**Tier:** internal
+
+**UI:** default
+
+### Request
+
+| Tag | Field | Type | Description |
+|---:|---|---|---|
+| 1 | `mode` | `u8` | Selected physical transport: Off=0, STA=1, UART=5, NAN=6. |
+| 2 | `ssid` | `string` | STA target. |
+| 3 | `bssid` | `string` | Optional directed STA BSSID. |
+| 4 | `channel` | `u8` | Selected channel. |
+| 5 | `raw_tx_rate` | `u8` | Raw injection diagnostic rate. |
+| 6 | `sta_driver_tx` | `bool` | Legacy setting; UDP6 always sends through the ESP-IDF/lwIP socket path. |
+| 7 | `sta_bssid_check_disabled` | `bool` | Disable BSSID filtering in raw RX. |
+| 8 | `sta_ampdu_enabled` | `bool` | Enable STA A-MPDU. |
+| 9 | `sta_11b_rates_disabled` | `bool` | Disable legacy 802.11b rates. |
+| 10 | `sta_raw_rx_enabled` | `bool` | Enable the UDP6 socket receive adapter. |
+| 13 | `espnow_capture` | `bool` | Legacy diagnostic capture setting. |
+| 14 | `nan_dw_interval` | `u8` | NAN discovery-window interval. |
+| 15 | `now` | `u8` | ESP-NOW policy. |
+| 16 | `ap` | `u8` | AP policy. |
+| 17 | `passphrase` | `string` | Volatile WPA2 override. |
+| 18 | `uart` | `u8` | Physical UART selector: 0/default or 1=115200, 2=9600, 3=19200, 4=38400, 5=57600, 6=230400, 7=460800, 8=off, 9=921600. ESP applies the volatile rate after the response finishes; native USB-JTAG ignores it. The UART bearer starts at 115200 and uses this field to upgrade to 921600 after its handshake; `uart.baud` is only a legacy boot override. |
+| 19 | `ndp` | `u8` | NAN Data Path policy. |
+| 24 | `open` | `bool` | Open-mode policy. |
+| 25 | `wake_target` | `string` | MAC address allowed to apply NAN wake. |
+| 26 | `ble` | `u8` | BLE policy. |
+| 27 | `iface` | `string` | Linux-owned interface; omitted on devices. |
+| 28 | `uart_mode` | `u8` | UART ownership: 0 off, 1 line, 2 packet. Overrides the legacy selector's enable state. |
+| 29 | `uart_baud` | `u32` | UART baud rate, independently of the legacy selector. |
+| 30 | `uart_port` | `u8` | UART peripheral index; 3 selects USB Serial/JTAG. |
+| 31 | `radio_mode` | `u8` | Module radio: 0 off, 1 LoRa, 2 FSK. |
+| 32 | `radio_frequency` | `u32` | Radio center frequency in Hz; 0 selects module settings. |
+| 33 | `radio_bandwidth` | `u32` | Radio bandwidth in Hz; 0 selects module settings. |
+| 34 | `radio_bitrate` | `u32` | FSK bitrate; 0 selects module settings. |
+| 35 | `radio_tx_power` | `i32` | Requested radio TX power in dBm. |
+| 36 | `radio_spreading_factor` | `u8` | LoRa spreading factor; 0 selects module settings. |
+| 37 | `radio_coding_rate` | `u8` | LoRa coding-rate denominator; 0 selects module settings. |
+| 38 | `ap_ssid` | `string` | AP network name; independent of the STA target. |
+| 39 | `ap_passphrase` | `string` | AP passphrase; never returned in public status. |
 
 # `companion` API (209)
 
@@ -937,6 +980,8 @@ decoder rejects them.
 | 14 | `direction` | `string` | `download` (default), `upload`, or simultaneous `both`. |
 | 15 | `to` | `string` | Node that runs the probe (envelope destination). |
 | 16 | `verify` | `bool` | Default false. Check deterministic payload bytes on both receivers; byte counts and FIN are always required. |
+| 17 | `link` | `string` | Optional client-local link or interface selector used to originate the probe (`espnow`, `udp6`, `nan`, `ble`, or an interface name). Stripped from the inner `probe.handler` request. |
+| 18 | `via` | `string` | Optional relay hop or route URI used to reach `peer` (`FIRST_HOP:DCID`, `mesh://VIP`, or relay URI). Stripped from the inner `probe.handler` request. |
 
 ### Response
 
@@ -947,6 +992,8 @@ decoder rejects them.
 | 3 | `requested_bytes` | `u64` | Requested payload length. |
 | 4 | `received_bytes` | `u64` | Total received payload bytes, including peer-confirmed upload; pattern-checked only when `verify=true`. |
 | 5 | `elapsed_us` | `u64` | Elapsed time. |
+| 6 | `link` | `string` | Client-side link or interface used for the probe, when known. |
+| 7 | `via` | `string` | Relay hop or route used for the probe, when applicable. |
 
 ## 2. `handler` — Answer a probe with a header and then the probe payload
 

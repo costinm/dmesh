@@ -7,16 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 def read_api(path: str) -> str:
-    source = (ROOT / path).read_text()
-    marker = '<!-- xip-transport-schema -->'
-    if marker in source:
-        # The esp repo moved the consolidated `abi/API.md` (a C ABI document)
-        # to per-component specs; the transport schema is now canonical at
-        # `api/transport.API.md`, which starts with the same section heading.
-        canonical = ROOT.parent / 'esp-xip-modules/api/transport.API.md'
-        schema = canonical.read_text().split('# `transport` API (1)\n', 1)[1]
-        source = source.replace(marker, '# `transport` API (1)\n' + schema)
-    return source
+    return (ROOT / path).read_text()
 
 
 # Groups documented outside the root API.md.

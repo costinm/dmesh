@@ -8,7 +8,6 @@ it preserves other families until that separate transport migration is resolved.
 import json
 import os
 from pathlib import Path
-import re
 import shutil
 import subprocess
 import tempfile
@@ -39,11 +38,11 @@ if not generator:
 with tempfile.TemporaryDirectory(dir=root / 'target', prefix='discovery-api-') as temp:
     directory = Path(temp)
     (directory / 'API.md').write_text(source)
-    subprocess.run([generator, '--api', str(directory / 'API.md'), '--out-tools', str(directory / 'tools.json'),
-                    '--out-rust', str(directory / 'types.rs'), '--rust-tags'], check=True)
+    subprocess.run([generator, '--api', str(directory / 'API.md'), '--out-tools', str(directory / 'tools.json')],
+                   check=True)
     generated = json.loads((directory / 'tools.json').read_text())
     by_name = {tool['name']: tool for tool in generated}
-    for relative in ['crates/lmesh/resources/tools.json', 'crates/dmesh-server/platform/tools.json']:
+    for relative in ['crates/lmesh/resources/tools.json']:
         path = root / relative
         catalog = json.loads(path.read_text())
         tools = catalog['tools'] if isinstance(catalog, dict) else catalog
@@ -51,18 +50,8 @@ with tempfile.TemporaryDirectory(dir=root / 'target', prefix='discovery-api-') a
             if old['name'] in by_name:
                 old.update(by_name[old['name']])
         output(path, json.dumps(catalog, indent=2) + '\n')
-    # Generated request/response structs for this contiguous family are one
-    # prefix in platform_api.rs; replace that generated family as a whole.
-    path = root / 'crates/dmesh-server/src/platform_api.rs'
-    old = path.read_text()
-    new = (directory / 'types.rs').read_text()
-    names = set(re.findall(r'pub struct (\w+)', new))
-    matches = list(re.finditer(r'pub struct (\w+)', old))
-    first = next(m.start() for m in matches if m[1] in names)
-    following = next((m.start() for m in matches if m.start() > first and m[1] not in names), len(old))
-    start = old.rfind('///', 0, first)
-    end = old.rfind('///', first, following) if following < len(old) else following
-    # Locate the first type's documentation before its derive attribute.
-    new_first = re.search(r'pub struct (\w+)', new).start()
-    new_start = new.rfind('///', 0, new_first)
-    output(path, old[:start] + new[new_start:].rstrip() + '\n\n' + old[end:])
+    cbor_args = [generator, '--api', str(directory / 'API.md'),
+                 '--out-api-cbor-dir', str(root / 'android/app-dmesh/src/main/assets/schemas')]
+    if check:
+        cbor_args.insert(1, '--check')
+    subprocess.run(cbor_args, check=True)
