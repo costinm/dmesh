@@ -234,8 +234,8 @@ For a host-only control, run the normal probe over in-memory and UDP loopback
 bearers in release mode, sequentially and without concurrent builds:
 
 ```sh
-cargo test --release -p dmesh-server --lib probe_performance \
-  -- --ignored --nocapture --test-threads=1
+cargo test --release -p quic-tools --features tokio --lib \
+  -- --nocapture --test-threads=1
 ```
 
 Measure CPU utilization during the workload; elapsed owner time includes

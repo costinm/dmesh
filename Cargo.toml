@@ -21,15 +21,6 @@ edition = "2024"
 version = "0.1.0"
 publish = false
 
-[patch."https://github.com/costinm/ssh-mesh"]
-mesh-api = { path = "../rust/ssh-mesh/crates/mesh-api" }
-mesh = { path = "../rust/ssh-mesh/crates/mesh" }
-quic-base = { path = "../rust/ssh-mesh/crates/quic-base" }
-quic-mux = { path = "../rust/ssh-mesh/crates/quic-mux" }
-quic-link = { path = "../rust/ssh-mesh/crates/quic-link" }
-quic-relay = { path = "../rust/ssh-mesh/crates/quic-relay" }
-quic-tools = { path = "../rust/ssh-mesh/crates/quic-tools" }
-
 # DMesh routinely builds release artifacts for Android, host radio services,
 # and ESP firmware from one long-lived target directory. Keep release builds
 # incremental too: production optimization remains enabled, while unchanged
