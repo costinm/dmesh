@@ -5,14 +5,14 @@
 //! MAC). This turns the inventory's authenticated devices into those records, merged into the
 //! node directory without touching an owner's secret; it writes only when something changed.
 
-use dmesh_server::device_record::{DeviceRecord, DeviceStore};
+use crate::device_record::{DeviceRecord, DeviceStore};
 
 use crate::Device;
 
 /// The radio MAC worth keeping: only an ESP's is stable (a phone's NAN/NOW address is
 /// randomized), and only one a NAN or NOW observation reports.
 fn stable_mac(device: &Device) -> Option<[u8; 6]> {
-    let family = dmesh_server::announce::device_class_name(device.announce.as_ref()?.device_class);
+    let family = crate::announce::device_class_name(device.announce.as_ref()?.device_class);
     if !family.starts_with("esp") {
         return None;
     }
@@ -53,8 +53,8 @@ pub fn persist_devices(store: &DeviceStore, devices: &[Device]) -> Result<usize,
 mod tests {
     use super::*;
     use crate::{Identity, P256Identity};
-    use dmesh_server::announce::{self, Announce};
-    use dmesh_server::discovery::{DiscoveryObservation, DiscoveryPacketKind, OBSERVATION_ALL_FIELDS};
+    use crate::announce::{self, Announce};
+    use crate::discovery::{DiscoveryObservation, DiscoveryPacketKind, OBSERVATION_ALL_FIELDS};
     use std::collections::BTreeMap;
 
     fn device(authenticated: bool, class: u8, peer: &str) -> Device {

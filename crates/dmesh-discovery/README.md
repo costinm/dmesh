@@ -2,10 +2,13 @@
 
 Local discovery for DMesh: how a node finds the others near it. Every platform learns
 about neighbours from the same signed CBOR `announce` record
-(`dmesh_server::announce`), whatever carried it: UDP6/UDP4 multicast, NAN, ESP-NOW, BLE.
+(`dmesh_discovery::announce`), whatever carried it: UDP6/UDP4 multicast, NAN, ESP-NOW, BLE.
 
 | Piece | What it does |
 |---|---|
+| `announce`, `discovery`, `discovery_nodes`, `local_networks`, `net`, `provision`, `wake` | `#![no_std]` wire codecs, receiver observations, provisioning records, and NAN wake planning |
+| `device_record` (feature `std`) | persisted `DeviceRecord` and `DeviceStore` TOML files (identity, public keys, trusted controller root key, and private secret) |
+| `controller` (feature `tokio`) | node control ownership ("who can control this node"): `Controllers`, `ControllerLink`, `pair_mux`, `unpair_mux` |
 | `Identity` (`P256Identity`, `UnsignedIdentity`) | the stable device id, and the signature on our announce |
 | `Inventory`, `Device` | typed discovered devices with per-bearer observations, expiry, and `resolve_udp` (`mesh://VIP`, hex id, name -> endpoint, or *why there is none*) |
 | `Engine` | sans-IO: builds our announce, answers directed requests, validates and records what arrives (`on_datagram(&Carrier, bytes)`) |

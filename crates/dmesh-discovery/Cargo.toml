@@ -6,21 +6,37 @@ publish = false
 description = "Local discovery for DMesh: signed announces, a typed device inventory and a sans-IO engine, with an optional tokio UDP6 transport."
 
 [features]
-default = []
-# The UDP6/UDP4 multicast transport and its receive loop. Without it the crate
-# is the sans-IO engine only, so a platform with its own sockets or radios
-# (NAN, NOW, BLE, an Android-owned socket) supplies the transport.
-tokio = ["dep:tokio"]
+default = ["std"]
+std = [
+    "mesh-api/std",
+    "dep:libc",
+    "dep:p256",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:tempfile",
+    "dep:toml",
+    "dep:tracing",
+]
+# The UDP6/UDP4 multicast transport, node controller enrollment (`controller`),
+# and its receive loop. Without it the crate is the sans-IO engine only, so a
+# platform with its own sockets or radios (NAN, NOW, BLE, an Android-owned
+# socket) supplies the transport.
+tokio = ["std", "dep:tokio", "dep:async-trait", "dep:quic-mux", "dep:quic-tools"]
 
 [dependencies]
-# The announce wire format, `tagged` envelope and shared observation model.
-dmesh-server = { path = "../dmesh-server" }
-p256 = { version = "=0.14.0-rc.7", features = ["pem", "ecdsa"] }
-sha2 = "0.11"
-libc = "0.2"
-tracing = "0.1"
-serde_json = "1"
-tokio = { version = "1", default-features = false, features = ["net", "time", "sync", "rt", "macros"], optional = true }
+mesh-api = { git = "https://github.com/costinm/ssh-mesh", package = "mesh-api", default-features = false }
+sha2 = { version = "0.11", default-features = false }
+p256 = { version = "=0.14.0-rc.7", features = ["pem", "ecdsa"], optional = true }
+libc = { version = "0.2", optional = true }
+tracing = { version = "0.1", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+toml = { version = "0.8", optional = true }
+tempfile = { version = "3", optional = true }
+async-trait = { version = "0.1", optional = true }
+quic-mux = { git = "https://github.com/costinm/ssh-mesh", default-features = false, features = ["tokio"], optional = true }
+quic-tools = { git = "https://github.com/costinm/ssh-mesh", default-features = false, features = ["tokio"], optional = true }
+tokio = { version = "1", default-features = false, features = ["io-util", "net", "time", "sync", "rt", "macros"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = ["net", "time", "sync", "rt", "macros"] }

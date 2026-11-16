@@ -5,7 +5,7 @@ use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
-use dmesh_server::announce::{self, Announce};
+use crate::announce::{self, Announce};
 use p256::SecretKey;
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature, SigningKey};
@@ -169,7 +169,7 @@ mod tests {
 
     #[test]
     fn a_signed_announce_becomes_a_first_seen_record_and_an_unsigned_one_does_not() {
-        use dmesh_server::device_record::DeviceRecord;
+        use crate::device_record::DeviceRecord;
         let identity = P256Identity::generate();
         let mut announce = Announce::discovery(identity.device_id(), 16, 5);
         announce.set_device_name("light1");

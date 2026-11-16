@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 
-use dmesh_server::announce::{self, Announce, DiscoveryFacts};
-use dmesh_server::discovery::{
+use crate::announce::{self, Announce, DiscoveryFacts};
+use crate::discovery::{
     DiscoveryObservation, OBSERVATION_BSSID, OBSERVATION_CHANNEL, OBSERVATION_PAYLOAD_FINGERPRINT,
     OBSERVATION_PEER, OBSERVATION_RSSI,
 };
@@ -15,7 +15,9 @@ use crate::engine::Carrier;
 pub type NodeKey = String;
 
 /// Port assumed for an ESP device that advertises none (its raw UDP6 listener).
-pub const ESP_UDP_PORT: u16 = dmesh_server::announce::DEFAULT_ESP_UDP_PORT;
+pub const ESP_UDP_PORT: u16 = crate::announce::DEFAULT_ESP_UDP_PORT;
+
+pub use crate::DEFAULT_EVENT_PORT;
 
 /// One discovered device: its latest validated announce, and what each bearer
 /// has observed of it. A device seen only over NAN or BLE has no UDP sender.
@@ -67,7 +69,7 @@ impl Device {
     /// (a sender never serializes a receiver's interface index). `None` for a
     /// device never seen over UDP and advertising no address.
     pub fn udp_endpoint(&self) -> Result<SocketAddr, NoRoute> {
-        self.udp_endpoint_with(dmesh_server::firmware_profile::DEFAULT_EVENT_PORT)
+        self.udp_endpoint_with(DEFAULT_EVENT_PORT)
     }
 
     /// [`Self::udp_endpoint`] with the port to assume for a device that
@@ -193,11 +195,11 @@ impl Inventory {
             device.announce = Some(announce);
             // Prefer the original record (including outer/future fields). Decoded-only
             // legacy adapters still preserve the peer's signature when encoding it.
-            device.record = if dmesh_server::announce::decode_announce(payload) == Some(announce) {
+            device.record = if crate::announce::decode_announce(payload) == Some(announce) {
                 Some(payload.to_vec())
             } else {
                 let mut record=vec![0;512];
-                dmesh_server::announce::encode(announce,&mut record).map(|n|{record.truncate(n);record})
+                crate::announce::encode(announce,&mut record).map(|n|{record.truncate(n);record})
             };
             device.authenticated = authenticated;
         }
@@ -323,7 +325,7 @@ impl Inventory {
 
     /// The UDP endpoint to use for `target`.
     pub fn resolve_udp(&self, target: &str) -> Result<SocketAddr, NoRoute> {
-        self.resolve_udp_with(target, dmesh_server::firmware_profile::DEFAULT_EVENT_PORT)
+        self.resolve_udp_with(target, DEFAULT_EVENT_PORT)
     }
 
     pub fn resolve_udp_with(&self, target: &str, default_port: u16) -> Result<SocketAddr, NoRoute> {
@@ -346,7 +348,7 @@ impl Device {
     /// The compatibility view for consumers that read a device as JSON (the
     /// Android status text, `discovery.nodes` over the JSON bridge): the shared
     /// `DiscoveredDevice` shape with an `info` projection of the announce.
-    pub fn discovered_view(&self) -> dmesh_server::discovery::DiscoveredDevice {
+    pub fn discovered_view(&self) -> crate::discovery::DiscoveredDevice {
         let ipv6 = |address: [u8; 16]| Ipv6Addr::from(address).to_string();
         let info = match &self.announce {
             Some(announce) => serde_json::json!({
@@ -379,7 +381,7 @@ impl Device {
             .max_by_key(|observation| observation.last_seen_ms)
             .map(|observation| observation.last_peer.clone())
             .unwrap_or_default();
-        dmesh_server::discovery::DiscoveredDevice {
+        crate::discovery::DiscoveredDevice {
             last_seen_ms: self.last_seen_ms,
             peer,
             info,
@@ -396,8 +398,8 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dmesh_server::announce::{DEVICE_CLASS_ANDROID, DEVICE_CLASS_ESP};
-    use dmesh_server::discovery::DiscoveryPacketKind;
+    use crate::announce::{DEVICE_CLASS_ANDROID, DEVICE_CLASS_ESP};
+    use crate::discovery::DiscoveryPacketKind;
 
     fn announce(id_byte: u8, name: &str, port: u16, link_local: Option<&str>, class: u8) -> Announce {
         let mut announce = Announce::discovery([id_byte; 16], 16, 1);
@@ -452,7 +454,7 @@ mod tests {
         see(&mut inventory, announce(2, "droid", 0, None, DEVICE_CLASS_ANDROID), Some("[fe80::cc%9]:5227"));
         assert_eq!(
             inventory.resolve_udp("droid").unwrap().to_string(),
-            format!("[fe80::cc%9]:{}", dmesh_server::firmware_profile::DEFAULT_EVENT_PORT)
+            format!("[fe80::cc%9]:{}", DEFAULT_EVENT_PORT)
         );
         // An ESP that advertises no port uses its raw UDP6 listener.
         see(&mut inventory, announce(3, "esp", 0, None, DEVICE_CLASS_ESP), Some("[fe80::dd%9]:5227"));

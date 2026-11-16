@@ -4,8 +4,8 @@ use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use dmesh_server::announce::{self, Announce, DiscoveryFacts};
-use dmesh_server::discovery::DiscoveryPacketKind;
+use crate::announce::{self, Announce, DiscoveryFacts};
+use crate::discovery::DiscoveryPacketKind;
 
 use crate::identity::{Identity, IdentityError};
 use crate::inventory::{Device, Inventory, hex};
@@ -199,7 +199,7 @@ impl Engine {
                 }
             };
         }
-        let Some(record) = dmesh_server::tagged::decode(bytes) else {
+        let Some(record) = mesh_api::envelope::decode(bytes) else {
             return Received::Ignored;
         };
         let reply_id = record.id;
@@ -275,7 +275,7 @@ impl Engine {
     /// authenticates the announcer, not the supplied receiver metadata. Crawling
     /// never replaces a direct observation on the same bearer or fulfills a
     /// directed-discovery waiter.
-    pub fn observe_crawled(&self, via: &[u8], row: &dmesh_server::discovery_nodes::Observation<'_>) -> bool {
+    pub fn observe_crawled(&self, via: &[u8], row: &crate::discovery_nodes::Observation<'_>) -> bool {
         let Some(announce)=announce::decode_announce(row.record) else {return false};
         if !announce.has_identity() || !announce::verify_identity(announce) || via.len()!=8 {return false;}
         if announce.device_id()==&self.device_id()[..announce.device_id().len()] {return false;}
@@ -295,7 +295,7 @@ impl Engine {
 
     /// The devices in the shape JSON consumers read (see
     /// [`Device::discovered_view`]), keyed by device id.
-    pub fn discovered_view(&self) -> std::collections::BTreeMap<String, dmesh_server::discovery::DiscoveredDevice> {
+    pub fn discovered_view(&self) -> std::collections::BTreeMap<String, crate::discovery::DiscoveredDevice> {
         self.devices()
             .into_iter()
             .map(|device| (device.id.clone(), device.discovered_view()))
@@ -357,7 +357,7 @@ pub(crate) fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use crate::identity::{P256Identity, UnsignedIdentity};
-    use dmesh_server::announce::DEVICE_CLASS_HOST;
+    use crate::announce::DEVICE_CLASS_HOST;
 
     struct Named(&'static str);
 
@@ -491,11 +491,11 @@ mod tests {
         let waiting = a.expect_response(id);
         let mut request = [0u8; 96];
         let used = announce::encode_discovery_request(id, &mut request).unwrap();
-        let carrier = Carrier::radio("now", "02:00:00:00:00:01", dmesh_server::discovery::DiscoveryPacketKind::ActiveSubscribe);
+        let carrier = Carrier::radio("now", "02:00:00:00:00:01", crate::discovery::DiscoveryPacketKind::ActiveSubscribe);
         let Received::Request { reply, .. } = b.on_datagram(&carrier, &request[..used]) else {
             panic!("a request must produce a reply");
         };
-        let back = Carrier::radio("now", "02:00:00:00:00:02", dmesh_server::discovery::DiscoveryPacketKind::ActivePublish);
+        let back = Carrier::radio("now", "02:00:00:00:00:02", crate::discovery::DiscoveryPacketKind::ActivePublish);
         assert!(matches!(a.on_datagram(&back, &reply), Received::Response { .. }));
         let device = waiting.recv_timeout(std::time::Duration::from_millis(100)).unwrap();
         assert_eq!(device.id, hex(&b.device_id()));

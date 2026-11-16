@@ -1,8 +1,7 @@
 //! Signed announcement streams, with optional retained receiver metadata.
-use crate::inventory::Device;
-use dmesh_server::{
+use crate::{
     discovery_nodes::{self as wire, Observation, Options, Origin},
-    stream::{BodyChunkProgress, BodyChunkWriteError, BodyChunkWriter, BodySource, Response},
+    inventory::Device,
 };
 use std::{
     collections::BTreeMap,
@@ -10,17 +9,19 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Same response header and record sequence on host, Android, and ESP.
-pub fn stream_response(
+/// Build the response header and live/retained byte source for `discovery.nodes`.
+///
+/// Transport stream adapters wrap [`NodesSource`] in their response body type.
+pub fn open_stream(
     engine: Arc<crate::Engine>,
     id: u64,
     options: Options,
     live_scopes_only: bool,
-) -> Option<Response> {
+) -> Option<(Vec<u8>, NodesSource)> {
     let mut header = vec![0; 64];
     let n = wire::header(id, &mut header)?;
     header.truncate(n);
-    Some(Response::with_body(
+    Some((
         header,
         NodesSource::new(engine, options, live_scopes_only),
     ))
@@ -99,7 +100,10 @@ fn records(
     rows
 }
 
-struct NodesSource {
+/// Incremental byte producer for `discovery.nodes`, emitting retained rows
+/// (when requested), polling live updates until `options.duration_ms` elapses,
+/// and terminating with [`wire::END`].
+pub struct NodesSource {
     engine: Arc<crate::Engine>,
     until: Instant,
     next_poll: Instant,
@@ -112,7 +116,7 @@ struct NodesSource {
     closing: bool,
 }
 impl NodesSource {
-    fn new(engine: Arc<crate::Engine>, options: Options, scopes: bool) -> Self {
+    pub fn new(engine: Arc<crate::Engine>, options: Options, scopes: bool) -> Self {
         let now = Instant::now();
         let mut source = Self {
             engine,
@@ -174,9 +178,41 @@ impl NodesSource {
             false
         }
     }
-}
-impl BodySource for NodesSource {
-    fn read(&mut self, out: &mut [u8]) -> (usize, bool) {
+
+    /// Borrow the next ready bytes without advancing `position`.
+    ///
+    /// Returns:
+    /// - `Some(slice)` with `!slice.is_empty()` when bytes are ready to send;
+    /// - `None` when either waiting for new observations (`!is_done()`) or
+    ///   completely finished (`is_done()`).
+    pub fn peek_chunk(&mut self) -> Option<&[u8]> {
+        if !self.prepare() {
+            return None;
+        }
+        Some(&self.current[self.position..])
+    }
+
+    /// Advance past `accepted` bytes from [`Self::peek_chunk`].
+    ///
+    /// Returns `false` if `accepted` exceeds the remaining bytes of the
+    /// current record.
+    pub fn consume(&mut self, accepted: usize) -> bool {
+        let remaining = self.current.len().saturating_sub(self.position);
+        if accepted > remaining {
+            return false;
+        }
+        self.position += accepted;
+        true
+    }
+
+    /// Whether the final [`wire::END`] sentinel has been completely consumed.
+    pub fn is_done(&self) -> bool {
+        self.ended && self.position >= self.current.len()
+    }
+
+    /// Fill `out` and return `(count, done)`. `(0, false)` means no bytes are
+    /// available yet; `done` means the final [`wire::END`] byte was included.
+    pub fn read(&mut self, out: &mut [u8]) -> (usize, bool) {
         if !self.prepare() {
             return (0, self.ended);
         }
@@ -185,32 +221,49 @@ impl BodySource for NodesSource {
         self.position += n;
         (n, self.ended && self.position == self.current.len())
     }
-    fn write_chunk(&mut self, writer: &mut dyn BodyChunkWriter) -> Option<BodyChunkProgress> {
-        if !self.prepare() {
-            return Some(if self.ended {
-                BodyChunkProgress::Done
-            } else {
-                BodyChunkProgress::Waiting
-            });
+}
+
+/// Write a `discovery.nodes` response stream (header, retained/live rows, and
+/// [`wire::END`]) directly to an asynchronous writer and close its write half.
+#[cfg(feature = "tokio")]
+pub async fn serve_stream<S>(
+    engine: Arc<crate::Engine>,
+    id: u64,
+    options: Options,
+    live_scopes_only: bool,
+    stream: &mut S,
+) -> std::io::Result<()>
+where
+    S: tokio::io::AsyncWrite + Unpin + ?Sized,
+{
+    use tokio::io::AsyncWriteExt;
+    let Some((header, mut source)) = open_stream(engine, id, options, live_scopes_only) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "failed to encode discovery.nodes header",
+        ));
+    };
+    stream.write_all(&header).await?;
+    while !source.is_done() {
+        if let Some(chunk) = source.peek_chunk() {
+            let n = chunk.len();
+            stream.write_all(chunk).await?;
+            source.consume(n);
+        } else {
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        Some(match writer.write(&self.current[self.position..]) {
-            Ok(0) => BodyChunkProgress::Waiting,
-            Ok(n) if n <= self.current.len() - self.position => {
-                self.position += n;
-                BodyChunkProgress::Accepted(n)
-            }
-            Ok(_) => BodyChunkProgress::Failed,
-            Err(BodyChunkWriteError::Retryable) => BodyChunkProgress::Retryable,
-            Err(BodyChunkWriteError::Failed) => BodyChunkProgress::Failed,
-        })
     }
+    stream.shutdown().await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Carrier, Engine, NoFacts, P256Identity, UnsignedIdentity};
-    use dmesh_server::{announce, cbor::Decoder, discovery::DiscoveryPacketKind};
+    use crate::{
+        Carrier, Engine, NoFacts, P256Identity, UnsignedIdentity, announce,
+        discovery::DiscoveryPacketKind,
+    };
+    use mesh_api::cbor::Decoder;
     fn engine() -> Arc<Engine> {
         Arc::new(Engine::new(
             Arc::new(UnsignedIdentity::from_seed(b"observer")),
@@ -270,7 +323,7 @@ mod tests {
         let mut d = Decoder::new(&response);
         d.skip().unwrap();
         assert!(wire::is_header(
-            dmesh_server::tagged::decode(&response[..d.position()]).unwrap()
+            mesh_api::envelope::decode(&response[..d.position()]).unwrap()
         ));
         let rows = items(&response[d.position()..]);
         assert_eq!(rows.len(), 2);
@@ -396,21 +449,11 @@ mod tests {
             },
             false,
         );
-        struct Refuse(usize);
-        impl BodyChunkWriter for Refuse {
-            fn write(&mut self, data: &[u8]) -> Result<usize, BodyChunkWriteError> {
-                self.0 = data.as_ptr() as usize;
-                Err(BodyChunkWriteError::Retryable)
-            }
-        }
-        let mut writer = Refuse(0);
-        assert!(matches!(
-            source.write_chunk(&mut writer),
-            Some(BodyChunkProgress::Retryable)
-        ));
+        let first_ptr = source.peek_chunk().unwrap().as_ptr() as usize;
         assert_eq!(source.position, 0);
-        assert_eq!(source.current.as_ptr() as usize, writer.0);
+        assert_eq!(source.current.as_ptr() as usize, first_ptr);
         let bytes = drain(&mut source);
         assert_eq!(items(&bytes).len(), 1);
+        assert!(source.is_done());
     }
 }
