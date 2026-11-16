@@ -24,11 +24,11 @@ use crate::load_default_infrastructure_credentials;
 use dmesh_rawnan::linux::*;
 use crate::radio_protocol;
 use dmesh_rawnan::{NanActivePublish, NanState};
-use dmesh_server::discovery::{
+use dmesh_discovery::discovery::{
     DiscoveryObservation as CommonDiscoveryObservation, DiscoveryPacketKind, OBSERVATION_BSSID,
     OBSERVATION_PAYLOAD_FINGERPRINT, OBSERVATION_PEER,
 };
-use dmesh_server::raw_wifi::{
+use dmesh_rawnan::raw_wifi::{
     WifiCaptureCounters, WifiLinkMetrics,
 };
 
@@ -77,7 +77,7 @@ const DEFAULT_DISCOVERY_CHANGE_LOG: &str = "/run/mesh/lmesh-wifi/discovery.jsonl
 
 /// Process-local adapter state around the shared, allocation-free capture
 /// counters. Each lmesh/lmesh-wifi process has one radio owner, while the
-/// counter vocabulary itself is shared with ESP in `dmesh-server`.
+/// counter vocabulary itself is shared with ESP in `dmesh-rawnan`.
 #[derive(Default)]
 struct HostCaptureCounters {
     capture: WifiCaptureCounters,
@@ -126,7 +126,7 @@ struct RadioHost {
     espnow_ingress: Arc<Mutex<Option<Arc<dyn crate::espnow_bearer::EspNowIngress>>>>,
 }
 
-fn announce_summary(announce: &dmesh_server::announce::Announce) -> Value {
+fn announce_summary(announce: &dmesh_discovery::announce::Announce) -> Value {
     json!({
         "kind": announce.kind,
         "device_id": hex_bytes(announce.device_id()),
@@ -172,7 +172,7 @@ impl CaptureHost for RadioHost {
     fn nan_announce(&self, peer: &str, bssid: Option<&str>, payloads: &[&[u8]]) -> NanAnnounce {
         let decoded = payloads
             .iter()
-            .filter_map(|payload| dmesh_server::announce::decode_announce(payload).map(|a|(a,*payload)))
+            .filter_map(|payload| dmesh_discovery::announce::decode_announce(payload).map(|a|(a,*payload)))
             .find(|(item,_)| !is_placeholder_announce_id(item.device_id()));
         let Some((announce,payload)) = decoded else {
             return NanAnnounce::default();
@@ -207,8 +207,8 @@ impl CaptureHost for RadioHost {
             .observe_nan_packet(peer, bssid, kind, payload);
     }
 
-    fn now_sync(&self, peer: [u8; 6], cluster_id: [u8; 6], service_info: &[u8]) {
-        if let Some(announce) = dmesh_server::announce::decode_announce(service_info)
+    fn now_sync(&self, peer: [u8; 6], cluster_id: [u8; 6], service_info: &[u8]) -> Option<Vec<u8>> {
+        if let Some(announce) = dmesh_discovery::announce::decode_announce(service_info)
             && announce_identity_valid(announce)
         {
             self.discovered_devices
@@ -222,12 +222,13 @@ impl CaptureHost for RadioHost {
                     service_info,
                 );
         }
+        None
     }
 
     fn now_discovery(&self, peer: [u8; 6], bssid: Option<[u8; 6]>, payload: &[u8]) -> Option<Vec<u8>> {
         // NOW discovery is NAN's discovery in NOW's envelope: observe it like a NAN
         // descriptor. Whatever is not an announce is not discovery and is ignored.
-        let announce = dmesh_server::announce::decode_announce(payload)?;
+        let announce = dmesh_discovery::announce::decode_announce(payload)?;
         if !announce_identity_valid(announce) {
             return None;
         }
@@ -268,12 +269,14 @@ impl CaptureHost for RadioHost {
 pub struct RadioService {
     history: Arc<Mutex<VecDeque<RadioEvent>>>,
     discovered_devices: Arc<Mutex<DiscoveredDeviceRegistry>>,
+    #[allow(dead_code)]
     radios: Arc<Vec<RadioAdapter>>,
     raw_wifi_listeners: Arc<Mutex<HashSet<String>>>,
     raw_wifi_stop_flags: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     espnow_ingress: Arc<Mutex<Option<Arc<dyn crate::espnow_bearer::EspNowIngress>>>>,
     /// The application side of the raw capture loops.
     capture_host: Arc<RadioHost>,
+    #[allow(dead_code)]
     rawnan_subscribers: Arc<Mutex<HashMap<String, usize>>>,
     rawnan_state: Arc<Mutex<NanState>>,
     active_nan_publish: Arc<Mutex<NanActivePublish>>,
@@ -328,7 +331,7 @@ struct DiscoveredDeviceRegistry {
 }
 
 /// `(source, peer, announce)` for each announce admitted from a radio bearer.
-pub type AnnounceSink = Arc<dyn Fn(&str, &str, dmesh_server::announce::Announce, &[u8]) + Send + Sync>;
+pub type AnnounceSink = Arc<dyn Fn(&str, &str, dmesh_discovery::announce::Announce, &[u8]) + Send + Sync>;
 
 #[derive(Clone, Debug)]
 struct DiscoveredBss {
@@ -559,10 +562,10 @@ impl DiscoveredDeviceRegistry {
         source: &str,
         peer: String,
         bssid: Option<String>,
-        announce: dmesh_server::announce::Announce,
+        announce: dmesh_discovery::announce::Announce,
     ) {
         let mut bytes=[0;512];
-        let n=dmesh_server::announce::encode(announce,&mut bytes).unwrap_or(0);
+        let n=dmesh_discovery::announce::encode(announce,&mut bytes).unwrap_or(0);
         self.observe_announce_wire(source,peer,bssid,announce,&bytes[..n]);
     }
 
@@ -571,7 +574,7 @@ impl DiscoveredDeviceRegistry {
         source: &str,
         peer: String,
         bssid: Option<String>,
-        announce: dmesh_server::announce::Announce,
+        announce: dmesh_discovery::announce::Announce,
         payload: &[u8],
     ) {
         let device_id = hex_bytes(announce.device_id());
@@ -605,8 +608,8 @@ impl DiscoveredDeviceRegistry {
                 "udp_port": (announce.udp_port != 0).then_some(announce.udp_port),
                 "udp_link_local_v6": announce.udp_link_local_v6().map(Ipv6Addr::from).map(|address| address.to_string()),
                 "public_key": (!announce.public_key().is_empty()).then(|| hex_bytes(announce.public_key())),
-                "vip6": dmesh_server::announce::virtual_ip6(announce.public_key())
-                    .or_else(|| dmesh_server::announce::virtual_ip6_from_identity_hint(announce.device_id()))
+                "vip6": dmesh_discovery::announce::virtual_ip6(announce.public_key())
+                    .or_else(|| dmesh_discovery::announce::virtual_ip6_from_identity_hint(announce.device_id()))
                     .map(Ipv6Addr::from).map(|address| address.to_string()),
                 // This is the exact discovery identity accepted by the QUIC
                 // forwarding handler, not a display-only device id or MAC.
@@ -947,7 +950,7 @@ fn discovered_device_json(entry: &DiscoveredDevice) -> Value {
             .map(|offset| u8::from_str_radix(&public_key[offset..offset + 2], 16))
             .collect::<std::result::Result<Vec<_>, _>>();
         if let Ok(key) = key
-            && let Some(address) = dmesh_server::announce::virtual_ip6(&key)
+            && let Some(address) = dmesh_discovery::announce::virtual_ip6(&key)
         {
             announce["vip6"] = Value::String(Ipv6Addr::from(address).to_string());
         }
@@ -981,11 +984,11 @@ fn discovered_device_json(entry: &DiscoveredDevice) -> Value {
         .and_then(Value::as_u64)
         .and_then(|value| u8::try_from(value).ok())
     {
-        Some(class) if dmesh_server::announce::is_esp_device_class(class) => {
-            dmesh_server::announce::device_class_name(class)
+        Some(class) if dmesh_discovery::announce::is_esp_device_class(class) => {
+            dmesh_discovery::announce::device_class_name(class)
         }
-        Some(dmesh_server::announce::DEVICE_CLASS_ANDROID) => "android",
-        Some(dmesh_server::announce::DEVICE_CLASS_HOST) => "host",
+        Some(dmesh_discovery::announce::DEVICE_CLASS_ANDROID) => "android",
+        Some(dmesh_discovery::announce::DEVICE_CLASS_HOST) => "host",
         _ => "unknown",
     };
     let mut value = json!({
@@ -1018,8 +1021,8 @@ fn discovered_device_json(entry: &DiscoveredDevice) -> Value {
 /// observation while older devices are being upgraded. Keeping this check in
 /// the radio library prevents UDP, NAN, and local sibling ingress from
 /// gradually accepting different identities.
-fn announce_identity_valid(announce: dmesh_server::announce::Announce) -> bool {
-    dmesh_server::announce::verify_identity(announce)
+fn announce_identity_valid(announce: dmesh_discovery::announce::Announce) -> bool {
+    dmesh_discovery::announce::verify_identity(announce)
 }
 
 impl RadioService {
@@ -1060,7 +1063,7 @@ impl RadioService {
         source: &str,
         peer: String,
         bssid: Option<String>,
-        announce: dmesh_server::announce::Announce,
+        announce: dmesh_discovery::announce::Announce,
     ) -> bool {
         if !announce_identity_valid(announce) {
             return false;
@@ -1521,15 +1524,15 @@ impl RadioService {
         if target_mac == [0; 6] || target_mac[0] & 1 != 0 {
             return json!({"ok": false, "error": "nan.wakeup to must be a unicast MAC", "to": target});
         }
-        let request = dmesh_server::control::Request::TransportSet {
-            kind: dmesh_server::control::TransportKind::Sta,
-            config: dmesh_server::control::TransportConfig {
+        let request = dmesh_discovery::control::Request::TransportSet {
+            kind: dmesh_discovery::control::TransportKind::Sta,
+            config: dmesh_discovery::control::TransportConfig {
                 wake_target: Some(target_mac),
-                ..dmesh_server::control::TransportConfig::default()
+                ..dmesh_discovery::control::TransportConfig::default()
             },
         };
         let mut record = [0u8; 96];
-        let Some(used) = dmesh_server::control::encode_request(request, None, &mut record) else {
+        let Some(used) = dmesh_discovery::control::encode_request(request, None, &mut record) else {
             return json!({"ok": false, "error": "encode targeted STA activation"});
         };
         let request_id = now_millis_u64();
@@ -1563,7 +1566,7 @@ impl RadioService {
             anyhow::bail!("pairing wake target must be a unicast MAC");
         }
         let mut record = [0u8; 96];
-        let used = dmesh_server::announce::encode_nan_pair_wakeup_request(
+        let used = dmesh_discovery::announce::encode_nan_pair_wakeup_request(
             target_mac,
             now_millis_u64(),
             &mut record,
@@ -1611,7 +1614,7 @@ impl RadioService {
             // DW retransmissions. Receivers use it to suppress duplicate
             // replies from Android/host framework Subscribe repetition.
             let Some(used) =
-                dmesh_server::announce::encode_discovery_request(started_at, &mut record)
+                dmesh_discovery::announce::encode_discovery_request(started_at, &mut record)
             else {
                 return json!({"ok": false, "iface": iface, "error": "encode announce.discovery"});
             };
@@ -2025,7 +2028,7 @@ impl RadioService {
             let mut record = [0u8; 96];
             let request_id = now_millis_u64();
             let Some(used) =
-                dmesh_server::announce::encode_discovery_request(request_id, &mut record)
+                dmesh_discovery::announce::encode_discovery_request(request_id, &mut record)
             else {
                 return json!({"ok": false, "error": "encode announce.discovery"});
             };
@@ -4314,6 +4317,7 @@ fn wpa_owner_iface_names(anchor_iface: &str, legacy_sta_iface: &str) -> Vec<Stri
 struct ApRuntime {
     _owner_socket: Nl80211Socket,
     ssid: String,
+    #[allow(dead_code)]
     channel: u8,
     ht40: bool,
     beacon_interval_tu: u16,
@@ -4792,7 +4796,7 @@ fn is_placeholder_announce_id(device_id: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dmesh_server::raw_wifi::WIFI_LINK_METRICS_SCHEMA_VERSION;
+    use dmesh_rawnan::raw_wifi::WIFI_LINK_METRICS_SCHEMA_VERSION;
     use p256::SecretKey;
     use p256::ecdsa::SigningKey;
     use p256::ecdsa::signature::Signer;
@@ -4887,7 +4891,7 @@ mod tests {
                 .unwrap()
                 .push((source.to_owned(), peer.to_owned(), announce.uptime_secs));
         }));
-        let announce = dmesh_server::announce::Announce::discovery([0x61; 16], 16, 9);
+        let announce = dmesh_discovery::announce::Announce::discovery([0x61; 16], 16, 9);
         assert!(service.observe_discovered_announce("nan_sd", "aa:bb:cc:dd:ee:61".to_owned(), None, announce));
         assert_eq!(
             seen.lock().unwrap().as_slice(),
@@ -4897,12 +4901,12 @@ mod tests {
 
     #[test]
     fn announce_identity_validation_accepts_unsigned_devices_and_rejects_fake_hosts() {
-        let unsigned = dmesh_server::announce::Announce::discovery([0x41; 16], 16, 1);
+        let unsigned = dmesh_discovery::announce::Announce::discovery([0x41; 16], 16, 1);
         assert!(announce_identity_valid(unsigned));
 
         let mut fake = unsigned;
         assert!(fake.set_public_key(b"not-a-p256-spki"));
-        assert!(fake.set_signature(&[0x55; dmesh_server::announce::SIGNATURE_LEN]));
+        assert!(fake.set_signature(&[0x55; dmesh_discovery::announce::SIGNATURE_LEN]));
         assert!(!announce_identity_valid(fake));
     }
 
@@ -4916,10 +4920,10 @@ mod tests {
         let digest = Sha256::digest(public_key.as_bytes());
         let mut device_id = [0_u8; 16];
         device_id.copy_from_slice(&digest[..16]);
-        let mut announce = dmesh_server::announce::Announce::discovery(device_id, 16, 1);
+        let mut announce = dmesh_discovery::announce::Announce::discovery(device_id, 16, 1);
         assert!(announce.set_public_key(public_key.as_bytes()));
         let mut signing_bytes = [0_u8; 384];
-        let used = dmesh_server::announce::signing_bytes(announce, &mut signing_bytes).unwrap();
+        let used = dmesh_discovery::announce::signing_bytes(announce, &mut signing_bytes).unwrap();
         let signature: Signature = signing_key.sign(&signing_bytes[..used]);
         assert!(announce.set_signature(signature.to_bytes().as_ref()));
 
@@ -4933,7 +4937,7 @@ mod tests {
         let mut registry = DiscoveredDeviceRegistry::with_change_log(path.clone());
         let mut id = [0_u8; 16];
         id[..6].copy_from_slice(b"peer-a");
-        let announce = dmesh_server::announce::Announce::discovery(id, 6, 1);
+        let announce = dmesh_discovery::announce::Announce::discovery(id, 6, 1);
         registry.observe_announce(
             "nan",
             "02:00:00:00:00:01".to_string(),
@@ -4979,7 +4983,7 @@ mod tests {
             DiscoveredDeviceRegistry::with_change_log(dir.path().join("nodes.jsonl"));
         let mut id = [0_u8; 16];
         id[..10].copy_from_slice(b"android-p7");
-        let mut multicast = dmesh_server::announce::Announce::discovery(id, 10, 1);
+        let mut multicast = dmesh_discovery::announce::Announce::discovery(id, 10, 1);
         multicast.set_udp_port(3336);
         multicast.set_udp_link_local_v6("fe80::1234".parse::<Ipv6Addr>().unwrap().octets());
         registry.observe_announce(
@@ -4991,7 +4995,7 @@ mod tests {
 
         // The generic directed reply has no sender-local endpoint because it
         // cannot know which local interface carried the request.
-        let reply = dmesh_server::announce::Announce::discovery(id, 10, 2);
+        let reply = dmesh_discovery::announce::Announce::discovery(id, 10, 2);
         registry.observe_announce(
             "udp_multicast",
             "[fe80::1234%5]:3336".to_owned(),
@@ -5019,7 +5023,7 @@ mod tests {
             "udp_multicast",
             "[fe80::5678%5]:3336".to_owned(),
             None,
-            dmesh_server::announce::Announce::discovery(id, 10, 1),
+            dmesh_discovery::announce::Announce::discovery(id, 10, 1),
         );
 
         let entry = registry.devices.get(&hex_bytes(&id[..10])).unwrap();
@@ -5073,7 +5077,7 @@ mod tests {
         let path = dir.path().join("discovery.jsonl");
         let mut id = [0_u8; 16];
         id[..6].copy_from_slice(b"peer-r");
-        let announce = dmesh_server::announce::Announce::discovery(id, 6, 1);
+        let announce = dmesh_discovery::announce::Announce::discovery(id, 6, 1);
         DiscoveredDeviceRegistry::with_change_log(path.clone()).observe_announce(
             "nan",
             "02:00:00:00:00:02".to_string(),
@@ -5553,14 +5557,14 @@ mod tests {
 
 /// Station links of the AP interface `iface`, from an nl80211 station dump, as the common
 /// `telemetry.wifi_link` rows.
-pub fn station_links(iface: &str) -> Result<Vec<dmesh_server::platform_api::WifiLink>> {
+pub fn station_links(iface: &str) -> Result<Vec<crate::rpc_router::WifiLink>> {
     let interface_index = ifindex(iface)?;
     let socket = Nl80211Socket::open()?;
     Ok(socket
         .station_dump(interface_index)?
         .iter()
         .map(|station| station_link_metrics(station, interface_index))
-        .map(|metrics| dmesh_server::platform_api::WifiLink::from(&metrics))
+        .map(|metrics| crate::rpc_router::WifiLink::from(&metrics))
         .collect())
 }
 

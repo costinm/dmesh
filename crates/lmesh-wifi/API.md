@@ -5,7 +5,7 @@ radio library that `lmesh` currently links. They are **not part of the DMesh
 common API** (`../../API.md`): Android and the firmware do not implement them, and
 `lmesh` will stop registering them when it no longer depends on `lmesh-wifi`
 (it will use `crates/rawnan` for NAN and NOW, `crates/lmesh-wpa` for the station and
-P2P AP, and `dmesh-server` for UDP discovery). The crate is intended to move to its
+P2P AP, and `dmesh-discovery` for UDP discovery). The crate is intended to move to its
 own repository for Wi-Fi radio experiments.
 
 Numbers and field tags are fixed so the generated catalog and typed requests

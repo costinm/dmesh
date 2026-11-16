@@ -6,10 +6,13 @@ edition.workspace = true
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
-dmesh-server = { path = "../dmesh-server" }
 dmesh-discovery = { path = "../dmesh-discovery", features = ["tokio"] }
 dmesh-rawnan = { path = "../rawnan", features = ["linux"] }
-quic-lite = { path = "../quic-lite", features = ["tokio"] }
+mesh-api = { git = "https://github.com/costinm/ssh-mesh", package = "mesh-api" }
+quic-base = { git = "https://github.com/costinm/ssh-mesh" }
+quic-link = { git = "https://github.com/costinm/ssh-mesh", features = ["tokio"] }
+quic-mux = { git = "https://github.com/costinm/ssh-mesh", features = ["tokio"] }
+quic-tools = { git = "https://github.com/costinm/ssh-mesh", features = ["tokio"] }
 libc = "0.2"
 lmesh-wpa = { path = "../lmesh-wpa" }
 minicbor = "2.2"

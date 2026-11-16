@@ -11,7 +11,7 @@ internal adapter/test functions. They are intentionally absent from public
 tool catalogs. Bearer lifecycle uses common `transport.set`; discovery uses
 `discovery.nodes`; local NAN health uses
 `telemetry.nan_status`; probing uses the bearer-neutral `probe` QUIC stream
-service from the common `dmesh-server` schema.
+service from `quic-tools`.
 
 The shared NAN frame/state implementation is documented in
 [`dmesh-rawnan/README.md`](../rawnan/README.md). The Linux `lmesh` daemon

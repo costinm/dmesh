@@ -5,32 +5,22 @@ use std::{
 };
 
 use crate::mesh_core::{LmeshService, LocalDiscovery};
-use anyhow::{Context, Result};
-use dmesh_server::registry::{
-    Call, CallContext, Handler, LocalOnly, Method, Registry, Reply, methods,
+use crate::rpc_router::{
+    AcceptedStream, Call, CallContext, Handler, LocalOnly, Method, MethodStreamHandler,
+    OpenStreamFuture, Registry, RegistryStreamHandler, Reply, StreamHandler, StreamOutcome,
+    TypedHandler, methods,
 };
+use anyhow::{Context, Result};
 use tokio::time::{Duration, sleep};
 use tracing::{debug, error, warn};
-
-pub type HostPacketPool =
-    quic_lite::packet_pool::PacketPool<32, { quic_lite::DEFAULT_PACKET_POOL_SLOT_SIZE }>;
-pub type HostQuicNode = quic_lite::QuicNode<HostPacketPool>;
 
 /// Keep host multicast presence aligned with NAN/NOW/ESP refreshes. Operators
 /// may still override this through `LMESH_ANNOUNCE_INTERVAL_SECS`.
 const DEFAULT_ANNOUNCE_INTERVAL_SECS: u64 = 5 * 60;
 const ANNOUNCE_INTERVAL_ENV: &str = "LMESH_ANNOUNCE_INTERVAL_SECS";
 const RAW_WIFI_CHANNEL_ENV: &str = "LMESH_RAW_WIFI_CHANNEL";
-
-fn quic_driver_exit_error(
-    result: Result<Result<(), quic_lite::QuicNodeEgressError>, tokio::task::JoinError>,
-) -> anyhow::Error {
-    match result {
-        Ok(Ok(())) => anyhow::anyhow!("lmesh QUIC node driver exited unexpectedly"),
-        Ok(Err(error)) => anyhow::anyhow!("lmesh QUIC node driver failed: {error:?}"),
-        Err(error) => anyhow::anyhow!("lmesh QUIC node driver task failed: {error}"),
-    }
-}
+const MUX_TCP_ENV: &str = "LMESH_MUX_TCP";
+const MUX_UDS_ENV: &str = "LMESH_MUX_UDS";
 
 /// Process-local endpoints for a Linux mesh service.
 ///
@@ -41,47 +31,51 @@ fn quic_driver_exit_error(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RuntimeDefaults {
     pub control_socket: &'static str,
+    /// Local `quic-mux` Unix stream socket (`""` disables it unless `LMESH_MUX_UDS` overrides).
+    pub mux_socket: &'static str,
     pub http_port: u16,
     /// Normal unicast object/QUIC-lite listener: the one DMesh UDP port every platform
     /// (ESP32, Android, Linux) serves, so a peer needs no per-platform port. A client such
     /// as `dmesh-cli` binds an ephemeral port instead of this one.
     pub udp_port: u16,
+    /// `quic-mux` TCP stream listener port (`5229`, matching ESP `mod_mux` `--stream 4`; `0` disables unless `LMESH_MUX_TCP` overrides).
+    pub mux_tcp_port: u16,
 }
 
 /// Stable endpoints for the Linux mesh daemon.
 pub const LMESH_DEFAULTS: RuntimeDefaults = RuntimeDefaults {
     control_socket: "/run/mesh/lmesh/mesh.sock.cbor",
+    mux_socket: "/run/mesh/lmesh/mesh.mux.sock",
     http_port: 18981,
     udp_port: 3339,
+    mux_tcp_port: 5229,
 };
 
-/// Generated public catalog. Only reviewed entries carry numeric tags, so the
-/// CBOR path cannot accidentally expose or number a legacy control method.
-static CONTROL_CATALOG: LazyLock<mesh::tagged::TaggedCatalog> = LazyLock::new(|| {
-    mesh::tagged::TaggedCatalog::from_tools_json(&public_tools_json())
-        .expect("lmesh tools.json must be a valid tagged catalog")
-});
-static COMMON_REGISTRY: LazyLock<mesh::registry::ServiceRegistry> = LazyLock::new(|| {
-    mesh::registry::ServiceRegistry::new("lmesh").with_tools_json(public_tools_json())
-});
+static COMMON_REGISTRY: LazyLock<mesh::registry::ServiceRegistry> =
+    LazyLock::new(|| mesh::registry::ServiceRegistry::new("lmesh"));
 
-/// Installed catalog shared by the local daemon and device clients.
-fn public_tools_json() -> serde_json::Value {
-    let catalog: serde_json::Value =
-        serde_json::from_str(include_str!("../../lmesh/resources/tools.json"))
-            .expect("lmesh tools.json must be valid JSON");
-    catalog
-        .get("tools")
-        .cloned()
-        .expect("lmesh tools.json must contain tools")
+/// Resolve the installed lmesh schema catalog dynamically from disk via the
+/// shared `CatalogResolver` (re-reading automatically if the file changes).
+fn resolve_lmesh_catalog() -> Result<Arc<mesh::catalog::ResolvedCatalog>> {
+    if let Some(resolved) = mesh::catalog::service_catalog_resolver().resolve("lmesh") {
+        return resolved;
+    }
+    #[cfg(test)]
+    {
+        let dev_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../lmesh/resources/tools.json");
+        if dev_path.is_file() {
+            return mesh::catalog::service_catalog_resolver().load_path("lmesh", dev_path);
+        }
+    }
+    mesh::catalog::service_catalog_resolver().require("lmesh")
 }
 
 /// Registers an executable's own handlers (for example a bearer it owns) with
-/// the service registry. It receives the running QUIC node, for attaching
-/// bearers, and this node's compressed P-256 public key, the default
-/// control-plane root a pairing installs.
+/// the service registry. It receives this node's compressed P-256 public key,
+/// the default control-plane root a pairing installs.
 pub type RegistryExtension =
-    Box<dyn FnOnce(&Registry, &quic_lite::tokio::TokioNode, &[u8], &Arc<LocalDiscovery>) + Send>;
+    Box<dyn FnOnce(&Registry, &[u8], &Arc<LocalDiscovery>) + Send>;
 
 /// Who owns the Wi-Fi radio. `Internal` is this crate's `RadioService` (the
 /// experimental AP/NAN/NOW stack). `External` means the executable runs the radio
@@ -95,14 +89,14 @@ pub enum RadioOwner {
 /// Run the shared Linux mesh control plane.
 pub async fn run_mesh_service(
     defaults: RuntimeDefaults,
-    node: HostQuicNode,
-    now_bearer: quic_lite::BearerId,
+    now_mux: Option<quic_mux::TokioMux>,
+    mux_acceptors: Vec<quic_mux::TokioMuxAcceptor>,
     radio: RadioOwner,
     extend: RegistryExtension,
 ) -> Result<()> {
     let (trace_buffer, _trace_guard) = mesh::local_trace::init("lmesh");
     mesh::local_trace::serve("lmesh", trace_buffer.clone());
-    if let Err(error) = run_server(defaults, node, now_bearer, radio, extend).await {
+    if let Err(error) = run_server(defaults, now_mux, mux_acceptors, radio, extend).await {
         // mesh-init intentionally discards child stderr in the production
         // service unit. Persist the startup failure in the service log so a
         // stale control socket is diagnosable without changing radio state or
@@ -115,22 +109,13 @@ pub async fn run_mesh_service(
 
 async fn run_server(
     defaults: RuntimeDefaults,
-    node: HostQuicNode,
-    now_bearer: quic_lite::BearerId,
+    now_mux: Option<quic_mux::TokioMux>,
+    mux_acceptors: Vec<quic_mux::TokioMuxAcceptor>,
     radio: RadioOwner,
     extend: RegistryExtension,
 ) -> Result<()> {
     crate::mesh_core::note_service_started();
     let external_radio = matches!(radio, RadioOwner::External);
-    let (node, driver) = quic_lite::tokio::TokioNodeDriver::new(
-        node,
-        quic_lite::AssociationLimits::host().connection,
-    );
-    // Keep the driver task handle so the service cannot remain "healthy" with
-    // a closed QUIC stream receiver. In particular, if the driver exits or
-    // panics, let mesh-init restart the whole service (and its radio/bearers)
-    // instead of spinning in the accept loop and logging BrokenPipe forever.
-    let mut quic_driver = tokio::task::spawn_local(async move { driver.run().await });
     let mut discovery = LocalDiscovery::new(None).await?;
     // The shared LAN label is local configuration only. The wire announce
     // carries the resulting IPv6 address and this service's distinct UDP
@@ -141,7 +126,9 @@ async fn run_server(
     discovery.start().await?;
     let discovery = Arc::new(discovery);
     let service = Arc::new(LmeshService::new(discovery.clone()));
-    service.set_now_quic_client(node.clone(), now_bearer);
+    if let Some(mux) = now_mux {
+        service.set_now_mux(mux);
+    }
     if let RadioOwner::Internal(ingress) = radio {
         service.set_espnow_ingress(ingress);
     }
@@ -193,29 +180,59 @@ async fn run_server(
         });
     }
     // One registry serves both the QUIC streams and the control socket.
-    let extension_node = node.clone();
     let public_key = discovery.public_key_bytes().to_vec();
     let extension_discovery = discovery.clone();
     let cbor_handler = LmeshCborHandler::new(service.clone(), external_radio, move |registry| {
-        extend(registry, &extension_node, &public_key, &extension_discovery)
+        extend(registry, &public_key, &extension_discovery)
     });
-    // QUIC streams are served from the registry as handler streams (header,
-    // then an optional raw body). A text-named common ssh-mesh method is
-    // numbered at the edge, before dispatch.
-    let udp_handler = Arc::new(
-        dmesh_server::stream_service::RegistryStreamHandler::new(cbor_handler.registry.clone())
+    // QUIC streams route passive `ComponentDirectory` components first (single-pass
+    // envelope decode + lazy activation) and fall back to `RegistryStreamHandler`
+    // for legacy numeric methods. A text-named common ssh-mesh method is numbered
+    // at the edge before fallback dispatch.
+    let udp_fallback = Arc::new(
+        RegistryStreamHandler::new(cbor_handler.registry.clone())
             .with_header_rewrite(number_common_names_in_header),
     );
-    tokio::task::spawn_local(async move {
-        loop {
-            if let Err(error) =
-                dmesh_server::stream_service::accept_one(&node, udp_handler.as_ref()).await
-            {
-                warn!(%error, "lmesh_quic_stream_failed");
-            }
-        }
+    let mux_net_fallback = udp_fallback.clone();
+    let mux_local_fallback = Arc::new(
+        RegistryStreamHandler::new(cbor_handler.registry.clone())
+            .local()
+            .with_header_rewrite(number_common_names_in_header),
+    );
+    let udp_handler = Arc::new(LmeshNodeStreamHandler {
+        components: cbor_handler.components.clone(),
+        fallback: udp_fallback,
     });
+    for mut acceptor in mux_acceptors {
+        let udp_handler = udp_handler.clone();
+        tokio::task::spawn_local(async move {
+            while let Some(mut stream) = acceptor.accept().await {
+                if let Err(error) = udp_handler.accept(&mut stream).await {
+                    warn!(%error, "lmesh_quic_stream_failed");
+                }
+            }
+        });
+    }
     debug!(port = defaults.udp_port, "lmesh_quic_node_started");
+    if let Some(mux_tcp_addr) = resolve_mux_tcp_bind(defaults)? {
+        let tcp_listener = bind_mux_tcp_listener(mux_tcp_addr).await?;
+        let local_addr = tcp_listener.local_addr().unwrap_or(mux_tcp_addr);
+        tokio::spawn(serve_component_mux_tcp_listener(
+            tcp_listener,
+            cbor_handler.components.clone(),
+            mux_net_fallback,
+        ));
+        debug!(addr = %local_addr, "lmesh_mux_tcp_started");
+    }
+    if let Some(mux_uds_path) = resolve_mux_uds_path(defaults)? {
+        let uds_listener = bind_mux_uds_listener(&mux_uds_path).await?;
+        tokio::spawn(serve_component_mux_uds_listener(
+            uds_listener,
+            cbor_handler.components.clone(),
+            mux_local_fallback,
+        ));
+        debug!(path = %mux_uds_path.display(), "lmesh_mux_uds_started");
+    }
     // The validated multicast observation updates this daemon's radio inventory.
     let announce_service = service.clone();
     discovery
@@ -317,14 +334,7 @@ async fn run_server(
         }
     });
     loop {
-        let stream = tokio::select! {
-            result = &mut quic_driver => {
-                let error = quic_driver_exit_error(result);
-                error!(%error, "lmesh_quic_driver_stopped");
-                return Err(error);
-            }
-            result = listener.accept() => result.context("lmesh CBOR accept")?,
-        };
+        let stream = listener.accept().await.context("lmesh CBOR accept")?;
         let handler = cbor_handler.clone();
         tokio::spawn(async move {
             if let Err(error) = handle_seqpacket_connection(stream, handler).await {
@@ -356,6 +366,338 @@ fn parse_announce_interval_secs(value: &str) -> Option<u64> {
 
 fn standalone_listen_path(defaults: RuntimeDefaults) -> Result<PathBuf> {
     resolve_relative_path(PathBuf::from(defaults.control_socket))
+}
+
+fn is_disabled_endpoint_value(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.is_empty()
+        || trimmed == "0"
+        || trimmed.eq_ignore_ascii_case("none")
+        || trimmed.eq_ignore_ascii_case("off")
+}
+
+fn parse_mux_tcp_override(value: &str) -> Result<Option<std::net::SocketAddr>> {
+    let trimmed = value.trim();
+    if is_disabled_endpoint_value(trimmed) {
+        return Ok(None);
+    }
+    if let Ok(port) = trimmed.parse::<u16>() {
+        return Ok((port != 0).then(|| {
+            std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port))
+        }));
+    }
+    let addr = trimmed
+        .parse::<std::net::SocketAddr>()
+        .with_context(|| format!("invalid {MUX_TCP_ENV} address {trimmed:?}"))?;
+    Ok(Some(addr))
+}
+
+fn resolve_mux_tcp_bind(defaults: RuntimeDefaults) -> Result<Option<std::net::SocketAddr>> {
+    if let Ok(raw) = std::env::var(MUX_TCP_ENV) {
+        return parse_mux_tcp_override(&raw);
+    }
+    Ok((defaults.mux_tcp_port != 0).then(|| {
+        std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, defaults.mux_tcp_port))
+    }))
+}
+
+fn resolve_mux_uds_path(defaults: RuntimeDefaults) -> Result<Option<PathBuf>> {
+    let raw = std::env::var(MUX_UDS_ENV).unwrap_or_else(|_| defaults.mux_socket.to_owned());
+    let trimmed = raw.trim();
+    if is_disabled_endpoint_value(trimmed) {
+        return Ok(None);
+    }
+    Ok(Some(resolve_relative_path(PathBuf::from(trimmed))?))
+}
+
+/// Bind a TCP listener for `quic-mux`, falling back to `0.0.0.0` if `[::]` is unavailable.
+pub async fn bind_mux_tcp_listener(addr: std::net::SocketAddr) -> Result<tokio::net::TcpListener> {
+    match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => Ok(listener),
+        Err(err) if addr.ip() == std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED) => {
+            let v4 = std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, addr.port()));
+            tokio::net::TcpListener::bind(v4)
+                .await
+                .with_context(|| format!("bind lmesh mux TCP listener on {addr} (and {v4}): {err}"))
+        }
+        Err(err) => Err(err).with_context(|| format!("bind lmesh mux TCP listener on {addr}")),
+    }
+}
+
+/// Bind a local Unix stream listener for `quic-mux`, refusing to clobber an active daemon socket.
+pub async fn bind_mux_uds_listener(path: &std::path::Path) -> Result<tokio::net::UnixListener> {
+    if path.exists() {
+        anyhow::ensure!(
+            tokio::net::UnixStream::connect(path).await.is_err(),
+            "lmesh mux socket {} is already active",
+            path.display()
+        );
+    }
+    if let Err(error) = std::fs::remove_file(path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(error).with_context(|| format!("remove stale {}", path.display()));
+    }
+    let listener = tokio::net::UnixListener::bind(path)
+        .with_context(|| format!("bind lmesh mux socket {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
+    }
+    Ok(listener)
+}
+
+/// Serve one `quic-mux` byte-stream bearer (`TcpStream` or `UnixStream`), dispatching every
+/// peer-opened [`quic_mux::MuxStream`] through `handler`.
+pub async fn serve_mux_stream_connection<S>(
+    stream: S,
+    handler: Arc<RegistryStreamHandler>,
+    config: quic_mux::TokioMuxConfig,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+{
+    let (mux, mut acceptor) = quic_mux::TokioMux::server(stream, config);
+    while let Some(mut mux_stream) = acceptor.accept().await {
+        let h = handler.clone();
+        tokio::spawn(async move {
+            if let Err(error) = h.serve(&mut mux_stream).await {
+                warn!(%error, "lmesh_mux_stream_failed");
+            }
+        });
+    }
+    drop(mux);
+}
+
+/// Alias for [`serve_mux_stream_connection`] dispatching peer-opened [`quic_mux::MuxStream`]s
+/// on a `quic-mux` connection through `handler`.
+pub async fn serve_mux_connection<S>(
+    stream: S,
+    handler: Arc<RegistryStreamHandler>,
+    config: quic_mux::TokioMuxConfig,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+{
+    serve_mux_stream_connection(stream, handler, config).await;
+}
+
+/// Accept `quic-mux` connections on `listener` and dispatch peer streams through `handler`.
+pub async fn serve_mux_tcp_listener(
+    listener: tokio::net::TcpListener,
+    handler: Arc<RegistryStreamHandler>,
+) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, _peer)) => {
+                let _ = stream.set_nodelay(true);
+                let h = handler.clone();
+                tokio::spawn(async move {
+                    serve_mux_stream_connection(stream, h, quic_mux::TokioMuxConfig::default())
+                        .await;
+                });
+            }
+            Err(error) => {
+                warn!(%error, "lmesh_mux_tcp_accept_failed");
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+}
+
+/// Accept local `quic-mux` connections on `listener` and dispatch peer streams through `handler`.
+pub async fn serve_mux_uds_listener(
+    listener: tokio::net::UnixListener,
+    handler: Arc<RegistryStreamHandler>,
+) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, _peer)) => {
+                let h = handler.clone();
+                tokio::spawn(async move {
+                    serve_mux_stream_connection(stream, h, quic_mux::TokioMuxConfig::default())
+                        .await;
+                });
+            }
+            Err(error) => {
+                warn!(%error, "lmesh_mux_uds_accept_failed");
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+}
+
+/// Serve one `MeshStream` (`quic_mux::MuxStream`, TCP, or UDS): decode the opening envelope
+/// in a single pass, route passively registered components through [`mesh::ComponentDirectory`]
+/// (activating on demand), and rewind into `fallback` for legacy numeric methods.
+pub async fn serve_component_mux_stream<S>(
+    mut stream: S,
+    components: &mesh::ComponentDirectory,
+    fallback: &RegistryStreamHandler,
+) -> Result<()>
+where
+    S: mesh::MeshStream + 'static,
+{
+    let (envelope, framed) = match mesh::read_envelope_prefix(&mut stream).await {
+        Ok(parts) => parts,
+        Err(error) => {
+            if error.kind() == std::io::ErrorKind::InvalidData {
+                let _ = tokio::io::AsyncWriteExt::write_all(
+                    &mut stream,
+                    &mesh::mesh_api::envelope::encode_error_header(
+                        None,
+                        b"invalid stream envelope header",
+                    ),
+                )
+                .await;
+                let _ = tokio::io::AsyncWriteExt::shutdown(&mut stream).await;
+            }
+            return Err(error.into());
+        }
+    };
+    let is_component = envelope
+        .component()
+        .is_some_and(|comp| components.has_component(comp));
+    if is_component {
+        let (_, remaining) = framed.into_parts();
+        let boxed: Box<dyn mesh::MeshStream> = Box::new(stream);
+        let framed_owned = mesh::FramedStream::new(boxed, remaining);
+        return components.serve_framed_stream(envelope, framed_owned).await;
+    }
+    let mut rewound = mesh::rewind_envelope(envelope, framed);
+    fallback.serve(&mut rewound).await.map_err(Into::into)
+}
+
+/// Serve one `quic-mux` connection, routing peer streams through `components` first and
+/// falling back to `fallback` for legacy numeric methods.
+pub async fn serve_component_mux_connection<S>(
+    stream: S,
+    components: Arc<mesh::ComponentDirectory>,
+    fallback: Arc<RegistryStreamHandler>,
+    config: quic_mux::TokioMuxConfig,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+{
+    let (mux, mut acceptor) = quic_mux::TokioMux::server(stream, config);
+    while let Some(mux_stream) = acceptor.accept().await {
+        let c = components.clone();
+        let f = fallback.clone();
+        tokio::spawn(async move {
+            if let Err(error) = serve_component_mux_stream(mux_stream, &c, &f).await {
+                warn!(%error, "lmesh_mux_stream_failed");
+            }
+        });
+    }
+    drop(mux);
+}
+
+/// Accept `quic-mux` TCP connections and route streams through `components` then `fallback`.
+pub async fn serve_component_mux_tcp_listener(
+    listener: tokio::net::TcpListener,
+    components: Arc<mesh::ComponentDirectory>,
+    fallback: Arc<RegistryStreamHandler>,
+) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, _peer)) => {
+                let _ = stream.set_nodelay(true);
+                let c = components.clone();
+                let f = fallback.clone();
+                tokio::spawn(async move {
+                    serve_component_mux_connection(
+                        stream,
+                        c,
+                        f,
+                        quic_mux::TokioMuxConfig::default(),
+                    )
+                    .await;
+                });
+            }
+            Err(error) => {
+                warn!(%error, "lmesh_mux_tcp_accept_failed");
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+}
+
+/// Accept local `quic-mux` UDS connections and route streams through `components` then `fallback`.
+pub async fn serve_component_mux_uds_listener(
+    listener: tokio::net::UnixListener,
+    components: Arc<mesh::ComponentDirectory>,
+    fallback: Arc<RegistryStreamHandler>,
+) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, _peer)) => {
+                let c = components.clone();
+                let f = fallback.clone();
+                tokio::spawn(async move {
+                    serve_component_mux_connection(
+                        stream,
+                        c,
+                        f,
+                        quic_mux::TokioMuxConfig::default(),
+                    )
+                    .await;
+                });
+            }
+            Err(error) => {
+                warn!(%error, "lmesh_mux_uds_accept_failed");
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+}
+
+/// Adapter for `!Send` `quic-lite` `TokioNode` streams in `LocalSet`, routing
+/// [`mesh::ComponentDirectory`] components first and rewinding into `fallback` otherwise.
+struct LmeshNodeStreamHandler {
+    components: Arc<mesh::ComponentDirectory>,
+    fallback: Arc<RegistryStreamHandler>,
+}
+
+impl StreamHandler for LmeshNodeStreamHandler {
+    fn accept<'a>(
+        &'a self,
+        stream: &'a mut dyn AcceptedStream,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + 'a>> {
+        Box::pin(async move {
+            let (envelope, framed) = match mesh::read_envelope_prefix(&mut *stream).await {
+                Ok(parts) => parts,
+                Err(error) => {
+                    if error.kind() == std::io::ErrorKind::InvalidData {
+                        let _ = tokio::io::AsyncWriteExt::write_all(
+                            stream,
+                            &mesh::mesh_api::envelope::encode_error_header(
+                                None,
+                                b"invalid stream envelope header",
+                            ),
+                        )
+                        .await;
+                        let _ = tokio::io::AsyncWriteExt::shutdown(stream).await;
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
+            };
+            let is_component = envelope
+                .component()
+                .is_some_and(|comp| self.components.has_component(comp));
+            if is_component {
+                let (_, remaining) = framed.into_parts();
+                let (mut bridge_io, handler_io) = tokio::io::duplex(32 * 1024);
+                let boxed: Box<dyn mesh::MeshStream> = Box::new(handler_io);
+                let framed_owned = mesh::FramedStream::new(boxed, remaining);
+                let (_, comp_res) = tokio::join!(
+                    tokio::io::copy_bidirectional(stream, &mut bridge_io),
+                    self.components.serve_framed_stream(envelope, framed_owned),
+                );
+                return comp_res.map_err(std::io::Error::other);
+            }
+            let mut rewound = mesh::rewind_envelope(envelope, framed);
+            self.fallback.serve(&mut rewound).await
+        })
+    }
 }
 
 fn resolve_relative_path(path: PathBuf) -> Result<PathBuf> {
@@ -404,6 +746,7 @@ async fn handle_seqpacket_connection(
 #[derive(Clone)]
 struct LmeshCborHandler {
     service: Arc<LmeshService>,
+    components: Arc<mesh::ComponentDirectory>,
     registry: Arc<Registry>,
 }
 
@@ -413,9 +756,20 @@ impl LmeshCborHandler {
         external_radio: bool,
         extend: impl FnOnce(&Registry),
     ) -> Self {
+        let components = Arc::new(mesh::ComponentDirectory::from_static(
+            LMESH_COMPONENTS,
+            service.clone(),
+        ));
+        let registry = linux_registry(
+            service.clone(),
+            Arc::downgrade(&components),
+            external_radio,
+            extend,
+        );
         Self {
-            registry: linux_registry(service.clone(), external_radio, extend),
             service,
+            components,
+            registry,
         }
     }
 
@@ -562,6 +916,7 @@ impl Handler for LinuxHandler {
 /// scan/connect methods have no Linux source today and are not registered.
 fn linux_registry(
     service: Arc<LmeshService>,
+    components: std::sync::Weak<mesh::ComponentDirectory>,
     external_radio: bool,
     extend: impl FnOnce(&Registry),
 ) -> Arc<Registry> {
@@ -587,25 +942,18 @@ fn linux_registry(
         }
         register_telemetry(&registry, &service, external_radio);
         assert!(
-            registry.register(methods::SERVICES, ServicesHandler(this.clone())),
+            registry.register(
+                methods::SERVICES,
+                ServicesHandler {
+                    registry: this.clone(),
+                    components,
+                },
+            ),
             "services registered twice"
         );
         assert!(
             registry.register_stream(methods::DISCOVERY_NODES, DiscoveryNodesHandler(service.clone())),
             "discovery.nodes registered twice"
-        );
-        register_log_watch(&registry, this.clone());
-        // The probed node's end of a probe: a header, then the payload as the
-        // response body. Any node can be probed by any other.
-        assert!(
-            registry.register_stream(methods::PROBE_HANDLER, dmesh_server::probe::ProbeHandler),
-            "probe.handler registered twice"
-        );
-        // `probe`: run a probe against `peer` with this node as the client.
-        // Header only in both directions; the response header is the outcome.
-        assert!(
-            registry.register(methods::PROBE_START, ProbeStartHandler(service.clone())),
-            "probe registered twice"
         );
         register_common_methods(&registry);
         extend(&registry);
@@ -617,8 +965,7 @@ fn linux_registry(
 /// handler returning its generated struct (`API.md`). `bearers`, `power` and
 /// `runtime` have no Linux source and are not registered.
 fn register_telemetry(registry: &Registry, service: &Arc<LmeshService>, external_radio: bool) {
-    use dmesh_server::platform_api as api;
-    use dmesh_server::registry_bridge::TypedHandler;
+    use crate::rpc_router as api;
     macro_rules! typed {
         ($method:expr, $request:ty, $call:ident) => {{
             let service = service.clone();
@@ -680,30 +1027,6 @@ fn register_telemetry(registry: &Registry, service: &Arc<LmeshService>, external
     );
 }
 
-/// `log.watch` over this process's `tracing` history (`mesh::local_trace`).
-/// Periodic snapshots go through the same registry, so a snapshot is exactly
-/// the response of the telemetry method it names; a method that needs an async
-/// runtime (`telemetry.quic`) cannot be snapshotted and is reported as skipped.
-fn register_log_watch(registry: &Registry, this: std::sync::Weak<Registry>) {
-    let Some(buffer) = mesh::local_trace::global_buffer() else {
-        return;
-    };
-    let dispatch: dmesh_server::log_watch::Dispatch = Arc::new(move |request| {
-        this.upgrade()?
-            .dispatch_now(request, CallContext::local())
-    });
-    assert!(
-        registry.register_stream(
-            methods::LOG_WATCH_RECORDS,
-            dmesh_server::log_watch::LogWatchHandler::new(
-                Arc::new(dmesh_server::log_watch::MeshLogSource(buffer)),
-                Some(dispatch),
-            ),
-        ),
-        "log.watch registered twice"
-    );
-}
-
 /// The common ssh-mesh methods (`mesh.*`, `trace.*`) have reserved numbers
 /// and dispatch by CBOR. The supervisor-private `mesh.lifecycle` and the
 /// mutating `trace.set_level` are local-only.
@@ -721,77 +1044,139 @@ fn register_common_methods(registry: &Registry) {
     }
 }
 
-/// `probe` on Linux: run the exchange with the node named by `peer` and answer
-/// with the outcome header.
-#[derive(Clone)]
-struct ProbeStartHandler(Arc<LmeshService>);
+/// Passive `probe` component (`# \`probe\` API (8)`), instantiated lazily on
+/// the first `probe.start` unary request or `probe.handler` stream.
+struct ProbeComponentHandler(Arc<LmeshService>);
 
-impl Handler for ProbeStartHandler {
-    fn call<'a>(&'a self, call: Call<'a>) -> Reply<'a> {
-        Box::pin(async move {
-            let (id, request) = dmesh_server::probe::decode_probe_start_record(call.record)?;
-            let peer = request.peer?;
-            let mut outbound = request;
-            outbound.peer = None;
-            let started = std::time::Instant::now();
-            let timeout = std::time::Duration::from_millis(dmesh_server::probe::probe_timeout_ms(
-                call.context.timeout_ms,
-                request.total_bytes(),
-            ));
-            let outcome = self
-                .0
-                .probe_exchange(peer.as_str(), outbound, timeout)
-                .await;
-            let (success, received, elapsed) = match outcome {
-                Ok(result) => (true, result.bytes, result.elapsed_us),
-                Err(_) => (
-                    false,
-                    0,
-                    started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
-                ),
-            };
-            let mut response = vec![0u8; 256];
-            let used = dmesh_server::probe::encode_probe_result_response(
-                id, request, success, received, elapsed, &mut response,
-            )?;
-            response.truncate(used);
-            Some(response)
-        })
+#[async_trait::async_trait]
+impl mesh::ComponentHandler for ProbeComponentHandler {
+    async fn call_cbor(
+        &self,
+        method: mesh::MethodCall<'_>,
+        fields_cbor: &[u8],
+    ) -> Result<Vec<u8>> {
+        if method.name != "start" && method.id != Some(1) {
+            anyhow::bail!("unsupported unary probe method `{}`", method.name);
+        }
+        let request = quic_tools::decode_probe_fields(fields_cbor)
+            .context("invalid probe.start request fields")?;
+        let peer = request
+            .peer
+            .context("probe.start requires a target `peer` URI")?;
+        let mut outbound = request;
+        outbound.peer = None;
+        let started = std::time::Instant::now();
+        let timeout = std::time::Duration::from_millis(quic_tools::probe_timeout_ms(
+            method.timeout_ms,
+            request.total_bytes(),
+        ));
+        let outcome = self.0.probe_exchange(peer.as_str(), outbound, timeout).await;
+        let (success, received, elapsed) = match outcome {
+            Ok(result) => (true, result.bytes, result.elapsed_us),
+            Err(_) => (
+                false,
+                0,
+                started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+            ),
+        };
+        let mut out = vec![0u8; 160];
+        let used =
+            quic_tools::encode_probe_result_value(request, success, received, elapsed, &mut out)
+                .context("failed to encode probe.start result")?;
+        out.truncate(used);
+        Ok(out)
+    }
+
+    async fn open_stream(
+        &self,
+        method: mesh::MethodCall<'_>,
+        envelope: mesh::OwnedEnvelope,
+        mut stream: mesh::FramedStream<Box<dyn mesh::MeshStream>>,
+    ) -> Result<()> {
+        if method.name != "handler" && method.id != Some(2) {
+            anyhow::bail!("unsupported stream probe method `{}`", method.name);
+        }
+        let record = envelope.record().context("invalid probe.handler envelope")?;
+        let req_id = record.id.context("probe.handler envelope missing id")?;
+        quic_tools::serve_framed_probe_stream(req_id, record.fields, &mut stream)
+            .await
+            .context("probe.handler stream failed")
     }
 }
+
+fn create_probe_component(service: &Arc<LmeshService>) -> Arc<dyn mesh::ComponentHandler> {
+    Arc::new(ProbeComponentHandler(Arc::clone(service)))
+}
+
+/// Passively registered `lmesh` components in `.rodata`. Zero component handlers
+/// are instantiated at boot; each `create` function runs only on the first matching request.
+const LMESH_COMPONENTS: &[mesh::StaticComponent<Arc<LmeshService>>] = &[mesh::StaticComponent {
+    spec: &quic_tools::COMPONENT_PROBE,
+    create: create_probe_component,
+}];
 
 /// Original announcement records and receiver metadata, using the same
 /// retained/live response source as Android and the same wire as ESP.
 #[derive(Clone)]
 struct DiscoveryNodesHandler(Arc<LmeshService>);
 
-impl dmesh_server::stream::StreamHandler for DiscoveryNodesHandler {
-    fn open<'a>(&'a self, request: dmesh_server::stream::Request<'a>) -> dmesh_server::stream::OpenFuture<'a> {
+impl MethodStreamHandler for DiscoveryNodesHandler {
+    fn open<'a>(&'a self, call: Call<'a>) -> OpenStreamFuture<'a> {
         Box::pin(async move {
-            let options=dmesh_server::discovery_nodes::Options::decode(request.record.fields)?;
-            if request.record.to.is_some() || request.record.params.is_some() {return None;}
-            // Snapshot/subscription creation precedes solicitation.
-            let response=dmesh_discovery::nodes::stream_response(self.0.discovery_engine().clone(),request.record.id?,options,true)?;
-            if options.active && options.duration_ms != 0 {
-                let _=self.0.handle_request(crate::mesh_core::Request::DiscoveryActive {medium:None,to:None}).await;
+            let options = dmesh_discovery::discovery_nodes::Options::decode(call.record.fields)?;
+            if call.record.to.is_some() || call.record.params.is_some() {
+                return None;
             }
-            Some(dmesh_server::stream::Outcome::Respond(response))
+            // Snapshot/subscription creation precedes solicitation.
+            let (header, source) = dmesh_discovery::nodes::open_stream(
+                self.0.discovery_engine().clone(),
+                call.record.id?,
+                options,
+                true,
+            )?;
+            if options.active && options.duration_ms != 0 {
+                let _ = self
+                    .0
+                    .handle_request(crate::mesh_core::Request::DiscoveryActive {
+                        medium: None,
+                        to: None,
+                    })
+                    .await;
+            }
+            Some(StreamOutcome::Nodes { header, source })
         })
     }
 }
 
-/// `services`: the methods this service's own registry holds, as `[component, method, name]`
-/// rows. It reads the registry it is registered in, not a global one, so it lists exactly
-/// what a request can reach.
+/// `services`: the methods this service's registry and passive [`mesh::ComponentDirectory`]
+/// hold, as `[component, method, name]` rows. Inspecting passive component specs never
+/// instantiates their handlers.
 #[derive(Clone)]
-struct ServicesHandler(std::sync::Weak<Registry>);
+struct ServicesHandler {
+    registry: std::sync::Weak<Registry>,
+    components: std::sync::Weak<mesh::ComponentDirectory>,
+}
 
 impl Handler for ServicesHandler {
     fn call<'a>(&'a self, call: Call<'a>) -> Reply<'a> {
         Box::pin(async move {
             let id = mesh::cbor::decode_record(call.data).ok()?.id?;
-            let catalog = self.0.upgrade()?.encode_service_catalog();
-            let services = mesh::cbor::decode_value_bytes(&catalog).ok()?;
+            let registry = self.registry.upgrade()?;
+            let mut rows: Vec<(u64, u64, String)> = registry
+                .methods()
+                .into_iter()
+                .map(|m| (m.component, m.method, m.wire_name()))
+                .collect();
+            if let Some(components) = self.components.upgrade() {
+                rows.extend(components.catalog_rows());
+            }
+            rows.sort_by_key(|(c, m, _)| (*c, *m));
+            rows.dedup_by_key(|(c, m, _)| (*c, *m));
+            let services = serde_json::Value::Array(
+                rows.into_iter()
+                    .map(|(c, m, name)| serde_json::json!([c, m, name]))
+                    .collect(),
+            );
             mesh::cbor::encode_record(&mesh::wire::response_ok(id, services)).ok()
         })
     }
@@ -820,6 +1205,13 @@ impl mesh::wire::TaggedRecordHandler for LmeshCborHandler {
         record: mesh::tagged::TaggedRecord,
     ) -> Result<Option<mesh::tagged::TaggedRecord>> {
         anyhow::ensure!(record.id.is_some(), "tagged-CBOR request missing id");
+        let comp_name = match &record.component {
+            mesh::tagged::NameOrTag::Name(s) => mesh::mesh_api::envelope::Name::Text(s.as_bytes()),
+            mesh::tagged::NameOrTag::Tag(t) => mesh::mesh_api::envelope::Name::Tag(u64::from(*t)),
+        };
+        if self.components.has_component(comp_name) {
+            return mesh::wire::TaggedRecordHandler::handle_record(&*self.components, record).await;
+        }
         // The control socket is local ingress.
         let request = mesh::cbor::encode_record(&number_common_names(record))?;
         let response = self
@@ -853,7 +1245,7 @@ impl mesh::wire::TaggedRecordHandler for LmeshCborHandler {
         // route selection at this HTTP/QUIC boundary, never a recursively
         // forwarded application field.
         record.to = None;
-        let wire = CONTROL_CATALOG.encode_request(&record)?;
+        let wire = resolve_lmesh_catalog()?.catalog.encode_request(&record)?;
         // The caller's `timeout` bounds the whole directed exchange; the
         // remote gets the same allowance in the record it receives.
         let response = match record.timeout {
@@ -909,55 +1301,55 @@ async fn host_component_response(
         return None;
     };
     let (component, method) = (u64::from(*component), u64::from(*method));
-    let fields = CONTROL_CATALOG.to_jsonl(record);
+    let fields = resolve_lmesh_catalog().ok()?.catalog.to_jsonl(record);
     let response = match (component, method) {
         // Connection diagnostics (`services` is `ServicesHandler`).
         (
-            dmesh_server::services::DIAGNOSTIC_COMPONENT,
-            dmesh_server::services::DIAGNOSTIC_STATUS_METHOD,
+            crate::rpc_router::DIAGNOSTIC_COMPONENT,
+            crate::rpc_router::DIAGNOSTIC_STATUS_METHOD,
         ) => service.host_status(),
         // Common control-plane settings, backed by the shared settings store.
-        (dmesh_server::control::CONTROL_COMPONENT, dmesh_server::control::SETTINGS_GET) => {
+        (dmesh_discovery::control::CONTROL_COMPONENT, dmesh_discovery::control::SETTINGS_GET) => {
             host_settings_get(fields.get("key").and_then(serde_json::Value::as_str))
         }
-        (dmesh_server::control::CONTROL_COMPONENT, dmesh_server::control::SETTINGS_SET) => {
+        (dmesh_discovery::control::CONTROL_COMPONENT, dmesh_discovery::control::SETTINGS_SET) => {
             host_settings_set(
                 fields.get("key").and_then(serde_json::Value::as_str),
                 fields.get("value").and_then(serde_json::Value::as_str),
             )
         }
-        (dmesh_server::control::CONTROL_COMPONENT, dmesh_server::control::SETTINGS_LIST) => {
+        (dmesh_discovery::control::CONTROL_COMPONENT, dmesh_discovery::control::SETTINGS_LIST) => {
             host_settings_list()
         }
         // Raw-radio laboratory surface.
         (
-            dmesh_server::raw_wifi::RAW_WIFI_COMPONENT,
-            dmesh_server::raw_wifi::RAW_WIFI_METHOD_TX,
+            dmesh_rawnan::raw_wifi::RAW_WIFI_COMPONENT,
+            dmesh_rawnan::raw_wifi::RAW_WIFI_METHOD_TX,
         ) => host_radio_tx(service, record, &fields),
         (
-            dmesh_server::raw_wifi::RAW_WIFI_COMPONENT,
-            dmesh_server::raw_wifi::RAW_WIFI_METHOD_CONTROL,
+            dmesh_rawnan::raw_wifi::RAW_WIFI_COMPONENT,
+            dmesh_rawnan::raw_wifi::RAW_WIFI_METHOD_CONTROL,
         ) => service.host_radio_control(&fields),
         (
-            dmesh_server::raw_wifi::RAW_WIFI_COMPONENT,
-            dmesh_server::raw_wifi::RAW_WIFI_METHOD_SNAPSHOT,
+            dmesh_rawnan::raw_wifi::RAW_WIFI_COMPONENT,
+            dmesh_rawnan::raw_wifi::RAW_WIFI_METHOD_SNAPSHOT,
         ) => service.host_radio_snapshot(),
         (
-            dmesh_server::raw_wifi::RAW_WIFI_COMPONENT,
-            dmesh_server::raw_wifi::RAW_WIFI_METHOD_RESET_COUNTERS,
+            dmesh_rawnan::raw_wifi::RAW_WIFI_COMPONENT,
+            dmesh_rawnan::raw_wifi::RAW_WIFI_METHOD_RESET_COUNTERS,
         ) => service.host_radio_reset_counters(),
         // Directed pairing wake.
         (
-            dmesh_server::announce::ANNOUNCE_COMPONENT,
-            dmesh_server::announce::ANNOUNCE_NAN_PAIR_WAKEUP,
+            dmesh_discovery::announce::ANNOUNCE_COMPONENT,
+            dmesh_discovery::announce::ANNOUNCE_NAN_PAIR_WAKEUP,
         ) => match fields.get("to").and_then(serde_json::Value::as_str) {
             Some(to) => service.host_pair_wakeup(to),
             None => mesh::protocol::Response::err("nan.pair_wakeup requires to"),
         },
         // Host identity.
         (
-            dmesh_server::telemetry::TELEMETRY_COMPONENT,
-            dmesh_server::telemetry::DEVICE_METHOD,
+            crate::rpc_router::TELEMETRY_COMPONENT,
+            crate::rpc_router::DEVICE_METHOD,
         ) => host_device_telemetry(),
         _ => return None,
     };
@@ -965,7 +1357,7 @@ async fn host_component_response(
 }
 
 /// The host settings file: an explicit path wins over the service home.
-fn host_settings_store() -> Result<dmesh_server::settings::FileSettings, String> {
+fn host_settings_store() -> Result<crate::settings::FileSettings, String> {
     let path = std::env::var_os("DMESH_SETTINGS_FILE")
         .map(std::path::PathBuf::from)
         .or_else(|| {
@@ -973,7 +1365,7 @@ fn host_settings_store() -> Result<dmesh_server::settings::FileSettings, String>
                 .map(|home| std::path::PathBuf::from(home).join("etc/settings.conf"))
         })
         .ok_or_else(|| "no settings file: set DMESH_SETTINGS_FILE".to_owned())?;
-    Ok(dmesh_server::settings::FileSettings::new(path, "linux"))
+    Ok(crate::settings::FileSettings::new(path, "linux"))
 }
 
 fn host_settings_get(key: Option<&str>) -> mesh::protocol::Response {
@@ -982,7 +1374,7 @@ fn host_settings_get(key: Option<&str>) -> mesh::protocol::Response {
     };
     match host_settings_store() {
         Ok(mut store) => {
-            let handler = dmesh_server::settings::SettingsHandler::new(&mut store);
+            let handler = crate::settings::SettingsHandler::new(&mut store);
             match handler.get(key) {
                 Ok(value) => mesh::protocol::Response::ok_with_data(
                     serde_json::json!({"key": key, "value": value}),
@@ -1000,7 +1392,7 @@ fn host_settings_set(key: Option<&str>, value: Option<&str>) -> mesh::protocol::
     };
     match host_settings_store() {
         Ok(mut store) => {
-            let mut handler = dmesh_server::settings::SettingsHandler::new(&mut store);
+            let mut handler = crate::settings::SettingsHandler::new(&mut store);
             match handler.set(key, value) {
                 Ok(()) => mesh::protocol::Response::ok_with_data(
                     serde_json::json!({"key": key, "set": true}),
@@ -1015,7 +1407,7 @@ fn host_settings_set(key: Option<&str>, value: Option<&str>) -> mesh::protocol::
 fn host_settings_list() -> mesh::protocol::Response {
     match host_settings_store() {
         Ok(mut store) => {
-            let handler = dmesh_server::settings::SettingsHandler::new(&mut store);
+            let handler = crate::settings::SettingsHandler::new(&mut store);
             match handler.list() {
                 Ok(entries) => mesh::protocol::Response::ok_with_data(serde_json::json!({
                     "entries": entries
@@ -1099,17 +1491,18 @@ fn host_device_telemetry() -> mesh::protocol::Response {
         "version": env!("CARGO_PKG_VERSION"),
         "cpu_type": std::env::consts::ARCH,
         "role": "linux",
-        "total_ram_bytes": dmesh_server::telemetry::host_total_ram_bytes(),
+        "total_ram_bytes": dmesh_discovery::host_total_ram_bytes(),
     }))
 }
 
 fn decode_lmesh_tagged_request(
     record: &mesh::tagged::TaggedRecord,
 ) -> Result<crate::mesh_core::Request> {
-    if CONTROL_CATALOG.method_name(record).is_none() {
+    let resolved = resolve_lmesh_catalog()?;
+    if resolved.catalog.method_name(record).is_none() {
         anyhow::bail!("tagged-CBOR method is outside the reviewed lmesh catalog");
     }
-    let mut value = CONTROL_CATALOG.to_jsonl(record);
+    let mut value = resolved.catalog.to_jsonl(record);
     let method = value["method"]
         .as_str()
         .context("tagged-CBOR request has no documented method")?
@@ -1149,22 +1542,17 @@ fn decode_lmesh_tagged_request(
 mod tests {
     use super::*;
 
-    #[test]
-    fn quic_driver_clean_exit_is_reported_as_unexpected() {
-        let error = quic_driver_exit_error(Ok(Ok(())));
-        assert!(error.to_string().contains("exited unexpectedly"));
+    fn test_catalog() -> Arc<mesh::tagged::TaggedSchema> {
+        resolve_lmesh_catalog().unwrap().catalog.clone()
     }
 
-    #[test]
-    fn quic_driver_error_is_preserved_for_service_supervision() {
-        let error =
-            quic_driver_exit_error(Ok(Err(quic_lite::QuicNodeEgressError::AssociationTimedOut)));
-        assert!(error.to_string().contains("AssociationTimedOut"));
+    fn public_tools_json() -> serde_json::Value {
+        (*resolve_lmesh_catalog().unwrap().tools).clone()
     }
 
     #[test]
     fn shared_method_names_keep_linux_fields() {
-        let transport = CONTROL_CATALOG
+        let transport = test_catalog()
             .parse_argv(
                 "transport.set",
                 &["--mode=6".into(), "--iface=wlan0".into()],
@@ -1217,7 +1605,6 @@ mod tests {
             methods::TELEMETRY_WIFI_LINK_METRICS,
             methods::TELEMETRY_QUIC_METRICS,
             methods::TELEMETRY_MEMORY,
-            methods::LOG_WATCH_RECORDS,
         ] {
             let tool = tools
                 .iter()
@@ -1290,7 +1677,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            dmesh_server::tagged::decode(&network)
+            mesh_api::envelope::decode(&network)
                 .unwrap()
                 .error
                 .is_some()
@@ -1328,7 +1715,7 @@ mod tests {
         // a JSON request, and no second inventory name exists.
         assert!(
             decode_lmesh_tagged_request(
-                &CONTROL_CATALOG
+                &test_catalog()
                     .record_from_value("discovery.nodes", &serde_json::json!({}))
                     .unwrap()
             )
@@ -1559,7 +1946,7 @@ mod tests {
 
     #[test]
     fn local_wifi_method_uses_generated_numeric_tags() {
-        let record = CONTROL_CATALOG
+        let record = test_catalog()
             .record_from_value(
                 "wifi.interface.channel",
                 &serde_json::json!({
@@ -1577,7 +1964,7 @@ mod tests {
 
     #[test]
     fn active_discovery_keeps_its_explicit_path_local() {
-        let mut record = CONTROL_CATALOG
+        let mut record = test_catalog()
             .record_from_value("discovery.active", &serde_json::json!({}))
             .unwrap();
         record.id = Some(serde_json::json!(1));
@@ -1600,7 +1987,7 @@ mod tests {
         // `forward_record` clears `to` at the QUIC boundary (route selection
         // is never a forwarded application field), so decode the same way the
         // remote handler receives it.
-        let mut record = CONTROL_CATALOG
+        let mut record = test_catalog()
             .record_from_value(
                 "radio.tx",
                 &serde_json::json!({
@@ -1614,12 +2001,327 @@ mod tests {
             )
             .unwrap();
         record.to = None;
-        let wire = CONTROL_CATALOG.encode_request(&record).unwrap();
-        let request = dmesh_server::raw_wifi::decode_raw_wifi_tx_record(
-            dmesh_server::tagged::decode(&wire).unwrap(),
+        let wire = test_catalog().encode_request(&record).unwrap();
+        let request = dmesh_rawnan::raw_wifi::decode_raw_wifi_tx_record(
+            mesh_api::envelope::decode(&wire).unwrap(),
         )
         .unwrap();
         assert_eq!(request.channel, 6);
         assert_eq!(request.frame[0], 0xd0);
+    }
+
+    #[test]
+    fn parse_mux_tcp_override_handles_ports_addresses_and_disabled_tokens() {
+        assert_eq!(parse_mux_tcp_override("").unwrap(), None);
+        assert_eq!(parse_mux_tcp_override("0").unwrap(), None);
+        assert_eq!(parse_mux_tcp_override("none").unwrap(), None);
+        assert_eq!(parse_mux_tcp_override("OFF").unwrap(), None);
+        assert_eq!(
+            parse_mux_tcp_override("5229").unwrap(),
+            Some(std::net::SocketAddr::from((
+                std::net::Ipv6Addr::UNSPECIFIED,
+                5229
+            )))
+        );
+        assert_eq!(
+            parse_mux_tcp_override("127.0.0.1:15229").unwrap(),
+            Some("127.0.0.1:15229".parse().unwrap())
+        );
+        assert!(parse_mux_tcp_override("not-an-addr").is_err());
+    }
+
+    #[tokio::test]
+    async fn mux_tcp_and_uds_listeners_serve_registry_local_policy_and_duplex_probes() {
+        use crate::rpc_router::ProbeStreamHandler;
+        use quic_tools::{
+            ProbeDirection, ProbeServiceRequest, encode_probe_handler_request, exchange,
+            probe_duplex, probe_stream,
+        };
+
+        let registry = Arc::new(Registry::new());
+        register_common_methods(&registry);
+        registry.register_stream(methods::PROBE_HANDLER, ProbeStreamHandler);
+
+        let mux_net_handler = Arc::new(
+            RegistryStreamHandler::new(registry.clone())
+                .with_header_rewrite(number_common_names_in_header),
+        );
+        let mux_local_handler = Arc::new(
+            RegistryStreamHandler::new(registry.clone())
+                .local()
+                .with_header_rewrite(number_common_names_in_header),
+        );
+
+        let tcp_listener = bind_mux_tcp_listener("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let tcp_addr = tcp_listener.local_addr().unwrap();
+        let tcp_task = tokio::spawn(serve_mux_tcp_listener(tcp_listener, mux_net_handler));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let uds_path = tmp.path().join("mesh.mux.sock");
+        let uds_listener = bind_mux_uds_listener(&uds_path).await.unwrap();
+        // Refuses to clobber an active listener socket.
+        assert!(bind_mux_uds_listener(&uds_path).await.is_err());
+        let uds_task = tokio::spawn(serve_mux_uds_listener(uds_listener, mux_local_handler));
+
+        let tcp_stream = tokio::net::TcpStream::connect(tcp_addr).await.unwrap();
+        let _ = tcp_stream.set_nodelay(true);
+        let (tcp_mux, _tcp_acc) =
+            quic_mux::TokioMux::client(tcp_stream, quic_mux::TokioMuxConfig::default());
+
+        let uds_stream = tokio::net::UnixStream::connect(&uds_path).await.unwrap();
+        let (uds_mux, _uds_acc) =
+            quic_mux::TokioMux::client(uds_stream, quic_mux::TokioMuxConfig::default());
+
+        // 1. Text-named `mesh.initialize` rewritten at edge succeeds on both TCP and UDS.
+        let init_req = mesh::cbor::encode_record(&mesh::tagged::TaggedRecord {
+            component: mesh::tagged::NameOrTag::Name("mesh".to_owned()),
+            method: mesh::tagged::NameOrTag::Name("initialize".to_owned()),
+            id: Some(serde_json::json!(11)),
+            ..Default::default()
+        })
+        .unwrap();
+        for mux in [&tcp_mux, &uds_mux] {
+            let mut s = mux.open_bidi().await.unwrap();
+            let raw = exchange(&mut s, &[&init_req]).await.unwrap();
+            let reply = mesh::cbor::decode_record(&raw).unwrap();
+            assert_eq!(reply.id, Some(serde_json::json!(11)));
+            assert!(reply.result.is_some());
+        }
+
+        #[derive(Clone, Copy)]
+        struct LocalEchoHandler;
+        impl Handler for LocalEchoHandler {
+            fn call<'a>(&'a self, call: Call<'a>) -> Reply<'a> {
+                Box::pin(async move {
+                    let id = mesh::cbor::decode_record(call.data).ok()?.id?;
+                    let v = mesh::cbor::decode_value_bytes(&[0xa1, 0x65, b'l', b'o', b'c', b'a', b'l', 0xf5]).ok()?;
+                    mesh::cbor::encode_record(&mesh::wire::response_ok(id, v)).ok()
+                })
+            }
+        }
+        registry.register(Method::new(99, "test", 1, "local_echo"), LocalOnly(LocalEchoHandler));
+
+        // 2. `LocalOnly` method (`test.local_echo`, 99.1) is declined on TCP (`local: false`)
+        //    and accepted on UDS (`local: true`), alongside `trace.set_level` (2001.2) declined on TCP.
+        for (comp, meth) in [(99u32, 1u32), (2001u32, 2u32)] {
+            let req = mesh::cbor::encode_record(&mesh::tagged::TaggedRecord {
+                component: mesh::tagged::NameOrTag::Tag(comp),
+                method: mesh::tagged::NameOrTag::Tag(meth),
+                id: Some(serde_json::json!(12)),
+                ..Default::default()
+            })
+            .unwrap();
+            let mut s = tcp_mux.open_bidi().await.unwrap();
+            let raw = exchange(&mut s, &[&req]).await.unwrap();
+            assert!(mesh_api::envelope::decode(&raw).unwrap().error.is_some());
+        }
+        {
+            let local_req = mesh::cbor::encode_record(&mesh::tagged::TaggedRecord {
+                component: mesh::tagged::NameOrTag::Tag(99),
+                method: mesh::tagged::NameOrTag::Tag(1),
+                id: Some(serde_json::json!(13)),
+                ..Default::default()
+            })
+            .unwrap();
+            let mut s = uds_mux.open_bidi().await.unwrap();
+            let raw = exchange(&mut s, &[&local_req]).await.unwrap();
+            let reply = mesh::cbor::decode_record(&raw).unwrap();
+            assert!(reply.error.is_none(), "expected local UDS success, got {reply:?}");
+            assert_eq!(reply.result, Some(serde_json::json!({ "local": true })));
+        }
+
+        // 3. Validated `probe` (`upload`, `download`, `both`) over both TCP and UDS `quic-mux`.
+        for mux in [&tcp_mux, &uds_mux] {
+            let mut up_req = ProbeServiceRequest::new(24_577, 1024);
+            up_req.direction = ProbeDirection::Upload;
+            up_req.verify = true;
+            let mut hdr = [0u8; 160];
+            let n = encode_probe_handler_request(up_req, 201, &mut hdr).unwrap();
+            let mut s = mux.open_bidi().await.unwrap();
+            let up_res = probe_stream(&mut s, &hdr[..n], up_req).await.unwrap();
+            assert_eq!(up_res.bytes, 24_577);
+            assert_eq!(up_res.callback_errors, [0; 6]);
+
+            let mut down_req = ProbeServiceRequest::new(24_577, 1024);
+            down_req.direction = ProbeDirection::Download;
+            down_req.verify = true;
+            let n = encode_probe_handler_request(down_req, 202, &mut hdr).unwrap();
+            let mut s = mux.open_bidi().await.unwrap();
+            let down_res = probe_stream(&mut s, &hdr[..n], down_req).await.unwrap();
+            assert_eq!(down_res.bytes, 24_577);
+            assert_eq!(down_res.callback_errors, [0; 6]);
+
+            let mut both_req = ProbeServiceRequest::new(24_577, 1024);
+            both_req.direction = ProbeDirection::Both;
+            both_req.verify = true;
+            let mut s_up = mux.open_bidi().await.unwrap();
+            let mut s_down = mux.open_bidi().await.unwrap();
+            let both_res = probe_duplex(&mut s_up, &mut s_down, both_req, 203)
+                .await
+                .unwrap();
+            assert_eq!(both_res.bytes, 2 * 24_577);
+            assert_eq!(both_res.callback_errors, [0; 6]);
+        }
+
+        tcp_mux.close();
+        uds_mux.close();
+        tcp_task.abort();
+        uds_task.abort();
+    }
+
+    #[tokio::test]
+    async fn passive_probe_component_stays_unloaded_at_boot_and_serves_named_and_numeric_mux_streams() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use quic_tools::{
+            ProbeDirection, ProbeServiceRequest, exchange, probe_duplex, probe_stream,
+        };
+
+        struct StreamOnlyProbeComponent;
+
+        #[async_trait::async_trait]
+        impl mesh::ComponentHandler for StreamOnlyProbeComponent {
+            async fn open_stream(
+                &self,
+                method: mesh::MethodCall<'_>,
+                envelope: mesh::OwnedEnvelope,
+                mut stream: mesh::FramedStream<Box<dyn mesh::MeshStream>>,
+            ) -> Result<()> {
+                anyhow::ensure!(method.name == "handler" || method.id == Some(2));
+                let record = envelope.record().context("invalid probe envelope")?;
+                let req_id = record.id.context("probe envelope missing id")?;
+                quic_tools::serve_framed_probe_stream(req_id, record.fields, &mut stream)
+                    .await
+                    .context("probe stream failed")
+            }
+        }
+
+        fn create_counted_probe(counter: &Arc<AtomicUsize>) -> Arc<dyn mesh::ComponentHandler> {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Arc::new(StreamOnlyProbeComponent)
+        }
+
+        const TEST_COMPONENTS: &[mesh::StaticComponent<Arc<AtomicUsize>>] =
+            &[mesh::StaticComponent {
+                spec: &quic_tools::COMPONENT_PROBE,
+                create: create_counted_probe,
+            }];
+
+        let instantiations = Arc::new(AtomicUsize::new(0));
+        let components = Arc::new(mesh::ComponentDirectory::from_static(
+            TEST_COMPONENTS,
+            instantiations.clone(),
+        ));
+        assert_eq!(instantiations.load(Ordering::SeqCst), 0);
+        assert!(!components.is_active("probe"));
+
+        let comp_weak = Arc::downgrade(&components);
+        let registry = Arc::new_cyclic(|this: &std::sync::Weak<Registry>| {
+            let r = Registry::new();
+            register_common_methods(&r);
+            assert!(r.register(
+                methods::SERVICES,
+                ServicesHandler {
+                    registry: this.clone(),
+                    components: comp_weak,
+                },
+            ));
+            r
+        });
+
+        let fallback = Arc::new(
+            RegistryStreamHandler::new(registry)
+                .with_header_rewrite(number_common_names_in_header),
+        );
+
+        let tcp_listener = bind_mux_tcp_listener("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let tcp_addr = tcp_listener.local_addr().unwrap();
+        let tcp_task = tokio::spawn(serve_component_mux_tcp_listener(
+            tcp_listener,
+            components.clone(),
+            fallback,
+        ));
+
+        let tcp_stream = tokio::net::TcpStream::connect(tcp_addr).await.unwrap();
+        let _ = tcp_stream.set_nodelay(true);
+        let (mux, _acc) =
+            quic_mux::TokioMux::client(tcp_stream, quic_mux::TokioMuxConfig::default());
+
+        // 1. Querying `services` lists `[8, 1, "probe.start"]` and `[8, 2, "probe.handler"]`
+        //    from passive `.rodata` metadata WITHOUT instantiating `StreamOnlyProbeComponent`!
+        let services_req = mesh::cbor::encode_record(&mesh::tagged::TaggedRecord {
+            component: mesh::tagged::NameOrTag::Tag(methods::SERVICES.component as u32),
+            method: mesh::tagged::NameOrTag::Tag(methods::SERVICES.method as u32),
+            id: Some(serde_json::json!(41)),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut s_srv = mux.open_bidi().await.unwrap();
+        let raw_srv = exchange(&mut s_srv, &[&services_req]).await.unwrap();
+        let srv_reply = mesh::cbor::decode_record(&raw_srv).unwrap();
+        let srv_rows = srv_reply.result.unwrap();
+        let rows = srv_rows.as_array().unwrap();
+        assert!(rows.contains(&serde_json::json!([8, 1, "probe.start"])));
+        assert!(rows.contains(&serde_json::json!([8, 2, "probe.handler"])));
+        assert_eq!(instantiations.load(Ordering::SeqCst), 0);
+        assert!(!components.is_active("probe"));
+
+        // 2. String-named, string-keyed `probe.handler` upload activates `probe` lazily!
+        let mut up_req = ProbeServiceRequest::new(12_288, 1024);
+        up_req.direction = ProbeDirection::Upload;
+        up_req.verify = true;
+        let mut named_hdr = [0u8; 256];
+        let mut enc = mesh::mesh_api::cbor::Encoder::new(&mut named_hdr);
+        enc.map(4).unwrap();
+        enc.str(b"component").unwrap();
+        enc.str(b"probe").unwrap();
+        enc.str(b"method").unwrap();
+        enc.str(b"handler").unwrap();
+        enc.str(b"id").unwrap();
+        enc.uint(301).unwrap();
+        enc.str(b"fields").unwrap();
+        enc.map(4).unwrap();
+        enc.str(b"bytes").unwrap();
+        enc.uint(12_288).unwrap();
+        enc.str(b"packet_size").unwrap();
+        enc.uint(1024).unwrap();
+        enc.str(b"direction").unwrap();
+        enc.str(b"upload").unwrap();
+        enc.str(b"verify").unwrap();
+        enc.bool(true).unwrap();
+        let hdr_len = enc.len();
+
+        let mut s_up = mux.open_bidi().await.unwrap();
+        let up_res = probe_stream(&mut s_up, &named_hdr[..hdr_len], up_req)
+            .await
+            .unwrap();
+        assert_eq!(up_res.bytes, 12_288);
+        assert_eq!(up_res.callback_errors, [0; 6]);
+        assert_eq!(instantiations.load(Ordering::SeqCst), 1);
+        assert!(components.is_active("probe"));
+
+        // 3. Numeric `probe.handler` (8.2) duplex probe reuses the active instance.
+        let mut both_req = ProbeServiceRequest::new(16_384, 1024);
+        both_req.direction = ProbeDirection::Both;
+        both_req.verify = true;
+        let mut d_up = mux.open_bidi().await.unwrap();
+        let mut d_down = mux.open_bidi().await.unwrap();
+        let both_res = probe_duplex(&mut d_up, &mut d_down, both_req, 302)
+            .await
+            .unwrap();
+        assert_eq!(both_res.bytes, 2 * 16_384);
+        assert_eq!(both_res.callback_errors, [0; 6]);
+        assert_eq!(instantiations.load(Ordering::SeqCst), 1);
+
+        // 4. Idle eviction reclaims the active instance once streams close.
+        tokio::task::yield_now().await;
+        assert_eq!(components.evict_idle(Duration::ZERO), 1);
+        assert!(!components.is_active("probe"));
+
+        mux.close();
+        tcp_task.abort();
     }
 }

@@ -63,9 +63,12 @@ pub struct InfrastructureProfile {
     security: InfrastructureSecurity,
     default_gateway: Option<std::net::IpAddr>,
     ipv4_address: Option<std::net::Ipv4Addr>,
+    #[allow(dead_code)]
     ipv4_prefix: Option<u8>,
     ipv6_address: Option<std::net::Ipv6Addr>,
+    #[allow(dead_code)]
     ipv6_prefix: Option<u8>,
+    #[allow(dead_code)]
     ipv6_gateway: Option<std::net::Ipv6Addr>,
 }
 

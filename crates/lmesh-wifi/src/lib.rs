@@ -27,9 +27,12 @@ pub mod recovery;
 extern crate self as lmesh_wifi;
 pub mod mesh_core;
 pub mod mesh_runtime;
+pub mod rpc_router;
+pub mod settings;
 
 pub use infra_credentials::{
-    INFRA_STA_CREDENTIALS_PATH, InfrastructureCredentials, load_default_infrastructure_credentials,
+    INFRA_STA_CREDENTIALS_PATH, InfrastructureCredentials, InfrastructureProfile,
+    InfrastructureSecurity, load_default_infrastructure_credentials,
     load_infrastructure_credentials,
 };
 pub use radio::{RadioService, station_links};

@@ -1,48 +1,52 @@
 //! `companion.pair` and `companion.unpair` for `kind=ble`.
 
 use std::collections::HashMap;
-use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use dmesh_server::companion::{CompanionLink, PairRequest};
-use dmesh_server::companion_pair;
-use dmesh_server::device_record::DeviceStore;
-use quic_lite::packet_pool::PacketPool;
-use quic_lite::tokio::TokioNode;
-use quic_lite::{BearerId, PacketMeta, PeerL2Address};
+use dmesh_discovery::controller::{self, ControllerLink, PairRequest};
+use dmesh_discovery::device_record::DeviceStore;
+use quic_link::{
+    AssocConfig, ConnectionId, LinkId, LinkProfile, PeerL2Address, TokioAssocDriver,
+};
+use quic_mux::{TokioMux, TokioMuxConfig};
 
 use crate::CocBearer;
-use crate::coc::CocChannel;
+use crate::coc::{COC_PACKET_MAX, CocChannel};
 
 /// Whole-operation limit after the CoC is connected.
 const TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Linux implementation of the BLE half of the common companion handlers.
-///
-/// The CoC is attached to the caller's running QUIC node as an ordinary
-/// bearer, and pairing is an ordinary association with the device. The link is
-/// encrypted (`CocBearer::connect` requires it) and the device refuses a BLE
-/// pairing when it already has a secret. The caller dispatches by `kind`: requests whose kind is `ble` go
-/// to [`Self::pair`] and [`Self::unpair`], any other kind to its own bearer.
-/// `SLOTS` and `MTU` are the node's packet pool.
-pub struct BleCompanion<const SLOTS: usize, const MTU: usize> {
-    node: TokioNode,
-    connected: Mutex<HashMap<String, (BearerId, Arc<CocChannel>)>>,
-    _pool: PhantomData<fn() -> PacketPool<SLOTS, MTU>>,
+struct ConnectedBle {
+    _mux: TokioMux,
+    driver_task: tokio::task::JoinHandle<()>,
+    channel: Arc<CocChannel>,
 }
 
-impl<const SLOTS: usize, const MTU: usize> BleCompanion<SLOTS, MTU> {
-    pub fn new(node: TokioNode) -> Self {
-        Self {
-            node,
-            connected: Mutex::new(HashMap::new()),
-            _pool: PhantomData,
-        }
+impl Drop for ConnectedBle {
+    fn drop(&mut self) {
+        self.driver_task.abort();
+        self.channel.shutdown();
+    }
+}
+
+/// Linux implementation of the BLE half of the common companion handlers.
+///
+/// The CoC is driven by `quic-link` (`TokioAssocDriver`) + `quic-mux` (`TokioMux`),
+/// and pairing exchanges control records over a mux stream. The link is encrypted
+/// (`CocBearer::connect` requires it) and the device refuses a BLE pairing when it
+/// already has a secret.
+#[derive(Default)]
+pub struct BleCompanion {
+    connected: Mutex<HashMap<String, ConnectedBle>>,
+}
+
+impl BleCompanion {
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// Connect a CoC, attach it to the node, and install fresh credentials. The bearer stays
-    /// attached after a successful pair; a failed one is detached again.
+    /// Connect a CoC, drive it with `quic-link`/`quic-mux`, and install fresh credentials.
     async fn pair_device(&self, request: PairRequest<'_>) -> Result<(), String> {
         let address = request.id;
         let key = address.to_ascii_uppercase();
@@ -51,35 +55,33 @@ impl<const SLOTS: usize, const MTU: usize> BleCompanion<SLOTS, MTU> {
         }
         // Connecting is a blocking kernel call that waits for the link.
         let (connect_address, psm) = (address.to_owned(), request.psm);
-        let bearer = tokio::task::spawn_blocking(move || CocBearer::connect(&connect_address, psm))
+        let mut bearer = tokio::task::spawn_blocking(move || CocBearer::connect(&connect_address, psm))
             .await
             .map_err(|error| format!("connect task failed: {error}"))?
             .map_err(|error| format!("{error:#}"))?;
         let channel = bearer.channel();
-        let id = self
-            .node
-            .add_bearer::<PacketPool<SLOTS, MTU>, { quic_lite::DEFAULT_MAX_PACKET_SIZE }, _>(bearer)
-            .await?;
-        let outcome = tokio::time::timeout(TIMEOUT, async {
-            let association = self
-                .node
-                .associate(
-                    PacketMeta {
-                        bearer: id,
-                        peer_l2_address: PeerL2Address::new(1).ok_or("peer address")?,
-                        received_at_us: 0,
-                    },
-                    0,
-                )
-                .await
-                .map_err(|error| format!("start association: {error:?}"))?;
-            association
-                .wait_established()
-                .await
-                .map_err(|error| format!("establish association: {error:?}"))?;
-            let paired = companion_pair::pair(
-                &association,
-                &companion_pair::Pairing {
+
+        let peer_cid = ConnectionId::new(1).unwrap();
+        let mut driver = TokioAssocDriver::new(AssocConfig::default(), 64);
+        let profile = LinkProfile::udp_datagram(1, COC_PACKET_MAX, peer_cid);
+        let _ = driver.add_link_with(
+            LinkId(1),
+            PeerL2Address::new(1).ok_or("peer address")?,
+            profile,
+            |pool, ingress| {
+                bearer.attach(pool, ingress);
+                Ok::<_, std::convert::Infallible>(bearer)
+            },
+        );
+        let (tx, rx, driver_task) = driver.spawn();
+        let (mux, _acceptor) = TokioMux::spawn(true, TokioMuxConfig::default());
+        mux.add_packet_link(tx, rx, COC_PACKET_MAX, 10);
+
+        let outcome = tokio::time::timeout(
+            TIMEOUT,
+            controller::pair_mux(
+                &mux,
+                &controller::Pairing {
                     vip6: request.vip6,
                     name: request.name,
                     root_public_key: request
@@ -88,27 +90,33 @@ impl<const SLOTS: usize, const MTU: usize> BleCompanion<SLOTS, MTU> {
                     store: request.store,
                     endpoint: ("ble", address),
                 },
-            )
-            .await;
-            let _ = association.finish().await;
-            paired
-        })
+            ),
+        )
         .await
         .unwrap_or_else(|_| Err(format!("BLE pairing with {address} timed out after {TIMEOUT:?}")));
+
         match outcome {
             Ok(_) => {
-                self.lock().insert(key, (id, channel));
+                self.lock().insert(
+                    key,
+                    ConnectedBle {
+                        _mux: mux,
+                        driver_task,
+                        channel,
+                    },
+                );
                 Ok(())
             }
             Err(error) => {
-                self.node.remove_bearer(id).await;
+                drop(mux);
+                driver_task.abort();
                 channel.shutdown();
                 Err(error)
             }
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, (BearerId, Arc<CocChannel>)>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, ConnectedBle>> {
         self.connected
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -116,7 +124,7 @@ impl<const SLOTS: usize, const MTU: usize> BleCompanion<SLOTS, MTU> {
 }
 
 #[async_trait::async_trait]
-impl<const SLOTS: usize, const MTU: usize> CompanionLink for BleCompanion<SLOTS, MTU> {
+impl ControllerLink for BleCompanion {
     async fn pair(&self, request: PairRequest<'_>) -> Result<(), String> {
         self.pair_device(request).await
     }
@@ -131,22 +139,9 @@ impl<const SLOTS: usize, const MTU: usize> CompanionLink for BleCompanion<SLOTS,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quic_lite::{QuicNode, tokio::TokioNodeDriver};
 
-    const SLOTS: usize = 4;
-    const MTU: usize = quic_lite::DEFAULT_PACKET_POOL_SLOT_SIZE;
-    type Pool = PacketPool<SLOTS, MTU>;
-    static POOL: Pool = Pool::new();
-
-    fn companion() -> BleCompanion<SLOTS, MTU> {
-        let (handle, driver) = TokioNodeDriver::new(
-            QuicNode::<Pool>::new(&POOL),
-            quic_lite::AssociationLimits::host().connection,
-        );
-        tokio::task::spawn_local(async move {
-            let _ = driver.run().await;
-        });
-        BleCompanion::new(handle)
+    fn companion() -> BleCompanion {
+        BleCompanion::new()
     }
 
     fn local<F: std::future::Future>(future: F) -> F::Output {
@@ -158,7 +153,15 @@ mod tests {
     }
 
     fn pair_request<'a>(id: &'a str, psm: Option<u16>, store: &'a DeviceStore) -> PairRequest<'a> {
-        PairRequest { id, vip6: None, baud: None, psm, name: None, root_public_key: Some([2; 33]), store }
+        PairRequest {
+            id,
+            vip6: None,
+            baud: None,
+            psm,
+            name: None,
+            root_public_key: Some([2; 33]),
+            store,
+        }
     }
 
     #[test]
@@ -176,8 +179,10 @@ mod tests {
     #[test]
     fn ble_unpair_does_not_claim_device_reset() {
         local(async {
-            let error = companion().unpair("AA:BB:CC:DD:EE:FF", &DeviceStore::new("/nonexistent"))
-                .await.unwrap_err();
+            let error = companion()
+                .unpair("AA:BB:CC:DD:EE:FF", &DeviceStore::new("/nonexistent"))
+                .await
+                .unwrap_err();
             assert!(error.contains("use USB/UART"));
         });
     }

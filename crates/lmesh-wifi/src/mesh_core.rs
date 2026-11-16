@@ -7,10 +7,6 @@
 use anyhow::{Context, Result};
 
 use p256::SecretKey;
-use p256::ecdsa::signature::{Signer, Verifier};
-use p256::elliptic_curve::Generate;
-use p256::elliptic_curve::sec1::ToSec1Point;
-use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -18,8 +14,6 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::{
     Arc,
@@ -64,7 +58,7 @@ pub fn announce_parse_errors() -> u64 {
 /// takes semantic data, never a UDP buffer, so another local owner can merge
 /// it into its inventory without coupling the multicast receive loop to a
 /// particular Wi-Fi implementation.
-type AnnounceObserver = Arc<dyn Fn(SocketAddr, dmesh_server::announce::Announce) + Send + Sync>;
+type AnnounceObserver = Arc<dyn Fn(SocketAddr, dmesh_discovery::announce::Announce) + Send + Sync>;
 
 /// Optional discovery-only host label. Stable key material remains the
 /// identity; this short presentation value will later be superseded by a
@@ -74,8 +68,8 @@ fn discovery_device_name() -> Option<String> {
     // Linux's signed announce aligned with `settings.get key=name`, while the
     // hostname remains a useful zero-config fallback.
     if let Some(path) = std::env::var_os("DMESH_SETTINGS_FILE") {
-        let mut store = dmesh_server::settings::FileSettings::new(path, "linux");
-        if let Ok(name) = dmesh_server::settings::SettingsHandler::new(&mut store).get("name")
+        let mut store = crate::settings::FileSettings::new(path, "linux");
+        if let Ok(name) = crate::settings::SettingsHandler::new(&mut store).get("name")
             && !name.is_empty()
         {
             return Some(name);
@@ -85,7 +79,7 @@ fn discovery_device_name() -> Option<String> {
     let compact = name
         .chars()
         .filter(|character| character.is_ascii_graphic())
-        .take(dmesh_server::announce::MAX_DEVICE_NAME)
+        .take(dmesh_discovery::announce::MAX_DEVICE_NAME)
         .collect::<String>();
     (!compact.is_empty()).then_some(compact)
 }
@@ -93,7 +87,7 @@ fn discovery_device_name() -> Option<String> {
 fn discovery_device_domain() -> Option<String> {
     let domain = std::env::var("DMESH_DISCOVERY_DOMAIN").ok()?;
     let domain = domain.trim();
-    (!domain.is_empty() && domain.len() <= dmesh_server::announce::MAX_DEVICE_DOMAIN)
+    (!domain.is_empty() && domain.len() <= dmesh_discovery::announce::MAX_DEVICE_DOMAIN)
         .then(|| domain.to_owned())
 }
 
@@ -458,15 +452,49 @@ fn parse_unicast_mac(value: &str) -> Option<[u8; 6]> {
 }
 
 fn parse_now_destination(value: &str) -> Option<[u8; 6]> {
-    dmesh_server::probe::ProbeDestination::parse(value)
+    quic_tools::ProbeDestination::parse(value)
         .and_then(|destination| destination.espnow_mac())
         // Preserve the existing direct-MAC command form while callers move
         // to the shared URI destination syntax.
         .or_else(|| parse_unicast_mac(value))
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MuxEndpoint {
+    Tcp(SocketAddr),
+    Uds(std::path::PathBuf),
+}
+
+/// Parse an explicit `quic-mux` destination (`mux://HOST[:PORT]`, `tcp://HOST[:PORT]`,
+/// `mux:///path/to/sock`, `unix:///path/to/sock`, or `uds:///path/to/sock`).
+/// TCP endpoints without an explicit port default to `LMESH_DEFAULTS.mux_tcp_port` (`5229`).
+pub fn parse_mux_destination(value: &str) -> Result<Option<MuxEndpoint>> {
+    let trimmed = value.trim();
+    if let Some(path) = trimmed
+        .strip_prefix("unix://")
+        .or_else(|| trimmed.strip_prefix("uds://"))
+    {
+        anyhow::ensure!(!path.is_empty(), "empty UDS mux destination");
+        return Ok(Some(MuxEndpoint::Uds(std::path::PathBuf::from(path))));
+    }
+    let Some((scheme, target)) = trimmed.split_once("://") else {
+        return Ok(None);
+    };
+    if !matches!(scheme, "mux" | "tcp") {
+        return Ok(None);
+    }
+    anyhow::ensure!(!target.is_empty(), "empty {scheme}:// mux destination");
+    if scheme == "mux" && (target.starts_with('/') || target.starts_with("./")) {
+        return Ok(Some(MuxEndpoint::Uds(std::path::PathBuf::from(target))));
+    }
+    let default_port = crate::mesh_runtime::LMESH_DEFAULTS.mux_tcp_port;
+    let addr = quic_link::parse_udp_peer(target, default_port)
+        .with_context(|| format!("invalid mux TCP endpoint {trimmed:?}"))?;
+    Ok(Some(MuxEndpoint::Tcp(require_live_udp6_scope(addr)?)))
+}
+
 fn mesh_discovery_key(value: &str) -> Option<String> {
-    let destination = dmesh_server::probe::ProbeDestination::parse(value)?;
+    let destination = quic_tools::ProbeDestination::parse(value)?;
     (destination.scheme() == "mesh").then(|| destination.target().to_owned())
 }
 
@@ -504,7 +532,7 @@ struct LinuxFacts {
 }
 
 impl dmesh_discovery::LocalFacts for LinuxFacts {
-    fn describe(&self, announce: &mut dmesh_server::announce::Announce) {
+    fn describe(&self, announce: &mut dmesh_discovery::announce::Announce) {
         if let Some(name) = discovery_device_name() {
             let _ = announce.set_device_name(&name);
         }
@@ -521,12 +549,12 @@ impl dmesh_discovery::LocalFacts for LinuxFacts {
             announce.set_udp_link_local_v6(address);
         }
         announce.set_probe_descriptor(
-            dmesh_server::announce::DEVICE_CLASS_HOST,
-            dmesh_server::probe::PROBE_CAP_NAN
-                | dmesh_server::probe::PROBE_CAP_NOW
-                | dmesh_server::probe::PROBE_CAP_STA
-                | dmesh_server::probe::PROBE_CAP_AP
-                | dmesh_server::probe::PROBE_CAP_UDP6,
+            dmesh_discovery::announce::DEVICE_CLASS_HOST,
+            dmesh_discovery::announce::PROBE_CAP_NAN
+                | dmesh_discovery::announce::PROBE_CAP_NOW
+                | dmesh_discovery::announce::PROBE_CAP_STA
+                | dmesh_discovery::announce::PROBE_CAP_AP
+                | dmesh_discovery::announce::PROBE_CAP_UDP6,
         );
     }
 }
@@ -619,7 +647,7 @@ impl LocalDiscovery {
             use dmesh_discovery::Received;
             match received {
                 Received::Announce { .. } | Received::Response { .. } => {
-                    if let Some(announce) = dmesh_server::announce::decode_announce(bytes)
+                    if let Some(announce) = dmesh_discovery::announce::decode_announce(bytes)
                         && let Ok(observer) = observer.try_read()
                         && let Some(observer) = observer.clone()
                     {
@@ -699,11 +727,11 @@ impl LocalDiscovery {
     /// the 8-byte identity hint as device id so it fits the 24-byte DMesh
     /// Follow-up envelope.
     pub fn nan_announce_service_info(&self, uptime_secs: u64) -> Result<Vec<u8>> {
-        let identity_hint = dmesh_server::announce::identity_hint(self.identity.public_key())
+        let identity_hint = dmesh_discovery::announce::identity_hint(self.identity.public_key())
             .context("missing local public-key identity hint")?;
         let mut device_id = [0; 16];
         device_id[..identity_hint.len()].copy_from_slice(&identity_hint);
-        let mut announce = dmesh_server::announce::Announce::discovery(
+        let mut announce = dmesh_discovery::announce::Announce::discovery(
             device_id,
             identity_hint.len() as u8,
             uptime_secs.min(u64::from(u32::MAX)) as u32,
@@ -712,7 +740,7 @@ impl LocalDiscovery {
         dmesh_discovery::Identity::sign(self.identity.as_ref(), &mut announce)
             .context("sign the NAN Service Info announce")?;
         let mut wire = [0; 384];
-        let used = dmesh_server::announce::encode(announce, &mut wire)
+        let used = dmesh_discovery::announce::encode(announce, &mut wire)
             .context("Failed to encode compact NAN Service Info announce")?;
         // A directed Follow-up wraps Service Info in the 24-byte DMesh
         // envelope. Keep the shared discovery reply inside that portable
@@ -732,7 +760,7 @@ impl LocalDiscovery {
     pub fn signed_discovery_announce(
         &self,
         _uptime_secs: u64,
-    ) -> Result<dmesh_server::announce::Announce> {
+    ) -> Result<dmesh_discovery::announce::Announce> {
         self.engine
             .local_announce()
             .context("sign the local announce")
@@ -957,7 +985,7 @@ pub struct LmeshService {
     wifi_service: lmesh_wifi::WifiService,
     radio: lmesh_wifi::RadioService,
     wifi: lmesh_wifi::WifiNetd,
-    now_quic_client: std::sync::Mutex<Option<(quic_lite::tokio::TokioNode, quic_lite::BearerId)>>,
+    now_mux: std::sync::Mutex<Option<quic_mux::TokioMux>>,
 }
 
 /// Convert the compact DMesh tagged response into the schema-neutral mesh
@@ -974,7 +1002,7 @@ fn decode_stream_response(response: &[u8]) -> Result<mesh::tagged::TaggedRecord>
     if let Ok(record) = mesh::cbor::decode_record(response) {
         return Ok(record);
     }
-    let record = dmesh_server::tagged::decode(response)
+    let record = mesh_api::envelope::decode(response)
         .ok_or_else(|| anyhow::anyhow!("decode DMesh tagged stream response"))?;
     let id = record
         .id
@@ -985,7 +1013,7 @@ fn decode_stream_response(response: &[u8]) -> Result<mesh::tagged::TaggedRecord>
         _ => anyhow::bail!("DMesh tagged stream response lacks one terminal result or error"),
     };
     let mut wire = vec![0u8; response.len().saturating_add(24)];
-    let mut encoder = dmesh_server::cbor::Encoder::new(&mut wire);
+    let mut encoder = mesh_api::cbor::Encoder::new(&mut wire);
     encoder
         .map(4)
         .ok_or_else(|| anyhow::anyhow!("encode mesh response map"))?;
@@ -1035,30 +1063,100 @@ async fn request_udp_stream(
 
 enum StreamReply {
     Record(Vec<u8>),
-    Probe(quic_lite::probe::ProbeResult),
+    Probe(quic_tools::probe::ProbeResult),
 }
 
-async fn stream_exchange(
-    association: &quic_lite::tokio::TokioAssociation,
+async fn stream_exchange_mux(
+    mux: &quic_mux::TokioMux,
     payload: &[u8],
-    probe: Option<dmesh_server::probe::ProbeServiceRequest>,
+    probe: Option<quic_tools::ProbeServiceRequest>,
 ) -> Result<StreamReply> {
     Ok(match probe {
         Some(request) => StreamReply::Probe(
-            dmesh_server::stream_client::probe_quic(association, payload, request).await?.transfer,
+            quic_tools::probe_mux(mux, payload, request)
+                .await
+                .context("run probe over quic-mux")?
+                .transfer,
         ),
         None => {
-            let mut stream = association.open_stream().await
-                .map_err(|error| anyhow::anyhow!("open request stream: {error:?}"))?;
-            StreamReply::Record(dmesh_server::stream_client::exchange(&mut stream, &[payload]).await?)
+            let mut stream = mux
+                .open_bidi()
+                .await
+                .context("open quic-mux request stream")?;
+            StreamReply::Record(
+                quic_tools::exchange(&mut stream, &[payload])
+                    .await
+                    .context("exchange request over quic-mux")?,
+            )
         }
     })
 }
 
+/// Execute one request record over an established [`quic_mux::TokioMux`] session.
+pub async fn request_mux_stream_on(
+    mux: &quic_mux::TokioMux,
+    payload: &[u8],
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    match tokio::time::timeout(timeout, stream_exchange_mux(mux, payload, None))
+        .await
+        .context("quic-mux stream request timed out")??
+    {
+        StreamReply::Record(record) => Ok(record),
+        StreamReply::Probe(_) => unreachable!("record request"),
+    }
+}
+
+/// Execute one request record against a `quic-mux` TCP or UDS endpoint.
+pub async fn request_mux_stream(
+    endpoint: MuxEndpoint,
+    payload: &[u8],
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    match run_mux_stream(endpoint, payload, None, timeout).await? {
+        StreamReply::Record(record) => Ok(record),
+        StreamReply::Probe(_) => unreachable!("record request"),
+    }
+}
+
+async fn run_mux_stream(
+    endpoint: MuxEndpoint,
+    payload: &[u8],
+    probe: Option<quic_tools::ProbeServiceRequest>,
+    timeout: Duration,
+) -> Result<StreamReply> {
+    tokio::time::timeout(timeout, async {
+        let (mux, _acceptor) = match endpoint {
+            MuxEndpoint::Tcp(peer) => {
+                let stream = tokio::net::TcpStream::connect(peer)
+                    .await
+                    .with_context(|| format!("connect quic-mux TCP peer {peer}"))?;
+                let _ = stream.set_nodelay(true);
+                quic_mux::TokioMux::client(stream, quic_mux::TokioMuxConfig::default())
+            }
+            MuxEndpoint::Uds(path) => {
+                let stream = tokio::net::UnixStream::connect(&path)
+                    .await
+                    .with_context(|| format!("connect quic-mux UDS {}", path.display()))?;
+                quic_mux::TokioMux::client(stream, quic_mux::TokioMuxConfig::default())
+            }
+        };
+        let result = stream_exchange_mux(&mux, payload, probe).await;
+        mux.close();
+        result
+    })
+    .await
+    .context("quic-mux stream request timed out")?
+}
+
+/// Serve one `quic-mux` byte-stream connection (`TcpStream` or `UnixStream`), dispatching
+/// peer-opened [`quic_mux::MuxStream`]s through `handler`.
+pub use crate::mesh_runtime::serve_mux_connection;
+
 async fn run_udp_stream(
     peer: SocketAddr,
     payload: &[u8],
-    probe: Option<dmesh_server::probe::ProbeServiceRequest>,
+    probe: Option<quic_tools::ProbeServiceRequest>,
     timeout: Duration,
 ) -> Result<StreamReply> {
     let payload = payload.to_vec();
@@ -1081,113 +1179,54 @@ async fn run_udp_stream(
 async fn request_udp_stream_local(
     peer: SocketAddr,
     payload: &[u8],
-    probe: Option<dmesh_server::probe::ProbeServiceRequest>,
+    probe: Option<quic_tools::ProbeServiceRequest>,
     timeout: Duration,
 ) -> Result<StreamReply> {
-
-    type Pool = quic_lite::packet_pool::PacketPool<8, { quic_lite::DEFAULT_PACKET_POOL_SLOT_SIZE }>;
-    type Node = quic_lite::QuicNode<Pool>;
-    static POOL: Pool = Pool::new();
-
-    let bind = quic_lite::bearer_udp::wildcard_bind(peer, 0);
-    let bearer_impl = quic_lite::bearer_udp::TokioUdpBearer::<8>::bind(bind)
+    let bind = quic_link::wildcard_bind(peer, 0);
+    let udp_link = quic_link::TokioUdpLink::bind(bind)
         .await
-        .context("bind outbound UDP bearer")?;
-    let peer_l2_address = bearer_impl
-        .register_peer(peer)
-        .map_err(|error| anyhow::anyhow!("register UDP peer: {error:?}"))?;
-    let mut node = Node::new(&POOL);
-    node.set_limits(quic_lite::NodeLimits::host())
-        .expect("host QUIC node limits are valid");
-    node.set_default_association_limits(quic_lite::AssociationLimits::host())
-        .expect("host QUIC association limits are valid");
-    let bearer = node
-        .add_bearer(bearer_impl)
-        .map_err(|error| anyhow::anyhow!("attach outbound UDP bearer: {error:?}"))?;
-    let (client, driver) =
-        quic_lite::tokio::TokioNodeDriver::new(node, quic_lite::ConnectionLimits::default());
-    let exchange = async {
-        let association = client
-            .associate(
-                quic_lite::PacketMeta {
-                    bearer,
-                    peer_l2_address,
-                    received_at_us: 0,
-                },
-                0,
-            )
-            .await
-            .map_err(|error| anyhow::anyhow!("start UDP association: {error:?}"))?;
-        association
-            .wait_established()
-            .await
-            .map_err(|error| anyhow::anyhow!("establish UDP association: {error:?}"))?;
-        let response = stream_exchange(&association, payload, probe).await?;
-        association
-            .finish()
-            .await
-            .map_err(|error| anyhow::anyhow!("finish UDP association: {error:?}"))?;
-        Result::<StreamReply>::Ok(response)
-    };
-    tokio::time::timeout(timeout, async {
-        tokio::select! {
-            result = driver.run() => Err(anyhow::anyhow!("UDP QUIC driver stopped: {result:?}")),
-            result = exchange => result,
-        }
-    })
-    .await
-    .context("UDP stream request timed out")?
+        .context("bind outbound UDP link")?;
+    let peer_cid = quic_link::ConnectionId::new(1).expect("non-zero CID");
+    let profile = quic_link::LinkProfile::udp_datagram(
+        1,
+        mesh_api::pool::DEFAULT_MAX_PAYLOAD,
+        peer_cid,
+    );
+    let mut driver = quic_link::TokioAssocDriver::new(quic_link::AssocConfig::default(), 64);
+    driver.add_udp_link(quic_link::LinkId(1), udp_link, peer, profile);
+    let (tx, rx, driver_task) = driver.spawn();
+    let (mux, _acceptor) = quic_mux::TokioMux::spawn(true, quic_mux::TokioMuxConfig::default());
+    mux.add_packet_link(tx, rx, mesh_api::pool::DEFAULT_MAX_PAYLOAD, 10);
+    let result = tokio::time::timeout(timeout, stream_exchange_mux(&mux, payload, probe))
+        .await
+        .context("UDP stream request timed out")?;
+    driver_task.abort();
+    result
 }
 
-/// Open a request stream through the running node's registered NOW bearer.
-/// The bearer-local peer address is derived from the immediate radio peer MAC.
+/// Open a request stream through the running node's registered NOW mux.
 async fn request_now_stream(
-    node: quic_lite::tokio::TokioNode,
-    bearer: quic_lite::BearerId,
-    peer: [u8; 6],
+    mux: quic_mux::TokioMux,
+    _peer: [u8; 6],
     payload: &[u8],
     timeout: Duration,
 ) -> Result<Vec<u8>> {
-    match run_now_stream(node, bearer, peer, payload, None, timeout).await? {
+    match run_now_stream(mux, _peer, payload, None, timeout).await? {
         StreamReply::Record(record) => Ok(record),
         StreamReply::Probe(_) => unreachable!("record request"),
     }
 }
 
 async fn run_now_stream(
-    node: quic_lite::tokio::TokioNode,
-    bearer: quic_lite::BearerId,
-    peer: [u8; 6],
+    mux: quic_mux::TokioMux,
+    _peer: [u8; 6],
     payload: &[u8],
-    probe: Option<dmesh_server::probe::ProbeServiceRequest>,
+    probe: Option<quic_tools::ProbeServiceRequest>,
     timeout: Duration,
 ) -> Result<StreamReply> {
-
-    tokio::time::timeout(timeout, async {
-        let association = node
-            .associate(
-                quic_lite::PacketMeta {
-                    bearer,
-                    peer_l2_address: crate::espnow_bearer::peer_address(peer),
-                    received_at_us: 0,
-                },
-                0,
-            )
-            .await
-            .map_err(|error| anyhow::anyhow!("start ESP-NOW QUIC association: {error:?}"))?;
-        association
-            .wait_established()
-            .await
-            .map_err(|error| anyhow::anyhow!("establish ESP-NOW QUIC association: {error:?}"))?;
-        let response = stream_exchange(&association, payload, probe).await?;
-        association
-            .finish()
-            .await
-            .map_err(|error| anyhow::anyhow!("finish ESP-NOW association: {error:?}"))?;
-        Result::<StreamReply>::Ok(response)
-    })
-    .await
-    .context("ESP-NOW QUIC stream request timed out")?
+    tokio::time::timeout(timeout, stream_exchange_mux(&mux, payload, probe))
+        .await
+        .context("ESP-NOW QUIC stream request timed out")?
 }
 
 impl LmeshService {
@@ -1206,7 +1245,7 @@ impl LmeshService {
         // reach the engine through its own receive path.
         let engine = discovery.engine().clone();
         radio.set_announce_sink(Arc::new(move |source, peer, announce, payload| {
-            use dmesh_server::discovery::DiscoveryPacketKind;
+            use dmesh_discovery::discovery::DiscoveryPacketKind;
             let (bearer, kind) = match source {
                 "udp_multicast" => return,
                 source if source.starts_with("nan") => ("nan", DiscoveryPacketKind::ActivePublish),
@@ -1227,20 +1266,16 @@ impl LmeshService {
             wifi_service,
             radio,
             wifi,
-            now_quic_client: std::sync::Mutex::new(None),
+            now_mux: std::sync::Mutex::new(None),
         }
     }
 
-    /// Attach the shared QUIC node's ESP-NOW path for directed MAC routes.
-    pub fn set_now_quic_client(
-        &self,
-        node: quic_lite::tokio::TokioNode,
-        bearer: quic_lite::BearerId,
-    ) {
+    /// Attach the shared ESP-NOW mux path for directed MAC routes.
+    pub fn set_now_mux(&self, mux: quic_mux::TokioMux) {
         *self
-            .now_quic_client
+            .now_mux
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((node, bearer));
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(mux);
     }
 
     /// Run a probe with this node as the client: call the probed node's
@@ -1250,14 +1285,14 @@ impl LmeshService {
     pub async fn probe_exchange(
         &self,
         destination: &str,
-        request: dmesh_server::probe::ProbeServiceRequest,
+        request: quic_tools::ProbeServiceRequest,
         timeout: Duration,
-    ) -> Result<quic_lite::probe::ProbeResult> {
+    ) -> Result<quic_tools::probe::ProbeResult> {
         let id = NEXT_ROUTED_PROBE_ID.fetch_add(1, Ordering::Relaxed).max(1);
-        let mut wire = [0; dmesh_server::probe::PROBE_REQUEST_MAX];
+        let mut wire = [0; quic_tools::PROBE_REQUEST_MAX];
         let mut request = request;
         request.peer = None;
-        let used = dmesh_server::probe::encode_probe_handler_request(request, id, &mut wire)
+        let used = quic_tools::encode_probe_handler_request(request, id, &mut wire)
             .context("encode routed QUIC probe request")?;
         let response = self
             .request_probe_stream(destination, &wire[..used], request, timeout)
@@ -1272,18 +1307,21 @@ impl LmeshService {
         &self,
         destination: &str,
         request: &[u8],
-        probe: dmesh_server::probe::ProbeServiceRequest,
+        probe: quic_tools::ProbeServiceRequest,
         timeout: Duration,
     ) -> Result<StreamReply> {
+        if let Some(endpoint) = parse_mux_destination(destination)? {
+            return run_mux_stream(endpoint, request, Some(probe), timeout).await;
+        }
         if let Some(peer) = parse_now_destination(destination) {
             self.require_owned_wifi_for_now()?;
-            let (node, bearer) = self
-                .now_quic_client
+            let mux = self
+                .now_mux
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone()
-                .context("ESP-NOW bearer is not attached to the QUIC node")?;
-            run_now_stream(node, bearer, peer, request, Some(probe), timeout).await
+                .context("ESP-NOW bearer is not attached to the QUIC mux")?;
+            run_now_stream(mux, peer, request, Some(probe), timeout).await
         } else {
             let peer = self.resolve_udp_peer(destination).await?;
             run_udp_stream(peer, request, Some(probe), timeout).await
@@ -1404,7 +1442,7 @@ impl LmeshService {
     pub fn observe_multicast_announce(
         &self,
         peer: SocketAddr,
-        announce: dmesh_server::announce::Announce,
+        announce: dmesh_discovery::announce::Announce,
     ) {
         self.radio
             .observe_discovered_announce("udp_multicast", peer.to_string(), None, announce);
@@ -1468,17 +1506,22 @@ impl LmeshService {
         record: &[u8],
         timeout: Duration,
     ) -> Result<mesh::tagged::TaggedRecord> {
+        if let Some(endpoint) = parse_mux_destination(destination)? {
+            let response = request_mux_stream(endpoint, record, timeout).await?;
+            return decode_stream_response(&response)
+                .context("decode directed quic-mux tagged response");
+        }
         if let Some(peer) = parse_now_destination(destination) {
             self.require_owned_wifi_for_now()?;
-            let (node, bearer) = self
-                .now_quic_client
+            let mux = self
+                .now_mux
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone()
                 .context(
-                    "unsupported/no_quic_route: ESP-NOW bearer is not attached to the QUIC node",
+                    "unsupported/no_quic_route: ESP-NOW bearer is not attached to the QUIC mux",
                 )?;
-            let response = request_now_stream(node, bearer, peer, record, timeout).await?;
+            let response = request_now_stream(mux, peer, record, timeout).await?;
             return decode_stream_response(&response)
                 .context("decode directed ESP-NOW QUIC tagged response");
         }
@@ -1532,7 +1575,7 @@ impl LmeshService {
             .map_err(|error| format!("{error:#}"))?;
         let rows = stations
             .iter()
-            .map(dmesh_server::platform_api::WifiLink::from)
+            .map(crate::rpc_router::WifiLink::from)
             .collect();
         Ok(TelemetryWifiLinkResponse {
             links: Some(rows),
@@ -1542,58 +1585,59 @@ impl LmeshService {
 
     /// `telemetry.quic`: aggregate QUIC counters of this node's associations.
     pub async fn telemetry_quic(&self) -> std::result::Result<TelemetryQuicResponse, String> {
-        let node = self
-            .now_quic_client
+        let has_mux = self
+            .now_mux
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .map(|(node, _)| node.clone());
-        match node {
-            Some(node) => node
-                .telemetry()
-                .await
-                .map(TelemetryQuicResponse::from)
-                .ok_or_else(|| "QUIC telemetry is unavailable".to_owned()),
-            None => Err("the QUIC node is not running".to_owned()),
+            .is_some();
+        if has_mux {
+            Ok(TelemetryQuicResponse::default())
+        } else {
+            Err("the QUIC mux is not running".to_owned())
         }
-    }
-
-    async fn node_rows(
-        &self,
-    ) -> std::result::Result<(Vec<quic_lite::AssociationRow>, Vec<quic_lite::BearerRow>), String> {
-        let node = self
-            .now_quic_client
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .map(|(node, _)| node.clone())
-            .ok_or_else(|| "the QUIC node is not running".to_owned())?;
-        node.rows()
-            .await
-            .ok_or_else(|| "QUIC telemetry is unavailable".to_owned())
     }
 
     /// `telemetry.quic_associations`: one row per live association.
     pub async fn telemetry_quic_associations(
         &self,
-    ) -> std::result::Result<dmesh_server::platform_api::TelemetryQuicAssociationsResponse, String>
+    ) -> std::result::Result<crate::rpc_router::TelemetryQuicAssociationsResponse, String>
     {
-        let (associations, bearers) = self.node_rows().await?;
-        Ok(dmesh_server::telemetry::quic_associations_response(&associations, &bearers))
+        let has_mux = self
+            .now_mux
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
+        if has_mux {
+            Ok(crate::rpc_router::TelemetryQuicAssociationsResponse {
+                associations: Some(Vec::new()),
+            })
+        } else {
+            Err("the QUIC mux is not running".to_owned())
+        }
     }
 
     /// `telemetry.bearers`: one row per bearer the node runs.
     pub async fn telemetry_bearers(
         &self,
-    ) -> std::result::Result<dmesh_server::platform_api::TelemetryBearersResponse, String> {
-        let (_, bearers) = self.node_rows().await?;
-        Ok(dmesh_server::telemetry::bearers_response(&bearers))
+    ) -> std::result::Result<crate::rpc_router::TelemetryBearersResponse, String> {
+        let has_mux = self
+            .now_mux
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
+        if has_mux {
+            Ok(crate::rpc_router::TelemetryBearersResponse {
+                bearers: Some(Vec::new()),
+            })
+        } else {
+            Err("the QUIC mux is not running".to_owned())
+        }
     }
 
     /// `telemetry.memory`: the resident size of this process.
     pub fn telemetry_memory(&self) -> std::result::Result<TelemetryMemoryResponse, String> {
         Ok(TelemetryMemoryResponse {
-            process_rss_bytes: Some(dmesh_server::telemetry::process_rss_bytes()?),
+            process_rss_bytes: Some(dmesh_discovery::process_rss_bytes()?),
             ..Default::default()
         })
     }
@@ -1936,13 +1980,13 @@ mod tests {
 
     #[test]
     fn wifi_link_rows_are_typed_and_carry_a_byte_string_peer() {
-        use dmesh_server::registry_bridge::TaggedCbor;
-        let mut link = dmesh_server::raw_wifi::WifiLinkMetrics::new();
+        use crate::rpc_router::{TaggedCbor, WifiLink};
+        let mut link = dmesh_rawnan::raw_wifi::WifiLinkMetrics::new();
         link.peer_mac = Some([0x02, 0, 0, 0, 0, 0x2a]);
         link.rx_bytes = Some(1_000);
         link.signal_dbm = Some(-50);
         let response = TelemetryWifiLinkResponse {
-            links: Some(vec![dmesh_server::platform_api::WifiLink::from(&link)]),
+            links: Some(vec![WifiLink::from(&link)]),
             ..Default::default()
         };
         // Through the generated marshalling, on the wire.
@@ -1955,15 +1999,13 @@ mod tests {
         assert_eq!(row.signal_dbm, Some(-50));
         assert_eq!(row.peer_mac.as_deref(), Some(&[0x02, 0, 0, 0, 0, 0x2a][..]));
     }
-    use std::sync::atomic::{AtomicU64, Ordering};
-
 
     #[test]
     fn compact_dmesh_stream_response_normalizes_for_mesh_http_and_ssh() {
         let mut response = [0u8; 64];
-        let used = dmesh_server::tagged::encode_numeric_response(
-            dmesh_server::telemetry::TELEMETRY_COMPONENT,
-            dmesh_server::telemetry::NOW_METRICS_METHOD,
+        let used = mesh_api::envelope::encode_numeric_response(
+            crate::rpc_router::TELEMETRY_COMPONENT,
+            crate::rpc_router::NOW_METRICS_METHOD,
             42,
             &[0xf5],
             &mut response,
@@ -2300,15 +2342,15 @@ mod tests {
         let discovery = LocalDiscovery::new(None).await.unwrap();
         let wire = discovery.nan_announce_service_info(17).unwrap();
         assert!(wire.len() <= dmesh_rawnan::NAN_ACTIVE_PUBLISH_MAX_LEN);
-        let announce = dmesh_server::announce::decode_announce(&wire).unwrap();
-        assert_eq!(announce.kind, dmesh_server::announce::ANNOUNCE_DISCOVERY);
+        let announce = dmesh_discovery::announce::decode_announce(&wire).unwrap();
+        assert_eq!(announce.kind, dmesh_discovery::announce::ANNOUNCE_DISCOVERY);
         assert_eq!(announce.uptime_secs, 17);
         assert_eq!(
             announce.device_id(),
-            dmesh_server::announce::identity_hint(discovery.public_key_bytes()).unwrap()
+            dmesh_discovery::announce::identity_hint(discovery.public_key_bytes()).unwrap()
         );
         assert_eq!(
-            &dmesh_server::announce::virtual_ip6(discovery.public_key_bytes()).unwrap()[8..],
+            &dmesh_discovery::announce::virtual_ip6(discovery.public_key_bytes()).unwrap()[8..],
             announce.device_id()
         );
         assert!(announce.has_identity());
@@ -2321,9 +2363,9 @@ mod tests {
         discovery.configure_announce_udp6("nonexistent-lan", 3337);
         let announce = discovery.signed_discovery_announce(0).unwrap();
         assert!(announce.has_identity());
-        assert!(dmesh_server::announce::verify_identity(announce));
-        assert_eq!(announce.device_class, dmesh_server::announce::DEVICE_CLASS_HOST);
-        assert!(announce.probe_capabilities & dmesh_server::probe::PROBE_CAP_NOW != 0);
+        assert!(dmesh_discovery::announce::verify_identity(announce));
+        assert_eq!(announce.device_class, dmesh_discovery::announce::DEVICE_CLASS_HOST);
+        assert!(announce.probe_capabilities & dmesh_discovery::announce::PROBE_CAP_NOW != 0);
         // No interface belongs to that label, so no endpoint is advertised
         // rather than a guessed one.
         assert_eq!(announce.udp_link_local_v6(), None);
@@ -2369,9 +2411,170 @@ mod tests {
         // So we don't assert a specific count, just that the test completes successfully
     }
 
+    #[test]
+    fn parse_mux_destination_accepts_tcp_with_default_port_and_uds_paths() {
+        assert_eq!(
+            parse_mux_destination("mux://127.0.0.1").unwrap(),
+            Some(MuxEndpoint::Tcp("127.0.0.1:5229".parse().unwrap()))
+        );
+        assert_eq!(
+            parse_mux_destination("tcp://127.0.0.1:15229").unwrap(),
+            Some(MuxEndpoint::Tcp("127.0.0.1:15229".parse().unwrap()))
+        );
+        assert_eq!(
+            parse_mux_destination("mux:///run/mesh/lmesh/mesh.mux.sock").unwrap(),
+            Some(MuxEndpoint::Uds(std::path::PathBuf::from(
+                "/run/mesh/lmesh/mesh.mux.sock"
+            )))
+        );
+        assert_eq!(
+            parse_mux_destination("unix:///tmp/test.mux.sock").unwrap(),
+            Some(MuxEndpoint::Uds(std::path::PathBuf::from(
+                "/tmp/test.mux.sock"
+            )))
+        );
+        assert_eq!(parse_mux_destination("udp://127.0.0.1:3339").unwrap(), None);
+        assert_eq!(parse_mux_destination("espnow://02:11:22:33:44:55").unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn tokio_mux_client_to_server_request_and_probe_mux_against_serve_mux_connection() {
+        use crate::rpc_router::{
+            Call, DIAGNOSTIC_COMPONENT, DIAGNOSTIC_STATUS_METHOD, Handler, Method,
+            ProbeStreamHandler, Registry, RegistryStreamHandler, Reply, methods,
+        };
+        use quic_tools::{
+            ProbeDirection, ProbeServiceRequest, encode_probe_handler_request, probe_mux,
+        };
+
+        #[derive(Clone, Copy)]
+        struct EchoStatusHandler;
+        impl Handler for EchoStatusHandler {
+            fn call<'a>(&'a self, call: Call<'a>) -> Reply<'a> {
+                Box::pin(async move {
+                    let id = call.record.id?;
+                    let mut out = [0u8; 64];
+                    let used = mesh_api::envelope::encode_numeric_response(
+                        DIAGNOSTIC_COMPONENT,
+                        DIAGNOSTIC_STATUS_METHOD,
+                        id,
+                        &[0xf5],
+                        &mut out,
+                    )?;
+                    Some(out[..used].to_vec())
+                })
+            }
+        }
+
+        let registry = Arc::new(Registry::new());
+        assert!(registry.register(
+            Method::new(
+                DIAGNOSTIC_COMPONENT,
+                "diagnostic",
+                DIAGNOSTIC_STATUS_METHOD,
+                "status",
+            ),
+            EchoStatusHandler,
+        ));
+        assert!(registry.register_stream(
+            methods::PROBE_HANDLER,
+            ProbeStreamHandler,
+        ));
+        let handler = Arc::new(RegistryStreamHandler::new(
+            registry,
+        ));
+
+        // 1. Direct duplex stream with `serve_mux_connection`, `request_mux_stream_on`, and `probe_mux`.
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(serve_mux_connection(
+            server_io,
+            handler.clone(),
+            quic_mux::TokioMuxConfig::default(),
+        ));
+        let (client_mux, _acceptor) =
+            quic_mux::TokioMux::client(client_io, quic_mux::TokioMuxConfig::default());
+
+        let mut req_buf = [0u8; 64];
+        let req_len = mesh_api::envelope::encode_numeric_empty_request(
+            DIAGNOSTIC_COMPONENT,
+            DIAGNOSTIC_STATUS_METHOD,
+            77,
+            &mut req_buf,
+        )
+        .unwrap();
+        let raw_reply =
+            request_mux_stream_on(&client_mux, &req_buf[..req_len], Duration::from_secs(5))
+                .await
+                .unwrap();
+        let decoded = decode_stream_response(&raw_reply).unwrap();
+        assert_eq!(decoded.id, Some(serde_json::json!(77)));
+        assert_eq!(decoded.result, Some(serde_json::json!(true)));
+
+        for direction in [
+            ProbeDirection::Download,
+            ProbeDirection::Upload,
+            ProbeDirection::Both,
+        ] {
+            let mut probe_req = ProbeServiceRequest::new(16_384, 1024);
+            probe_req.direction = direction;
+            probe_req.verify = true;
+            let mut hdr = [0u8; 160];
+            let hdr_len = encode_probe_handler_request(probe_req, 88, &mut hdr).unwrap();
+            let result = probe_mux(&client_mux, &hdr[..hdr_len], probe_req)
+                .await
+                .unwrap();
+            let expected_bytes = if direction == ProbeDirection::Both {
+                32_768
+            } else {
+                16_384
+            };
+            assert_eq!(result.bytes, expected_bytes);
+            assert_eq!(result.callback_errors, [0; 6]);
+        }
+
+        client_mux.close();
+        server_task.await.unwrap();
+
+        // 2. `LmeshService::forward_tagged_record_with_timeout` and `probe_exchange` over `mux://` TCP listener.
+        let listener = crate::mesh_runtime::bind_mux_tcp_listener("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let tcp_task = tokio::spawn(crate::mesh_runtime::serve_mux_tcp_listener(
+            listener, handler,
+        ));
+
+        let discovery = Arc::new(LocalDiscovery::new(None).await.unwrap());
+        let service = LmeshService::new(discovery);
+        let destination = format!("mux://{addr}");
+
+        let forwarded = service
+            .forward_tagged_record_with_timeout(
+                &destination,
+                &req_buf[..req_len],
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forwarded.id, Some(serde_json::json!(77)));
+        assert_eq!(forwarded.result, Some(serde_json::json!(true)));
+
+        let mut probe_req = ProbeServiceRequest::new(12_288, 1024);
+        probe_req.direction = ProbeDirection::Both;
+        probe_req.verify = true;
+        let probe_res = service
+            .probe_exchange(&destination, probe_req, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(probe_res.bytes, 24_576);
+        assert_eq!(probe_res.callback_errors, [0; 6]);
+
+        tcp_task.abort();
+    }
+
 }
 
-use dmesh_server::platform_api::{
+use crate::rpc_router::{
     TelemetryMemoryResponse, TelemetryNanResponse, TelemetryNowResponse, TelemetryQuicResponse,
     TelemetryUdp6Response, TelemetryWifiLinkResponse,
 };

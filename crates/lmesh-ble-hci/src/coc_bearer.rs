@@ -1,23 +1,22 @@
-//! QUIC-lite bearer over one encrypted Linux BLE CoC packet channel.
+//! Encrypted Linux BLE CoC packet link over [`mesh_api::link::PacketLink`].
 
 use std::sync::Arc;
 
-use quic_lite::{
-    BearerContext, BearerInfo, BearerName, EgressSubmission, PacketBearer, PacketEgress,
-    PacketMeta, PacketPool, PacketSendOutcome, PacketSubmitError, PeerL2Address,
+use mesh_api::link::{
+    LinkInfo, LinkIngress, LinkMeta, LinkName, LinkTxOutcome, PacketLink, PeerL2Address,
 };
+use mesh_api::pool::{PacketPool, PoolPacket};
 
 use crate::coc::{COC_PACKET_MAX, CocChannel, DEFAULT_COC_PSM};
 
-/// One connected BLE CoC exposed as an opaque packet bearer.
+/// One connected BLE CoC exposed as an opaque [`PacketLink`].
 ///
 /// This implementation currently owns one channel. It may evolve into one
-/// multi-peer CoC bearer with dynamically added and removed channels, each
-/// represented by a distinct `PeerL2Address`, consistent with UDP, ESP-NOW,
-/// multi-port UART, and Android's Java-owned BLE bearer.
+/// multi-peer CoC link with dynamically added and removed channels, each
+/// represented by a distinct [`PeerL2Address`].
 pub struct CocBearer {
     channel: Arc<CocChannel>,
-    info: BearerInfo,
+    info: LinkInfo,
 }
 
 impl CocBearer {
@@ -39,8 +38,8 @@ impl CocBearer {
     fn new(channel: CocChannel) -> Self {
         Self {
             channel: Arc::new(channel),
-            info: BearerInfo {
-                name: BearerName::new("ble-coc").expect("static bearer name is valid"),
+            info: LinkInfo {
+                name: LinkName::new("ble-coc").expect("static link name is valid"),
                 max_packet_size: COC_PACKET_MAX,
                 prefix_required: 0,
                 suffix_required: 0,
@@ -52,62 +51,50 @@ impl CocBearer {
             },
         }
     }
-}
 
-impl<B: AsRef<[u8]>> PacketEgress<B> for CocBearer {
-    fn submit(
-        &mut self,
-        _peer: PeerL2Address,
-        submission: EgressSubmission<B>,
-    ) -> Result<(), PacketSubmitError<B>> {
-        let outcome = self.channel.write_packet(submission.packet().bytes());
-        submission.complete(
-            if outcome.is_ok() {
-                PacketSendOutcome::Sent
-            } else {
-                PacketSendOutcome::Failed
-            },
-            0,
-        );
-        Ok(())
-    }
-}
-
-impl<P> PacketBearer<P> for CocBearer
-where
-    P: PacketPool + Sync + 'static,
-    P::Buffer: Send,
-{
-    type AttachError = std::io::Error;
-
-    fn info(&self) -> BearerInfo {
-        self.info
-    }
-
-    fn attach(&mut self, context: BearerContext<P>) -> Result<(), Self::AttachError> {
+    /// Spawn the blocking BLE CoC reader thread using `pool` and `ingress`.
+    pub fn attach<Pool>(&mut self, pool: Pool, ingress: Arc<dyn LinkIngress<Pool::Packet>>)
+    where
+        Pool: PacketPool + Send + Sync + 'static,
+    {
         let channel = self.channel.clone();
         std::thread::Builder::new()
             .name("lmesh-ble-coc".to_owned())
             .spawn(move || {
                 let peer = PeerL2Address::new(1).expect("one is a valid CoC peer");
+                let mut buf = [0u8; COC_PACKET_MAX];
                 loop {
-                    let packet = context.pool().build_packet(0, 0, |output| {
-                        channel.read_packet(output)
-                    });
-                    match packet {
-                        Ok(packet) => context.enqueue_packet(
-                            PacketMeta {
-                                bearer: context.bearer(),
-                                peer_l2_address: peer,
+                    let n = match channel.read_packet(&mut buf) {
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+                    if let Ok(mut packet) = pool.alloc()
+                        && packet.append(&buf[..n]).is_ok()
+                    {
+                        ingress.on_packet(
+                            LinkMeta {
+                                peer,
                                 received_at_us: 0,
+                                rssi_dbm: None,
                             },
                             packet,
-                        ),
-                        Err(quic_lite::PacketBuildError::Serialize(_)) => break,
-                        Err(_) => std::thread::yield_now(),
+                        );
                     }
                 }
-            })?;
-        Ok(())
+            })
+            .expect("spawn ble coc reader thread");
+    }
+}
+
+impl<P: PoolPacket> PacketLink<P> for CocBearer {
+    fn info(&self) -> &LinkInfo {
+        &self.info
+    }
+
+    fn send_packet(&mut self, _peer: PeerL2Address, packet: P) -> Result<LinkTxOutcome, P> {
+        match self.channel.write_packet(packet.bytes()) {
+            Ok(()) => Ok(LinkTxOutcome::Sent),
+            Err(_) => Ok(LinkTxOutcome::Failed),
+        }
     }
 }

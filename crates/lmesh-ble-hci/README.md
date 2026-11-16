@@ -1,8 +1,7 @@
 # Linux BLE
 
 `lmesh-ble-hci` is the Linux BLE adapter. It defines no API: method and field
-numbers are in the [root API](../../API.md) and arrive as the generated types
-in `dmesh_server::platform_api`. Its whole public surface is two types:
+numbers are in the [root API](../../API.md). Its whole public surface is two types:
 
 - `CocBearer`: a QUIC-lite packet bearer over one L2CAP CoC. `connect` requests
   an encrypted link and checks the negotiated security level; BlueZ's agent
@@ -12,7 +11,7 @@ in `dmesh_server::platform_api`. Its whole public surface is two types:
 - `BleCompanion`: the Linux half of `companion.pair` and `companion.unpair` for
   `kind=ble`. It attaches the CoC to the daemon's running QUIC node as an
   ordinary bearer and pairs over an ordinary association, using the shared
-  exchange in `dmesh_server::companion_pair`. The device refuses a BLE pairing
+  exchange in `dmesh_discovery::controller`. The device refuses a BLE pairing
   when it already has a secret.
 
 Not implemented: `unpair` over BLE only releases the channel; it does not reset
