@@ -80,13 +80,13 @@ pub fn decode_packet(payload: &[u8]) -> Result<&[u8], PacketFrameError> {
     if packet.is_empty() {
         return Err(PacketFrameError::Empty);
     }
-    if packet.len() > quic_lite::DEFAULT_MAX_PACKET_SIZE {
+    if packet.len() > mesh_api::DEFAULT_MAX_PAYLOAD {
         return Err(PacketFrameError::PayloadTooLarge);
     }
     Ok(packet)
 }
 
-/// Construct a streaming PPP encoder for one opaque QUIC-lite packet.
+/// Construct a streaming PPP encoder for one opaque packet.
 pub fn encode_packet(packet: &[u8]) -> codec::Result<codec::Encoder<'_>> {
     if packet.is_empty() {
         return Err(codec::Error::EmptyPayload);
@@ -94,7 +94,7 @@ pub fn encode_packet(packet: &[u8]) -> codec::Result<codec::Encoder<'_>> {
     codec::Encoder::new_prefixed(
         PACKET_MARKER,
         packet,
-        quic_lite::DEFAULT_MAX_PACKET_SIZE + 1,
+        mesh_api::DEFAULT_MAX_PAYLOAD + 1,
     )
 }
 

@@ -8,26 +8,24 @@
 //! attaches the UART as an ordinary bearer of the caller's running QUIC node
 //! and leaves it attached and in use: a port that is already attached (at
 //! startup, or by an earlier pairing) is reused. The exchange itself is the
-//! bearer-independent one in `dmesh_server::companion_pair`.
+//! bearer-independent one in `dmesh_discovery::controller`.
 
 use std::boxed::Box;
 use std::{
     collections::HashMap,
     format,
-    marker::PhantomData,
     net::Ipv6Addr,
-    path::Path,
     string::{String, ToString},
     sync::Mutex,
     time::Duration,
 };
 
-use dmesh_server::companion_pair::{self, Paired};
-use quic_lite::{
-    BearerId, BearerName, PacketMeta, PeerL2Address,
-    packet_pool::PacketPool,
-    tokio::{TokioAssociation, TokioNode},
-};
+use dmesh_discovery::controller::{self, ControllerLink, PairRequest, Paired};
+use dmesh_discovery::device_record::DeviceStore;
+use mesh_api::link::{LinkName, PeerL2Address};
+use mesh_api::pool::{DEFAULT_HEADROOM, DEFAULT_MAX_PAYLOAD};
+use quic_link::{AssocConfig, ConnectionId, LinkId, LinkProfile, TokioAssocDriver};
+use quic_mux::{TokioMux, TokioMuxConfig};
 
 use crate::host::UartPort;
 
@@ -48,39 +46,37 @@ pub struct Pairing<'a> {
     /// Compressed P-256 control-plane root to install (33 bytes).
     pub root_public_key: [u8; 33],
     /// Where the device's record is saved.
-    pub store: &'a dmesh_server::device_record::DeviceStore,
+    pub store: &'a DeviceStore,
 }
 
-/// The serial ports attached to one QUIC node. `SLOTS` and `MTU` are the node's
-/// packet pool.
-pub struct UartCompanion<const SLOTS: usize, const MTU: usize> {
-    node: TokioNode,
-    attached: Mutex<HashMap<String, BearerId>>,
-    _pool: PhantomData<fn() -> PacketPool<SLOTS, MTU>>,
+struct ConnectedUart {
+    mux: TokioMux,
+    driver_task: tokio::task::JoinHandle<()>,
 }
 
-impl<const SLOTS: usize, const MTU: usize> UartCompanion<SLOTS, MTU> {
-    pub fn new(node: TokioNode) -> Self {
-        Self {
-            node,
-            attached: Mutex::new(HashMap::new()),
-            _pool: PhantomData,
-        }
+impl Drop for ConnectedUart {
+    fn drop(&mut self) {
+        self.driver_task.abort();
     }
+}
 
-    /// Record a port the daemon already attached to the node (for example from
-    /// its startup configuration), so a pairing reuses that bearer instead of
-    /// opening the port a second time.
-    pub fn adopt(&self, path: &str, bearer: BearerId) {
-        self.lock().insert(path.to_string(), bearer);
+/// The serial ports attached for `companion.pair kind=uart`.
+#[derive(Default)]
+pub struct UartCompanion {
+    attached: Mutex<HashMap<String, ConnectedUart>>,
+}
+
+impl UartCompanion {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Pair the device on a serial port. The port stays attached afterwards.
     pub async fn pair(&self, request: Pairing<'_>) -> Result<Paired, String> {
-        self.with_association(request.path, request.baud, |association| async move {
-            companion_pair::pair(
-                &association,
-                &companion_pair::Pairing {
+        self.with_mux(request.path, request.baud, |mux| async move {
+            controller::pair_mux(
+                &mux,
+                &controller::Pairing {
                     vip6: request.vip6,
                     name: request.name,
                     root_public_key: request.root_public_key,
@@ -100,83 +96,70 @@ impl<const SLOTS: usize, const MTU: usize> UartCompanion<SLOTS, MTU> {
         &self,
         path: &str,
         baud: Option<u32>,
-        store: &dmesh_server::device_record::DeviceStore,
+        store: &DeviceStore,
     ) -> Result<Ipv6Addr, String> {
-        self.with_association(path, baud, |association| async move {
-            companion_pair::unpair(&association, store).await
+        self.with_mux(path, baud, |mux| async move {
+            controller::unpair_mux(&mux, store).await
         })
         .await
     }
 
-    /// Run `operation` on a fresh association over the port's bearer, attaching
-    /// the port first when needed. A port this call attached is detached again
-    /// if the association cannot be set up, since nothing then answers on it;
-    /// so is a stale one, so the next attempt reopens the port.
-    async fn with_association<T, F>(
+    async fn with_mux<T, F>(
         &self,
         path: &str,
         baud: Option<u32>,
-        operation: impl FnOnce(TokioAssociation) -> F,
+        operation: impl FnOnce(TokioMux) -> F,
     ) -> Result<T, String>
     where
         F: std::future::Future<Output = Result<T, String>>,
     {
-        let existing = self.lock().get(path).copied();
-        let bearer = match existing {
-            Some(bearer) => bearer,
-            None => self.attach(path, baud).await?,
+        let existing = self.lock().get(path).map(|conn| conn.mux.clone());
+        let mux = match existing {
+            Some(mux) => mux,
+            None => self.attach(path, baud)?,
         };
-        let association = match self.associate(bearer).await {
-            Ok(association) => association,
-            Err(error) => {
-                self.lock().remove(path);
-                self.node.remove_bearer(bearer).await;
-                return Err(format!("UART {path}: {error}"));
-            }
-        };
-        let outcome = operation(association.clone()).await;
-        let _ = association.finish().await;
+        let outcome = tokio::time::timeout(SETUP_TIMEOUT, operation(mux))
+            .await
+            .unwrap_or_else(|_| Err(format!("UART {path}: timed out after {SETUP_TIMEOUT:?}")));
+        if outcome.is_err() {
+            self.lock().remove(path);
+        }
         outcome
     }
 
-    async fn attach(&self, path: &str, baud: Option<u32>) -> Result<BearerId, String> {
+    fn attach(&self, path: &str, baud: Option<u32>) -> Result<TokioMux, String> {
         let port = UartPort::open(path, baud).map_err(|error| format!("open {path}: {error}"))?;
-        let bearer = port
-            .into_tokio::<SLOTS, MTU>(BearerName::new("uart").ok_or("bearer name")?)
+        let mut bearer = port
+            .into_tokio(LinkName::new("uart").ok_or("link name")?)
             .map_err(|error| format!("start UART bearer: {error}"))?;
-        let id = self
-            .node
-            .add_bearer::<PacketPool<SLOTS, MTU>, { quic_lite::DEFAULT_MAX_PACKET_SIZE }, _>(bearer)
-            .await?;
-        self.lock().insert(path.to_string(), id);
-        Ok(id)
+        let peer_cid = ConnectionId::new(1).unwrap();
+        let mut driver = TokioAssocDriver::new(AssocConfig::default(), 64);
+        let profile = LinkProfile::udp_datagram(1, DEFAULT_MAX_PAYLOAD, peer_cid);
+        driver
+            .add_link_with(
+                LinkId(1),
+                PeerL2Address::new(1).unwrap(),
+                profile,
+                |pool, ingress| {
+                    bearer.attach(pool, DEFAULT_HEADROOM, ingress)?;
+                    Ok::<_, std::io::Error>(bearer)
+                },
+            )
+            .map_err(|error| format!("attach UART {path}: {error}"))?;
+        let (tx, rx, driver_task) = driver.spawn();
+        let (mux, _acceptor) = TokioMux::spawn(true, TokioMuxConfig::default());
+        mux.add_packet_link(tx, rx, DEFAULT_MAX_PAYLOAD, 10);
+        self.lock().insert(
+            path.to_string(),
+            ConnectedUart {
+                mux: mux.clone(),
+                driver_task,
+            },
+        );
+        Ok(mux)
     }
 
-    async fn associate(&self, bearer: BearerId) -> Result<TokioAssociation, String> {
-        tokio::time::timeout(SETUP_TIMEOUT, async {
-            let association = self
-                .node
-                .associate(
-                    PacketMeta {
-                        bearer,
-                        peer_l2_address: PeerL2Address::new(1).ok_or("peer address")?,
-                        received_at_us: 0,
-                    },
-                    0,
-                )
-                .await
-                .map_err(|error| format!("start association: {error:?}"))?;
-            association
-                .wait_established()
-                .await
-                .map_err(|error| format!("establish association: {error:?}"))?;
-            Ok(association)
-        })
-        .await
-        .unwrap_or_else(|_| Err(format!("association timed out after {SETUP_TIMEOUT:?}")))
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, BearerId>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, ConnectedUart>> {
         self.attached
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -184,10 +167,8 @@ impl<const SLOTS: usize, const MTU: usize> UartCompanion<SLOTS, MTU> {
 }
 
 #[async_trait::async_trait]
-impl<const SLOTS: usize, const MTU: usize> dmesh_server::companion::CompanionLink
-    for UartCompanion<SLOTS, MTU>
-{
-    async fn pair(&self, request: dmesh_server::companion::PairRequest<'_>) -> Result<(), String> {
+impl ControllerLink for UartCompanion {
+    async fn pair(&self, request: PairRequest<'_>) -> Result<(), String> {
         UartCompanion::pair(
             self,
             Pairing {
@@ -205,7 +186,7 @@ impl<const SLOTS: usize, const MTU: usize> dmesh_server::companion::CompanionLin
         .map(|_| ())
     }
 
-    async fn unpair(&self, id: &str, store: &dmesh_server::device_record::DeviceStore) -> Result<(), String> {
+    async fn unpair(&self, id: &str, store: &DeviceStore) -> Result<(), String> {
         UartCompanion::unpair(self, id, None, store).await.map(|_| ())
     }
 }
@@ -213,17 +194,14 @@ impl<const SLOTS: usize, const MTU: usize> dmesh_server::companion::CompanionLin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dmesh_server::announce::{self, Announce};
-    use dmesh_server::device_record::{DeviceRecord, DeviceStore};
-    use dmesh_server::{provision, tagged};
-    use quic_lite::{QuicNode, tokio::TokioNodeDriver};
+    use dmesh_discovery::announce::{self, Announce};
+    use dmesh_discovery::device_record::DeviceRecord;
+    use dmesh_discovery::provision;
+    use mesh_api::envelope as tagged;
     use std::{boxed::Box, vec, vec::Vec, string::ToString, borrow::ToOwned, format, future::Future};
-    const SLOTS: usize = 16;
-    const MTU: usize = quic_lite::DEFAULT_PACKET_POOL_SLOT_SIZE;
-    type Pool = PacketPool<SLOTS, MTU>;
 
     use dmesh_discovery::{Engine, NoFacts, P256Identity};
-    use dmesh_server::stream_service::{RecordHandler, RecordStreamHandler};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
@@ -235,44 +213,39 @@ mod tests {
         accept: bool,
     }
 
-    impl RecordHandler for FakeDevice {
-        fn handle<'a>(
-            &'a self,
-            request: Vec<u8>,
-        ) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<Vec<u8>>> + 'a>> {
-            Box::pin(async move {
-                let record = tagged::decode(&request).unwrap();
-                let id = record.id.unwrap();
-                let mut out = [0u8; 512];
-                let used = if let Some(install) = provision::decode_install(record) {
-                    if self.accept {
-                        self.installed.lock().unwrap().push((
-                            install.name.to_owned(),
-                            install.root_public_key.to_vec(),
-                            install.secret.to_vec(),
-                        ));
-                    }
-                    tagged::encode_numeric_response(
-                        provision::COMPONENT,
-                        provision::INSTALL,
-                        id,
-                        if self.accept { &[0xf5] } else { &[0xf4] },
-                        &mut out,
-                    )
-                } else if provision::is_unpair(record) {
-                    self.installed.lock().unwrap().clear();
-                    tagged::encode_numeric_response(
-                        provision::COMPONENT,
-                        provision::UNPAIR,
-                        id,
-                        &[0xf5],
-                        &mut out,
-                    )
-                } else {
-                    announce::encode_discovery_response(self.announce, id, &mut out)
-                };
-                Ok(out[..used.unwrap()].to_vec())
-            })
+    impl FakeDevice {
+        fn handle(&self, request: &[u8]) -> Vec<u8> {
+            let record = tagged::decode(request).unwrap();
+            let id = record.id.unwrap();
+            let mut out = [0u8; 512];
+            let used = if let Some(install) = provision::decode_install(record) {
+                if self.accept {
+                    self.installed.lock().unwrap().push((
+                        install.name.to_owned(),
+                        install.root_public_key.to_vec(),
+                        install.secret.to_vec(),
+                    ));
+                }
+                tagged::encode_numeric_response(
+                    provision::COMPONENT,
+                    provision::INSTALL,
+                    id,
+                    if self.accept { &[0xf5] } else { &[0xf4] },
+                    &mut out,
+                )
+            } else if provision::is_unpair(record) {
+                self.installed.lock().unwrap().clear();
+                tagged::encode_numeric_response(
+                    provision::COMPONENT,
+                    provision::UNPAIR,
+                    id,
+                    &[0xf5],
+                    &mut out,
+                )
+            } else {
+                announce::encode_discovery_response(self.announce, id, &mut out)
+            };
+            out[..used.unwrap()].to_vec()
         }
     }
 
@@ -344,9 +317,6 @@ mod tests {
         }
     }
 
-    static DEVICE_POOL: Pool = Pool::new();
-    static HOST_POOL: Pool = Pool::new();
-
     fn start_device(
         cable: &Cable,
         device: FakeDevice,
@@ -358,20 +328,34 @@ mod tests {
                 .build()
                 .unwrap()
                 .block_on(async move {
-                    let mut node = QuicNode::<Pool>::new(&DEVICE_POOL);
-                    node.set_limits(quic_lite::NodeLimits::host()).unwrap();
-                    node.set_default_association_limits(quic_lite::AssociationLimits::host()).unwrap();
                     let port = UartPort::open(&path, None).unwrap();
-                    node.add_bearer(port.into_tokio::<SLOTS, MTU>(BearerName::new("uart").unwrap()).unwrap()).unwrap();
-                    let (handle, driver) =
-                        TokioNodeDriver::new(node, quic_lite::AssociationLimits::host().connection);
-                    let handler = RecordStreamHandler::new(device, 4096);
+                    let mut bearer = port.into_tokio(LinkName::new("uart").unwrap()).unwrap();
+                    let peer_cid = ConnectionId::new(1).unwrap();
+                    let mut driver = TokioAssocDriver::new(AssocConfig::default(), 64);
+                    let profile = LinkProfile::udp_datagram(1, DEFAULT_MAX_PAYLOAD, peer_cid);
+                    driver
+                        .add_link_with(
+                            LinkId(1),
+                            PeerL2Address::new(1).unwrap(),
+                            profile,
+                            |pool, ingress| {
+                                bearer.attach(pool, DEFAULT_HEADROOM, ingress)?;
+                                Ok::<_, std::io::Error>(bearer)
+                            },
+                        )
+                        .unwrap();
+                    let (tx, rx, driver_task) = driver.spawn();
+                    let (_mux, mut acceptor) = TokioMux::spawn(false, TokioMuxConfig::default());
+                    _mux.add_packet_link(tx, rx, DEFAULT_MAX_PAYLOAD, 10);
                     tokio::select! {
-                        _ = driver.run() => {}
+                        _ = driver_task => {}
                         _ = async {
-                            loop {
-                                if dmesh_server::stream_service::accept_one(&handle, &handler).await.is_err() {
-                                    break;
+                            while let Some(mut stream) = acceptor.accept().await {
+                                let mut request = Vec::new();
+                                if stream.read_to_end(&mut request).await.is_ok() && !request.is_empty() {
+                                    let response = device.handle(&request);
+                                    let _ = stream.write_all(&response).await;
+                                    let _ = stream.shutdown().await;
                                 }
                             }
                         } => {}
@@ -387,23 +371,8 @@ mod tests {
         (announce, vip6)
     }
 
-
-    /// The host's node, as lmesh runs it: one long-lived node whose driver is
-    /// already running when a pairing attaches its bearer.
-    fn host_node() -> TokioNode {
-        let mut node = QuicNode::<Pool>::new(&HOST_POOL);
-        node.set_limits(quic_lite::NodeLimits::host()).unwrap();
-        node.set_default_association_limits(quic_lite::AssociationLimits::host()).unwrap();
-        let (handle, driver) =
-            TokioNodeDriver::new(node, quic_lite::AssociationLimits::host().connection);
-        tokio::task::spawn_local(async move {
-            let _ = driver.run().await;
-        });
-        handle
-    }
-
-    fn companion() -> UartCompanion<SLOTS, MTU> {
-        UartCompanion::new(host_node())
+    fn companion() -> UartCompanion {
+        UartCompanion::new()
     }
 
     fn request<'a>(cable: &'a Cable, vip6: Ipv6Addr, store: &'a DeviceStore) -> Pairing<'a> {
@@ -463,7 +432,8 @@ mod tests {
             start_device(&cable, FakeDevice { announce, installed: installed.clone(), accept: true });
             let directory = tempfile::tempdir().unwrap();
             let store = DeviceStore::new(directory.path());
-            let paired = companion().pair(request(&cable, vip6, &store))
+            let host = companion();
+            let paired = host.pair(request(&cable, vip6, &store))
                 .await
                 .unwrap();
             assert_eq!(paired.vip6, vip6);

@@ -6,11 +6,10 @@ use crate::{
     codec::{DEFAULT_RECORD_MAX, Decoder, Encoder, UART_FLAG},
     decode_packet,
 };
-use quic_lite::{BearerContext, BearerInfo, BearerName, PacketBearer, PacketMeta, PeerL2Address};
-use quic_lite::{
-    EgressSubmission, PacketEgress, PacketSendOutcome, PacketSubmitError,
-    packet_pool::{PacketPool, PoolBufferLease},
+use mesh_api::link::{
+    LinkInfo, LinkIngress, LinkMeta, LinkName, LinkTxOutcome, PacketLink, PeerL2Address,
 };
+use mesh_api::pool::{DEFAULT_MAX_PAYLOAD, PacketPool, PoolPacket};
 use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
@@ -330,10 +329,10 @@ impl UartPort {
     /// If `UART_CODEC_LOG` names a file, complete console lines observed
     /// outside marker-qualified QUIC frames are appended there. The diagnostic
     /// file is independent from quic-lite's `QUIC_LITE_PCAP` packet capture.
-    pub fn into_tokio<const SLOTS: usize, const MTU: usize>(
+    pub fn into_tokio<P: PoolPacket + Send + 'static>(
         self,
-        name: BearerName,
-    ) -> io::Result<TokioUartBearer<SLOTS, MTU>> {
+        name: LinkName,
+    ) -> io::Result<TokioUartBearer<P>> {
         TokioUartBearer::new(self.file, name)
     }
 
@@ -522,8 +521,8 @@ impl UartPort {
     }
 }
 
-struct PendingSend<const SLOTS: usize, const MTU: usize> {
-    submission: EgressSubmission<PoolBufferLease<'static, SLOTS, MTU>>,
+struct PendingSend<P: PoolPacket> {
+    packet: P,
     cursor: crate::codec::EncoderCursor,
 }
 
@@ -533,66 +532,48 @@ enum WriteProgress {
     Complete,
 }
 
-struct TokioUartTxState<const SLOTS: usize, const MTU: usize> {
-    active: Option<PendingSend<SLOTS, MTU>>,
+struct TokioUartTxState<P: PoolPacket> {
+    active: Option<PendingSend<P>>,
 }
 
-struct TokioUartTx<const SLOTS: usize, const MTU: usize> {
-    state: Mutex<TokioUartTxState<SLOTS, MTU>>,
+struct TokioUartTx<P: PoolPacket> {
+    state: Mutex<TokioUartTxState<P>>,
     fd: File,
     accepted: tokio::sync::Notify,
 }
 
-/// Nonblocking submission handle for the Tokio UART writer task.
-///
-/// Submission only transfers one packet lease to an idle writer. It performs
-/// no system call and never waits for UART writability. While that lease is
-/// active, later submissions are returned unchanged as `WouldBlock`.
-struct TokioUartEgress<const SLOTS: usize, const MTU: usize> {
-    tx: Arc<TokioUartTx<SLOTS, MTU>>,
-}
-
-impl<const SLOTS: usize, const MTU: usize> Clone for TokioUartEgress<SLOTS, MTU> {
-    fn clone(&self) -> Self {
-        Self {
-            tx: self.tx.clone(),
-        }
-    }
-}
-
-/// Tokio UART I/O owner backed directly by the shared quic-lite packet pool.
+/// Tokio UART I/O owner backed directly by a [`PoolPacket`] pool.
 /// It retains exactly one active egress submission and no packet FIFO.
 ///
 /// This implementation currently owns one port. It may evolve into one
 /// multi-peer UART bearer whose dynamic link table maps several open ports to
 /// distinct `PeerL2Address` values, matching UDP, ESP-NOW, BLE, and Android
 /// USB bearer semantics without changing QUIC associations.
-pub struct TokioUartBearer<const SLOTS: usize, const MTU: usize> {
-    info: BearerInfo,
+pub struct TokioUartBearer<P: PoolPacket> {
+    info: LinkInfo,
     reader: Option<tokio::io::unix::AsyncFd<File>>,
-    writer: Option<TokioUartWriter<SLOTS, MTU>>,
-    tx: Arc<TokioUartTx<SLOTS, MTU>>,
+    writer: Option<TokioUartWriter<P>>,
+    tx: Arc<TokioUartTx<P>>,
     sideband: Option<Arc<dyn Fn(TokioUartReceive) + Send + Sync>>,
     log_file: Option<Arc<Mutex<File>>>,
-    /// Dropped with the bearer (when the node removes it), which ends the
-    /// reader and writer tasks so the port is released.
+    /// Dropped with the bearer, which ends the reader and writer tasks so the port is released.
     closed: tokio::sync::watch::Sender<()>,
 }
 
 /// Read half of a Tokio UART bearer. It owns incremental framing state and can
 /// run independently from the writer task.
-struct TokioUartReader<const SLOTS: usize, const MTU: usize> {
+struct TokioUartReader<Pool: PacketPool> {
     fd: tokio::io::unix::AsyncFd<File>,
-    rx_decoder: PooledDecoder<PacketPool<SLOTS, MTU>>,
+    rx_decoder: PooledDecoder<Pool>,
     sideband: SidebandText,
     log_file: Option<Arc<Mutex<File>>>,
 }
 
 /// Write half of a Tokio UART bearer. It waits for an accepted submission and
 /// UART writability without preventing the read half from making progress.
-struct TokioUartWriter<const SLOTS: usize, const MTU: usize> {
+struct TokioUartWriter<P: PoolPacket> {
     fd: tokio::io::unix::AsyncFd<File>,
-    tx: Arc<TokioUartTx<SLOTS, MTU>>,
+    tx: Arc<TokioUartTx<P>>,
 }
 
 #[derive(Debug, Default)]
@@ -604,8 +585,8 @@ pub struct TokioUartReceive {
     pub pool_drops: usize,
 }
 
-impl<const SLOTS: usize, const MTU: usize> TokioUartBearer<SLOTS, MTU> {
-    fn new(file: File, name: BearerName) -> io::Result<Self> {
+impl<P: PoolPacket + Send + 'static> TokioUartBearer<P> {
+    fn new(file: File, name: LinkName) -> io::Result<Self> {
         let write_file = file.try_clone()?;
         let continuation_file = write_file.try_clone()?;
         let tx = Arc::new(TokioUartTx {
@@ -618,9 +599,9 @@ impl<const SLOTS: usize, const MTU: usize> TokioUartBearer<SLOTS, MTU> {
             .transpose()?
             .map(|file| Arc::new(Mutex::new(file)));
         Ok(Self {
-            info: BearerInfo {
+            info: LinkInfo {
                 name,
-                max_packet_size: quic_lite::DEFAULT_MAX_PACKET_SIZE,
+                max_packet_size: DEFAULT_MAX_PAYLOAD,
                 // PPP encoding is streamed into the device; it does not use
                 // packet-pool headroom or tailroom for its variable expansion.
                 prefix_required: 0,
@@ -650,18 +631,90 @@ impl<const SLOTS: usize, const MTU: usize> TokioUartBearer<SLOTS, MTU> {
     ) {
         self.sideband = Some(Arc::new(handler));
     }
+
+    /// Attach the UART reader and writer Tokio tasks using `pool` and `ingress`.
+    pub fn attach<Pool>(
+        &mut self,
+        pool: Pool,
+        payload_offset: usize,
+        ingress: Arc<dyn LinkIngress<P>>,
+    ) -> io::Result<()>
+    where
+        Pool: PacketPool<Packet = P> + Clone + Send + Sync + 'static,
+    {
+        let reader_fd = self.reader.take().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "UART bearer is already attached",
+            )
+        })?;
+        let writer = self.writer.take().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "UART bearer is already attached",
+            )
+        })?;
+        let mut reader = TokioUartReader {
+            fd: reader_fd,
+            rx_decoder: PooledDecoder::new(pool),
+            sideband: SidebandText::new(),
+            log_file: self.log_file.clone(),
+        };
+        let sideband = self.sideband.clone();
+        let mut reader_closed = self.closed.subscribe();
+        let mut writer_closed = self.closed.subscribe();
+        let reader_ingress = ingress.clone();
+        tokio::spawn(async move {
+            let peer = PeerL2Address::new(1).expect("one is a valid UART peer address");
+            loop {
+                let received = tokio::select! {
+                    // The sender is only ever dropped, never sent on.
+                    _ = reader_closed.changed() => break,
+                    received = reader.receive_into(
+                        peer,
+                        payload_offset,
+                        0,
+                        reader_ingress.as_ref(),
+                    ) => received,
+                };
+                match received {
+                    Ok(received) => {
+                        if let Some(handler) = &sideband
+                            && (!received.logs.is_empty()
+                                || !received.log_records.is_empty()
+                                || received.pool_drops != 0)
+                        {
+                            handler(received);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        tokio::spawn(async move {
+            loop {
+                let ready = tokio::select! {
+                    _ = writer_closed.changed() => break,
+                    ready = writer.write_ready() => ready,
+                };
+                match ready {
+                    Ok(true) => ingress.on_tx_ready(),
+                    Ok(false) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+        Ok(())
+    }
 }
 
-impl<const SLOTS: usize, const MTU: usize> TokioUartWriter<SLOTS, MTU> {
+impl<P: PoolPacket> TokioUartWriter<P> {
     fn has_pending_send(&self) -> bool {
         self.tx.state.lock().unwrap().active.is_some()
     }
 
-    fn try_write_pending(
-        fd: &File,
-        pending: &mut PendingSend<SLOTS, MTU>,
-    ) -> io::Result<WriteProgress> {
-        let payload = pending.submission.packet().bytes();
+    fn try_write_pending(fd: &File, pending: &mut PendingSend<P>) -> io::Result<WriteProgress> {
+        let payload = pending.packet.bytes();
         let before = pending.cursor;
         let mut advanced = before;
         let mut wire = [0u8; 256];
@@ -715,7 +768,7 @@ impl<const SLOTS: usize, const MTU: usize> TokioUartWriter<SLOTS, MTU> {
         };
         match progress {
             Ok(WriteProgress::Complete) => {
-                let pending = self
+                let _pending = self
                     .tx
                     .state
                     .lock()
@@ -723,7 +776,6 @@ impl<const SLOTS: usize, const MTU: usize> TokioUartWriter<SLOTS, MTU> {
                     .active
                     .take()
                     .expect("completed UART submission remains active");
-                pending.submission.complete(PacketSendOutcome::Sent, 0);
                 Ok(true)
             }
             Ok(WriteProgress::Partial) => Ok(false),
@@ -732,7 +784,7 @@ impl<const SLOTS: usize, const MTU: usize> TokioUartWriter<SLOTS, MTU> {
                 Ok(false)
             }
             Err(error) => {
-                let pending = self
+                let _pending = self
                     .tx
                     .state
                     .lock()
@@ -740,14 +792,13 @@ impl<const SLOTS: usize, const MTU: usize> TokioUartWriter<SLOTS, MTU> {
                     .active
                     .take()
                     .expect("failed UART submission remains active");
-                pending.submission.complete(PacketSendOutcome::Failed, 0);
                 Err(error)
             }
         }
     }
 }
 
-impl<const SLOTS: usize, const MTU: usize> TokioUartReader<SLOTS, MTU> {
+impl<Pool: PacketPool> TokioUartReader<Pool> {
     /// Read one Tokio readiness turn and deliver complete marked frames from
     /// pool leases. Unmarked PPP frames and console lines remain sideband.
     async fn receive_into(
@@ -755,7 +806,7 @@ impl<const SLOTS: usize, const MTU: usize> TokioUartReader<SLOTS, MTU> {
         peer_l2_address: PeerL2Address,
         payload_offset: usize,
         received_at_us: u64,
-        context: &BearerContext<PacketPool<SLOTS, MTU>>,
+        ingress: &dyn LinkIngress<Pool::Packet>,
     ) -> io::Result<TokioUartReceive> {
         let mut ready = self.fd.readable().await?;
         let mut bytes = [0u8; 1024];
@@ -773,14 +824,16 @@ impl<const SLOTS: usize, const MTU: usize> TokioUartReader<SLOTS, MTU> {
         self.scan_async_text(&bytes[..used], &mut result.logs);
         self.rx_decoder
             .push(&bytes[..used], payload_offset, |frame| match frame {
-                PooledFrame::Packet(packet) => context.enqueue_packet(
-                    PacketMeta {
-                        bearer: context.bearer(),
-                        peer_l2_address,
-                        received_at_us,
-                    },
-                    packet,
-                ),
+                PooledFrame::Packet(packet) => {
+                    ingress.on_packet(
+                        LinkMeta {
+                            peer: peer_l2_address,
+                            received_at_us,
+                            rssi_dbm: None,
+                        },
+                        packet,
+                    );
+                }
                 PooledFrame::Log(bytes) => result.log_records.push(bytes),
                 PooledFrame::PoolUnavailable => result.pool_drops += 1,
                 PooledFrame::Wake => {}
@@ -865,20 +918,18 @@ pub fn render_sideband_record(bytes: &[u8]) -> String {
     out
 }
 
-impl<const SLOTS: usize, const MTU: usize> PacketEgress<PoolBufferLease<'static, SLOTS, MTU>>
-    for TokioUartEgress<SLOTS, MTU>
-{
-    fn submit(
-        &mut self,
-        _peer_l2_address: PeerL2Address,
-        submission: EgressSubmission<PoolBufferLease<'static, SLOTS, MTU>>,
-    ) -> Result<(), PacketSubmitError<PoolBufferLease<'static, SLOTS, MTU>>> {
+impl<P: PoolPacket + Send + 'static> PacketLink<P> for TokioUartBearer<P> {
+    fn info(&self) -> &LinkInfo {
+        &self.info
+    }
+
+    fn send_packet(&mut self, _peer: PeerL2Address, packet: P) -> Result<LinkTxOutcome, P> {
         let mut tx = self.tx.state.lock().unwrap();
         if tx.active.is_some() {
-            return Err(PacketSubmitError::WouldBlock(submission));
+            return Err(packet);
         }
         tx.active = Some(PendingSend {
-            submission,
+            packet,
             cursor: crate::codec::EncoderCursor::prefixed(PACKET_MARKER),
         });
         let progress = TokioUartWriter::try_write_pending(
@@ -888,122 +939,22 @@ impl<const SLOTS: usize, const MTU: usize> PacketEgress<PoolBufferLease<'static,
                 .expect("accepted UART submission is active"),
         );
         if matches!(progress, Ok(WriteProgress::Complete) | Err(_)) {
-            let pending = tx
+            let _pending = tx
                 .active
                 .take()
                 .expect("finished UART submission remains active");
-            drop(tx);
-            pending.submission.complete(
-                if progress.is_ok() {
-                    PacketSendOutcome::Sent
-                } else {
-                    PacketSendOutcome::Failed
-                },
-                0,
-            );
-            return Ok(());
+            return Ok(if progress.is_ok() {
+                LinkTxOutcome::Sent
+            } else {
+                LinkTxOutcome::Failed
+            });
         }
         drop(tx);
         // The first write is deliberately synchronous and nonblocking. Wake
         // the task only when the kernel accepted a partial frame or reported
         // EAGAIN, so the common one-write packet path needs no task handoff.
         self.tx.accepted.notify_waiters();
-        Ok(())
-    }
-}
-
-impl<const SLOTS: usize, const MTU: usize> PacketEgress<PoolBufferLease<'static, SLOTS, MTU>>
-    for TokioUartBearer<SLOTS, MTU>
-{
-    fn submit(
-        &mut self,
-        peer_l2_address: PeerL2Address,
-        submission: EgressSubmission<PoolBufferLease<'static, SLOTS, MTU>>,
-    ) -> Result<(), PacketSubmitError<PoolBufferLease<'static, SLOTS, MTU>>> {
-        TokioUartEgress {
-            tx: self.tx.clone(),
-        }
-        .submit(peer_l2_address, submission)
-    }
-}
-
-impl<const SLOTS: usize, const MTU: usize> PacketBearer<PacketPool<SLOTS, MTU>>
-    for TokioUartBearer<SLOTS, MTU>
-{
-    type AttachError = io::Error;
-
-    fn info(&self) -> BearerInfo {
-        self.info
-    }
-
-    fn attach(
-        &mut self,
-        context: BearerContext<PacketPool<SLOTS, MTU>>,
-    ) -> Result<(), Self::AttachError> {
-        let reader_fd = self.reader.take().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "UART bearer is already attached",
-            )
-        })?;
-        let writer = self.writer.take().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "UART bearer is already attached",
-            )
-        })?;
-        let mut reader = TokioUartReader {
-            fd: reader_fd,
-            rx_decoder: PooledDecoder::new(context.pool()),
-            sideband: SidebandText::new(),
-            log_file: self.log_file.clone(),
-        };
-        let receive_context = context.clone();
-        let sideband = self.sideband.clone();
-        let mut reader_closed = self.closed.subscribe();
-        let mut writer_closed = self.closed.subscribe();
-        tokio::spawn(async move {
-            let peer = PeerL2Address::new(1).expect("one is a valid UART peer address");
-            loop {
-                let received = tokio::select! {
-                    // The sender is only ever dropped, never sent on.
-                    _ = reader_closed.changed() => break,
-                    received = reader.receive_into(
-                        peer,
-                        quic_lite::PACKET_PREFIX_RESERVE,
-                        0,
-                        &receive_context,
-                    ) => received,
-                };
-                match received {
-                    Ok(received) => {
-                        if (!received.logs.is_empty()
-                            || !received.log_records.is_empty()
-                            || received.pool_drops != 0)
-                            && let Some(handler) = sideband.as_ref()
-                        {
-                            handler(received);
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-        let writer_context = context;
-        tokio::spawn(async move {
-            loop {
-                let ready = tokio::select! {
-                    _ = writer_closed.changed() => break,
-                    ready = writer.write_ready() => ready,
-                };
-                match ready {
-                    Ok(true) => writer_context.send_ready(),
-                    Ok(false) => {}
-                    Err(_) => break,
-                }
-            }
-        });
-        Ok(())
+        Ok(LinkTxOutcome::Sent)
     }
 }
 
@@ -1187,8 +1138,8 @@ mod tests {
     use std::os::fd::FromRawFd;
     use std::vec;
 
-    static NODE_POOL: PacketPool<4, { quic_lite::DEFAULT_PACKET_POOL_SLOT_SIZE }> =
-        PacketPool::new();
+    static NODE_POOL: mesh_api::pool::StaticPacketPool<4, { mesh_api::pool::DEFAULT_SLOT_SIZE }> =
+        mesh_api::pool::StaticPacketPool::new();
 
     #[test]
     fn baud_negotiation_waits_for_matching_ack_then_changes_termios() {
@@ -1413,22 +1364,27 @@ mod tests {
         let path = fs::read_link(format!("/proc/self/fd/{}", slave.as_raw_fd())).unwrap();
         let port = UartPort::open(&path, None).unwrap();
         drop(slave);
-        let bearer = port
-            .into_tokio::<4, { quic_lite::DEFAULT_PACKET_POOL_SLOT_SIZE }>(
-                BearerName::new("uart0").unwrap(),
-            )
+        let mut bearer = port
+            .into_tokio(LinkName::new("uart0").unwrap())
             .unwrap();
-        let mut node = quic_lite::QuicNode::<_>::new(&NODE_POOL);
-        let bearer_id = node.add_bearer(bearer).unwrap();
-        node.associate(
-            PacketMeta {
-                bearer: bearer_id,
-                peer_l2_address: PeerL2Address::new(1).unwrap(),
-                received_at_us: 0,
-            },
-            0,
-        )
-        .unwrap();
+        struct NoopIngress;
+        impl LinkIngress<mesh_api::pool::StaticPacketLease<'static, 4, { mesh_api::pool::DEFAULT_SLOT_SIZE }>>
+            for NoopIngress
+        {
+            fn on_packet(
+                &self,
+                _meta: LinkMeta,
+                _packet: mesh_api::pool::StaticPacketLease<'static, 4, { mesh_api::pool::DEFAULT_SLOT_SIZE }>,
+            ) {
+            }
+        }
+        bearer.attach(&NODE_POOL, 0, Arc::new(NoopIngress)).unwrap();
+        let mut pkt = mesh_api::pool::PacketPool::alloc(&&NODE_POOL).unwrap();
+        pkt.append(b"hello-uart").unwrap();
+        assert_eq!(
+            bearer.send_packet(PeerL2Address::new(1).unwrap(), pkt).ok(),
+            Some(LinkTxOutcome::Sent)
+        );
 
         let mut wire = [0u8; 2048];
         // The normal short-frame path writes during submit; it must not rely
@@ -1436,9 +1392,9 @@ mod tests {
         let immediate = master.read(&mut wire).unwrap();
         assert_ne!(immediate, 0);
         let used = immediate;
-        let mut decoder = Decoder::with_max(quic_lite::DEFAULT_MAX_PACKET_SIZE + 1);
+        let mut decoder = Decoder::with_max(DEFAULT_MAX_PAYLOAD + 1);
         let records = decoder.push(&wire[..used]).unwrap();
         assert_eq!(records.len(), 1);
-        assert!(decode_packet(&records[0]).is_ok());
+        assert_eq!(decode_packet(&records[0]), Ok(b"hello-uart".as_slice()));
     }
 }

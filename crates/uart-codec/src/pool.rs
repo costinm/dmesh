@@ -1,20 +1,20 @@
 //! Pool-backed PPP decoding shared by host and firmware UART adapters.
 
 use alloc::vec::Vec;
-use quic_lite::{OwnedPacket, PacketPool, PacketWriter};
+use mesh_api::pool::{DEFAULT_MAX_PAYLOAD, PacketPool, PoolPacket};
 
 use crate::{
     PACKET_MARKER, WAKE_MARKER,
     codec::{DEFAULT_RECORD_MAX, UART_ESCAPE, UART_ESCAPE_XOR, UART_FLAG},
 };
 
-pub enum PooledFrame<B> {
-    /// A complete marked record backed by the shared QUIC packet pool.
-    Packet(OwnedPacket<B>),
-    /// One exact, non-QUIC wake request record.
+pub enum PooledFrame<P> {
+    /// A complete marked record backed by the shared packet pool.
+    Packet(P),
+    /// One exact, non-packet wake request record.
     Wake,
     /// Unmarked UART sideband. It is diagnostic/log data, never a packet for
-    /// QUIC or an application-control handler.
+    /// upper-layer transport or an application-control handler.
     Log(Vec<u8>),
     /// A marker was decoded, but no shared-pool slot was available. The rest
     /// of that record is discarded so it cannot be mistaken for sideband.
@@ -22,10 +22,10 @@ pub enum PooledFrame<B> {
 }
 
 /// Incremental PPP decoder which writes marked packets directly into the
-/// shared quic-lite packet pool. Unmarked records are retained separately for
+/// shared `mesh-api` packet pool. Unmarked records are retained separately for
 /// boot/crash or application-specific sideband handling.
-pub struct PooledDecoder<P: PacketPool + 'static> {
-    pool: &'static P,
+pub struct PooledDecoder<P: PacketPool> {
+    pool: P,
     /// At least one opening [`UART_FLAG`] has been observed.
     in_frame: bool,
     /// The previous wire byte was [`UART_ESCAPE`].
@@ -37,11 +37,13 @@ pub struct PooledDecoder<P: PacketPool + 'static> {
     marked: Option<FrameKind>,
     wake_payload_len: usize,
     /// Reserved immediately after decoding [`PACKET_MARKER`]. Marked payload
-    /// bytes are written here directly and the writer is committed at EOF.
-    writer: Option<P::Writer>,
-    /// Number of initialized packet payload bytes in `writer`.
+    /// bytes are written here directly and the active range is committed at EOF.
+    packet: Option<P::Packet>,
+    /// Starting headroom offset within `packet`.
+    start: usize,
+    /// Number of initialized packet payload bytes written at `start..start + len`.
     len: usize,
-    /// Smaller of the writer's payload capacity and the QUIC packet limit.
+    /// Smaller of the slot's payload capacity and `DEFAULT_MAX_PAYLOAD`.
     packet_limit: usize,
     /// Storage only for unmarked diagnostic records. Packet data never enters
     /// this allocation.
@@ -55,8 +57,8 @@ enum FrameKind {
     Log,
 }
 
-impl<P: PacketPool + 'static> PooledDecoder<P> {
-    pub fn new(pool: &'static P) -> Self {
+impl<P: PacketPool> PooledDecoder<P> {
+    pub fn new(pool: P) -> Self {
         Self {
             pool,
             in_frame: false,
@@ -64,7 +66,8 @@ impl<P: PacketPool + 'static> PooledDecoder<P> {
             discard: false,
             marked: None,
             wake_payload_len: 0,
-            writer: None,
+            packet: None,
+            start: 0,
             len: 0,
             packet_limit: 0,
             other: Vec::new(),
@@ -77,7 +80,8 @@ impl<P: PacketPool + 'static> PooledDecoder<P> {
         self.discard = false;
         self.marked = None;
         self.wake_payload_len = 0;
-        self.writer = None;
+        self.packet = None;
+        self.start = 0;
         self.len = 0;
         self.packet_limit = 0;
         self.other.clear();
@@ -87,7 +91,7 @@ impl<P: PacketPool + 'static> PooledDecoder<P> {
         &mut self,
         bytes: &[u8],
         payload_offset: usize,
-        mut frame: impl FnMut(PooledFrame<P::Buffer>),
+        mut frame: impl FnMut(PooledFrame<P::Packet>),
     ) {
         for &wire_byte in bytes {
             if wire_byte == UART_FLAG {
@@ -97,8 +101,8 @@ impl<P: PacketPool + 'static> PooledDecoder<P> {
                 if self.in_frame && !self.escaped && !self.discard {
                     match self.marked {
                         Some(FrameKind::Packet) if self.len != 0 => {
-                            if let Some(writer) = self.writer.take()
-                                && let Some(packet) = writer.commit(self.len)
+                            if let Some(mut packet) = self.packet.take()
+                                && packet.set_range(self.start..self.start + self.len).is_ok()
                             {
                                 frame(PooledFrame::Packet(packet));
                             }
@@ -117,7 +121,8 @@ impl<P: PacketPool + 'static> PooledDecoder<P> {
                 self.discard = false;
                 self.marked = None;
                 self.wake_payload_len = 0;
-                self.writer = None;
+                self.packet = None;
+                self.start = 0;
                 self.len = 0;
                 self.packet_limit = 0;
                 self.other.clear();
@@ -138,9 +143,6 @@ impl<P: PacketPool + 'static> PooledDecoder<P> {
                 wire_byte
             };
             if self.marked.is_none() {
-                // Classification happens once, on the first decoded byte. It
-                // chooses either a pool lease or the sideband Vec for the
-                // entire record.
                 let kind = if byte == PACKET_MARKER {
                     FrameKind::Packet
                 } else if byte == WAKE_MARKER {
@@ -150,19 +152,21 @@ impl<P: PacketPool + 'static> PooledDecoder<P> {
                 };
                 self.marked = Some(kind);
                 if kind == FrameKind::Packet {
-                    // The marker is only a UART envelope byte. Reserve the QUIC
+                    // The marker is only a UART envelope byte. Reserve the
                     // pool slot now, then decode every following byte directly
                     // into its payload area; no complete-frame scratch buffer or
-                    // copy is needed at the UART/QUIC ownership boundary.
-                    match self.pool.acquire_writer(payload_offset, 0) {
-                        Some(mut writer) => {
-                            self.packet_limit = writer
-                                .payload_mut()
-                                .len()
-                                .min(quic_lite::DEFAULT_MAX_PACKET_SIZE);
-                            self.writer = Some(writer);
+                    // copy is needed at the UART ownership boundary.
+                    match self.pool.alloc_with_headroom(payload_offset) {
+                        Ok(mut packet) => {
+                            let capacity = packet
+                                .slot_slice_mut()
+                                .map(|s| s.len().saturating_sub(payload_offset))
+                                .unwrap_or(0);
+                            self.packet_limit = capacity.min(DEFAULT_MAX_PAYLOAD);
+                            self.start = payload_offset;
+                            self.packet = Some(packet);
                         }
-                        None => {
+                        Err(_) => {
                             frame(PooledFrame::PoolUnavailable);
                             self.discard = true;
                         }
@@ -173,19 +177,22 @@ impl<P: PacketPool + 'static> PooledDecoder<P> {
                 continue;
             }
             if self.marked == Some(FrameKind::Packet) {
-                // Dropping an uncommitted writer returns its slot to the pool.
+                // Dropping an uncommitted packet returns its slot to the pool.
                 // Keep discarding until a flag resynchronizes the decoder.
                 if self.len >= self.packet_limit {
                     self.discard = true;
-                    self.writer = None;
+                    self.packet = None;
                     continue;
                 }
-                // `packet_limit` was derived from this writer's payload slice.
-                self.writer
-                    .as_mut()
-                    .expect("marked frame owns a writer")
-                    .payload_mut()[self.len] = byte;
-                self.len += 1;
+                if let Some(packet) = self.packet.as_mut()
+                    && let Ok(slot) = packet.slot_slice_mut()
+                {
+                    slot[self.start + self.len] = byte;
+                    self.len += 1;
+                } else {
+                    self.discard = true;
+                    self.packet = None;
+                }
             } else if self.marked == Some(FrameKind::Wake) {
                 self.wake_payload_len += 1;
                 if self.wake_payload_len > 0 {
@@ -208,8 +215,8 @@ mod tests {
     use super::*;
     use crate::codec::encode_payload;
 
-    static POOL: quic_lite::packet_pool::PacketPool<1, 128> =
-        quic_lite::packet_pool::PacketPool::new();
+    static POOL: mesh_api::pool::StaticPacketPool<1, 128> =
+        mesh_api::pool::StaticPacketPool::with_geometry(0, 128);
 
     #[test]
     fn exact_wake_marker_is_not_admitted_as_quic() {
