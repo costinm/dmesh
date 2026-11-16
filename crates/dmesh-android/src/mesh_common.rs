@@ -153,7 +153,7 @@ pub fn start_mesh(
             Some(fd) => unsafe { std::net::UdpSocket::from_raw_fd(fd) },
             None => std::net::UdpSocket::bind((
                 Ipv6Addr::UNSPECIFIED,
-                dmesh_server::firmware_profile::DEFAULT_EVENT_PORT,
+                dmesh_discovery::DEFAULT_EVENT_PORT,
             ))?,
         };
         socket.set_nonblocking(true)?;

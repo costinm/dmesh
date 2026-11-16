@@ -12,10 +12,13 @@ jni-wrapper = ["dep:jni"]
 # live in this workspace so Android and Linux builds use the same source.
 ssh-mesh = { git = "https://github.com/costinm/ssh-mesh", package = "ssh-mesh" }
 mesh-tun = { path = "../tun", default-features = false }
-dmesh-server = { path = "../dmesh-server" }
 dmesh-discovery = { path = "../dmesh-discovery", features = ["tokio"] }
 dmesh-rawnan = { path = "../rawnan" }
-quic-lite = { path = "../quic-lite", features = ["tokio"] }
+mesh-api = { git = "https://github.com/costinm/ssh-mesh", package = "mesh-api" }
+quic-base = { git = "https://github.com/costinm/ssh-mesh" }
+quic-link = { git = "https://github.com/costinm/ssh-mesh", features = ["tokio"] }
+quic-mux = { git = "https://github.com/costinm/ssh-mesh", features = ["tokio"] }
+quic-tools = { git = "https://github.com/costinm/ssh-mesh", features = ["tokio"] }
 uart-codec = { path = "../uart-codec" }
 mesh = { git = "https://github.com/costinm/ssh-mesh", package = "mesh" }
 tokio = { version = "1", features = ["full"] }
@@ -28,6 +31,7 @@ log = "0.4"
 libc = "0.2"
 hyper-util = { version = "0.1", features = ["full"] }
 tun-rs = { version = "2.8", features = ["async"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = "0.4"
 sha2 = "0.11"
