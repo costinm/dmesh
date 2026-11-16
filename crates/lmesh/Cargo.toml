@@ -7,9 +7,13 @@ autoexamples = false
 [dependencies]
 dmesh-rawnan = { path = "../rawnan", features = ["linux"] }
 dmesh-discovery = { path = "../dmesh-discovery", features = ["tokio"] }
-dmesh-server = { path = "../dmesh-server" }
-quic-lite = { path = "../quic-lite", features = ["tokio"] }
+mesh-api = { git = "https://github.com/costinm/ssh-mesh", package = "mesh-api" }
+quic-base = { git = "https://github.com/costinm/ssh-mesh" }
+quic-link = { git = "https://github.com/costinm/ssh-mesh", features = ["tokio"] }
+quic-mux = { git = "https://github.com/costinm/ssh-mesh", features = ["tokio"] }
+quic-tools = { git = "https://github.com/costinm/ssh-mesh", features = ["tokio"] }
 lmesh-wifi = { path = "../lmesh-wifi" }
+lmesh-wpa = { path = "../lmesh-wpa" }
 lmesh-ble-hci = { path = "../lmesh-ble-hci" }
 uart-codec = { path = "../uart-codec", features = ["host", "pair"] }
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros", "time", "sync", "net", "io-util"] }

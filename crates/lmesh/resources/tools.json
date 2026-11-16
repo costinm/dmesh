@@ -1464,6 +1464,11 @@
             "x-protobuf-index": 11,
             "x-protobuf-type": "u32"
           },
+          "link": {
+            "type": "string",
+            "x-protobuf-index": 17,
+            "x-protobuf-type": "string"
+          },
           "low_priority_bytes": {
             "type": "integer",
             "x-protobuf-index": 8,
@@ -1493,6 +1498,11 @@
             "type": "boolean",
             "x-protobuf-index": 16,
             "x-protobuf-type": "bool"
+          },
+          "via": {
+            "type": "string",
+            "x-protobuf-index": 18,
+            "x-protobuf-type": "string"
           }
         },
         "required": [],
@@ -1504,6 +1514,11 @@
             "type": "integer",
             "x-protobuf-index": 5,
             "x-protobuf-type": "u64"
+          },
+          "link": {
+            "type": "string",
+            "x-protobuf-index": 6,
+            "x-protobuf-type": "string"
           },
           "peer": {
             "type": "string",
@@ -1523,6 +1538,11 @@
           "status": {
             "type": "string",
             "x-protobuf-index": 1,
+            "x-protobuf-type": "string"
+          },
+          "via": {
+            "type": "string",
+            "x-protobuf-index": 7,
             "x-protobuf-type": "string"
           }
         },

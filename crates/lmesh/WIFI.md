@@ -11,6 +11,10 @@ are in [the radio README](../lmesh-wifi/README.md).
 - **Control: Unix domain socket** `/run/mesh/lmesh/mesh.sock.cbor`. Local
   interaction (the `mesh lmesh <method>` client, `dmesh-cli`, tests) uses this
   socket. It is mode 0660 owned by the service user.
+- **Multiplexed streams: Unix domain socket** `/run/mesh/lmesh/mesh.mux.sock`
+  (`LMESH_MUX_UDS`) and **TCP 5229** (`LMESH_MUX_TCP`). Serves `quic-mux`
+  handler streams from the same registry (local permissions on UDS, network
+  permissions on TCP).
 - **UDP 3339**: the DMesh QUIC-lite port shared with ESP32 and Android.
 - **HTTP: not served by lmesh.** HTTP, auth and certificates belong to
   ssh-mesh. The intended design is an ssh-mesh HTTP forwarder configured to

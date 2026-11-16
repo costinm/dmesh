@@ -7,29 +7,87 @@
 //! request and the same announce on every medium (UDP multicast, NAN, NOW); the radio
 //! answers a request that arrives on NOW, like it does on UDP.
 
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use dmesh_discovery::{Carrier, Engine, Received};
 use dmesh_rawnan::linux::{
-    NanAnnounce, NanPacketKind, NowKind, Observer, Radio, RadioConfig, SHARED_CHANNEL,
+    DEFAULT_SSID, NL80211_IFTYPE_AP, NL80211_IFTYPE_STATION, NanAnnounce, NanPacketKind,
+    Nl80211Socket, NowKind, Observer, Radio, RadioConfig, SHARED_CHANNEL, channel_to_freq,
+    ensure_link_local_address, freq_to_channel, ifindex, link_state_result, link_up_confirmed,
 };
-use dmesh_server::discovery::DiscoveryPacketKind;
-use dmesh_server::platform_api::{
-    DiscoveryActiveRequest, DiscoveryActiveResponse, TelemetryNanRequest, TelemetryNanResponse,
-    TelemetryNanStatusRequest, TelemetryNanStatusResponse, TelemetryNowRequest,
-    TelemetryNowResponse, TelemetryUdp6Request, TelemetryUdp6Response, TelemetryWifiLinkRequest,
-    TelemetryWifiLinkResponse, TransportSetRequest, TransportSetResponse,
+use dmesh_discovery::discovery::DiscoveryPacketKind;
+use dmesh_rawnan::raw_wifi::{
+    RAW_WIFI_COMPONENT, RAW_WIFI_METHOD_SCAN, RAW_WIFI_SCAN_MAX_RECORDS, RawWifiLabRequest,
+    RawWifiScanEntry, RawWifiScanRequest, RawWifiScanResponse, decode_raw_wifi_handler_record,
+    encode_raw_wifi_scan_response,
 };
-use dmesh_server::registry::{Call, CallContext, Handler, Registry, Reply, methods};
-use dmesh_server::registry_bridge::TypedHandler;
 use lmesh_wifi::mesh_core::LocalDiscovery;
+use lmesh_wifi::rpc_router::{
+    Call, CallContext, DiscoveryActiveRequest, DiscoveryActiveResponse, Handler, Registry, Reply,
+    TelemetryNanRequest, TelemetryNanResponse, TelemetryNanStatusRequest,
+    TelemetryNanStatusResponse, TelemetryNowRequest, TelemetryNowResponse, TelemetryUdp6Request,
+    TelemetryUdp6Response, TelemetryWifiLinkRequest, TelemetryWifiLinkResponse,
+    TransportSetRequest, TransportSetResponse, TypedHandler, methods,
+};
 use serde_json::json;
 
 /// How often the interface state is re-checked and the NAN publish refreshed.
 const MAINTAIN_INTERVAL: Duration = Duration::from_secs(30);
-/// `transport.set` mode value for NAN.
+/// `transport.set` mode values (`TransportKind` on the wire).
+const MODE_OFF: u8 = 0;
+const MODE_STA: u8 = 1;
 const MODE_NAN: u8 = 6;
+/// Default WPA2 passphrase for DMesh softAP when WPA2 AP mode is selected without an explicit passphrase.
+const DEFAULT_AP_PASSPHRASE: &str = "dmesh-p2p";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DesiredTransportMode {
+    Off,
+    NanOpenAp,
+    NanWpa2Ap {
+        ssid: String,
+        passphrase: String,
+    },
+    Sta {
+        ssid: String,
+        channel: u8,
+        nan_coexist: bool,
+    },
+}
+
+struct TransportRuntime {
+    iface: String,
+    mode: DesiredTransportMode,
+    supplicant: Option<lmesh_wpa::WpaSupplicant>,
+}
+
+impl TransportRuntime {
+    fn new(iface: String, configured: bool) -> Self {
+        Self {
+            iface,
+            mode: if configured {
+                DesiredTransportMode::NanOpenAp
+            } else {
+                DesiredTransportMode::Off
+            },
+            supplicant: None,
+        }
+    }
+}
+
+fn wpa_runtime_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("LMESH_WPA_RUNTIME_DIR") {
+        return PathBuf::from(path);
+    }
+    if let Some(socket) = std::env::var_os("LMESH_CONTROL_SOCKET")
+        && let Some(parent) = PathBuf::from(socket).parent()
+    {
+        return parent.join("wpa");
+    }
+    PathBuf::from("/run/mesh/lmesh/wpa")
+}
 
 /// Feeds what the radio observes into the discovery engine, which decodes, validates
 /// and records it. The engine only exists once the service is running, so it is set
@@ -61,6 +119,10 @@ impl EngineObserver {
             channel: None,
             kind,
         };
+        if payload.is_empty() {
+            engine.observe_provisional(&carrier, &peer_text, payload);
+            return Received::Ignored;
+        }
         engine.on_datagram(&carrier, payload)
     }
 }
@@ -75,6 +137,10 @@ fn mac_text(mac: &[u8; 6]) -> String {
 impl Observer for EngineObserver {
     fn nan(&self, peer: [u8; 6], bssid: Option<[u8; 6]>, payloads: &[&[u8]]) -> NanAnnounce {
         let mut seen = NanAnnounce::default();
+        if payloads.is_empty() {
+            let _ = self.observe("nan", peer, bssid, DiscoveryPacketKind::ActivePublish, &[]);
+            return seen;
+        }
         for payload in payloads {
             match self.observe("nan", peer, bssid, DiscoveryPacketKind::ActivePublish, payload) {
                 Received::Announce { key, .. } => {
@@ -134,8 +200,8 @@ pub fn create<P>() -> (
     bool,
 )
 where
-    P: quic_lite::bearer::PacketPool + Sync + 'static,
-    P::Buffer: Send,
+    P: mesh_api::pool::PacketPool + Clone + Send + Sync + 'static,
+    P::Packet: Send,
 {
     let (iface, configured) = interface();
     let observer = Arc::new(EngineObserver::default());
@@ -153,11 +219,13 @@ pub fn register(
     configured: bool,
 ) {
     let _ = observer.engine.set(discovery.engine().clone());
+    let iface = interface().0;
+    let runtime = Arc::new(Mutex::new(TransportRuntime::new(iface.clone(), configured)));
     if configured {
-        maintain(radio.clone(), discovery.clone());
+        maintain(radio.clone(), discovery.clone(), runtime.clone());
     }
     persist_nodes(discovery.clone());
-    register_methods(registry, radio, discovery.clone(), interface().0);
+    register_methods(registry, radio, discovery.clone(), iface, runtime);
 }
 
 /// Keep the stable part of the inventory on disk: every minute, the authenticated devices are
@@ -187,26 +255,59 @@ fn persist_nodes(discovery: Arc<LocalDiscovery>) {
 /// recovers when the adapter reappears. The announce is published (NAN and NOW) once it
 /// is available and then at the shared interval, like the firmware: every publish
 /// restarts a burst of window transmissions, so it is not repeated at the check rate.
-fn maintain(radio: Radio, discovery: Arc<LocalDiscovery>) {
+fn maintain(radio: Radio, discovery: Arc<LocalDiscovery>, runtime: Arc<Mutex<TransportRuntime>>) {
     let started = std::time::Instant::now();
     let interval = Duration::from_millis(dmesh_rawnan::NAN_ACTIVE_PUBLISH_INTERVAL_MS);
     tokio::spawn(async move {
         let mut last_publish: Option<std::time::Instant> = None;
         loop {
+            let mode = runtime
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .mode
+                .clone();
             let worker = radio.clone();
-            let started_ok = match tokio::task::spawn_blocking(move || worker.start()).await {
-                Ok(Ok(outcome)) => {
-                    tracing::debug!(?outcome, "lmesh_radio_checked");
-                    true
+            let started_ok = match mode {
+                DesiredTransportMode::NanOpenAp => {
+                    match tokio::task::spawn_blocking(move || worker.start()).await {
+                        Ok(Ok(outcome)) => {
+                            tracing::debug!(?outcome, "lmesh_radio_checked");
+                            true
+                        }
+                        Ok(Err(error)) => {
+                            tracing::warn!(error = %format!("{error:#}"), "lmesh_radio_start_failed");
+                            false
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "lmesh_radio_task_failed");
+                            false
+                        }
+                    }
                 }
-                Ok(Err(error)) => {
-                    tracing::warn!(error = %format!("{error:#}"), "lmesh_radio_start_failed");
-                    false
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "lmesh_radio_task_failed");
-                    false
-                }
+                DesiredTransportMode::NanWpa2Ap { .. }
+                | DesiredTransportMode::Sta {
+                    channel: SHARED_CHANNEL,
+                    nan_coexist: true,
+                    ..
+                } => match tokio::task::spawn_blocking(move || {
+                    worker.start_monitor_only(SHARED_CHANNEL)
+                })
+                .await
+                {
+                    Ok(Ok(())) => true,
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            error = %format!("{error:#}"),
+                            "lmesh_radio_monitor_only_failed"
+                        );
+                        false
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "lmesh_radio_task_failed");
+                        false
+                    }
+                },
+                DesiredTransportMode::Sta { .. } | DesiredTransportMode::Off => false,
             };
             if started_ok && last_publish.is_none_or(|at| at.elapsed() >= interval) {
                 match discovery.nan_announce_service_info(started.elapsed().as_secs()) {
@@ -300,8 +401,14 @@ fn register_telemetry(registry: &Registry, radio: &Radio, iface: String) {
     );
 }
 
-fn register_methods(registry: &Registry, radio: Radio, discovery: Arc<LocalDiscovery>, iface: String) {
-    register_telemetry(registry, &radio, iface);
+fn register_methods(
+    registry: &Registry,
+    radio: Radio,
+    discovery: Arc<LocalDiscovery>,
+    iface: String,
+    runtime: Arc<Mutex<TransportRuntime>>,
+) {
+    register_telemetry(registry, &radio, iface.clone());
     let status_radio = radio.clone();
     assert!(
         registry.register(
@@ -322,36 +429,33 @@ fn register_methods(registry: &Registry, radio: Radio, discovery: Arc<LocalDisco
         "telemetry.nan_status registered twice"
     );
 
-    // `transport.set`: Linux has one physical transport, NAN with the open AP and
-    // monitor on the shared channel. Anything else is not available here.
     let transport_radio = radio.clone();
+    let transport_runtime = runtime.clone();
     assert!(
         registry.register(
             methods::TRANSPORT_SET,
             TypedHandler::new(move |request: TransportSetRequest, _: CallContext| {
                 let radio = transport_radio.clone();
+                let runtime = transport_runtime.clone();
                 async move {
-                    if !matches!(request.mode, None | Some(MODE_NAN)) {
-                        return Err(format!(
-                            "Linux runs transport mode {MODE_NAN} (NAN with the open AP) only, not {:?}",
-                            request.mode
-                        ));
-                    }
-                    if request.channel.is_some_and(|channel| channel != SHARED_CHANNEL) {
-                        return Err(format!(
-                            "the shared channel is {SHARED_CHANNEL}, not {:?}",
-                            request.channel
-                        ));
-                    }
-                    tokio::task::spawn_blocking(move || radio.start())
+                    tokio::task::spawn_blocking(move || apply_transport_set(&radio, &runtime, request))
                         .await
                         .map_err(|error| error.to_string())?
-                        .map_err(|error| format!("{error:#}"))?;
-                    Ok(TransportSetResponse::default())
                 }
             }),
         ),
         "transport.set registered twice"
+    );
+
+    assert!(
+        registry.register(
+            methods::WIFI_SCAN,
+            WifiScanHandler {
+                iface,
+                runtime,
+            }
+        ),
+        "wifi.scan registered twice"
     );
 
     let active_radio = radio.clone();
@@ -420,7 +524,7 @@ async fn discovery_active(
         };
         let id = now_ms();
         let mut record = [0u8; 96];
-        let used = dmesh_server::announce::encode_discovery_request(id, &mut record)
+        let used = dmesh_discovery::announce::encode_discovery_request(id, &mut record)
             .ok_or("encode announce.discovery")?;
         let waiting = discovery.engine().expect_response(id);
         // Directed: NOW and NAN, now and in the next discovery windows.
@@ -444,7 +548,7 @@ async fn discovery_active(
     if wants(&["all", "nan", "now", "best"]) {
         let id = now_ms();
         let mut record = [0u8; 96];
-        match dmesh_server::announce::encode_discovery_request(id, &mut record) {
+        match dmesh_discovery::announce::encode_discovery_request(id, &mut record) {
             Some(used) => {
                 radio.request(record[..used].to_vec(), None, wants(&["all", "nan", "best"]));
             }
@@ -466,6 +570,430 @@ fn now_ms() -> u64 {
         .max(1)
 }
 
+fn apply_transport_set(
+    radio: &Radio,
+    runtime: &Arc<Mutex<TransportRuntime>>,
+    request: TransportSetRequest,
+) -> Result<TransportSetResponse, String> {
+    let mode = request.mode.unwrap_or(MODE_NAN);
+    let iface = {
+        let guard = runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        request
+            .iface
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| guard.iface.clone())
+    };
+    match mode {
+        MODE_OFF => {
+            {
+                let mut guard = runtime
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard.mode = DesiredTransportMode::Off;
+                guard.supplicant = None;
+            }
+            radio
+                .stop_and_release()
+                .map_err(|error| format!("{error:#}"))?;
+            Ok(TransportSetResponse::default())
+        }
+        MODE_NAN => {
+            if request.channel.is_some_and(|channel| channel != SHARED_CHANNEL) {
+                return Err(format!(
+                    "the shared channel is {SHARED_CHANNEL}, not {:?}",
+                    request.channel
+                ));
+            }
+            let ap_passphrase = request
+                .ap_passphrase
+                .as_deref()
+                .or(request.passphrase.as_deref())
+                .filter(|s| !s.is_empty());
+            let wants_wpa2_ap = ap_passphrase.is_some() || request.open == Some(false);
+            if wants_wpa2_ap {
+                let passphrase = ap_passphrase.unwrap_or(DEFAULT_AP_PASSPHRASE);
+                if !(8..=63).contains(&passphrase.len()) || passphrase.contains('\0') {
+                    return Err(
+                        "transport.set passphrase must contain 8 through 63 non-NUL bytes"
+                            .to_owned(),
+                    );
+                }
+                let ssid = request
+                    .ap_ssid
+                    .as_deref()
+                    .or(request.ssid.as_deref())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(DEFAULT_SSID)
+                    .to_owned();
+                {
+                    let mut guard = runtime
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    guard.supplicant = None;
+                }
+                radio
+                    .stop_and_release()
+                    .map_err(|error| format!("{error:#}"))?;
+                let _ = link_up_confirmed(&iface, 3);
+                let supplicant = lmesh_wpa::WpaSupplicant::start(
+                    &iface,
+                    wpa_runtime_dir(),
+                    Duration::from_secs(5),
+                )
+                .map_err(|error| format!("wpa_supplicant start failed: {error:#}"))?;
+                supplicant
+                    .start_wpa2_ap(
+                        ssid.as_bytes(),
+                        passphrase,
+                        channel_to_freq(SHARED_CHANNEL),
+                        Duration::from_secs(15),
+                    )
+                    .map_err(|error| format!("WPA2 AP start failed: {error:#}"))?;
+                let _ = ensure_link_local_address(&iface);
+                radio
+                    .start_monitor_only(SHARED_CHANNEL)
+                    .map_err(|error| format!("monitor start failed: {error:#}"))?;
+                let mut guard = runtime
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard.mode = DesiredTransportMode::NanWpa2Ap { ssid, passphrase: passphrase.to_owned() };
+                guard.supplicant = Some(supplicant);
+                Ok(TransportSetResponse::default())
+            } else {
+                {
+                    let mut guard = runtime
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    guard.mode = DesiredTransportMode::NanOpenAp;
+                    guard.supplicant = None;
+                }
+                radio.start().map_err(|error| format!("{error:#}"))?;
+                let _ = ensure_link_local_address(&iface);
+                Ok(TransportSetResponse::default())
+            }
+        }
+        MODE_STA => {
+            let infra = lmesh_wifi::load_default_infrastructure_credentials()
+                .map_err(|error| format!("load infrastructure credentials: {error:#}"))?;
+            let ssid = match request.ssid.as_deref().filter(|s| !s.is_empty()) {
+                Some(ssid) => ssid.to_owned(),
+                None => infra
+                    .as_ref()
+                    .map(|creds| creds.ssid().to_owned())
+                    .ok_or_else(|| "transport.set mode=1 (STA) requires ssid or a default profile in infra-sta.toml".to_owned())?,
+            };
+            let bssid = match request.bssid.as_deref().filter(|s| !s.is_empty()) {
+                Some(text) => Some(
+                    parse_mac(text)
+                        .ok_or_else(|| format!("transport.set bssid={text:?} is not a MAC address"))?,
+                ),
+                None => None,
+            };
+            let supplied_passphrase = request.passphrase.as_deref().filter(|s| !s.is_empty());
+            if let Some(passphrase) = supplied_passphrase
+                && (!(8..=63).contains(&passphrase.len()) || passphrase.contains('\0'))
+            {
+                return Err(
+                    "transport.set passphrase must contain 8 through 63 non-NUL bytes".to_owned(),
+                );
+            }
+            let credentials = if request.open == Some(true) {
+                None
+            } else if let Some(passphrase) = supplied_passphrase {
+                Some((
+                    passphrase.to_owned(),
+                    lmesh_wifi::InfrastructureSecurity::Wpa2Psk,
+                ))
+            } else {
+                infra
+                    .as_ref()
+                    .and_then(|creds| creds.find_by_ssid(&ssid))
+                    .map(|p| (p.password().to_owned(), p.security()))
+            };
+
+            {
+                let mut guard = runtime
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard.mode = DesiredTransportMode::Off;
+                guard.supplicant = None;
+            }
+            radio
+                .stop_and_release()
+                .map_err(|error| format!("{error:#}"))?;
+
+            let (associated_channel, supplicant_opt) = if let Some((passphrase, security)) = credentials {
+                let _ = link_state_result(&iface, true);
+                let supplicant = lmesh_wpa::WpaSupplicant::start(
+                    &iface,
+                    wpa_runtime_dir(),
+                    Duration::from_secs(5),
+                )
+                .map_err(|error| format!("wpa_supplicant start failed: {error:#}"))?;
+                let connect_res = match security {
+                    lmesh_wifi::InfrastructureSecurity::Wpa2Psk => {
+                        supplicant.connect_wpa2(ssid.as_bytes(), &passphrase, Duration::from_secs(20))
+                    }
+                    lmesh_wifi::InfrastructureSecurity::Wpa3Sae => {
+                        supplicant.connect_wpa3_sae(ssid.as_bytes(), &passphrase, Duration::from_secs(20))
+                    }
+                };
+                connect_res.map_err(|error| format!("WPA STA connect to {ssid:?} failed: {error:#}"))?;
+                let freq = supplicant
+                    .connected_frequency(Duration::from_secs(2))
+                    .map_err(|error| format!("query connected frequency: {error:#}"))?;
+                let ch = freq_to_channel(freq).unwrap_or(request.channel.unwrap_or(0));
+                (ch, Some(supplicant))
+            } else {
+                if request.open == Some(false) {
+                    return Err(format!("no WPA credentials found for SSID {ssid:?}"));
+                }
+                let channel = request.channel.unwrap_or(SHARED_CHANNEL);
+                if !(1..=13).contains(&channel) {
+                    return Err(format!("open STA channel must be in 1..=13, not {channel}"));
+                }
+                let freq = channel_to_freq(channel);
+                let index = ifindex(&iface).map_err(|error| format!("{error:#}"))?;
+                let socket = Nl80211Socket::open().map_err(|error| format!("{error:#}"))?;
+                socket
+                    .set_interface_type(index, NL80211_IFTYPE_STATION)
+                    .map_err(|error| format!("{error:#}"))?;
+                let up = link_up_confirmed(&iface, 3);
+                if up.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+                    return Err(format!("failed to bring {iface} up: {up}"));
+                }
+                socket
+                    .connect_open(index, &ssid, freq, bssid)
+                    .map_err(|error| format!("{error:#}"))?;
+                let deadline = Instant::now() + Duration::from_secs(8);
+                loop {
+                    let peers = socket
+                        .station_dump(index)
+                        .map_err(|error| format!("{error:#}"))?;
+                    if !peers.is_empty() {
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(format!("timed out waiting for open STA association to {ssid:?}"));
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                (channel, None)
+            };
+
+            let _ = ensure_link_local_address(&iface);
+            // NAN is only active in STA mode when the associated AP is on channel 6 (2437 MHz)
+            // and NOW is not explicitly disabled (`now == 2`).
+            let nan_coexist = associated_channel == SHARED_CHANNEL && request.now != Some(2);
+            if nan_coexist {
+                if let Err(error) = radio.start_monitor_only(SHARED_CHANNEL) {
+                    tracing::warn!(
+                        error = %format!("{error:#}"),
+                        "lmesh_sta_channel6_monitor_unavailable"
+                    );
+                }
+            }
+            let mut guard = runtime
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.mode = DesiredTransportMode::Sta {
+                ssid,
+                channel: associated_channel,
+                nan_coexist,
+            };
+            guard.supplicant = supplicant_opt;
+            Ok(TransportSetResponse::default())
+        }
+        other => Err(format!(
+            "unsupported transport.set mode {other}; expected {MODE_OFF} (Off), {MODE_STA} (STA), or {MODE_NAN} (NAN)"
+        )),
+    }
+}
+
+struct WifiScanHandler {
+    iface: String,
+    runtime: Arc<Mutex<TransportRuntime>>,
+}
+
+impl Handler for WifiScanHandler {
+    fn call<'a>(&'a self, call: Call<'a>) -> Reply<'a> {
+        Box::pin(async move {
+            let id = call.record.id?;
+            let parsed = decode_raw_wifi_handler_record(call.record);
+            let req = match parsed {
+                Ok(RawWifiLabRequest::Scan(scan)) => scan,
+                _ => RawWifiScanRequest {
+                    fresh: false,
+                    last_results: false,
+                },
+            };
+            let iface = self.iface.clone();
+            let runtime = self.runtime.clone();
+            let outcome = tokio::task::spawn_blocking(move || execute_wifi_scan(&iface, &runtime, req))
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|res| res);
+            let mut out = [0u8; 2048];
+            let used = match outcome {
+                Ok(payload) => mesh_api::envelope::encode_numeric_response(
+                    RAW_WIFI_COMPONENT,
+                    RAW_WIFI_METHOD_SCAN,
+                    id,
+                    &payload,
+                    &mut out,
+                )?,
+                Err(message) => mesh_api::envelope::encode_numeric_error(
+                    RAW_WIFI_COMPONENT,
+                    RAW_WIFI_METHOD_SCAN,
+                    id,
+                    message.as_bytes(),
+                    &mut out,
+                )?,
+            };
+            Some(out[..used].to_vec())
+        })
+    }
+}
+
+fn is_direct_dmesh_ssid(ssid: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(ssid) else {
+        return false;
+    };
+    text.eq_ignore_ascii_case(DEFAULT_SSID)
+        || (text.starts_with("DIRECT-") && text.to_ascii_lowercase().ends_with("dmesh"))
+}
+
+fn execute_wifi_scan(
+    iface: &str,
+    runtime: &Arc<Mutex<TransportRuntime>>,
+    req: RawWifiScanRequest,
+) -> Result<Vec<u8>, String> {
+    let index = ifindex(iface).map_err(|error| format!("{error:#}"))?;
+    let socket = Nl80211Socket::open().map_err(|error| format!("{error:#}"))?;
+    let info = socket
+        .interface_info(index)
+        .map_err(|error| format!("{error:#}"))?;
+    let is_ap = info.iftype == Some(NL80211_IFTYPE_AP);
+
+    let mut did_fresh = false;
+    if req.fresh && !req.last_results {
+        if socket.trigger_scan(index, is_ap).is_ok() {
+            did_fresh = true;
+            let deadline = Instant::now() + Duration::from_millis(2_500);
+            while Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(250));
+                if let Ok(list) = socket.scan_dump(index)
+                    && list.iter().any(|bss| bss.seen_ms_ago < 2_000)
+                {
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut bss_list = socket
+        .scan_dump(index)
+        .map_err(|error| format!("{error:#}"))?;
+    if bss_list.is_empty() && !req.last_results && !did_fresh {
+        if socket.trigger_scan(index, is_ap).is_ok() {
+            did_fresh = true;
+            std::thread::sleep(Duration::from_millis(1_500));
+            bss_list = socket
+                .scan_dump(index)
+                .map_err(|error| format!("{error:#}"))?;
+        }
+    }
+
+    // Sort strongest first and deduplicate by BSSID.
+    bss_list.sort_by(|a, b| b.signal_dbm.cmp(&a.signal_dbm));
+    let mut seen_bssids = Vec::new();
+    let mut unique = Vec::new();
+    for bss in bss_list {
+        if !seen_bssids.contains(&bss.bssid) {
+            seen_bssids.push(bss.bssid);
+            unique.push(bss);
+        }
+    }
+
+    let total_aps = unique.len().min(u16::MAX as usize) as u16;
+    let direct_dmesh_aps = unique
+        .iter()
+        .filter(|bss| is_direct_dmesh_ssid(&bss.ssid))
+        .count()
+        .min(u16::MAX as usize) as u16;
+    let age_ms = unique
+        .iter()
+        .map(|bss| bss.seen_ms_ago)
+        .min()
+        .unwrap_or(0);
+
+    let mut entries = [RawWifiScanEntry {
+        ssid: [0u8; 32],
+        ssid_len: 0,
+        bssid: [0u8; 6],
+        channel: 0,
+        signal_dbm: -100,
+    }; RAW_WIFI_SCAN_MAX_RECORDS];
+    let count = unique.len().min(RAW_WIFI_SCAN_MAX_RECORDS);
+    for (slot, bss) in entries.iter_mut().zip(unique.iter().take(count)) {
+        let len = bss.ssid.len().min(32);
+        slot.ssid[..len].copy_from_slice(&bss.ssid[..len]);
+        slot.ssid_len = len as u8;
+        slot.bssid = bss.bssid;
+        slot.channel = bss.channel;
+        slot.signal_dbm = bss.signal_dbm;
+    }
+
+    let mut configured_sta_ssid = [0u8; 32];
+    let mut configured_sta_ssid_len = 0u8;
+    let mut configured_sta_auth_mode = None;
+    let mode_ssid = {
+        let guard = runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match &guard.mode {
+            DesiredTransportMode::Sta { ssid, .. } => Some(ssid.clone()),
+            _ => None,
+        }
+    };
+    if let Some(ssid) = mode_ssid {
+        let bytes = ssid.as_bytes();
+        let len = bytes.len().min(32);
+        configured_sta_ssid[..len].copy_from_slice(&bytes[..len]);
+        configured_sta_ssid_len = len as u8;
+        configured_sta_auth_mode = Some(3);
+    } else if let Ok(Some(creds)) = lmesh_wifi::load_default_infrastructure_credentials()
+        && let Some(profile) = creds.find_by_ssid(creds.ssid())
+    {
+        let bytes = creds.ssid().as_bytes();
+        let len = bytes.len().min(32);
+        configured_sta_ssid[..len].copy_from_slice(&bytes[..len]);
+        configured_sta_ssid_len = len as u8;
+        configured_sta_auth_mode = Some(match profile.security() {
+            lmesh_wifi::InfrastructureSecurity::Wpa2Psk => 3,
+            lmesh_wifi::InfrastructureSecurity::Wpa3Sae => 6,
+        });
+    }
+
+    let response = RawWifiScanResponse {
+        entries: count,
+        total_aps,
+        direct_dmesh_aps,
+        age_ms,
+        fresh: did_fresh,
+        configured_sta_ssid,
+        configured_sta_ssid_len,
+        configured_sta_auth_mode,
+    };
+    let mut scan_cbor = [0u8; 1536];
+    let used = encode_raw_wifi_scan_response(&entries[..count], response, &mut scan_cbor)
+        .ok_or_else(|| "encode wifi.scan response".to_owned())?;
+    Ok(scan_cbor[..used].to_vec())
+}
+
 /// `nan.wakeup {to}`: queue a targeted STA activation as an active Subscribe; with `pair`,
 /// `nan.pair_wakeup {to}`, the invitation an unpaired device accepts to open its pairing window.
 struct WakeupHandler {
@@ -477,11 +1005,11 @@ impl Handler for WakeupHandler {
     fn call<'a>(&'a self, call: Call<'a>) -> Reply<'a> {
         Box::pin(async move {
             let id = call.record.id?;
-            let component = dmesh_server::announce::ANNOUNCE_COMPONENT;
+            let component = dmesh_discovery::announce::ANNOUNCE_COMPONENT;
             let method = if self.pair {
-                dmesh_server::announce::ANNOUNCE_NAN_PAIR_WAKEUP
+                dmesh_discovery::announce::ANNOUNCE_NAN_PAIR_WAKEUP
             } else {
-                dmesh_server::announce::ANNOUNCE_NAN_WAKEUP
+                dmesh_discovery::announce::ANNOUNCE_NAN_WAKEUP
             };
             // A wake is a NAN service-discovery request addressed to one device: sent
             // on NOW and NAN, now and in the next discovery windows. Linux and the
@@ -491,8 +1019,8 @@ impl Handler for WakeupHandler {
             });
             let mut out = [0u8; 160];
             let used = match outcome {
-                Ok(()) => dmesh_server::tagged::encode_numeric_response(component, method, id, &[0xf5], &mut out)?,
-                Err(message) => dmesh_server::tagged::encode_numeric_error(
+                Ok(()) => mesh_api::envelope::encode_numeric_response(component, method, id, &[0xf5], &mut out)?,
+                Err(message) => mesh_api::envelope::encode_numeric_error(
                     component,
                     method,
                     id,
@@ -506,14 +1034,14 @@ impl Handler for WakeupHandler {
 }
 
 fn wake_request(
-    record: dmesh_server::tagged::Record<'_>,
+    record: mesh_api::envelope::Record<'_>,
     pair: bool,
 ) -> Result<([u8; 6], Vec<u8>), String> {
     let name = if pair { "nan.pair_wakeup" } else { "nan.wakeup" };
     let target = if pair {
-        dmesh_server::announce::decode_nan_pair_wakeup_request(record)
+        dmesh_discovery::announce::decode_nan_pair_wakeup_request(record)
     } else {
-        dmesh_server::announce::decode_nan_wakeup_request(record)
+        dmesh_discovery::announce::decode_nan_wakeup_request(record)
     }
     .ok_or_else(|| format!("{name} needs `to`, a MAC address"))?;
     if target == [0; 6] || target[0] & 1 != 0 {
@@ -521,19 +1049,19 @@ fn wake_request(
     }
     if pair {
         let mut record = [0u8; 96];
-        let used = dmesh_server::announce::encode_nan_pair_wakeup_request(target, 0, &mut record)
+        let used = dmesh_discovery::announce::encode_nan_pair_wakeup_request(target, 0, &mut record)
             .ok_or("encode pairing invitation")?;
         return Ok((target, record[..used].to_vec()));
     }
-    let request = dmesh_server::control::Request::TransportSet {
-        kind: dmesh_server::control::TransportKind::Sta,
-        config: dmesh_server::control::TransportConfig {
+    let request = dmesh_discovery::control::Request::TransportSet {
+        kind: dmesh_discovery::control::TransportKind::Sta,
+        config: dmesh_discovery::control::TransportConfig {
             wake_target: Some(target),
-            ..dmesh_server::control::TransportConfig::default()
+            ..dmesh_discovery::control::TransportConfig::default()
         },
     };
     let mut record = [0u8; 96];
-    let used = dmesh_server::control::encode_request(request, None, &mut record)
+    let used = dmesh_discovery::control::encode_request(request, None, &mut record)
         .ok_or("encode targeted STA activation")?;
     Ok((target, record[..used].to_vec()))
 }
@@ -553,8 +1081,8 @@ mod tests {
     fn a_wake_request_for_a_unicast_mac_encodes_the_sta_activation() {
         let mut wire = [0u8; 96];
         let target = [0x02, 1, 2, 3, 4, 5];
-        let used = dmesh_server::announce::encode_nan_wakeup_request(target, 7, &mut wire).unwrap();
-        let record = dmesh_server::tagged::decode(&wire[..used]).unwrap();
+        let used = dmesh_discovery::announce::encode_nan_wakeup_request(target, 7, &mut wire).unwrap();
+        let record = mesh_api::envelope::decode(&wire[..used]).unwrap();
         let (to, bytes) = wake_request(record, false).unwrap();
         assert_eq!(to, target);
         assert!(!bytes.is_empty());
@@ -565,15 +1093,15 @@ mod tests {
         let mut wire = [0u8; 96];
         let target = [0x02, 1, 2, 3, 4, 5];
         let used =
-            dmesh_server::announce::encode_nan_pair_wakeup_request(target, 7, &mut wire).unwrap();
-        let record = dmesh_server::tagged::decode(&wire[..used]).unwrap();
+            dmesh_discovery::announce::encode_nan_pair_wakeup_request(target, 7, &mut wire).unwrap();
+        let record = mesh_api::envelope::decode(&wire[..used]).unwrap();
         let (to, bytes) = wake_request(record, true).unwrap();
         assert_eq!(to, target);
-        let sent = dmesh_server::tagged::decode(&bytes).unwrap();
-        assert_eq!(dmesh_server::announce::decode_nan_pair_wakeup_request(sent), Some(target));
+        let sent = mesh_api::envelope::decode(&bytes).unwrap();
+        assert_eq!(dmesh_discovery::announce::decode_nan_pair_wakeup_request(sent), Some(target));
         // A plain wake request is not accepted as an invitation.
-        let used = dmesh_server::announce::encode_nan_wakeup_request(target, 7, &mut wire).unwrap();
-        let record = dmesh_server::tagged::decode(&wire[..used]).unwrap();
+        let used = dmesh_discovery::announce::encode_nan_wakeup_request(target, 7, &mut wire).unwrap();
+        let record = mesh_api::envelope::decode(&wire[..used]).unwrap();
         assert!(wake_request(record, true).is_err());
     }
 
@@ -581,8 +1109,8 @@ mod tests {
     fn a_wake_request_for_a_multicast_mac_is_refused() {
         let mut wire = [0u8; 96];
         let used =
-            dmesh_server::announce::encode_nan_wakeup_request([0x01, 0, 0, 0, 0, 1], 7, &mut wire).unwrap();
-        let record = dmesh_server::tagged::decode(&wire[..used]).unwrap();
+            dmesh_discovery::announce::encode_nan_wakeup_request([0x01, 0, 0, 0, 0, 1], 7, &mut wire).unwrap();
+        let record = mesh_api::envelope::decode(&wire[..used]).unwrap();
         assert!(wake_request(record, false).unwrap_err().contains("unicast"));
     }
 
@@ -613,7 +1141,7 @@ mod tests {
         let id = 99;
         let waiting = a_engine.expect_response(id);
         let mut request = [0u8; 96];
-        let used = dmesh_server::announce::encode_discovery_request(id, &mut request).unwrap();
+        let used = dmesh_discovery::announce::encode_discovery_request(id, &mut request).unwrap();
         let a_mac = [0x02, 0, 0, 0, 0, 0xa];
         let b_mac = [0x02, 0, 0, 0, 0, 0xb];
         let reply = b
@@ -630,7 +1158,7 @@ mod tests {
         let (other, other_engine) = observer_with_engine(b"other");
         let announce = other_engine.local_announce().unwrap();
         let mut wire = [0u8; 256];
-        let used = dmesh_server::announce::encode(announce, &mut wire).unwrap();
+        let used = dmesh_discovery::announce::encode(announce, &mut wire).unwrap();
         let peer = [0x02, 1, 2, 3, 4, 5];
         let seen = observer.nan(peer, None, &[&wire[..used]]);
         assert!(seen.summary.is_some());
@@ -640,5 +1168,32 @@ mod tests {
         assert!(devices[0].observations.contains_key("nan"));
         assert!(devices[0].observations.contains_key("now"));
         let _ = other;
+    }
+
+    #[test]
+    fn empty_nan_and_now_frames_record_provisional_unpaired_devices() {
+        let (observer, engine) = observer_with_engine(b"me");
+        let peer_nan = [0x20, 0x6e, 0xf1, 0x13, 0xa4, 0x00];
+        let peer_now = [0x98, 0x88, 0xe0, 0x01, 0x29, 0x14];
+        observer.nan(peer_nan, None, &[]);
+        observer.now(peer_now, None, NowKind::Sync, &[]);
+        let view = engine.discovered_view();
+        assert_eq!(view.len(), 2);
+        assert!(view.contains_key("20:6e:f1:13:a4:00"));
+        assert!(view.contains_key("98:88:e0:01:29:14"));
+    }
+
+    #[test]
+    fn outbound_now_payload_is_wrapped_in_now_sync_envelope() {
+        let nan = Arc::new(Mutex::new(dmesh_rawnan::NanState::new(
+            dmesh_rawnan::NAN_CLUSTER_STALE_AFTER_US,
+        )));
+        let local = [0x74, 0x19, 0xf8, 0x17, 0xde, 0x65];
+        let mut request = [0u8; 96];
+        let used = dmesh_discovery::announce::encode_discovery_request(42, &mut request).unwrap();
+        let wrapped =
+            dmesh_rawnan::linux::wrap_now_sync_payload(local, &nan, &request[..used]);
+        let parsed = dmesh_rawnan::parse_now_sync_body(&wrapped).expect("valid NOW_SYNC body");
+        assert_eq!(parsed.service_info, &request[..used]);
     }
 }
